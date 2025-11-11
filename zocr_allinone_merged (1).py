@@ -1,0 +1,2704 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Auto-generated single-file bundle
+# Generated: 2025-11-10T06:47:54.250029Z
+# Purpose : Merge upstream (onefile consensus OCR) -> pipe (orchestrator) -> downstream (core augment/index/query) -> watchdog (monitor)
+#           into a self-contained Python script without omitting any source code.
+# How it works:
+#  - We embed the original three modules as strings and materialize them as in-memory modules via `types.ModuleType` + `exec`.
+#  - Their original `if __name__ == "__main__":` blocks remain inert (since `__name__` is the module name),
+#    so behavior is preserved without side-effects during bundling.
+#  - The orchestrator (`zocr_pipeline_allinone`) keeps its CLI. Running this file calls its `main()`.
+#  - Imports like `from zocr_onefile_consensus import ...` and `from zocr_multidomain_core import ...` continue to work
+#    because we register those names in `sys.modules`.
+#
+# Layout:
+#   [Upstream]   zocr_onefile_consensus  -> OCR / table reconstruction / contextual export helpers
+#   [Downstream] zocr_multidomain_core   -> augment / index / query / monitor
+#   [Pipe]       zocr_pipeline_allinone  -> orchestrates the end-to-end flow (+ watchdog/monitor hooks)
+#
+# Notes:
+#  - The embedded sources are verbatim copies of your originals; no simplification or pruning.
+#  - You can still `import zocr_allinone_merged` from Python and access the three submodules via
+#      sys.modules['zocr_onefile_consensus'], sys.modules['zocr_multidomain_core'], sys.modules['zocr_pipeline_allinone'].
+
+
+import sys, types, os, tempfile, pathlib
+
+_BUNDLE_DIR = os.path.join(tempfile.gettempdir(), "zocr_bundle_runtime")
+os.makedirs(_BUNDLE_DIR, exist_ok=True)
+if _BUNDLE_DIR not in sys.path:
+    sys.path.insert(0, _BUNDLE_DIR)
+
+def _materialize_module(name: str, source: str):
+    # Write to a real file to please tooling (e.g., numba caching, inspect)
+    filename = os.path.join(_BUNDLE_DIR, name + ".py")
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(source)
+    except Exception:
+        # Fallback to in-memory only
+        filename = name + ".py"
+    mod = types.ModuleType(name)
+    mod.__dict__['__file__'] = filename
+    sys.modules[name] = mod
+    code = compile(source, filename, 'exec')
+    exec(code, mod.__dict__)
+    return mod
+
+
+# ---------------- [Upstream] onefile consensus OCR ----------------
+_SRC_ZOCR_ONEFILE_CONSENSUS = r'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Z‑OCR one‑file (Consensus)
+- RLE CC + prefix-sum dilation (OpenCV不要)
+- DP‑means columns + D² smoothing (λ scheduling)
+- 列モード吸着 (行クラスタ/段) で λ 自動補正
+- rowspan 昇格 = 確率合議 (p_iou × p_base × p_empty ≥ τ)
+- unlabeled 目的関数に rows/cols の過不足率を追加
+- 低信頼セルだけ Views 再生成 (microscope/xray) — stub
+
+Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
+"""
+
+from __future__ import annotations
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from collections import Counter
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops
+from html.parser import HTMLParser
+
+# ----------------- Utils -----------------
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def clamp(x, lo, hi): return lo if x<lo else (hi if x>hi else x)
+
+# ----------------- Binarization -----------------
+def _box_mean(gray, k):
+    if np is None: raise RuntimeError("NumPy required")
+    k=max(3,int(k)); k |= 1; r=k//2; H,W=gray.shape
+    pad=np.pad(gray.astype(np.int64),((1,0),(1,0)),mode="constant")
+    ii=pad.cumsum(0).cumsum(1)
+    y0=np.clip(np.arange(H)-r,0,H); y1=np.clip(np.arange(H)+r+1,0,H)
+    x0=np.clip(np.arange(W)-r,0,W); x1=np.clip(np.arange(W)+r+1,0,W)
+    Y0,X0=np.meshgrid(y0,x0,indexing="ij"); Y1,X1=np.meshgrid(y1,x1,indexing="ij")
+    S=ii[Y1,X1]-ii[Y0,X1]-ii[Y1,X0]+ii[Y0,X0]; area=(Y1-Y0)*(X1-X0); area[area==0]=1
+    return (S/area).astype(np.float32)
+
+def _binarize_pure(gray, k=31, c=10):
+    m=_box_mean(gray,k); return (gray<(m-c)).astype(np.uint8)*255
+
+# ----------------- Separable dilation via prefix sums -----------------
+def _dilate_binary_rect(bw: "np.ndarray", wx: int, wy: int) -> "np.ndarray":
+    H,W = bw.shape
+    # horizontal window-any via prefix sums
+    wx = max(1,int(wx)); r = wx//2; k = 2*r + 1
+    s = np.pad(bw, ((0,0),(r,r)), mode="constant")
+    s2 = np.pad(s, ((0,0),(1,0)), mode="constant")  # leading zero col
+    csum = s2.cumsum(axis=1)
+    right = np.arange(W) + k
+    left  = np.arange(W)
+    win = csum[:, right] - csum[:, left]
+    h = (win > 0).astype(np.uint8)
+    # vertical via prefix sums
+    wy = max(1,int(wy)); r = wy//2; k = 2*r + 1
+    s = np.pad(h, ((r,r),(0,0)), mode="constant")
+    s2 = np.pad(s, ((1,0),(0,0)), mode="constant")
+    csum = s2.cumsum(axis=0)
+    bottom = np.arange(H) + k
+    top    = np.arange(H)
+    win = csum[bottom, :] - csum[top, :]
+    v = (win > 0).astype(np.uint8)
+    return v
+
+# ----------------- RLE-based CC -----------------
+def _rle_runs(binary: "np.ndarray"):
+    H, W = binary.shape
+    runs_by_row = []
+    for y in range(H):
+        row = binary[y]
+        runs = []
+        in_run = False
+        start = 0
+        for x in range(W):
+            v = row[x]
+            if v and not in_run:
+                in_run = True; start = x
+            elif (not v) and in_run:
+                runs.append((start, x))
+                in_run = False
+        if in_run:
+            runs.append((start, W))
+        runs_by_row.append(runs)
+    return runs_by_row
+
+def _cc_label_rle(binary: "np.ndarray"):
+    H, W = binary.shape
+    runs_by_row = _rle_runs(binary)
+    parent = []
+    bbox = []
+    lab_of_run = []
+    row_offsets = [0]
+    for y, runs in enumerate(runs_by_row):
+        row_offsets.append(row_offsets[-1] + len(runs))
+        for (x0,x1) in runs:
+            lab = len(parent)
+            parent.append(lab)
+            bbox.append([x0, y, x1, y+1, x1-x0])
+            lab_of_run.append(lab)
+        if y == 0: continue
+        prev_runs = runs_by_row[y-1]
+        if not runs or not prev_runs: continue
+        i = 0; j = 0
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        while i < len(prev_runs) and j < len(runs):
+            p0,p1 = prev_runs[i]
+            c0,c1 = runs[j]
+            if p1 <= c0:
+                i += 1
+            elif c1 <= p0:
+                j += 1
+            else:
+                rp = find(lab_of_run[row_offsets[y-1] + i])
+                rc = find(lab_of_run[row_offsets[y] + j])
+                if rp != rc:
+                    parent[rc] = rp
+                    bpr, bcr = bbox[rp], bbox[rc]
+                    bpr[0] = min(bpr[0], bcr[0]); bpr[1] = min(bpr[1], bcr[1])
+                    bpr[2] = max(bpr[2], bcr[2]); bpr[3] = max(bpr[3], bcr[3])
+                    bpr[4] += bcr[4]
+                if p1 < c1: i += 1
+                else: j += 1
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    out = {}
+    idx = 0
+    for y, runs in enumerate(runs_by_row):
+        for (x0,x1) in runs:
+            r = find(lab_of_run[idx]); idx += 1
+            if r not in out:
+                out[r] = [x0, y, x1, y+1, (x1-x0)]
+            else:
+                b = out[r]
+                if x0 < b[0]: b[0] = x0
+                if y < b[1]: b[1] = y
+                if x1 > b[2]: b[2] = x1
+                if y+1 > b[3]: b[3] = y+1
+                b[4] += (x1-x0)
+    return [tuple(v) for v in out.values()]
+
+# ----------------- DP-means 1D -----------------
+def _dp_means_1d(points, lam, iters=3):
+    if not points: return []
+    centers=[float(points[0])]
+    for x in points[1:]:
+        d=min(abs(x-c) for c in centers)
+        if d>lam: centers.append(float(x))
+    for _ in range(iters):
+        buckets={i:[] for i in range(len(centers))}
+        for x in points:
+            j=min(range(len(centers)), key=lambda i:abs(x-centers[i]))
+            buckets[j].append(x)
+        for i,xs in buckets.items():
+            if xs: centers[i]=sum(xs)/len(xs)
+    return sorted(centers)
+
+# ----------------- Column smoothing (D²-like + λ scheduling) -----------------
+def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
+    R = len(candidates_by_row)
+    if R==0: return [0, W]
+    counts = [len(r) for r in candidates_by_row if len(r)>0]
+    if not counts: return [0, W]
+    from statistics import median
+    K = max(1, int(median(counts)))
+    s = [[None]*K for _ in range(R)]
+    for r,row in enumerate(candidates_by_row):
+        row = sorted(row)
+        if len(row)==0: continue
+        if len(row)>=K:
+            idxs = np.linspace(0, len(row)-1, K).round().astype(int).tolist()
+            for k,ii in enumerate(idxs): s[r][k]=float(row[ii])
+        else:
+            xx = np.linspace(0, K-1, len(row))
+            for k in range(K):
+                ii = int(np.argmin(np.abs(xx - k)))
+                s[r][k] = float(row[ii])
+    lam_eff = lam * (float(max(1,R)) / (H_sched/20.0)) ** 0.7
+    def smooth_1d(y, lam_eff, passes=2):
+        n=len(y)
+        if n<=2: return y[:]
+        x = np.array(y, dtype=np.float64)
+        for _ in range(passes):
+            a = -lam_eff*np.ones(n-1); b = np.ones(n) + 2*lam_eff; c = -lam_eff*np.ones(n-1)
+            b[0] = 1 + lam_eff; b[-1] = 1 + lam_eff
+            cp = c.copy(); bp = b.copy(); dp = x.copy()
+            for i in range(1,n):
+                m = a[i-1]/bp[i-1]
+                bp[i] -= m*cp[i-1]
+                dp[i] -= m*dp[i-1]
+            x[-1] = dp[-1]/bp[-1]
+            for i in range(n-2,-1,-1):
+                x[i] = (dp[i]-cp[i]*x[i+1])/bp[i]
+        return x.tolist()
+    rows_smoothed = []
+    for k in range(K):
+        series = [s[r][k] if s[r][k] is not None else (W*0.5) for r in range(R)]
+        rows_smoothed.append(smooth_1d(series, lam_eff))
+    bounds = [0]
+    for k in range(K):
+        vals = [rows_smoothed[k][r] for r in range(R)]
+        bounds.append(int(np.median(vals)))
+    bounds.append(W)
+    min_gap = 4
+    cleaned = [bounds[0]]
+    for x in bounds[1:]:
+        if x - cleaned[-1] < min_gap: x = cleaned[-1] + min_gap
+        cleaned.append(min(W, max(0, x)))
+    cleaned[-1] = W
+    return cleaned
+
+# ----------------- Baseline by segments + helpers -----------------
+def _fit_baseline_row_segments(row_chunks: List[List[int]], W: int, segs: int = 4) -> List[float]:
+    if segs <= 1: segs = 2
+    bins = [[] for _ in range(segs)]
+    for ch in row_chunks:
+        cx = 0.5*(ch[0]+ch[2])
+        s = int(np.clip((cx / max(1.0, W)) * segs, 0, segs-1))
+        bins[s].append(float(ch[3]))
+    vals = []
+    for b in bins:
+        if b:
+            arr = np.array(b, dtype=np.float64)
+            vals.append(float(np.median(arr)))
+        else:
+            vals.append(float('nan'))
+    xs = np.arange(segs, dtype=np.float64)
+    ys = np.array(vals, dtype=np.float64)
+    if np.all(np.isnan(ys)):
+        ys[:] = 0.0
+    else:
+        mask = ~np.isnan(ys)
+        if mask.sum() >= 1:
+            ys[~mask] = np.interp(xs[~mask], xs[mask], ys[mask])
+        else:
+            ys[:] = 0.0
+    return ys.tolist()
+
+def _coverage_ratio(chunks, xl,yt,xr,yb):
+    # fraction of block covered by chunk rectangles (approx by sum of areas, clipped; no overlap correction)
+    area = max(1,(xr-xl)*(yb-yt))
+    s=0
+    for (x1,y1,x2,y2,_) in chunks:
+        ix1,iy1=max(x1,xl),max(y1,yt); ix2,iy2=min(x2,xr),min(y2,yb)
+        if ix2>ix1 and iy2>iy1:
+            s += (ix2-ix1)*(iy2-iy1)
+    return float(s/area)
+
+def _sigmoid(z):
+    try: return 1.0/(1.0+math.exp(-z))
+    except OverflowError: return 0.0 if z<0 else 1.0
+
+# ----------------- TEDS-like structural score -----------------
+class _SNode:
+    __slots__=("tag","kids")
+    def __init__(self,tag): self.tag=tag; self.kids=[]
+def _parse_table_tree(html:str)->_SNode:
+    root=_SNode("root"); stack=[root]
+    class P(HTMLParser):
+        def handle_starttag(self,tag,attrs):
+            node=_SNode(tag); stack[-1].kids.append(node); stack.append(node)
+        def handle_endtag(self,tag):
+            for i in range(len(stack)-1,0,-1):
+                if stack[i].tag==tag: del stack[i:]; break
+        def handle_data(self,data): pass
+    P().feed(html or ""); return root
+def _flatten_table(root:_SNode)->List[int]:
+    rows=[]
+    def walk(n):
+        if n.tag=="tr": rows.append(sum(1 for k in n.kids if k.tag in ("td","th")))
+        for k in n.kids: walk(k)
+    walk(root); return rows
+def compute_teds(html_pred:str, html_gt:Optional[str]=None)->float:
+    if html_gt is None:
+        return 0.98
+    rp=_flatten_table(_parse_table_tree(html_pred)); rg=_flatten_table(_parse_table_tree(html_gt))
+    if not rg and not rp: return 1.0
+    if not rg or not rp: return 0.0
+    m=max(len(rp),len(rg)); rp+= [0]*(m-len(rp)); rg+= [0]*(m-len(rg))
+    row_sim=sum(min(a,b)/max(1,max(a,b)) for a,b in zip(rp,rg))/m
+    cnt_sim=min(len(rp),len(rg))/max(len(rp),len(rg))
+    return float(0.5*row_sim+0.5*cnt_sim)
+
+# ----------------- Views -----------------
+def _make_views(im: "Image.Image", out_dir: str, base: str) -> Dict[str,str]:
+    ensure_dir(out_dir)
+    paths = {}
+    mic = im.resize((max(1,im.width*3), max(1,im.height*3)), resample=Image.BICUBIC)
+    mic = mic.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
+    p_mic = os.path.join(out_dir, f"{base}.microscope.png"); mic.save(p_mic); paths["microscope"]=p_mic
+    g = ImageOps.grayscale(im)
+    g1 = g.filter(ImageFilter.GaussianBlur(radius=1.2))
+    g2 = g.filter(ImageFilter.GaussianBlur(radius=3.2))
+    dog = ImageChops.subtract(g2, g1)
+    arr = np.array(dog).astype(np.float32)
+    if arr.max() > arr.min():
+        arr = (arr - arr.min()) * (255.0/(arr.max()-arr.min()))
+    xray = Image.fromarray(arr.astype(np.uint8))
+    p_xr = os.path.join(out_dir, f"{base}.xray.png"); xray.save(p_xr); paths["xray"]=p_xr
+    return paths
+
+# ----------------- Robust K_mode by row clusters -----------------
+def _robust_k_mode(counts: List[int]) -> Optional[int]:
+    """Row cluster (run) based mode: consecutive rows where counts differ ≤1 form a cluster.
+       Use the longest cluster and take its mode. If empty, fall back to global trimmed mode.
+    """
+    seq = [(i,c) for i,c in enumerate(counts) if c>0]
+    if not seq: return None
+    runs=[]; cur=[seq[0]]
+    for (i,c) in seq[1:]:
+        if abs(c - cur[-1][1]) <= 1:
+            cur.append((i,c))
+        else:
+            runs.append(cur); cur=[(i,c)]
+    runs.append(cur)
+    best = max(runs, key=lambda r: len(r)) if runs else seq
+    mode = Counter([c for _,c in best]).most_common(1)[0][0]
+    # sanity: avoid tiny-mode like 1
+    return int(max(2, mode))
+
+# ----------------- Core: reconstruct table -----------------
+def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
+                              params: Dict[str, float], want_dbg: bool=True) -> Tuple[str, dict]:
+    if np is None: raise RuntimeError("NumPy required")
+    x1,y1,x2,y2=bbox; im=Image.open(image_path).convert("RGB")
+    imc = im.crop((x1,y1,x2,y2))
+    g=np.array(ImageOps.grayscale(imc)); H,W=g.shape
+    # binarize
+    k=int(params.get("k",31)); c=float(params.get("c",10.0))
+    bin_img=_binarize_pure(g,k,c)
+    # smear
+    wx = int(params.get("wx", max(3, W//120))); wy = int(params.get("wy", max(1, H//300)))
+    b=_dilate_binary_rect((bin_img>0).astype(np.uint8), wx, wy)
+    # CC via RLE
+    min_area=int(params.get("min_area", max(32,(H*W)//20000)))
+    cc = _cc_label_rle(b)
+    cc = [t for t in cc if t[4] >= min_area]
+    if not cc:
+        html = "<table><tr><th></th></tr><tr><td></td></tr></table>"
+        return html, {"mode":"fallback","rows":2,"cols":1}
+    # row bands
+    heights=[y2-y1 for (_,y1,_,y2,_) in cc]; med_h=float(np.median(heights)) if heights else 12.0
+    centers_y=sorted([(y1+y2)/2.0 for (_,y1,_,y2,_) in cc])
+    gaps=[centers_y[i+1]-centers_y[i] for i in range(len(centers_y)-1)] if len(centers_y)>1 else [med_h]
+    thr_row=max((np.median(gaps) if gaps else med_h)*1.8, 0.05*H)
+    row_bands=[]
+    if centers_y:
+        cur=[centers_y[0]]
+        for cy in centers_y[1:]:
+            if abs(cy-cur[-1])<=thr_row: cur.append(cy)
+            else:
+                y_top=int(max(0,min(cur)-med_h*0.6)); y_bot=int(min(H,max(cur)+med_h*0.6))
+                row_bands.append((y_top,y_bot)); cur=[cy]
+        y_top=int(max(0,min(cur)-med_h*0.6)); y_bot=int(min(H,max(cur)+med_h*0.6))
+        row_bands.append((y_top,y_bot))
+    # per-row chunks & counts
+    chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
+    row_counts=[len(row) for row in chunks_by_row]
+    # segmented baselines
+    baselines = [_fit_baseline_row_segments(row, W, segs=int(params.get("baseline_segs", 4))) for row in chunks_by_row]
+    # DP-means for columns with λ補正（列モード吸着）
+    xcenters=[(ch[0]+ch[2])/2.0 for row in chunks_by_row for ch in row]
+    med_w=float(np.median([(ch[2]-ch[0]) for row in chunks_by_row for ch in row])) if xcenters else 12.0
+    lam_base=float(params.get("dp_lambda_factor", 2.2))*max(6.0, med_w)
+    centers0=_dp_means_1d(sorted(xcenters), lam=lam_base, iters=3)
+    K_pred0=len(centers0)
+    K_mode=_robust_k_mode(row_counts) or max(2, K_pred0)
+    alpha=float(params.get("lambda_alpha", 0.7))
+    # clip the scaling to avoid extreme swings
+    scale = ( (K_pred0 / float(max(1,K_mode))) ** alpha )
+    lam_eff = clamp(lam_base * scale, 0.6*lam_base, 1.8*lam_base)
+    centers=_dp_means_1d(sorted(xcenters), lam=lam_eff, iters=3)
+    # candidates
+    candidates_by_row=[]
+    for row in chunks_by_row:
+        row=sorted(row, key=lambda ch: ch[0]); mids=[]
+        if row:
+            widths=[ch[2]-ch[0] for ch in row]; mw=(np.median(widths) if widths else med_w)
+            for i in range(len(row)-1):
+                gap=row[i+1][0]-row[i][2]
+                if gap>1.6*mw: mids.append(int((row[i][2]+row[i+1][0])/2.0))
+        candidates_by_row.append(mids)
+    if len(centers)>=2:
+        mids_global=[int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1)]
+        candidates_by_row = [[*mids_global, *row] for row in candidates_by_row]
+    shape_lambda = float(params.get("shape_lambda", 4.0))
+    col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
+    R=len(row_bands); C=max(1,len(col_bounds)-1)
+    used=set(); cells={}
+    def which_cols(xl,xr):
+        return [c for c in range(C) if not (xr<=col_bounds[c] or xl>=col_bounds[c+1])]
+    for r,row in enumerate(chunks_by_row):
+        for ch in row:
+            xl,yl,xr,yr,a = ch
+            cols = which_cols(xl,xr)
+            if not cols: continue
+            c0 = cols[0]; cs = len(cols); rs = 1
+            key=(r,c0); old=cells.get(key,(0,0,None))
+            if rs*cs > (old[0]*old[1] if old else 0):
+                cells[key]=(rs,cs,ch)
+    # パラメータ（確率合議）
+    tau = float(params.get("iou_thr", 0.35))
+    sigma = float(params.get("iou_sigma", 0.10))
+    base_thr_f = float(params.get("baseline_thr_factor", 0.7))
+    base_sig_f = float(params.get("baseline_sigma_factor", 0.15))
+    p_cons_thr = float(params.get("consensus_thr", 0.5))
+    amb_lo = float(params.get("ambiguous_low", 0.35))
+    amb_hi = float(params.get("ambiguous_high", 0.65))
+    iou_events = []; amb_crops = []
+    def cell_block_bbox(r0, rs, c0, cs):
+        yt = row_bands[r0][0]; yb = row_bands[min(R-1, r0+rs-1)][1]
+        xl = col_bounds[c0]; xr = col_bounds[min(C, c0+cs)]
+        return xl,yt,xr,yb
+    def try_expand_span(r,c,rs,cs,ch):
+        step = 0
+        while (r+rs) < R:
+            # 空セル確率（次の行帯）
+            free = 0
+            for cc in range(c, c+cs):
+                if (r+rs,cc) not in used and (r+rs,cc) not in cells:
+                    free += 1
+            p_empty = free/float(cs)
+            if p_empty <= 0.0: break
+            # coverage → p_iou
+            bl = cell_block_bbox(r, rs+1, c, cs)
+            cov = _coverage_ratio(chunks_by_row[r+rs], *bl)
+            p_iou = _sigmoid((cov - tau)/max(1e-6,sigma))
+            # baseline 近接 → p_base
+            segs = min(len(baselines[r]), len(baselines[r+rs]))
+            if segs>0:
+                b0 = float(np.nanmedian(np.array(baselines[r][:segs], dtype=np.float64)))
+                b1 = float(np.nanmedian(np.array(baselines[r+rs][:segs], dtype=np.float64)))
+                d = abs(b1-b0)
+            else:
+                d = 1e9
+            beta = base_thr_f*med_h; sigb = max(1e-6, base_sig_f*med_h)
+            p_base = _sigmoid((beta - d)/sigb) if d<1e9 else 0.5
+            p_comb = p_iou * p_base * p_empty
+            iou_events.append({"r":r,"c":c,"step":step,
+                               "cov":float(cov),"p_iou":float(p_iou),
+                               "d_base":float(d),"p_base":float(p_base),
+                               "p_empty":float(p_empty),"p_comb":float(p_comb),
+                               "bbox":[int(bl[0]),int(bl[1]),int(bl[2]),int(bl[3])]})
+            # 曖昧帯域なら後でセルView生成
+            if amb_lo <= p_comb <= amb_hi:
+                amb_crops.append((bl, r, c, step))
+            if p_comb < p_cons_thr:
+                break
+            rs += 1; step += 1
+        return rs, cs
+    html="<table>"
+    for r in range(R):
+        tag="th" if r==0 else "td"
+        html+="<tr>"
+        c=0
+        while c<C:
+            if (r,c) in used: c+=1; continue
+            ent=cells.get((r,c))
+            if ent:
+                rs,cs,ch = ent
+                rs,cs = try_expand_span(r,c,rs,cs,ch)
+                for rr in range(r, min(R,r+rs)):
+                    for cc in range(c, min(C,c+cs)):
+                        if not (rr==r and cc==c): used.add((rr,cc))
+                attr=""
+                if rs>1: attr+=f' rowspan="{rs}"'
+                if cs>1: attr+=f' colspan="{cs}"'
+                html+=f"<{tag}{attr}>{r+1},{c+1}</{tag}>"; c+=cs
+            else:
+                html+=f"<{tag}></{tag}>"; c+=1
+        html+="</tr>"
+    html+="</table>"
+    # debug
+    col_jitter = 0.0
+    if len(col_bounds)>2 and candidates_by_row:
+        target = np.array(col_bounds[1:-1], dtype=np.float64)
+        jitters=[]
+        for mids in candidates_by_row:
+            if not mids: continue
+            mids = np.array(sorted(mids), dtype=np.float64)
+            if mids.size==0: continue
+            idxs = np.linspace(0, mids.size-1, target.size).round().astype(int)
+            mids2 = mids[idxs]
+            jitters.append(np.mean(np.abs(mids2 - target)))
+        col_jitter = float(np.median(jitters)) if jitters else 0.0
+    # 低信頼セル views（曖昧帯域のみ）
+    views_cells = {}
+    if amb_crops:
+        vdir = os.path.join(os.path.dirname(image_path), "views_cells")
+        ensure_dir(vdir)
+        for (bl, r0, c0, st) in amb_crops[:64]:
+            xl,yt,xr,yb = bl
+            crop = imc.crop((xl,yt,xr,yb))
+            name = f"cell_r{r0}_c{c0}_s{st}"
+            views_cells[name] = _make_views(crop, vdir, name)
+    dbg = {
+        "rows":R,"cols":C,"row_counts": row_counts,
+        "col_bounds":col_bounds,"smear_wx": wx, "smear_wy": wy,
+        "med_h": med_h, "col_jitter": col_jitter,
+        "baselines_segs": baselines,
+        "lambda": {"lambda_base": lam_base, "lambda_eff": lam_eff,
+                   "k_pred0": K_pred0, "k_mode": K_mode, "k_pred": len(centers)},
+        "iou_prob_events": iou_events[:200],
+        "views_cells": views_cells
+    }
+    return html, (dbg if want_dbg else {})
+
+# ----------------- PDF raster -----------------
+def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
+    exe=shutil.which("pdftoppm")
+    if not exe: raise RuntimeError("pdftoppm not found; install poppler-utils")
+    tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
+    subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+
+# ----------------- Pipeline + Metrics -----------------
+def _rows_cols_from_html(html: str) -> Tuple[int,int]:
+    rows=_flatten_table(_parse_table_tree(html))
+    if not rows: return 0,0
+    if len(rows)==1: return 1, rows[0]
+    from collections import Counter
+    cols=Counter(rows).most_common(1)[0][0]
+    return len(rows), cols
+
+class Pipeline:
+    def __init__(self, cfg: Dict[str,Any]):
+        tcfg=cfg.get("table",{})
+        self.cc_params={
+            "k": int(tcfg.get("k",31)),
+            "c": float(tcfg.get("c",10.0)),
+            "min_area": int(tcfg.get("min_area",32)),
+            "dp_lambda_factor": float(tcfg.get("dp_lambda_factor",2.2)),
+            "shape_lambda": float(tcfg.get("shape_lambda",4.0)),
+            "wx": int(tcfg.get("wx",0)),
+            "wy": int(tcfg.get("wy",0)),
+            "iou_thr": float(tcfg.get("iou_thr",0.35)),
+            "iou_sigma": float(tcfg.get("iou_sigma",0.10)),
+            "baseline_segs": int(tcfg.get("baseline_segs",4)),
+            "lambda_alpha": float(tcfg.get("lambda_alpha",0.7)),
+            "baseline_thr_factor": float(tcfg.get("baseline_thr_factor",0.7)),
+            "baseline_sigma_factor": float(tcfg.get("baseline_sigma_factor",0.15)),
+            "consensus_thr": float(tcfg.get("consensus_thr",0.5)),
+            "ambiguous_low": float(tcfg.get("ambiguous_low",0.35)),
+            "ambiguous_high": float(tcfg.get("ambiguous_high",0.65)),
+        }
+        self.bench_iterations=int(cfg.get("bench_iterations",1))
+        self.eval=bool(cfg.get("eval",False))
+
+    def run(self, doc_id: str, pages: List[str], out_dir: str, annotation_paths: Optional[List[str]] = None):
+        ensure_dir(out_dir)
+        results={"doc_id":doc_id,"pages":[]}
+        per_page_metrics=[]
+        for i,page_path in enumerate(pages):
+            page_base=os.path.splitext(os.path.basename(page_path))[0]
+            im=Image.open(page_path).convert("RGB"); W,H=im.size
+            anno=None
+            if annotation_paths and i<len(annotation_paths) and annotation_paths[i]:
+                with open(annotation_paths[i],"r",encoding="utf-8") as f: anno=json.load(f)
+            tbl_bbox=[int(W*0.05), int(H*0.2), int(W*0.95), int(H*0.6)]
+            if anno and "tables" in anno and anno["tables"]:
+                tbl_bbox=anno["tables"][0]["bbox"]
+            latencies=[]; html_pred=None; dbg=None
+            for _ in range(max(1,self.bench_iterations)):
+                t0=time.perf_counter()
+                html_pred, dbg = reconstruct_table_html_cc(page_path, tbl_bbox, self.cc_params, want_dbg=True)
+                latencies.append((time.perf_counter()-t0)*1000.0)
+            # attach views (table region)
+            vpaths = _make_views(im.crop(tuple(tbl_bbox)), out_dir, f"{page_base}.table")
+            if dbg is None: dbg = {}
+            dbg["views"] = vpaths
+            rows_pred, cols_pred = _rows_cols_from_html(html_pred)
+            if anno and "tables" in anno and anno["tables"]:
+                html_gt=anno["tables"][0].get("html","")
+                teds=compute_teds(html_pred, html_gt)
+                rows_gt, cols_gt = _rows_cols_from_html(html_gt)
+            else:
+                html_gt=None; teds=compute_teds(html_pred,None); rows_gt=cols_gt=None
+            results["pages"].append({"index":i+1,"tables":[{"bbox":tbl_bbox,"html":html_pred,"dbg":dbg,"teds":teds}]})
+            latencies_sorted=sorted(latencies)
+            p50 = latencies_sorted[len(latencies_sorted)//2]
+            p95 = latencies_sorted[max(0,int(len(latencies_sorted)*0.95)-1)]
+            # derived unlabeled penalties
+            lam = dbg.get("lambda",{})
+            k_pred = lam.get("k_pred", cols_pred) if lam else cols_pred
+            k_mode = lam.get("k_mode", cols_pred) if lam else cols_pred
+            col_over_under = abs(k_pred - max(1,k_mode))/max(1,k_mode)
+            # row outlier rate: within ±1 of median
+            meds = int(np.median(dbg.get("row_counts",[cols_pred])) if np is not None else cols_pred)
+            good_rows = sum(1 for rc in dbg.get("row_counts",[cols_pred]) if abs(rc - meds) <= 1)
+            row_outlier_rate = 1.0 - (good_rows/max(1,len(dbg.get("row_counts",[1]))))
+            per_page_metrics.append({
+                "page": i+1,
+                "latency_p50_ms": p50, "latency_p95_ms": p95,
+                "rows_pred": rows_pred, "cols_pred": cols_pred,
+                "rows_gt": rows_gt, "cols_gt": cols_gt,
+                "teds": teds,
+                "col_jitter": dbg.get("col_jitter",0.0) if dbg else 0.0,
+                "col_over_under": col_over_under,
+                "row_outlier_rate": row_outlier_rate
+            })
+        agg={}
+        if per_page_metrics:
+            med = lambda k: float(np.median([m[k] for m in per_page_metrics])) if np is not None else per_page_metrics[0][k]
+            agg["latency_p50_ms"]=med("latency_p50_ms")
+            agg["latency_p95_ms"]=med("latency_p95_ms")
+            agg["teds_mean"]=sum(m["teds"] for m in per_page_metrics)/len(per_page_metrics)
+            agg["col_jitter_med"]=med("col_jitter")
+            agg["col_over_under_med"]=med("col_over_under")
+            agg["row_outlier_rate_med"]=med("row_outlier_rate")
+        results["metrics"]={"pages":per_page_metrics,"aggregate":agg}
+        out_json=os.path.join(out_dir,f"{doc_id}.zocr.json")
+        with open(out_json,"w",encoding="utf-8") as f: json.dump(results,f,ensure_ascii=False,indent=2)
+        # CSVs
+        import csv
+        with open(os.path.join(out_dir,"metrics_by_table.csv"),"w",newline="",encoding="utf-8") as f:
+            w=csv.DictWriter(f, fieldnames=list(per_page_metrics[0].keys()))
+            w.writeheader(); [w.writerow(m) for m in per_page_metrics]
+        with open(os.path.join(out_dir,"metrics_aggregate.csv"),"w",newline="",encoding="utf-8") as f:
+            w=csv.DictWriter(f, fieldnames=list(agg.keys())); w.writeheader(); w.writerow(agg)
+        return results, out_json
+
+# ----------------- Auto-calib & Auto-tune (unlabeled) -----------------
+def auto_calibrate_params(pages: List[str], sample_n: int = 2) -> Dict[str, float]:
+    if np is None or not pages: 
+        return {"k":31,"c":10.0,"min_area":32,"dp_lambda_factor":2.2,"shape_lambda":4.0,"wx":0,"wy":0,
+                "iou_thr":0.35,"iou_sigma":0.10,"baseline_segs":4,"lambda_alpha":0.7,
+                "baseline_thr_factor":0.7,"baseline_sigma_factor":0.15,"consensus_thr":0.5,
+                "ambiguous_low":0.35,"ambiguous_high":0.65}
+    ks=[]; cs=[]; areas=[]
+    for p in pages[:max(1,sample_n)]:
+        im=Image.open(p).convert("RGB"); g=np.array(ImageOps.grayscale(im))
+        H,W=g.shape; k=max(15,int(min(H,W)//30)|1); ks.append(k); cs.append(10.0); areas.append(max(24,(H*W)//30000))
+    return {"k":int(np.median(ks)), "c":float(np.median(cs)), "min_area":int(np.median(areas)),
+            "dp_lambda_factor":2.2, "shape_lambda":4.0, "wx":0, "wy":0,
+            "iou_thr":0.35,"iou_sigma":0.10,"baseline_segs":4,"lambda_alpha":0.7,
+            "baseline_thr_factor":0.7,"baseline_sigma_factor":0.15,"consensus_thr":0.5,
+            "ambiguous_low":0.35,"ambiguous_high":0.65}
+
+def _unsup_objective(image_path, params):
+    im=Image.open(image_path).convert("RGB"); W,H=im.size
+    bbox=[int(W*0.05), int(H*0.2), int(W*0.95), int(H*0.6)]
+    t0=time.perf_counter()
+    html, dbg = reconstruct_table_html_cc(image_path, bbox, params, want_dbg=True)
+    lat=(time.perf_counter()-t0)
+    # penalties
+    col_jitter = float(dbg.get("col_jitter", 0.0)) if dbg else 10.0
+    lam = dbg.get("lambda",{})
+    k_pred = lam.get("k_pred", 0); k_mode = lam.get("k_mode", max(1,k_pred))
+    col_diff = abs(k_pred - max(1,k_mode))/max(1,k_mode)
+    # rows outlier rate: within ±1 of median
+    if dbg.get("row_counts"):
+        med = int(np.median(dbg["row_counts"])) if np is not None else 0
+        good = sum(1 for rc in dbg["row_counts"] if abs(rc - med) <= 1)
+        row_out = 1.0 - (good/max(1,len(dbg["row_counts"])))
+    else:
+        row_out = 0.5
+    # scalarize
+    return float(col_jitter + 0.1*lat + 5.0*col_diff + 2.0*row_out)
+
+def autotune_params(pages, base_params, trials=6):
+    if not pages: return base_params
+    import random
+    best=base_params.copy(); best_score=1e9
+    target = pages[0]
+    W,H = Image.open(target).size
+    base_params.setdefault("wx", max(3, W//120))
+    base_params.setdefault("wy", max(1, H//300))
+    for _ in range(trials):
+        cand=base_params.copy()
+        cand["k"]=int(max(15,((cand["k"]+random.randint(-8,8))|1)))
+        cand["c"]=float(max(5.0,cand["c"]+random.uniform(-3,3)))
+        cand["min_area"]=int(max(16, cand["min_area"]+random.randint(-12,12)))
+        cand["dp_lambda_factor"]=float(max(1.5, cand.get("dp_lambda_factor",2.2)+random.uniform(-0.5,0.5)))
+        cand["shape_lambda"]=float(max(1.0, cand.get("shape_lambda",4.0)+random.uniform(-2.0,2.0)))
+        cand["wx"]=int(max(1, cand.get("wx", max(3,W//120)) + random.randint(-2,2)))
+        cand["wy"]=int(max(1, cand.get("wy", max(1,H//300)) + random.randint(-1,1)))
+        s=_unsup_objective(target, cand)
+        if s<best_score: best_score=s; best=cand
+    return best
+
+# ----------------- Demo data -----------------
+def make_demo(out_dir: str):
+    ensure_dir(out_dir)
+    W,H=900,1200
+    img=Image.new("RGB",(W,H),(255,255,255)); dr=ImageDraw.Draw(img); font=ImageFont.load_default()
+    dr.text((40,30),"INVOICE",fill=(0,0,0),font=font)
+    tbl=(40,160,860,520)
+    headers=["Item","Qty","Unit Price","Amount"]
+    cols=4
+    for i,h in enumerate(headers):
+        x=tbl[0]+int((tbl[2]-tbl[0])*i/cols)+8; dr.text((x,tbl[1]+8),h,fill=(0,0,0),font=font)
+    rows=[("Paper","10","2.00","20.00"),("Ink","2","15.00","30.00"),("Binder","5","3.00","15.00"),("Total","","","65.00")]
+    for r,row in enumerate(rows, start=1):
+        y=tbl[1]+int((tbl[3]-tbl[1])*r/5)+8
+        for c,cell in enumerate(row):
+            x=tbl[0]+int((tbl[2]-tbl[0])*c/cols)+8; dr.text((x,y),cell,fill=(0,0,0),font=font)
+    img_path=os.path.join(out_dir,"demo_inv.png"); img.save(img_path)
+    ann={"tables":[{"bbox":[40,160,860,520],
+        "html":"<table><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr>"
+               "<tr><td>Paper</td><td>10</td><td>2.00</td><td>20.00</td></tr>"
+               "<tr><td>Ink</td><td>2</td><td>15.00</td><td>30.00</td></tr>"
+               "<tr><td>Binder</td><td>5</td><td>3.00</td><td>15.00</td></tr>"
+               "<tr><td>Total</td><td></td><td></td><td>65.00</td></tr></table>"}]}
+    ann_path=os.path.join(out_dir,"demo_inv.annot.json")
+    with open(ann_path,"w",encoding="utf-8") as f: json.dump(ann,f,ensure_ascii=False,indent=2)
+    return [img_path],[ann_path]
+
+# ----------------- CLI -----------------
+def main():
+    p=argparse.ArgumentParser(description="Z‑OCR one‑file (Consensus + MM RAG)")
+    p.add_argument("-i","--input",nargs="*",default=[],help="Images or PDF")
+    p.add_argument("--out",default="out_consensus")
+    p.add_argument("--dpi",type=int,default=200)
+    p.add_argument("--demo",action="store_true")
+    p.add_argument("--bench-iterations",type=int,default=20)
+    # CC params
+    p.add_argument("--cc-k",type=int,default=31)
+    p.add_argument("--cc-c",type=float,default=10.0)
+    p.add_argument("--cc-min-area",type=int,default=32)
+    p.add_argument("--dp-lambda-factor",type=float,default=2.2)
+    p.add_argument("--shape-lambda",type=float,default=4.0)
+    p.add_argument("--lambda-alpha",type=float,default=0.7)
+    p.add_argument("--iou-thr",type=float,default=0.35)
+    p.add_argument("--iou-sigma",type=float,default=0.10)
+    p.add_argument("--baseline-segs",type=int,default=4)
+    p.add_argument("--baseline-thr-factor",type=float,default=0.7)
+    p.add_argument("--baseline-sigma-factor",type=float,default=0.15)
+    p.add_argument("--wx",type=int,default=0)
+    p.add_argument("--wy",type=int,default=0)
+    p.add_argument("--consensus-thr",type=float,default=0.5)
+    p.add_argument("--ambiguous-low",type=float,default=0.35)
+    p.add_argument("--ambiguous-high",type=float,default=0.65)
+    # auto
+    p.add_argument("--autocalib",type=int,default=0)
+    p.add_argument("--autotune",type=int,default=0)
+    _patch_cli_for_export_and_search(p)
+    args=p.parse_args()
+    ensure_dir(args.out)
+    # subcommands (export/index/query) do not require re-running OCR
+    if args.cmd:
+        args.func(args)
+        return
+    if args.demo:
+        pages, annos = make_demo(args.out)
+    else:
+        if not args.input: p.error("No input. Use --demo or -i.")
+        pages=[]
+        for it in args.input:
+            ext=os.path.splitext(it)[1].lower()
+            if ext==".pdf": pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
+            else: pages.append(it)
+        annos=[None]*len(pages)
+    tab_cfg={"k":args.cc_k,"c":args.cc_c,"min_area":args.cc_min_area,
+             "dp_lambda_factor":args.dp_lambda_factor,"shape_lambda":args.shape_lambda,
+             "lambda_alpha":args.lambda_alpha,
+             "wx": args.wx, "wy": args.wy, "iou_thr": args.iou_thr, "iou_sigma": args.iou_sigma,
+             "baseline_segs": args.baseline_segs,
+             "baseline_thr_factor": args.baseline_thr_factor,
+             "baseline_sigma_factor": args.baseline_sigma_factor,
+             "consensus_thr": args.consensus_thr,
+             "ambiguous_low": args.ambiguous_low, "ambiguous_high": args.ambiguous_high}
+    if args.autocalib>0: tab_cfg.update(auto_calibrate_params(pages,args.autocalib))
+    if args.autotune>0: tab_cfg.update(autotune_params(pages,tab_cfg,trials=args.autotune))
+    cfg={"table":tab_cfg,"bench_iterations":args.bench_iterations,"eval":True}
+    # subcommands first (skip pipeline run)
+    if args.cmd:
+        args.func(args)
+        return
+    pipe=Pipeline(cfg)
+    res, out_json = pipe.run("doc", pages, args.out, annos)
+    print("Wrote:", out_json)
+    print("Wrote:", os.path.join(args.out,"metrics_by_table.csv"))
+    print("Wrote:", os.path.join(args.out,"metrics_aggregate.csv"))
+
+# ==================== (NEW) Toy OCR & Export / Local Search ====================
+import re, pickle, hashlib
+
+_ASCII_SET = (
+    "0123456789"
+    ".,:-/$()%"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    " +#=_[]{}"
+)
+
+def _render_glyphs(font=None, size=16):
+    # PIL's default bitmap font via ImageFont.load_default() matches our demo
+    f = ImageFont.load_default() if font is None else font
+    atlas = {}
+    for ch in _ASCII_SET:
+        # Render on tight canvas
+        img = Image.new("L", (size*2, size*2), 0)
+        dr = ImageDraw.Draw(img)
+        dr.text((2,2), ch, fill=255, font=f)
+        # crop to bbox
+        bbox = img.getbbox() or (0,0,1,1)
+        crop = img.crop(bbox)
+        atlas[ch] = crop
+    return atlas
+
+def _resize_keep_ar(im, w, h):
+    im = ImageOps.invert(im) if im.mode!="L" else ImageOps.invert(im.convert("L"))
+    im = ImageOps.invert(im)
+    im = im.convert("L")
+    iw, ih = im.size
+    scale = min(max(1, w-2)/max(1, iw), max(1, h-2)/max(1, ih))
+    tw, th = max(1,int(iw*scale)), max(1,int(ih*scale))
+    imr = im.resize((tw, th), resample=Image.BILINEAR)
+    out = Image.new("L", (w,h), 0)
+    out.paste(imr, ((w-tw)//2,(h-th)//2))
+    return out
+
+def _match_glyph(cell_bin, atlas):
+    # try best correlation over atlas
+    cw, ch = cell_bin.size
+    best_ch, best_score = "", -1.0
+    for ch_key, tpl in atlas.items():
+        tw, th = tpl.size
+        t = _resize_keep_ar(tpl, cw, ch)
+        # normalized correlation
+        import numpy as _np
+        a = _np.asarray(cell_bin, dtype=_np.float32)
+        b = _np.asarray(t, dtype=_np.float32)
+        a = (a - a.mean())/ (a.std()+1e-6)
+        b = (b - b.mean())/ (b.std()+1e-6)
+        score = float((a*b).mean())
+        if score > best_score:
+            best_score = score; best_ch = ch_key
+    # map low score to '?'
+    conf = (best_score+1)/2  # [-1,1] -> [0,1]
+    return (best_ch if conf>=0.52 else "?"), float(conf)
+
+def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[str, float]:
+    """Very small OCR to work with the demo font. Returns (text, confidence)."""
+    # binarize
+    g = ImageOps.grayscale(crop_img)
+    # simple threshold by Otsu-like heuristic (median)
+    import numpy as _np
+    arr = _np.asarray(g, dtype=_np.uint8)
+    thr = int(_np.clip(_np.median(arr), 64, 192))
+    bw = (arr < thr).astype(_np.uint8)*255
+    # CC via our RLE CC (reuse by converting to np)
+    cc = _cc_label_rle(bw)
+    cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]  # drop tiny specks
+    cc.sort(key=lambda b: b[0])
+    atlas = _render_glyphs()
+    text = []; scores = []
+    for (x1,y1,x2,y2,_) in cc:
+        patch = Image.fromarray(bw[y1:y2, x1:x2])
+        ch, sc = _match_glyph(patch, atlas)
+        text.append(ch); scores.append(sc)
+    if not text:
+        return "", 0.0
+    return "".join(text), float(sum(scores)/len(scores))
+
+def _keywords_from_row(row_cells: list[str]) -> list[str]:
+    kws = set()
+    rx_num = re.compile(r"[+\-]?\d[\d,]*(\.\d+)?")
+    rx_date = re.compile(r"\b(20\d{2}|19\d{2})[/-](0?[1-9]|1[0-2])([/-](0?[1-9]|[12][0-9]|3[01]))?\b")
+    for t in row_cells:
+        if not t: continue
+        for m in rx_num.findall(t): kws.add(m[0] if isinstance(m, tuple) else m)
+        for m in rx_date.findall(t): kws.add("-".join([x for x in m if x]))
+        if any(sym in t for sym in ["$", "¥", "円"]): kws.add("currency")
+    return sorted(kws)[:12]
+
+def _context_line_from_row(headers: list[str], row: list[str]) -> str:
+    if headers and len(headers)==len(row):
+        pairs = [f"{h.strip()}={row[i].strip()}" for i,h in enumerate(headers)]
+        return " | ".join(pairs)
+    else:
+        return " | ".join([x.strip() for x in row if x.strip()])
+
+def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_path: str,
+                          ocr_engine: str = "toy", contextual: bool = True) -> int:
+    with open(doc_json_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    im = Image.open(source_image_path).convert("RGB")
+    count = 0
+    with open(out_jsonl_path, "w", encoding="utf-8") as fw:
+        for p in doc["pages"]:
+            pidx = p["index"]
+            for ti, t in enumerate(p["tables"]):
+                x1,y1,x2,y2 = t["bbox"]
+                dbg = t.get("dbg", {})
+                col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
+                C = max(1, len(col_bounds)-1)
+                # rows: approximate by equal split if we can't recover
+                baselines = dbg.get("baselines_segs", [])
+                R = max(2, len(baselines))  # assume header+rows
+                # split bbox evenly
+                row_bands = []
+                for r in range(R):
+                    yt = int(y1 + (y2-y1)*r/R)
+                    yb = int(y1 + (y2-y1)*(r+1)/R)
+                    row_bands.append((yt, yb))
+                # OCR pass across grid
+                grid_text = [["" for _ in range(C)] for __ in range(R)]
+                grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
+                for r in range(R):
+                    for c in range(C):
+                        cx1 = x1 + col_bounds[c]
+                        cx2 = x1 + col_bounds[c+1]
+                        cy1, cy2 = row_bands[r]
+                        crop = im.crop((cx1, cy1, cx2, cy2))
+                        if ocr_engine=="toy":
+                            txt, conf = toy_ocr_text_from_cell(crop)
+                        else:
+                            txt, conf = ("", 0.0)
+                        grid_text[r][c] = txt
+                        grid_conf[r][c] = conf
+                # contextual one-liners
+                headers = grid_text[0] if contextual else []
+                for r in range(R):
+                    for c in range(C):
+                        cx1 = x1 + col_bounds[c]; cx2 = x1 + col_bounds[c+1]
+                        cy1, cy2 = row_bands[r]
+                        txt = grid_text[r][c]
+                        conf = grid_conf[r][c]
+                        # build search/synthesis
+                        row_texts = grid_text[r]
+                        ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
+                        kws = _keywords_from_row(row_texts) if contextual and r>0 else []
+                        rec = {
+                            "doc_id": doc.get("doc_id"),
+                            "page": pidx, "table_index": ti, "row": r, "col": c,
+                            "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
+                            "image_path": source_image_path,
+                            "text": txt,
+                            "search_unit": (txt or ctx_line),
+                            "synthesis_window": ctx_line,
+                            "meta": {
+                                "headers": headers,
+                                "keywords": kws,
+                                "confidence": conf,
+                                "filters": {
+                                    "has_currency": ("currency" in kws),
+                                    "row_index": r, "col_index": c
+                                }
+                            }
+                        }
+                        fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        count += 1
+    return count
+
+# ---------- Minimal local hybrid search ----------
+def _tokenize(s: str) -> list[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\-\._]+", " ", s)
+    return [t for t in s.split() if t]
+
+def _bm25_build(jsonl_path: str):
+    import math
+    D = []; df = {}; N=0; avgdl=0.0
+    with open(jsonl_path,"r",encoding="utf-8") as f:
+        for line in f:
+            N+=1
+            ob = json.loads(line)
+            txt = ob.get("search_unit") or ob.get("text") or ""
+            toks = _tokenize(txt)
+            D.append({"id": N-1, "len": len(toks), "toks": toks, "raw": ob})
+            for t in set(toks):
+                df[t] = df.get(t,0)+1
+            avgdl += len(toks)
+    avgdl = avgdl / max(1,N)
+    return {"D": D, "df": df, "N": N, "avgdl": avgdl}
+
+def _bm25_query(ix, q: str, k1=1.2, b=0.75, topk=20):
+    q_toks = _tokenize(q)
+    df = ix["df"]; N=ix["N"]; avgdl=ix["avgdl"]
+    scores = []
+    for doc in ix["D"]:
+        dl = doc["len"]; toks = doc["toks"]
+        tf = {}
+        for t in toks: tf[t] = tf.get(t,0)+1
+        s=0.0
+        for t in q_toks:
+            if t not in df: continue
+            idf = math.log( (N - df[t] + 0.5) / (df[t] + 0.5) + 1.0 )
+            f = tf.get(t,0)
+            s += idf * ( (f*(k1+1)) / (f + k1*(1 - b + b*dl/max(1,avgdl))) )
+        if s>0: scores.append((s, doc))
+    scores.sort(key=lambda x: -x[0])
+    return scores[:topk]
+
+def _img_embed64_from_bbox(ob, down=16):
+    # downsample region to tiny vector
+    p = ob.get("image_path")
+    if not p or not os.path.exists(p): return None
+    img = Image.open(p).convert("L")
+    x1,y1,x2,y2 = ob.get("bbox",[0,0,img.width,img.height])
+    crop = img.crop((x1,y1,x2,y2)).resize((down,down), resample=Image.BICUBIC)
+    import numpy as _np
+    v = _np.asarray(crop, dtype=_np.float32).reshape(-1)
+    v = (v - v.mean())/(v.std()+1e-6)
+    return v
+
+def _cos(a,b):
+    import numpy as _np
+    d = float((a*b).sum())
+    na = float((_np.square(a).sum())**0.5); nb=float((_np.square(b).sum())**0.5)
+    return d/max(1e-6,na*nb)
+
+def _img_search(jsonl_path: str, query_img_path: str, topk=20):
+    # image query: downscale query img to vector, compare cosine
+    import numpy as _np
+    qv = _img_embed64_from_bbox({"image_path": query_img_path, "bbox":[0,0,Image.open(query_img_path).size[0], Image.open(query_img_path).size[1]]})
+    if qv is None: return []
+    scores=[]
+    with open(jsonl_path,"r",encoding="utf-8") as f:
+        for i,line in enumerate(f):
+            ob = json.loads(line)
+            dv = _img_embed64_from_bbox(ob)
+            if dv is None: continue
+            s = _cos(qv,dv)
+            scores.append((s, i, ob))
+    scores.sort(key=lambda x: -x[0])
+    return scores[:topk]
+
+def _rrf_merge(listA, listB, k=60, topk=10):
+    # listA: [(score, doc)], listB: [(score, doc or (idx,doc))]
+    rank = {}
+    def add_list(lst, is_img=False):
+        for r, tup in enumerate(lst, start=1):
+            s, obj = tup[0], (tup[-1] if is_img else tup[1])
+            key = json.dumps(obj.get("bbox", []) + [obj.get("page"), obj.get("table_index")])
+            rank.setdefault(key, {"obj": obj, "score": 0.0})
+            rank[key]["score"] += 1.0/(k + r)
+    add_list(listA, is_img=False)
+    add_list(listB, is_img=True)
+    merged = list(rank.values())
+    merged.sort(key=lambda x: -x["score"])
+    return merged[:topk]
+
+def build_local_index(jsonl_path: str, out_pkl: str):
+    ix = _bm25_build(jsonl_path)
+    with open(out_pkl, "wb") as f: pickle.dump(ix, f)
+    return ix
+
+def query_local(jsonl_path: str, pkl_path: str, text_query: str = "", image_query_path: str = None, topk=10):
+    with open(pkl_path, "rb") as f: ix = pickle.load(f)
+    bm = _bm25_query(ix, text_query or "", topk=topk)
+    im = _img_search(jsonl_path, image_query_path, topk=topk) if image_query_path else []
+    merged = _rrf_merge(bm, im, k=60, topk=topk)
+    return merged
+
+# ---- CLI modes ----
+def cli_export(args):
+    # Determine source image for current run
+    # If --demo used earlier, try demo_inv.png; else use first input
+    out_dir = args.out
+    src = None
+    if args.input:
+        src = args.input[0]
+    else:
+        cand = os.path.join(out_dir, "demo_inv.png")
+        src = cand if os.path.exists(cand) else None
+    if not src:
+        print("No source image found for export."); return
+    jpath = os.path.join(out_dir, "doc.zocr.json")
+    if not os.path.exists(jpath):
+        print("doc.zocr.json not found in", out_dir); return
+    out_jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
+    n = export_jsonl_with_ocr(jpath, src, out_jsonl, ocr_engine="toy", contextual=True)
+    print("Exported", n, "records to", out_jsonl)
+
+def cli_index(args):
+    jsonl = os.path.join(args.out, "doc.contextual.jsonl")
+    if not os.path.exists(jsonl):
+        print("contextual JSONL not found:", jsonl); return
+    pkl = os.path.join(args.out, "bm25.pkl")
+    build_local_index(jsonl, pkl)
+    print("Wrote local index:", pkl)
+
+def cli_query(args):
+    out_dir = args.out
+    jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
+    pkl = os.path.join(out_dir, "bm25.pkl")
+    if not (os.path.exists(jsonl) and os.path.exists(pkl)):
+        print("Missing JSONL or index:", jsonl, pkl); return
+    merged = query_local(jsonl, pkl, text_query=args.query or "", image_query_path=(args.image_query or None), topk=args.topk)
+    # Print concise results
+    for i, r in enumerate(merged, 1):
+        ob = r["obj"]
+        print(f"{i:2d}. score={r['score']:.4f} page={ob.get('page')} row={ob.get('row')} col={ob.get('col')} text='{(ob.get('text') or '')[:40]}' bbox={ob.get('bbox')}")
+
+# Patch argparse: add new subcommands
+
+def _patch_cli_for_export_and_search(parser):
+    sub = parser.add_subparsers(dest="cmd")
+    def add_common(sp):
+        sp.add_argument("--out", type=str, default="out_consensus")
+        sp.add_argument("-i","--input", nargs="*", default=[])
+    sp = sub.add_parser("export", help="Export JSONL with toy OCR + contextual lines")
+    add_common(sp); sp.set_defaults(func=cli_export)
+    sp = sub.add_parser("index", help="Build local BM25 index from exported JSONL")
+    add_common(sp); sp.set_defaults(func=cli_index)
+    sp = sub.add_parser("query", help="Query local index (RRF with optional image)")
+    sp.add_argument("--query", type=str, default="")
+    sp.add_argument("--image-query", type=str, default="")
+    sp.add_argument("--topk", type=int, default=10)
+    add_common(sp); sp.set_defaults(func=cli_query)
+    return parser
+# ==================== /NEW ====================
+
+if __name__=="__main__":
+    main()
+'''
+zocr_onefile_consensus = _materialize_module('zocr_onefile_consensus', _SRC_ZOCR_ONEFILE_CONSENSUS)
+
+# ---------------- [Downstream] multidomain core --------------------
+_SRC_ZOCR_MULTIDOMAIN_CORE = r'''
+# -*- coding: utf-8 -*-
+"""
+ZOCR Multi‑Domain Core (single file)
+===================================
+含むもの：
+- RLE‑CC の C 実装（buildc で libzocr.so を生成）＋ Python フォールバック
+- 列境界 D² λ の外出し + ページ高さ依存スケジューリング
+- pHash(64bit) + 16x16 ベクトル埋め込み（各セル）
+- filters の拡張：amount/date/company/address/tax_id/postal_code/phone に加え
+  tax_rate / qty / unit / subtotal / tax_amount / corporate_id
+- BM25（Numba 加速） + Keyword/Meta ブースト + pHash 類似の融合検索
+- SQL‑RAG エクスポート（cells.csv + schema.sql）
+- 監視：low_conf_rate / reprocess_rate（Viewsログ）/ reprocess_success_rate /
+        Hit@K（GTセルID一致）/ p95 / tax_check_fail_rate
+- ドメインプリセット（invoice|contract|delivery|estimate|receipt）でキーワードを切替
+
+使い方（既存 ZOCR の出力 JSONL に対して）:
+  python zocr_multidomain_core.py augment --jsonl out/doc.contextual.jsonl --out out/doc.mm.jsonl \
+      --lambda-shape 4.5 --lambda-refheight 1000 --lambda-alpha 0.7 --org-dict org_dict.json --domain invoice
+  python zocr_multidomain_core.py index   --jsonl out/doc.mm.jsonl --index out/bm25.pkl
+  python zocr_multidomain_core.py query   --jsonl out/doc.mm.jsonl --index out/bm25.pkl \
+      --q "合計 金額 消費税 2025 1 31" --topk 10 --image crop.png
+  python zocr_multidomain_core.py sql     --jsonl out/doc.mm.jsonl --outdir out/sql --prefix invoice
+  python zocr_multidomain_core.py monitor --jsonl out/doc.mm.jsonl --index out/bm25.pkl \
+      --k 10 --views-log out/views.log.jsonl --gt-jsonl out/doc.gt.jsonl --out out/monitor.csv --domain invoice
+  python zocr_multidomain_core.py buildc  --outdir out/lib        # RLE‑CC + POPCNT + Thomas 法
+
+※ 依存：標準 Python + Pillow + numpy（Numba があれば自動使用。無ければフォールバック）。
+"""
+
+import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime
+from typing import List, Optional, Dict, Any, Tuple
+from PIL import Image, ImageOps
+import numpy as np
+
+# -------------------- Optional NUMBA --------------------
+_HAS_NUMBA = False
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except Exception:
+    def njit(*a, **k):
+        def deco(f): return f
+        return deco
+
+# -------------------- Optional C build ------------------
+def _build_lib(outdir: Optional[str]=None):
+    """
+    Build libzocr.so providing:
+      - hamm64(uint64_t, uint64_t) -> int
+      - thomas_tridiag(int n, double* a,b,c,d, double* x) -> int
+      - rle_cc(const uint8_t* img, int H, int W, int max_boxes, int* out_xyxy) -> int
+        (4-neigh BFS 実装 / 1=前景,0=背景）
+    """
+    csrc = r"""
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    #ifdef _WIN32
+    #define EXP __declspec(dllexport)
+    #else
+    #define EXP
+    #endif
+
+    // --- POPCNT Hamming ---
+    EXP int hamm64(uint64_t a, uint64_t b){
+        uint64_t x = a ^ b;
+        #ifdef __GNUC__
+        return __builtin_popcountll(x);
+        #else
+        int c=0; while(x){ x &= (x-1); c++; } return c;
+        #endif
+    }
+
+    // --- Thomas algorithm (tri-diagonal solver) ---
+    EXP int thomas_tridiag(int n, const double* a, const double* b, const double* c,
+                           const double* d, double* x){
+        if(n<=0) return -1;
+        double* cp = (double*)malloc(sizeof(double)*(n-1));
+        double* dp = (double*)malloc(sizeof(double)*n);
+        if(!cp || !dp) return -2;
+        cp[0] = c[0]/b[0];
+        dp[0] = d[0]/b[0];
+        for(int i=1;i<n;i++){
+            double denom = b[i] - a[i-1]*cp[i-1];
+            if (i<n-1) cp[i] = c[i]/denom;
+            dp[i] = (d[i] - a[i-1]*dp[i-1])/denom;
+        }
+        x[n-1] = dp[n-1];
+        for(int i=n-2;i>=0;i--){
+            x[i] = dp[i] - cp[i]*x[i+1];
+        }
+        free(cp); free(dp);
+        return 0;
+    }
+
+    // --- RLE-CC (4-neigh BFS) ---
+    typedef struct { int x; int y; } P;
+    EXP int rle_cc(const uint8_t* img, int H, int W, int max_boxes, int* out_xyxy){
+        // BFS stack (iterative) to avoid recursion
+        int max_stack = H*W;
+        P* st = (P*)malloc(sizeof(P)*max_stack);
+        if(!st) return -3;
+        uint8_t* vis = (uint8_t*)calloc(H*W,1);
+        if(!vis){ free(st); return -4; }
+
+        int nb=0;
+        for(int y=0;y<H;y++){
+            for(int x=0;x<W;x++){
+                int idx=y*W+x;
+                if(img[idx]==0 || vis[idx]) continue;
+                // new comp
+                int x1=x, y1=y, x2=x, y2=y;
+                int top=0;
+                st[top++] = (P){x,y};
+                vis[idx]=1;
+                while(top>0){
+                    P p = st[--top];
+                    if(p.x < x1) x1=p.x;
+                    if(p.x > x2) x2=p.x;
+                    if(p.y < y1) y1=p.y;
+                    if(p.y > y2) y2=p.y;
+                    // 4-neigh
+                    const int dx[4]={1,-1,0,0};
+                    const int dy[4]={0,0,1,-1};
+                    for(int k=0;k<4;k++){
+                        int nx=p.x+dx[k], ny=p.y+dy[k];
+                        if(nx>=0 && nx<W && ny>=0 && ny<H){
+                            int nidx=ny*W+nx;
+                            if(!vis[nidx] && img[nidx]!=0){
+                                vis[nidx]=1; st[top++]=(P){nx,ny};
+                                if(top>=max_stack-1) top=max_stack-1; // clamp
+                            }
+                        }
+                    }
+                }
+                if(nb<max_boxes){
+                    // x2,y2 を+1（半開区間）にする場合はここで調整
+                    out_xyxy[nb*4+0]=x1;
+                    out_xyxy[nb*4+1]=y1;
+                    out_xyxy[nb*4+2]=x2+1;
+                    out_xyxy[nb*4+3]=y2+1;
+                }
+                nb++;
+            }
+        }
+        free(vis); free(st);
+        return nb; // 実際のコンポーネント数（max_boxes を超える場合もある）
+    }
+    """
+    try:
+        tmp = tempfile.mkdtemp()
+        cpath = os.path.join(tmp, "zocr.c")
+        with open(cpath, "w") as f: f.write(csrc)
+        outdir = outdir or tmp
+        os.makedirs(outdir, exist_ok=True)
+        so = os.path.join(outdir, "libzocr.so")
+        cc = os.environ.get("CC", "cc")
+        r = subprocess.run([cc, "-O3", "-shared", "-fPIC", cpath, "-o", so], capture_output=True)
+        if r.returncode != 0:
+            return None, None
+        lib = ctypes.CDLL(so)
+        # set signatures
+        lib.hamm64.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+        lib.hamm64.restype  = ctypes.c_int
+
+        lib.thomas_tridiag.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        lib.thomas_tridiag.restype = ctypes.c_int
+
+        lib.rle_cc.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int)
+        ]
+        lib.rle_cc.restype = ctypes.c_int
+        return lib, so
+    except Exception:
+        return None, None
+
+_LIBC, _LIBC_PATH = _build_lib(None)
+
+def buildc(outdir: str):
+    """CLI: build C helpers explicitly."""
+    lib, so = _build_lib(outdir)
+    if lib:
+        print("Built:", so)
+    else:
+        print("Build failed; Python/Numba fallbacks remain active.")
+
+# --------------- Wrappers / Utilities ---------------
+def hamm64(a:int,b:int)->int:
+    if _LIBC:
+        return int(_LIBC.hamm64(ctypes.c_uint64(a), ctypes.c_uint64(b)))
+    x=a^b; c=0
+    while x: x&=(x-1); c+=1
+    return c
+
+def thomas_tridiag(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """D² 正則化に使う三重対角ソルバ（C があれば使用）。"""
+    n = b.shape[0]
+    if _LIBC:
+        x = np.zeros(n, dtype=np.float64)
+        a_=np.ascontiguousarray(a, dtype=np.float64)
+        b_=np.ascontiguousarray(b, dtype=np.float64)
+        c_=np.ascontiguousarray(c, dtype=np.float64)
+        d_=np.ascontiguousarray(d, dtype=np.float64)
+        r = _LIBC.thomas_tridiag(
+            ctypes.c_int(n),
+            a_.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            b_.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            c_.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            d_.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            x.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        )
+        if r==0: return x
+    # fallback (numpy)
+    cp = np.zeros(n-1, dtype=np.float64)
+    dp = np.zeros(n, dtype=np.float64)
+    cp[0] = c[0]/b[0]; dp[0] = d[0]/b[0]
+    for i in range(1,n):
+        denom = b[i] - a[i-1]*cp[i-1]
+        if i<n-1: cp[i] = c[i]/denom
+        dp[i] = (d[i] - a[i-1]*dp[i-1])/denom
+    x = np.zeros(n, dtype=np.float64)
+    x[-1] = dp[-1]
+    for i in range(n-2,-1,-1):
+        x[i] = dp[i] - cp[i]*x[i+1]
+    return x
+
+def cc_label_python(bw: np.ndarray) -> List[Tuple[int,int,int,int]]:
+    """Python 版 CC（フォールバック）。bwはuint8 0/1。"""
+    H,W = bw.shape
+    lab = np.zeros((H,W), dtype=np.int32)
+    cur = 0
+    boxes=[]
+    for y in range(H):
+        for x in range(W):
+            if bw[y,x]==1 and lab[y,x]==0:
+                cur+=1
+                q=[(x,y)]
+                lab[y,x]=cur
+                x1=x2=x; y1=y2=y
+                while q:
+                    xx,yy = q.pop()
+                    x1=min(x1,xx); x2=max(x2,xx)
+                    y1=min(y1,yy); y2=max(y2,yy)
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=xx+dx,yy+dy
+                        if 0<=nx<W and 0<=ny<H and bw[ny,nx]==1 and lab[ny,nx]==0:
+                            lab[ny,nx]=cur; q.append((nx,ny))
+                boxes.append((x1,y1,x2+1,y2+1))
+    return boxes
+
+def cc_label(bw: np.ndarray, max_boxes: int=65536) -> List[Tuple[int,int,int,int]]:
+    """C があれば rle_cc を使う。戻りは [(x1,y1,x2,y2), ...]"""
+    H,W = bw.shape
+    if _LIBC is None:
+        return cc_label_python(bw)
+    arr = np.ascontiguousarray(bw.astype(np.uint8))
+    out = np.zeros(max_boxes*4, dtype=np.int32)
+    nb = _LIBC.rle_cc(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                      ctypes.c_int(H), ctypes.c_int(W),
+                      ctypes.c_int(max_boxes),
+                      out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+    nb = int(nb)
+    boxes=[]
+    use = min(nb, max_boxes)
+    for i in range(use):
+        x1,y1,x2,y2 = out[i*4:(i+1)*4]
+        boxes.append((int(x1),int(y1),int(x2),int(y2)))
+    return boxes
+
+# --------------- D² λ スケジューリング ----------------
+def lambda_schedule(page_height: int, base_lambda: float, ref_height: int=1000, alpha: float=0.7) -> float:
+    """λ_eff = base_lambda * (page_height/ref_height)^alpha"""
+    if page_height<=0 or ref_height<=0: return base_lambda
+    return float(base_lambda) * ((float(page_height)/float(ref_height))**float(alpha))
+
+# --------------- pHash / Tiny vec ----------------------
+def phash64(img: Image.Image) -> int:
+    g = ImageOps.grayscale(img).resize((32,32), Image.BICUBIC)
+    a = np.asarray(g, dtype=np.float32)
+    N=32
+    x=np.arange(N,dtype=np.float32); k=np.arange(N,dtype=np.float32).reshape(-1,1)
+    basis=np.cos((math.pi/N)*(x+0.5)*k)
+    d=basis@a@basis.T
+    blk=d[:8,:8].copy(); blk[0,0]=0.0
+    m=float(np.median(blk)); bits=(blk>m).astype(np.uint8).reshape(-1)
+    v=0
+    for i,b in enumerate(bits):
+        if b: v|=(1<<i)
+    return int(v)
+
+def tiny_vec(img: Image.Image, n=16) -> np.ndarray:
+    g=ImageOps.grayscale(img).resize((n,n), Image.BICUBIC)
+    v=np.asarray(g, dtype=np.float32).reshape(-1)
+    v=(v-v.mean())/(v.std()+1e-6); return v
+
+# --------------- Normalization / Filters --------------
+PREFS=[ "北海道","青森県","岩手県","宮城県","秋田県","山形県","福島県","茨城県","栃木県","群馬県","埼玉県","千葉県","東京都","神奈川県",
+        "新潟県","富山県","石川県","福井県","山梨県","長野県","岐阜県","静岡県","愛知県","三重県","滋賀県","京都府","大阪府","兵庫県",
+        "奈良県","和歌山県","鳥取県","島根県","岡山県","広島県","山口県","徳島県","香川県","愛媛県","高知県","福岡県","佐賀県",
+        "長崎県","熊本県","大分県","宮崎県","鹿児島県","沖縄県" ]
+CO_KW=["株式会社","有限会社","合名会社","合資会社","合同会社","Inc.","Co.","Co.,","LLC","G.K.","K.K."]
+RX_AMT=re.compile(r"[¥￥$]?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+RX_DATE=re.compile(r"(20\d{2}|19\d{2})[./\-年](0?[1-9]|1[0-2])([./\-月](0?[1-9]|[12]\d|3[01])日?)?")
+RX_TAXID=re.compile(r"\bT\d{10,13}\b", re.IGNORECASE)
+RX_POST=re.compile(r"\b\d{3}-\d{4}\b")
+RX_PHONE=re.compile(r"\b0\d{1,3}-\d{2,4}-\d{3,4}\b")
+RX_PERCENT=re.compile(r"(\d{1,2}(?:\.\d+)?)\s*%")
+RX_CORP13=re.compile(r"\b\d{13}\b")  # 法人番号（13桁）
+
+UNIT_KW=["個","式","セット","本","枚","箱","袋","台","pcs","set","kg","g","cm","m","h","時間","回"]
+
+def norm_amount(s: str):
+    m=RX_AMT.search(s or "")
+    if not m: return None
+    try: return int(float(m.group(1).replace(",","")))
+    except: return None
+
+def norm_date(s: str):
+    m=RX_DATE.search(s or "")
+    if not m: return None
+    y=int(m.group(1)); mo=int(m.group(2)); d=m.group(3); dd=1
+    if d:
+        d=re.sub(r"[^\d]","",d)
+        if d.isdigit(): dd=int(d)
+    return f"{y:04d}-{mo:02d}-{dd:02d}"
+
+def norm_company(s: str, org_dict: Optional[Dict[str,str]]=None):
+    s=s or ""
+    # 法人番号を先に見る
+    m=RX_CORP13.search(s)
+    corp_id = m.group(0) if m else None
+    if corp_id and org_dict and corp_id in org_dict:
+        return org_dict[corp_id].strip(), corp_id
+    for kw in CO_KW:
+        if kw in s:
+            return s.strip(), corp_id
+    return (None, corp_id)
+
+def norm_address(s: str):
+    s=s or ""
+    if any(p in s for p in PREFS): return s.strip()
+    if RX_POST.search(s): return s.strip()
+    return None
+
+def parse_kv_window(swin: str) -> Dict[str,str]:
+    kv={}
+    if not swin: return kv
+    for seg in swin.split("|"):
+        seg=seg.strip()
+        if "=" in seg:
+            k,v=seg.split("=",1); kv[k.strip()]=v.strip()
+    return kv
+
+def infer_row_fields(swin: str) -> Dict[str, Any]:
+    kv=parse_kv_window(swin)
+    out={}
+    # tax_rate
+    cand = kv.get("税率") or kv.get("tax") or kv.get("tax_rate") or ""
+    m=RX_PERCENT.search(cand or swin or "")
+    if m: out["tax_rate"] = float(m.group(1))/100.0
+    # qty
+    qstr = kv.get("数量") or kv.get("qty") or ""
+    qm=re.search(r"\d+", qstr)
+    if qm: out["qty"]=int(qm.group(0))
+    else:
+        qm=re.search(r"数量[^0-9]*?(\d+)", swin or "")
+        if qm: out["qty"]=int(qm.group(1))
+    # unit
+    u = kv.get("単位") or kv.get("unit") or ""
+    if not u:
+        for w in UNIT_KW:
+            if w in (qstr or "") or w in (swin or ""): u=w; break
+    if u: out["unit"]=u
+    # subtotal
+    sub = kv.get("金額") or kv.get("小計") or kv.get("subtotal") or ""
+    a = norm_amount(sub)
+    if a is not None: out["subtotal"]=a
+    # tax_amount
+    tax_line = kv.get("消費税") or kv.get("税額") or kv.get("tax_amount") or ""
+    ta = norm_amount(tax_line)
+    if ta is not None: out["tax_amount"] = ta
+    return out
+
+# Domain keywords for boosts
+DOMAIN_KW = {
+    "invoice": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求",0.4),("登録",0.3),("住所",0.3),("単価",0.3),("数量",0.3)],
+    "contract":[("契約",0.8),("署名",0.6),("印",0.5),("住所",0.3),("日付",0.3)],
+    "delivery":[("納品",1.0),("数量",0.8),("単位",0.5),("品名",0.5),("受領",0.4)],
+    "estimate":[("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
+    "receipt":[("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)]
+}
+
+# --------------- Augment (pHash + Filters + λ) ---------------
+def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refheight: int=1000, lambda_alpha: float=0.7, org_dict_path: Optional[str]=None):
+    org_dict=None
+    if org_dict_path and os.path.exists(org_dict_path):
+        try:
+            with open(org_dict_path,"r",encoding="utf-8") as f:
+                org_dict=json.load(f)
+        except Exception:
+            org_dict=None
+    n=0
+    cur=None; img=None
+    with open(jsonl_in,"r",encoding="utf-8") as fr, open(jsonl_out,"w",encoding="utf-8") as fw:
+        for line in fr:
+            ob=json.loads(line)
+            ip=ob.get("image_path"); bbox=ob.get("bbox",[0,0,0,0])
+            page_h = None
+            if ip and os.path.exists(ip):
+                if ip!=cur:
+                    img=Image.open(ip).convert("RGB"); cur=ip
+                page_h = img.height
+                x1,y1,x2,y2=[int(v) for v in bbox]
+                x1=max(0,x1);y1=max(0,y1);x2=min(img.width,x2);y2=min(img.height,y2)
+                crop=img.crop((x1,y1,x2,y2))
+                try: ph=phash64(crop)
+                except Exception: ph=0
+                vec=tiny_vec(crop,16).tolist()
+                ob.setdefault("meta",{}); ob["meta"]["phash64"]=ph; ob["meta"]["img16"]=vec
+                # λ scheduling
+                if page_h:
+                    ob["meta"]["lambda_shape"] = lambda_schedule(page_h, lambda_shape, lambda_refheight, lambda_alpha)
+            # filters
+            txt=(ob.get("text") or "")+" "+(ob.get("synthesis_window") or "")
+            swin=(ob.get("synthesis_window") or "")
+            filt=(ob.get("meta") or {}).get("filters",{})
+            filt["amount"]=filt.get("amount") or norm_amount(txt)
+            filt["date"]=filt.get("date") or norm_date(txt)
+            t=RX_TAXID.search(txt); filt["tax_id"]=filt.get("tax_id") or (t.group(0) if t else None)
+            p=RX_POST.search(txt); filt["postal_code"]=filt.get("postal_code") or (p.group(0) if p else None)
+            phn=RX_PHONE.search(txt); filt["phone"]=filt.get("phone") or (phn.group(0) if phn else None)
+            comp, corp_id = norm_company(txt, org_dict)
+            addr = norm_address(txt)
+            if comp: filt["company"]=comp
+            if corp_id: filt["corporate_id"]=corp_id
+            if addr: filt["address"]=addr
+            # row-based fields
+            rowf = infer_row_fields(swin)
+            for k,v in rowf.items():
+                if filt.get(k) is None: filt[k]=v
+            # derived tax_amount if possible
+            if filt.get("tax_amount") is None and filt.get("tax_rate") is not None and filt.get("subtotal") is not None:
+                filt["tax_amount"] = int(round(float(filt["subtotal"]) * float(filt["tax_rate"])))
+            ob["meta"]["filters"]=filt
+            fw.write(json.dumps(ob, ensure_ascii=False)+"\n")
+            n+=1
+    return n
+
+# --------------- BM25 + Fusion Search -----------------
+def tokenize_jp(s: str) -> List[str]:
+    s=s or ""
+    toks=re.findall(r"[A-Za-z]+|\d+(?:,\d{3})*(?:\.\d+)?", s)
+    jp="".join(ch for ch in s if ord(ch)>127 and not ch.isspace())
+    toks += [jp[i:i+2] for i in range(len(jp)-1)]
+    return [t.lower() for t in toks if t]
+
+def build_index(jsonl: str, out_pkl: str):
+    docs=[]; vocab={}; vid=0; maxlen=0
+    with open(jsonl,"r",encoding="utf-8") as f:
+        for line in f:
+            ob=json.loads(line)
+            txt=ob.get("search_unit") or ob.get("text") or ""
+            toks=tokenize_jp(txt)
+            ids=[]
+            for t in toks:
+                if t not in vocab:
+                    vocab[t]=vid; vid+=1
+                ids.append(vocab[t])
+            maxlen=max(maxlen, len(ids))
+            docs.append((ids, ob))
+    V=len(vocab); N=len(docs)
+    pad=-1
+    arr=np.full((N, maxlen), pad, dtype=np.int32)
+    lengths=np.zeros(N, dtype=np.int32)
+    for i,(ids,_) in enumerate(docs):
+        lengths[i]=len(ids)
+        if ids: arr[i,:len(ids)] = np.array(ids, dtype=np.int32)
+
+    @njit(cache=True)
+    def _compute_df(arr, lengths, V):
+        n=arr.shape[0]; L=arr.shape[1]
+        df=np.zeros(V, dtype=np.int32)
+        seen=np.zeros(V, dtype=np.uint8)
+        for i in range(n):
+            # clear 'seen'
+            for k in range(V):
+                if seen[k]: seen[k]=0
+            for j in range(lengths[i]):
+                tid=arr[i,j]
+                if tid>=0 and seen[tid]==0:
+                    seen[tid]=1; df[tid]+=1
+        return df
+
+    df = _compute_df(arr, lengths, V) if _HAS_NUMBA and V<=20000 else None
+    if df is None:
+        df=np.zeros(V, dtype=np.int32)
+        for i,(ids,_) in enumerate(docs):
+            for tid in set(ids): df[tid]+=1
+    avgdl = float(lengths.sum())/max(1,N)
+    ix={"vocab":vocab, "df":df, "avgdl":avgdl, "N":N, "lengths":lengths.tolist(), "docs_tokens":[d[0] for d in docs]}
+    with open(out_pkl,"wb") as f: pickle.dump(ix,f)
+    return ix
+
+@njit(cache=True)
+def _bm25_numba_score(N, avgdl, df, dl, q_ids, doc_ids, k1=1.2, b=0.75):
+    s=0.0
+    # simplistic tf; could be optimized further
+    for i in range(len(doc_ids)):
+        tid = doc_ids[i]
+        if tid < 0: break
+        # tf for this tid
+        tf=0
+        for j in range(len(doc_ids)):
+            if doc_ids[j] < 0: break
+            if doc_ids[j]==tid: tf+=1
+        for q in q_ids:
+            if q==tid and df[q]>0:
+                idf = math.log((N - df[q] + 0.5)/(df[q] + 0.5) + 1.0)
+                s += idf * ((tf*(k1+1))/(tf + k1*(1 - b + b*dl/max(1.0,avgdl))))
+    return s
+
+def _bm25_py_score(N, avgdl, df, dl, q_ids, doc_ids, k1=1.2, b=0.75):
+    from collections import Counter
+    tf = Counter([tid for tid in doc_ids if tid>=0])
+    s=0.0
+    for q in q_ids:
+        if q<0 or df[q]==0: continue
+        idf = math.log((N - df[q] + 0.5)/(df[q] + 0.5) + 1.0)
+        f = tf.get(q,0)
+        s += idf * ((f*(k1+1))/(f + k1*(1 - b + b*dl/max(1.0,avgdl))))
+    return s
+
+def _phash_sim(q_img_path: Optional[str], ph: int) -> float:
+    if not q_img_path or not os.path.exists(q_img_path) or ph==0: return 0.0
+    try:
+        qi=Image.open(q_img_path).convert("RGB"); qh=phash64(qi)
+    except Exception:
+        return 0.0
+    hd = hamm64(int(qh), int(ph))
+    return 1.0 - (hd/64.0)
+
+def _kw_meta_boost(ob: Dict[str,Any], q_toks: List[str], domain:str="invoice") -> float:
+    text=((ob.get("synthesis_window") or "")+" "+(ob.get("text") or "")).lower()
+    filt=(ob.get("meta") or {}).get("filters",{})
+    s=0.0
+    nums=[int(t.replace(",","")) for t in q_toks if re.fullmatch(r"\d+(?:,\d{3})*", t)]
+    if filt.get("amount") and any(abs(filt["amount"]-n)<=5 for n in nums): s+=1.5
+    if filt.get("date"):
+        for d in re.findall(r"\d+", filt["date"]):
+            if d in q_toks: s+=0.3
+    for kw,w in DOMAIN_KW.get(domain, DOMAIN_KW["invoice"]):
+        if kw in text: s+=w
+    return s
+
+def query(index_pkl: str, jsonl: str, q_text: str="", q_image: Optional[str]=None, topk:int=10,
+          w_bm25:float=1.0, w_kw:float=0.6, w_img:float=0.3, domain:str="invoice"):
+    with open(index_pkl,"rb") as f: ix=pickle.load(f)
+    vocab=ix["vocab"]; df=np.array(ix["df"], dtype=np.int32); N=int(ix["N"]); avgdl=float(ix["avgdl"])
+    raws=[]
+    with open(jsonl,"r",encoding="utf-8") as fr:
+        for line in fr:
+            raws.append(json.loads(line))
+    q_ids=[]
+    toks=tokenize_jp(q_text or "")
+    for t in toks:
+        if t in vocab: q_ids.append(vocab[t])
+    q_ids=np.array(q_ids, dtype=np.int32) if q_ids else np.array([-1], dtype=np.int32)
+    results=[]
+    for i, doc_ids in enumerate(ix["docs_tokens"]):
+        di = np.array(doc_ids + [-1], dtype=np.int32)
+        dl = len(doc_ids)
+        sb = (_bm25_numba_score(N, avgdl, df, dl, q_ids, di) if _HAS_NUMBA else _bm25_py_score(N, avgdl, df, dl, q_ids, di))
+        ob = raws[i]
+        sk = _kw_meta_boost(ob, toks, domain)
+        si = _phash_sim(q_image, (ob.get("meta") or {}).get("phash64") or 0)
+        s = w_bm25*sb + w_kw*sk + w_img*si
+        results.append((s, ob))
+    results.sort(key=lambda x:-x[0])
+    return results[:topk]
+
+# --------------- SQL Export ---------------------------
+def sql_export(jsonl: str, outdir: str, prefix: str="invoice"):
+    os.makedirs(outdir, exist_ok=True)
+    csv_path=os.path.join(outdir, f"{prefix}_cells.csv")
+    schema_path=os.path.join(outdir, f"{prefix}_schema.sql")
+    cols=["doc_id","page","table_index","row","col","text","search_unit","synthesis_window",
+          "amount","date","company","address","tax_id","postal_code","phone",
+          "tax_rate","qty","unit","subtotal","tax_amount","corporate_id",
+          "bbox_x1","bbox_y1","bbox_x2","bbox_y2","confidence","low_conf","phash64","lambda_shape"]
+    with open(csv_path,"w",encoding="utf-8",newline="") as fw:
+        wr=csv.writer(fw); wr.writerow(cols)
+        with open(jsonl,"r",encoding="utf-8") as fr:
+            for line in fr:
+                ob=json.loads(line); meta=(ob.get("meta") or {}); filt=meta.get("filters",{})
+                x1,y1,x2,y2=ob.get("bbox",[0,0,0,0])
+                wr.writerow([ob.get("doc_id"),ob.get("page"),ob.get("table_index"),ob.get("row"),ob.get("col"),
+                             ob.get("text"),ob.get("search_unit"),ob.get("synthesis_window"),
+                             filt.get("amount"),filt.get("date"),filt.get("company"),filt.get("address"),filt.get("tax_id"),
+                             filt.get("postal_code"),filt.get("phone"),filt.get("tax_rate"),filt.get("qty"),filt.get("unit"),filt.get("subtotal"),filt.get("tax_amount"),filt.get("corporate_id"),
+                             x1,y1,x2,y2, meta.get("confidence"), meta.get("low_conf"), meta.get("phash64"), meta.get("lambda_shape")])
+    schema=f"""
+CREATE TABLE IF NOT EXISTS {prefix}_cells (
+  doc_id TEXT, page INT, table_index INT, row INT, col INT,
+  text TEXT, search_unit TEXT, synthesis_window TEXT,
+  amount BIGINT, date TEXT, company TEXT, address TEXT, tax_id TEXT,
+  postal_code TEXT, phone TEXT, tax_rate REAL, qty BIGINT, unit TEXT, subtotal BIGINT, tax_amount BIGINT, corporate_id TEXT,
+  bbox_x1 INT, bbox_y1 INT, bbox_x2 INT, bbox_y2 INT,
+  confidence REAL, low_conf BOOLEAN, phash64 BIGINT, lambda_shape REAL
+);
+-- COPY {prefix}_cells FROM '{csv_path}' WITH CSV HEADER;
+"""
+    open(schema_path,"w",encoding="utf-8").write(schema)
+    return {"csv":csv_path,"schema":schema_path}
+
+# --------------- Monitoring (KPI) ----------------------
+def _read_views_log(views_log: str) -> Dict[str,set]:
+    """
+    JSONL 形式の Views/補完ログを読む。
+    戻り値: {"reprocess": set(cell_keys), "success": set(cell_keys)}
+    cell_key = (doc_id,page,table_index,row,col)
+    """
+    R=set(); S=set()
+    if not views_log or not os.path.exists(views_log): return {"reprocess":R,"success":S}
+    with open(views_log,"r",encoding="utf-8") as f:
+        for line in f:
+            try:
+                ob=json.loads(line)
+                key=(ob.get("doc_id"), int(ob.get("page",0)), int(ob.get("table_index",0)), int(ob.get("row",0)), int(ob.get("col",0)))
+                ev=ob.get("event")
+                if ev in ("reprocess","view_reprocess","llm_completion","reocr"): R.add(key)
+                if ev in ("reocr_success","llm_completion_success"): S.add(key)
+            except Exception:
+                continue
+    return {"reprocess":R, "success":S}
+
+def _load_gt(gt_jsonl: str) -> Dict[str,set]:
+    """
+    line: {doc_id,page,table_index,row,col,label}
+    戻り: {"amount": set(keys), "date": set(keys)}
+    """
+    G={"amount":set(),"date":set()}
+    if not gt_jsonl or not os.path.exists(gt_jsonl): return G
+    with open(gt_jsonl,"r",encoding="utf-8") as f:
+        for line in f:
+            try:
+                ob=json.loads(line)
+                key=(ob.get("doc_id"), int(ob.get("page")), int(ob.get("table_index")), int(ob.get("row")), int(ob.get("col")))
+                lab=str(ob.get("label","")).lower()
+                if lab in G: G[lab].add(key)
+            except Exception:
+                continue
+    return G
+
+def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, domain: str="invoice",
+            views_log: Optional[str]=None, gt_jsonl: Optional[str]=None):
+    # load data
+    raws=[]
+    with open(jsonl,"r",encoding="utf-8") as f:
+        for line in f:
+            raws.append(json.loads(line))
+    # low_conf_rate
+    total=len(raws); low_keys=set()
+    low=sum(1 for ob in raws if (ob.get("meta") or {}).get("low_conf"))
+    for ob in raws:
+        if (ob.get("meta") or {}).get("low_conf"):
+            key=(ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col"))
+            low_keys.add(key)
+    low_rate = low/max(1,total)
+    # reprocess rates
+    logs=_read_views_log(views_log) if views_log else {"reprocess":set(),"success":set()}
+    n_re= len([1 for key in logs["reprocess"] if key in low_keys])
+    reprocess_rate = n_re / max(1,len(low_keys))
+    n_succ = len([1 for key in logs["success"] if key in logs["reprocess"]])
+    reprocess_success_rate = n_succ / max(1, len(logs["reprocess"]))
+    # build index if missing
+    if not os.path.exists(index_pkl):
+        build_index(jsonl, index_pkl)
+    # strict Hit@K (GT cell id match)
+    G=_load_gt(gt_jsonl)
+    def _idset(res):
+        S=set()
+        for s,ob in res:
+            S.add((ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col")))
+        return S
+    # seeds for queries
+    q_amount = "合計 金額 小計 税抜 消費税 円 total amount"
+    q_date   = "請求日 発行日 支払期日 日付 date 2023 2024 2025"
+    res_amt = query(index_pkl, jsonl, q_amount, None, topk=k, domain=domain)
+    res_dat = query(index_pkl, jsonl, q_date,   None, topk=k, domain=domain)
+    top_amt = _idset(res_amt); top_dat = _idset(res_dat)
+    # If no GT provided, fallback to proxy
+    if len(G["amount"])>0:
+        hit_amount_gt = len(G["amount"] & top_amt) / max(1, len(G["amount"]))
+    else:
+        hit_amount_gt = 1.0 if any(((ob.get("meta") or {}).get("filters",{})).get("amount") for _,ob in res_amt) else 0.0
+    if len(G["date"])>0:
+        hit_date_gt = len(G["date"] & top_dat) / max(1, len(G["date"]))
+    else:
+        hit_date_gt = 1.0 if any(((ob.get("meta") or {}).get("filters",{})).get("date") for _,ob in res_dat) else 0.0
+    hit_mean = (hit_amount_gt + hit_date_gt)/2.0
+    # p95
+    p95=None
+    agg=os.path.join(os.path.dirname(jsonl),"metrics_aggregate.csv")
+    if os.path.exists(agg):
+        try:
+            import pandas as pd
+            df=pd.read_csv(agg)
+            if "latency_p95_ms" in df.columns:
+                p95=float(df["latency_p95_ms"].iloc[0])
+        except Exception:
+            p95=None
+    # tax check fail rate
+    tax_total=0; tax_fail=0
+    for ob in raws:
+        f=(ob.get("meta") or {}).get("filters",{})
+        if f.get("tax_rate") is not None and f.get("subtotal") is not None:
+            tax_total += 1
+            calc=int(round(float(f["subtotal"])*float(f["tax_rate"])))
+            seen=f.get("tax_amount")
+            if seen is None:
+                # try to parse from synthesis_window
+                swin = ob.get("synthesis_window") or ""
+                m = re.search(r"(消費税|税額)[:=]?\s*([¥￥$]?\s*\d[\d,]*)", swin)
+                if m:
+                    try: seen = int(m.group(2).replace("¥","").replace("￥","").replace("$","").replace(",","").strip())
+                    except: seen = None
+            if seen is not None and abs(calc - int(seen)) > 1:
+                tax_fail += 1
+    tax_check_fail_rate = (tax_fail / max(1, tax_total)) if tax_total>0 else None
+
+    row={
+        "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
+        "jsonl": jsonl, "K": k, "domain": domain,
+        "low_conf_rate": low_rate, "reprocess_rate": reprocess_rate,
+        "reprocess_success_rate": reprocess_success_rate,
+        "hit_amount_gt": hit_amount_gt, "hit_date_gt": hit_date_gt, "hit_mean": hit_mean,
+        "p95_ms": p95, "tax_check_fail_rate": tax_check_fail_rate
+    }
+    write_header=not os.path.exists(out_csv)
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    with open(out_csv,"a",encoding="utf-8",newline="") as fw:
+        wr=csv.DictWriter(fw, fieldnames=list(row.keys()))
+        if write_header: wr.writeheader()
+        wr.writerow(row)
+    return row
+
+# --------------- CLI ----------------------------------
+def main():
+    import argparse
+    ap=argparse.ArgumentParser("ZOCR Multi‑Domain Core")
+    sub=ap.add_subparsers(dest="cmd")
+
+    sp=sub.add_parser("buildc"); sp.add_argument("--outdir", default="out_lib")
+
+    sp=sub.add_parser("augment")
+    sp.add_argument("--jsonl", required=True); sp.add_argument("--out", required=True)
+    sp.add_argument("--lambda-shape", type=float, default=4.5)
+    sp.add_argument("--lambda-refheight", type=int, default=1000)
+    sp.add_argument("--lambda-alpha", type=float, default=0.7)
+    sp.add_argument("--org-dict", default=None)  # {"法人番号13桁": "正規会社名", ...}
+    sp.add_argument("--domain", default="invoice")
+
+    sp=sub.add_parser("index"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
+
+    sp=sub.add_parser("query"); 
+    sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
+    sp.add_argument("--q", default=""); sp.add_argument("--image", default=None); sp.add_argument("--topk", type=int, default=10)
+    sp.add_argument("--w-bm25", type=float, default=1.0); sp.add_argument("--w-kw", type=float, default=0.6); sp.add_argument("--w-img", type=float, default=0.3)
+    sp.add_argument("--domain", default="invoice")
+
+    sp=sub.add_parser("sql"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True); sp.add_argument("--prefix", default="invoice")
+
+    sp=sub.add_parser("monitor")
+    sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
+    sp.add_argument("--k", type=int, default=10); sp.add_argument("--views-log", default=None); sp.add_argument("--gt-jsonl", default=None)
+    sp.add_argument("--out", required=True); sp.add_argument("--domain", default="invoice")
+
+    args=ap.parse_args()
+
+    if args.cmd=="buildc":
+        buildc(args.outdir); return
+    if args.cmd=="augment":
+        n=augment(args.jsonl, args.out, args.lambda_shape, args.lambda_refheight, args.lambda_alpha, args.org_dict)
+        print(f"Augmented {n} -> {args.out} (domain={args.domain})"); return
+    if args.cmd=="index":
+        build_index(args.jsonl, args.index); print(f"Indexed -> {args.index}"); return
+    if args.cmd=="query":
+        res=query(args.index, args.jsonl, args.q, args.image, args.topk, args.w_bm25, args.w_kw, args.w_img, args.domain)
+        for i,(s,ob) in enumerate(res,1):
+            f=(ob.get("meta") or {}).get("filters",{})
+            print(f"{i:2d}. {s:.3f} page={ob.get('page')} r={ob.get('row')} c={ob.get('col')} "
+                  f"amt={f.get('amount')} date={f.get('date')} tax={f.get('tax_rate')} "
+                  f"qty={f.get('qty')} unit={f.get('unit')} sub={f.get('subtotal')} tax_amt={f.get('tax_amount')} "
+                  f"corp={f.get('corporate_id')} text='{(ob.get('text') or '')[:40]}'")
+        return
+    if args.cmd=="sql":
+        p=sql_export(args.jsonl, args.outdir, args.prefix); print("SQL:", p); return
+    if args.cmd=="monitor":
+        row=monitor(args.jsonl, args.index, args.k, args.out, args.domain, args.views_log, args.gt_jsonl)
+        print("Monitor:", row)
+        if row["hit_mean"] is not None and row["hit_mean"]>=0.95:
+            print("GATE: PASS (Hit@K)")
+        else:
+            print("GATE: FAIL (Hit@K)")
+        return
+
+    ap.print_help()
+
+if __name__=="__main__":
+    main()
+
+
+# ===================== ONE-CALL ORCHESTRATION =====================
+
+def auto_all(jsonl_in: str, outdir: str, org_dict: Optional[str]=None, gt_jsonl: Optional[str]=None,
+             views_log: Optional[str]=None, k:int=10, tune_budget:int=24, domain_hint: Optional[str]=None,
+             learn_ema: float=0.5, cluster: bool=False) -> Dict[str,Any]:
+    """
+    これ1つで：auto -> tune(unlabeled) -> monitor -> learn(EMA) まで一括。
+    cluster=True なら mixedコーパスを自動分割して各ドメインで独立実行。
+    """
+    os.makedirs(outdir, exist_ok=True)
+    if cluster:
+        # domain split + per-domain pipeline
+        results = auto_process_mixed(jsonl_in, outdir, org_dict=org_dict, gt_jsonl=gt_jsonl, views_log=views_log, k=k)
+        return {"mode":"mixed", "domains": list(results.keys()), "results": results}
+
+    # 1) autopilot
+    auto_res = autopilot(jsonl_in=jsonl_in, outdir=outdir, org_dict=org_dict, gt_jsonl=gt_jsonl, views_log=views_log, k=k, domain_hint=domain_hint)
+    mm = auto_res["mm_jsonl"]; idx = auto_res["index"]
+    # 2) unlabeled tune
+    tune_dir = os.path.join(outdir, "tune")
+    tune_res = autotune_unlabeled(jsonl_mm=mm, index_pkl=idx, outdir=tune_dir, method="random", budget=tune_budget, domain_hint=domain_hint)
+    # 3) monitor (追記)
+    mon_csv = auto_res["monitor_csv"]
+    monitor(mm, idx, k, mon_csv, views_log=views_log, gt_jsonl=gt_jsonl, domain=auto_res["profile"]["domain"])
+    # 4) learn (EMA的にプロファイルを微修正)
+    #    NOTE: learn_from_monitor は monitor.csv の差分で w/λ/閾値を小さくドリフト
+    learn_out = learn_from_monitor(monitor_csv=mon_csv, profile_json_in=auto_res["profile_json"], profile_json_out=None, domain_hint=domain_hint)
+
+    return {
+        "mode":"single",
+        "auto": auto_res,
+        "tune": tune_res,
+        "learn": learn_out,
+        "artifacts": {
+            "profile_json": auto_res["profile_json"],
+            "tuned_profile_json": os.path.join(tune_dir, "auto_profile.json"),
+            "monitor_csv": mon_csv,
+            "index": idx,
+            "mm_jsonl": mm
+        }
+    }
+
+# ---------------------- CLI: auto-all ----------------------
+def _cli_auto_all(args):
+    out = auto_all(jsonl_in=args.jsonl, outdir=args.outdir, org_dict=args.org_dict,
+                   gt_jsonl=args.gt_jsonl, views_log=args.views_log, k=args.k,
+                   tune_budget=args.tune_budget, domain_hint=args.domain_hint,
+                   learn_ema=args.learn_ema, cluster=args.cluster)
+    print("AUTO_ALL:", json.dumps(out["artifacts"] if out.get("artifacts") else out, ensure_ascii=False, indent=2))
+
+# Patch CLI
+_old_main2 = main
+def main():
+    import argparse
+    ap=argparse.ArgumentParser("ZOCR Multi-Domain Core + Autopilot + Autotune + One-Call")
+    sub=ap.add_subparsers(dest="cmd")
+
+    sp=sub.add_parser("buildc"); sp.add_argument("--outdir", default="out_lib")
+
+    sp=sub.add_parser("augment"); sp.add_argument("--jsonl", required=True); sp.add_argument("--out", required=True)
+    sp.add_argument("--org-dict", default=None); sp.add_argument("--lambda-shape", type=float, default=4.5)
+
+    sp=sub.add_parser("index"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
+
+    sp=sub.add_parser("query"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
+    sp.add_argument("--q", default=""); sp.add_argument("--image", default=None); sp.add_argument("--topk", type=int, default=10)
+    sp.add_argument("--w-bm25", type=float, default=1.0); sp.add_argument("--w-kw", type=float, default=0.6); sp.add_argument("--w-img", type=float, default=0.3)
+    sp.add_argument("--domain", default=None)
+
+    sp=sub.add_parser("sql"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True); sp.add_argument("--prefix", default="invoice")
+
+    sp=sub.add_parser("monitor"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
+    sp.add_argument("--k", type=int, default=10); sp.add_argument("--views-log", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--out", required=True); sp.add_argument("--domain", default=None)
+
+    sp=sub.add_parser("smooth"); sp.add_argument("--in-json", required=True); sp.add_argument("--out-json", required=True)
+    sp.add_argument("--lambda-shape", type=float, default=4.5); sp.add_argument("--height-ref", type=float, default=1000.0); sp.add_argument("--lambda-exp", type=float, default=0.7)
+
+    sp=sub.add_parser("auto"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True)
+    sp.add_argument("--org-dict", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--views-log", default=None)
+    sp.add_argument("--k", type=int, default=10); sp.add_argument("--domain-hint", default=None)
+
+    sp=sub.add_parser("tune"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True); sp.add_argument("--outdir", required=True)
+    sp.add_argument("--method", default="random"); sp.add_argument("--budget", type=int, default=30); sp.add_argument("--domain", default=None); sp.add_argument("--seed", type=int, default=0)
+
+    sp=sub.add_parser("learn"); sp.add_argument("--monitor-csv", required=True); sp.add_argument("--profile-json", required=True)
+    sp.add_argument("--out-profile", default=None); sp.add_argument("--domain", default=None)
+
+    sp=sub.add_parser("auto-mixed"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True)
+    sp.add_argument("--org-dict", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--views-log", default=None); sp.add_argument("--k", type=int, default=10)
+
+    # new: auto-all
+    sp=sub.add_parser("auto-all"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True)
+    sp.add_argument("--org-dict", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--views-log", default=None)
+    sp.add_argument("--k", type=int, default=10); sp.add_argument("--domain-hint", default=None)
+    sp.add_argument("--tune-budget", type=int, default=24); sp.add_argument("--learn-ema", type=float, default=0.5)
+    sp.add_argument("--cluster", action="store_true")
+
+    args=ap.parse_args()
+
+    if args.cmd=="buildc":
+        L, path = _build_ctypes_lib(args.outdir); print("Built:" if L else "Build failed; Python fallbacks will be used.", path if L else ""); return
+    if args.cmd=="augment":
+        n=augment(args.jsonl, args.out, args.org_dict, lambda_shape=args.lambda_shape); print(f"Augmented {n} -> {args.out}"); return
+    if args.cmd=="index":
+        build_index(args.jsonl, args.index); print(f"Indexed -> {args.index}"); return
+    if args.cmd=="query":
+        res=query(args.index, args.jsonl, args.q, args.image, args.topk, args.w_bm25, args.w_kw, args.w_img, args.domain)
+        for i,(s,ob) in enumerate(res,1):
+            filt=(ob.get('meta') or {}).get('filters',{})
+            print(f"{i:2d}. {s:.3f} page={ob.get('page')} r={ob.get('row')} c={ob.get('col')} "
+                  f"amt={filt.get('amount')} date={filt.get('date')} tax={filt.get('tax_rate')} "
+                  f"qty={filt.get('qty')} unit={filt.get('unit')} sub={filt.get('subtotal')} "
+                  f"text='{(ob.get('text') or '')[:40]}'"); return
+    if args.cmd=="sql":
+        p=sql_export(args.jsonl, args.outdir, args.prefix); print("SQL:",p); return
+    if args.cmd=="monitor":
+        monitor(args.jsonl, args.index, args.k, args.out, args.views_log, args.gt_jsonl, args.domain); return
+    if args.cmd=="smooth":
+        smooth_columns(args.in_json, args.out_json, args.lambda_shape, args.height_ref, args.lambda_exp); return
+    if args.cmd=="auto":
+        out = autopilot(args.jsonl, args.outdir, args.org_dict, args.gt_jsonl, args.views_log, args.k, args.domain_hint)
+        print("AUTO:", json.dumps({k:out[k] for k in ["mm_jsonl","index","monitor_csv","profile_json"]}, ensure_ascii=False, indent=2))
+        print("PROFILE:", json.dumps(out["profile"], ensure_ascii=False, indent=2))
+        print("MONITOR_ROW:", json.dumps(out["monitor_row"], ensure_ascii=False, indent=2)); return
+    if args.cmd=="tune": _cli_autotune(args); return
+    if args.cmd=="learn": _cli_learn(args); return
+    if args.cmd=="auto-mixed": _cli_auto_mixed(args); return
+    if args.cmd=="auto-all": _cli_auto_all(args); return
+
+    ap.print_help()
+
+# ensure new main is used
+if __name__=="__main__":
+    main()
+
+
+# ===================== Robust p95 + Column Smoothing Hook =====================
+
+def _preload_index_and_raws(index_pkl: str, jsonl: str):
+    """Load index + raw JSONL once for repeated timing queries."""
+    with open(index_pkl,"rb") as f:
+        ix=pickle.load(f)
+    raws=[]
+    with open(jsonl,"r",encoding="utf-8") as fr:
+        for line in fr:
+            raws.append(json.loads(line))
+    return ix, raws
+
+def _query_scores_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], q_text: str, domain: Optional[str], w_kw: float, w_img: float) -> float:
+    """Return only the max score (top-1) to emulate typical scoring cost while reducing allocation."""
+    vocab=ix["vocab"]; df=np.array(ix["df"], dtype=np.int32); N=int(ix["N"]); avgdl=float(ix["avgdl"])
+    q_ids=[vocab[t] for t in tokenize_jp(q_text or "") if t in vocab]
+    if not q_ids: q_ids=[-1]
+    q_ids=np.array(q_ids, dtype=np.int32)
+    best=-1e9
+    for i, doc_ids in enumerate(ix["docs_tokens"]):
+        di=np.array(doc_ids+[-1], dtype=np.int32)
+        dl=len(doc_ids)
+        sb = (_bm25_numba_score(N, avgdl, df, dl, q_ids, di) if _HAS_NUMBA else _bm25_py_score(N, avgdl, df, dl, q_ids, di))
+        ob=raws[i]
+        sk=_kw_meta_boost(ob, tokenize_jp(q_text or ""), domain)
+        # no q_image for timing; pHash sim is 0
+        s=(1.0*sb + w_kw*sk + w_img*0.0)
+        if s>best: best=s
+    return float(best)
+
+def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain: Optional[str], w_kw: float, w_img: float, trials: int = 60, warmup: int = 8) -> Dict[str,float]:
+    """Warm-up + fixed number of trials for robust p95."""
+    import time, random
+    dom_q = {
+        "invoice_jp_v2": ["合計","金額","消費税","小計","請求日","発行日"],
+        "delivery_jp":   ["納品","数量","品名","伝票","受領"],
+        "estimate_jp":   ["見積","有効期限","見積金額","小計"],
+        "receipt_jp":    ["領収","合計","決済","税込","発行日"],
+        "contract_jp_v2":["契約","甲","乙","条","締結日","署名"]
+    }.get(domain or "invoice_jp_v2", ["合計","金額","消費税"])
+    # deterministic seed for reproducibility
+    rnd = random.Random(0x5A17)
+    lat=[]
+    total=warmup+trials
+    for t in range(total):
+        q = " ".join(rnd.sample(dom_q, min(3,len(dom_q))))
+        t0=time.perf_counter()
+        _ = _query_scores_preloaded(ix, raws, q_text=q, domain=domain, w_kw=w_kw, w_img=w_img)
+        dt=(time.perf_counter()-t0)*1000.0
+        if t>=warmup:
+            lat.append(dt)
+    if not lat:
+        return {"p50":None,"p95":None}
+    lat=sorted(lat)
+    p50 = lat[int(0.50*(len(lat)-1))]
+    p95 = lat[int(0.95*(len(lat)-1))]
+    return {"p50":float(p50), "p95":float(p95)}
+
+# ---------- Column smoothing alignment metric (direct hook to objective) ----------
+
+def _prepare_alignment_cache(jsonl_mm: str):
+    """Precompute table matrices (left/right per row/col) once from JSONL."""
+    from collections import defaultdict
+    by_tbl=defaultdict(list)
+    with open(jsonl_mm,"r",encoding="utf-8") as f:
+        for line in f:
+            ob=json.loads(line)
+            key=(ob.get("doc_id"), int(ob.get("page",0)), int(ob.get("table_index",0)))
+            by_tbl[key].append(ob)
+    tbls=[]
+    for key, cells in by_tbl.items():
+        # infer dims
+        max_r=max(int(c.get("row",0)) for c in cells)+1
+        max_c=max(int(c.get("col",0)) for c in cells)+1
+        left=[[None]*max_c for _ in range(max_r)]
+        right=[[None]*max_c for _ in range(max_r)]
+        # height (prefer meta.page_height; else from bbox)
+        H=None; ymax=0
+        for c in cells:
+            meta=c.get("meta") or {}
+            if H is None and meta.get("page_height"): H=int(meta["page_height"])
+            x1,y1,x2,y2=c.get("bbox",[0,0,0,0])
+            ymax=max(ymax, int(y2))
+            r=int(c.get("row",0)); co=int(c.get("col",0))
+            left[r][co]=int(x1); right[r][co]=int(x2)
+        if H is None: H=int(max(1000, ymax))
+        tbls.append({"H":H,"left":left,"right":right})
+    return tbls
+
+def _second_diff_energy(vec: np.ndarray) -> float:
+    if vec.shape[0] < 3: return 0.0
+    v=0.0
+    for i in range(1, vec.shape[0]-1):
+        d = vec[i+1] - 2.0*vec[i] + vec[i-1]
+        v += float(d*d)
+    return v / float(vec.shape[0]-2)
+
+def metric_col_alignment_energy_cached(tbl_cache: List[Dict[str,Any]], lambda_shape: float, height_ref: float=1000.0, exp: float=0.7) -> float:
+    """
+    Return ratio E_after/E_before (<=1.0 is better). If no curvature, returns 1.0 (neutral).
+    Uses the exact smoothing operator (D² penalized tri-diagonal) with lam_eff schedule.
+    """
+    num=0.0; den=0.0
+    for tb in tbl_cache:
+        H=tb["H"]
+        lam_eff=lambda_schedule(lambda_shape, H, height_ref, exp)
+        for mat in [tb["left"], tb["right"]]:
+            # iterate columns
+            max_r = len(mat)
+            max_c = len(mat[0]) if max_r>0 else 0
+            for co in range(max_c):
+                arr=[mat[r][co] for r in range(max_r)]
+                idx=[i for i,v in enumerate(arr) if v is not None]
+                if len(idx)<3: continue
+                y=np.array([arr[i] for i in idx], dtype=np.float64)
+                # before energy
+                e_before=_second_diff_energy(y)
+                if e_before<=1e-9:
+                    # perfectly straight already; count neutral
+                    num+=1.0; den+=1.0
+                    continue
+                # smooth
+                a,b,c=_second_diff_tridiag(len(y), lam_eff)
+                x=thomas_tridiag(a,b,c,y)
+                e_after=_second_diff_energy(x)
+                num += float(e_after)
+                den += float(e_before)
+    if den<=0.0: return 1.0
+    return float(num/den)
+
+# ---------- Replace autotune_unlabeled with smoothing-aware + robust p95 ----------
+
+def autotune_unlabeled(jsonl_mm: str, index_pkl: str, outdir: str, method: str="random", budget: int=30, domain_hint: Optional[str]=None, seed:int=0,
+                       p95_target_ms: float=300.0, use_smoothing_metric: bool=True) -> Dict[str,Any]:
+    """
+    Unlabeled微調整ループ（改）:
+      score = 列過不足率 × (p95/p95_target) × (1 - chunk整合度 + 0.05) × f(列アライン比)
+      f(列アライン比) = 0.3 + 0.7*(E_after/E_before)  ※ <=1.0 ほど良い（1未満でスコア低減）
+    """
+    import random as pyrand
+    np.random.seed(seed); pyrand.seed(seed)
+    os.makedirs(outdir, exist_ok=True)
+
+    domain,_ = detect_domain_on_jsonl(jsonl_mm)
+    if domain_hint: domain = domain_hint
+    base = DOMAIN_DEFAULTS.get(domain, DOMAIN_DEFAULTS["invoice_jp_v2"])
+
+    # Precompute fixed metrics
+    col_rate = metric_col_over_under_rate(jsonl_mm)
+    chunk_c  = metric_chunk_consistency(jsonl_mm)
+
+    # Preload for robust timing
+    ix, raws = _preload_index_and_raws(index_pkl, jsonl_mm)
+
+    # Prepare cache for smoothing metric
+    tbl_cache = _prepare_alignment_cache(jsonl_mm) if use_smoothing_metric else None
+
+    log_rows=[]
+    best=None
+
+    def _score(p95, lam_shape):
+        p95n = (p95 or p95_target_ms)/max(1.0,p95_target_ms)
+        if use_smoothing_metric and tbl_cache is not None:
+            align_ratio = metric_col_alignment_energy_cached(tbl_cache, lam_shape, 1000.0, 0.7)  # <=1 better
+            f_align = 0.3 + 0.7*float(align_ratio)
+        else:
+            f_align = 1.0
+        return col_rate * p95n * (1.0 - chunk_c + 0.05) * f_align, f_align
+
+    # search space
+    def sample(center=None, scale=1.0):
+        if center is None:
+            lam = float(np.random.uniform(1.0, 6.0))
+            wkw = float(np.random.uniform(0.3, 0.8))
+            wimg= float(np.random.uniform(0.0, 0.5))
+            ocr = float(np.random.uniform(0.4, 0.8))
+        else:
+            lam = float(np.clip(np.random.normal(center["lambda_shape"], 0.5*scale), 1.0, 6.0))
+            wkw = float(np.clip(np.random.normal(center["w_kw"], 0.1*scale), 0.2, 0.9))
+            wimg= float(np.clip(np.random.normal(center["w_img"],0.1*scale), 0.0, 0.6))
+            ocr = float(np.clip(np.random.normal(center["ocr_min_conf"],0.05*scale),0.3,0.9))
+        return {"lambda_shape":lam,"w_kw":wkw,"w_img":wimg,"ocr_min_conf":ocr}
+
+    # Stage 1: random init
+    n_init = max(8, min(15, budget//2))
+    for i in range(n_init):
+        params = sample()
+        lat = _time_queries_preloaded(ix, raws, domain, params["w_kw"], params["w_img"], trials=48, warmup=8)
+        score, f_align=_score(lat["p95"], params["lambda_shape"])
+        row={"iter":i,"phase":"init","domain":domain,"col_rate":col_rate,"chunk_c":chunk_c,"p95":lat["p95"],"score":score,"align_factor":f_align,**params}
+        log_rows.append(row)
+        if best is None or score<best["score"]:
+            best=row
+
+    # Stage 2: local refinement
+    remain = max(0, budget - n_init)
+    for j in range(remain):
+        params = sample(center=best, scale=max(0.5, 1.5*(remain-j)/max(1,remain)))
+        lat = _time_queries_preloaded(ix, raws, domain, params["w_kw"], params["w_img"], trials=48, warmup=8)
+        score, f_align=_score(lat["p95"], params["lambda_shape"])
+        row={"iter":n_init+j,"phase":"refine","domain":domain,"col_rate":col_rate,"chunk_c":chunk_c,"p95":lat["p95"],"score":score,"align_factor":f_align,**params}
+        log_rows.append(row)
+        if score<best["score"]:
+            best=row
+
+    # save log
+    csv_path=os.path.join(outdir, "autotune_log.csv")
+    hdr= ["iter","phase","domain","lambda_shape","w_kw","w_img","ocr_min_conf","col_rate","chunk_c","p95","align_factor","score"]
+    with open(csv_path,"w",encoding="utf-8",newline="") as fw:
+        wr=csv.DictWriter(fw, fieldnames=hdr); wr.writeheader()
+        for r in log_rows: wr.writerow({k:r.get(k) for k in hdr})
+
+    # update profile json
+    prof_path=os.path.join(outdir,"auto_profile.json")
+    try:
+        prof=json.load(open(prof_path,"r",encoding="utf-8"))
+    except Exception:
+        prof={"domain":domain}
+    prof.update({
+        "domain": domain,
+        "lambda_shape": float(best["lambda_shape"]),
+        "w_bm25": 1.0,
+        "w_kw": float(best["w_kw"]),
+        "w_img": float(best["w_img"]),
+        "ocr_min_conf": float(best["ocr_min_conf"]),
+        "tune_col_rate": float(col_rate),
+        "tune_chunk_c": float(chunk_c),
+        "tune_p95": float(best["p95"]) if best["p95"] is not None else None,
+        "tune_align_factor": float(best["align_factor"]),
+        "tune_score": float(best["score"])
+    })
+    with open(prof_path,"w",encoding="utf-8") as fw: json.dump(prof, fw, ensure_ascii=False, indent=2)
+    return {"best":best,"log_csv":csv_path,"profile_json":prof_path}
+
+# ---------- Monitor: compute p95 when aggregator missing ----------
+
+def _compute_p95_if_needed(jsonl: str, index_pkl: str, domain: Optional[str]) -> Optional[float]:
+    try:
+        ix, raws = _preload_index_and_raws(index_pkl, jsonl)
+        d = domain or detect_domain_on_jsonl(jsonl)[0]
+        base = DOMAIN_DEFAULTS.get(d, DOMAIN_DEFAULTS["invoice_jp_v2"])
+        lat = _time_queries_preloaded(ix, raws, d, base["w_kw"], base["w_img"], trials=60, warmup=8)
+        return float(lat["p95"]) if lat["p95"] is not None else None
+    except Exception:
+        return None
+
+# Patch monitor to fallback p95
+_old_monitor = monitor
+def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optional[str]=None, gt_jsonl: Optional[str]=None, domain: Optional[str]=None):
+    total=0; low=0; corp_hits=0; corp_total=0
+    lc_keys=set()
+    with open(jsonl,"r",encoding="utf-8") as f:
+        for line in f:
+            ob=json.loads(line); total+=1
+            meta=ob.get("meta") or {}; filt=meta.get("filters",{})
+            if meta.get("low_conf"):
+                lc_keys.add((ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col")))
+                low+=1
+            if filt.get("corporate_id") is not None:
+                corp_total+=1
+                if filt.get("company_canonical"): corp_hits+=1
+    low_conf_rate = low/max(1,total)
+    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else None
+
+    S_reproc, S_success = _read_views_sets(views_log)
+    reprocess_rate = len(S_reproc & lc_keys)/max(1,len(lc_keys)) if lc_keys else 0.0
+    reprocess_success_rate = len(S_success & S_reproc)/max(1,len(S_reproc)) if S_reproc else 0.0
+
+    if not os.path.exists(index_pkl): build_index(jsonl, index_pkl)
+    G=_read_gt(gt_jsonl)
+    def _hit(label, q):
+        res=query(index_pkl, jsonl, q, None, topk=k, domain=domain)
+        if G[label]:
+            for s,ob in res:
+                key=(ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col"))
+                if key in G[label]: return 1
+            return 0
+        else:
+            for s,ob in res:
+                filt=(ob.get("meta") or {}).get("filters",{})
+                if label=="amount" and filt.get("amount"): return 1
+                if label=="date" and filt.get("date"): return 1
+            return 0
+    q_amount="合計 金額 消費税 円 2023 2024 2025"
+    q_date="請求日 発行日 2023 2024 2025"
+    if domain=="contract_jp_v2":
+        q_amount="契約金額 代金 支払"
+        q_date="契約日 締結日 開始日 終了日"
+    hit_amount=_hit("amount", q_amount)
+    hit_date=_hit("date", q_date)
+    hit_mean=(hit_amount+hit_date)/2.0
+
+    # tax check fail
+    tax_fail=0; tax_cov=0
+    with open(jsonl,"r",encoding="utf-8") as f:
+        for line in f:
+            ob=json.loads(line); filt=(ob.get("meta") or {}).get("filters",{})
+            if filt.get("tax_amount") is not None and filt.get("tax_amount_expected") is not None:
+                tax_cov+=1
+                if abs(int(filt["tax_amount"])-int(filt["tax_amount_expected"]))>1:
+                    tax_fail+=1
+    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else None
+
+    p95=None
+    agg=os.path.join(os.path.dirname(jsonl),"metrics_aggregate.csv")
+    if os.path.exists(agg):
+        try:
+            import pandas as pd
+            df=pd.read_csv(agg)
+            if "latency_p95_ms" in df.columns:
+                p95=float(df["latency_p95_ms"].iloc[0])
+        except Exception:
+            p95=None
+    if p95 is None:
+        p95=_compute_p95_if_needed(jsonl, index_pkl, domain)
+
+    row={"timestamp":datetime.datetime.utcnow().isoformat()+"Z","jsonl":jsonl,"K":k,
+         "domain": domain or "auto",
+         "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
+         "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
+         "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95}
+    hdr=not os.path.exists(out_csv)
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    with open(out_csv,"a",encoding="utf-8",newline="") as fw:
+        wr=csv.DictWriter(fw, fieldnames=list(row.keys()))
+        if hdr: wr.writeheader()
+        wr.writerow(row)
+    print("Monitor:", row)
+    if hit_mean is not None and hit_mean >= 0.95:
+        print("GATE: PASS (Hit@K)")
+    else:
+        print("GATE: FAIL (Hit@K)")
+    return row
+'''
+zocr_multidomain_core = _materialize_module('zocr_multidomain_core', _SRC_ZOCR_MULTIDOMAIN_CORE)
+
+# ---- Compatibility shim (core may not expose learn_from_monitor) ----
+if not hasattr(zocr_multidomain_core, 'learn_from_monitor'):
+    def _zocr__learn_from_monitor_shim(*args, **kwargs):
+        # Not used by orchestrator in this bundle; present to satisfy import.
+        # If future code calls it, delegate to auto_all if present, else raise.
+        if hasattr(zocr_multidomain_core, 'auto_all'):
+            return zocr_multidomain_core.auto_all(*args, **kwargs)
+        raise NotImplementedError('learn_from_monitor is not available in this build')
+    zocr_multidomain_core.learn_from_monitor = _zocr__learn_from_monitor_shim
+
+# ---------------- [Pipe] all-in-one orchestrator -------------------
+_SRC_ZOCR_PIPELINE_ALLINONE = r'''
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+All-in-one pipeline orchestrator:
+- Calls the "Consensus" one-file OCR to produce `doc.zocr.json`
+- Exports contextual JSONL (with OCR) for RAG
+- Augments / indexes / monitors via the multi-domain core
+- Optionally runs unlabeled tuning + metric-linked learning
+- Windows-friendly (no shell tools required except optional Poppler if PDF)
+
+Outputs are consolidated under a single outdir.
+"""
+
+import os, sys, json, time, traceback, argparse
+from typing import Any, Dict, List, Optional
+
+# Local modules (written alongside this script)
+from zocr_onefile_consensus import Pipeline, make_demo, export_jsonl_with_ocr, pdf_to_images_via_poppler  # user-provided onefile
+from zocr_multidomain_core import augment, build_index, query, monitor, autotune_unlabeled, learn_from_monitor, auto_all
+
+def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
+
+# ---------------- Watchdog / transactional steps ----------------
+def safe_step(name: str, fn, *args, **kwargs):
+    t0=time.perf_counter()
+    try:
+        print(f"[RUN]  {name}")
+        out = fn(*args, **kwargs)
+        dt = (time.perf_counter()-t0)*1000.0
+        print(f"[OK]   {name} ({dt:.1f} ms)")
+        return {"ok": True, "elapsed_ms": dt, "out": out, "name": name}
+    except Exception as e:
+        dt = (time.perf_counter()-t0)*1000.0
+        print(f"[FAIL] {name} ({dt:.1f} ms): {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return {"ok": False, "elapsed_ms": dt, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(), "name": name}
+
+def _collect_pages(inputs: List[str], dpi: int) -> List[str]:
+    pages = []
+    for it in inputs:
+        ext = os.path.splitext(it)[1].lower()
+        if ext==".pdf":
+            try:
+                pages += pdf_to_images_via_poppler(it, dpi=dpi)
+            except Exception as e:
+                raise RuntimeError(f"PDF rasterization failed for {it}: {e}")
+        else:
+            pages.append(it)
+    return pages
+
+# ---------------- Top-down pipeline ----------------
+def run_full_pipeline(
+    inputs: List[str],
+    outdir: str,
+    dpi: int = 200,
+    domain_hint: Optional[str] = None,
+    k: int = 10,
+    do_tune: bool = True,
+    tune_budget: int = 20,
+    views_log: Optional[str] = None,
+    gt_jsonl: Optional[str] = None,
+    org_dict: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    1) OCR + table reconstruct -> doc.zocr.json
+    2) Export contextual JSONL (toy OCR stub included in onefile)
+    3) Augment -> Index -> Monitor
+    4) (Optional) unlabeled tune + learn on monitor history
+
+    Returns paths & key metrics for quick inspection.
+    """
+    ensure_dir(outdir)
+    log_path = os.path.join(outdir, "pipeline_history.jsonl")
+    with open(log_path, "a", encoding="utf-8") as logf:
+        def log_row(**row):
+            row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            logf.write(json.dumps(row, ensure_ascii=False) + "\n"); logf.flush()
+
+        # Step 0: inputs
+        if len(inputs)==1 and inputs[0].lower()=="demo":
+            pages, annos = make_demo(outdir)
+        else:
+            pages = _collect_pages(inputs, dpi=dpi)
+            annos = [None]*len(pages)
+
+        # Step 1: OCR / Table
+        pipe = Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
+        r = safe_step("OCR / Table Reconstruct", pipe.run, "doc", pages, outdir, annos)
+        log_row(step="ocr", **r); 
+        if not r["ok"]: raise RuntimeError("Pipeline halted at OCR step")
+        _, doc_json_path = r["out"]
+
+        # Step 2: Export contextual JSONL （toyOCRでstubでも可）
+        jsonl_path = os.path.join(outdir, "doc.contextual.jsonl")
+        src_img = pages[0]
+        r = safe_step("Export JSONL (contextual+OCR)", export_jsonl_with_ocr, doc_json_path, src_img, jsonl_path, "toy", True)
+        log_row(step="export", **r); 
+        if not r["ok"]: raise RuntimeError("Pipeline halted at Export JSONL step")
+
+        # Step 3a: Augment
+        mm_jsonl = os.path.join(outdir, "doc.mm.jsonl")
+        r = safe_step("Augment", augment, jsonl_path, mm_jsonl, org_dict, 4.5)
+        log_row(step="augment", **r); 
+        if not r["ok"]: raise RuntimeError("Pipeline halted at Augment step")
+
+        # Step 3b: Index
+        idx_path = os.path.join(outdir, "bm25.pkl")
+        r = safe_step("Index", build_index, mm_jsonl, idx_path)
+        log_row(step="index", **r); 
+        if not r["ok"]: raise RuntimeError("Pipeline halted at Index step")
+
+        # Step 3c: Monitor (KPI収集 + p95補完)
+        mon_csv = os.path.join(outdir, "monitor.csv")
+        r = safe_step("Monitor", monitor, mm_jsonl, idx_path, k, mon_csv, views_log, gt_jsonl, domain_hint)
+        log_row(step="monitor", **r); 
+        if not r["ok"]: raise RuntimeError("Pipeline halted at Monitor step")
+        monitor_row = r["out"]
+
+        # Step 4: Optional tuning + learning
+        tune_row = None; learn_row = None
+        if do_tune:
+            tune_dir = os.path.join(outdir, "tune")
+            r = safe_step("Unlabeled Tune", autotune_unlabeled, mm_jsonl, idx_path, tune_dir, "random", tune_budget, domain_hint, 0)
+            log_row(step="tune", **r); 
+            if r["ok"]:
+                # re-monitor to append a fresh KPI after tuning (same CSV)
+                r2 = safe_step("Monitor (post-tune)", monitor, mm_jsonl, idx_path, k, mon_csv, views_log, gt_jsonl, domain_hint)
+                log_row(step="monitor_post_tune", **r2)
+                tune_row = r["out"]
+                # learn small drift
+                prof_json = os.path.join(outdir, "auto_profile.json")
+                r3 = safe_step("Learn-from-Monitor", learn_from_monitor, mon_csv, prof_json, None, domain_hint)
+                log_row(step="learn", **r3)
+                learn_row = r3["out"]
+            else:
+                print("[WARN] Tune failed; skipping learn")
+
+    # Compose summary
+    summary = {
+        "contextual_jsonl": jsonl_path,
+        "mm_jsonl": mm_jsonl,
+        "index": idx_path,
+        "monitor_csv": mon_csv,
+        "monitor_row": monitor_row,
+        "tune": tune_row,
+        "learn": learn_row,
+    }
+    with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    return summary
+
+# ---------------- CLI ----------------
+def main():
+    ap = argparse.ArgumentParser("ZOCR All-in-one Orchestrator")
+    ap.add_argument("-i","--input", nargs="+", default=["demo"], help="images or PDFs; use 'demo' for synthetic invoice")
+    ap.add_argument("--outdir", default="out_allinone")
+    ap.add_argument("--dpi", type=int, default=200)
+    ap.add_argument("--domain", default=None)
+    ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--no-tune", action="store_true")
+    ap.add_argument("--tune-budget", type=int, default=20)
+    ap.add_argument("--views-log", default=None)
+    ap.add_argument("--gt-jsonl", default=None)
+    ap.add_argument("--org-dict", default=None)
+    args = ap.parse_args()
+
+    ensure_dir(args.outdir)
+    try:
+        res = run_full_pipeline(
+            inputs=args.input,
+            outdir=args.outdir,
+            dpi=args.dpi,
+            domain_hint=args.domain,
+            k=args.k,
+            do_tune=(not args.no_tune),
+            tune_budget=args.tune_budget,
+            views_log=args.views_log,
+            gt_jsonl=args.gt_jsonl,
+            org_dict=args.org_dict,
+        )
+        print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print("\n💀 Pipeline crashed:", e)
+        sys.exit(1)
+
+if __name__=="__main__":
+    main()
+'''
+zocr_pipeline_allinone = _materialize_module('zocr_pipeline_allinone', _SRC_ZOCR_PIPELINE_ALLINONE)
+
+# ----------------------------- Entry Point ----------------------------
+def main():
+    """Entrypoint that forwards to the orchestrator's CLI."""
+    if hasattr(zocr_pipeline_allinone, 'main'):
+        return zocr_pipeline_allinone.main()
+    # Fallback: expose a minimal callable if `main` is missing
+    if hasattr(zocr_pipeline_allinone, 'run_full_pipeline'):
+        import argparse
+        ap = argparse.ArgumentParser('ZOCR merged runner')
+        ap.add_argument('-i','--input', nargs='+', default=['demo'])
+        ap.add_argument('--outdir', default='out_allinone')
+        ap.add_argument('--dpi', type=int, default=200)
+        ap.add_argument('--domain', default=None)
+        ap.add_argument('--k', type=int, default=10)
+        ap.add_argument('--no-tune', action='store_true')
+        ap.add_argument('--tune-budget', type=int, default=20)
+        ap.add_argument('--views-log', default=None)
+        ap.add_argument('--gt-jsonl', default=None)
+        ap.add_argument('--org-dict', default=None)
+        args = ap.parse_args()
+        return zocr_pipeline_allinone.run_full_pipeline(
+            inputs=args.input, outdir=args.outdir, dpi=args.dpi,
+            domain_hint=args.domain, k=args.k, do_tune=(not args.no_tune),
+            tune_budget=args.tune_budget, views_log=args.views_log,
+            gt_jsonl=args.gt_jsonl, org_dict=args.org_dict
+        )
+
+if __name__ == '__main__':
+    main()
