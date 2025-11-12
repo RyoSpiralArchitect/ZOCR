@@ -591,6 +591,25 @@ def _patched_run_full_pipeline(
         print("SQL export skipped:", e)
     _call("post_sql", sql_csv=summary.get("sql_csv"), sql_schema=summary.get("sql_schema"))
 
+    try:
+        rag_dir = os.path.join(outdir, "rag")
+        rag_manifest = zocr_multidomain_core.export_rag_bundle(
+            mm_jsonl,
+            rag_dir,
+            domain=prof.get("domain"),
+            summary=summary,
+        )
+        summary["rag_manifest"] = rag_manifest.get("manifest")
+        summary["rag_bundle"] = rag_manifest.get("bundle_dir")
+        summary["rag_cells"] = rag_manifest.get("cells")
+        summary["rag_sections"] = rag_manifest.get("sections")
+        summary["rag_tables_json"] = rag_manifest.get("tables_json")
+        summary["rag_markdown"] = rag_manifest.get("markdown")
+        summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
+    except Exception as e:
+        print("RAG bundle export skipped:", e)
+    _call("post_rag", manifest=summary.get("rag_manifest"), bundle=summary.get("rag_bundle"))
+
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
                                for stage, fns in PLUGINS.items()}

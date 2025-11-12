@@ -1757,7 +1757,17 @@ DOMAIN_KW = {
     "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
     "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
     "receipt_jp": [("領収書",1.0),("税込",0.8),("受領",0.6),("発行日",0.4)],
-    "receipt_en": [("receipt",1.0),("paid",0.9),("total",0.75),("payment",0.6),("tax",0.5)]
+    "receipt_en": [("receipt",1.0),("paid",0.9),("total",0.75),("payment",0.6),("tax",0.5)],
+    "bank_statement_en": [("statement",1.0),("account",0.9),("balance",0.8),("transaction",0.7),("debit",0.6),("credit",0.6),("bank",0.5)],
+    "bank_statement_jp": [("取引明細",1.0),("口座番号",0.9),("残高",0.8),("入金",0.7),("出金",0.7),("金融機関",0.6),("支店",0.5)],
+    "utility_bill_en": [("utility",1.0),("electric",0.85),("gas",0.8),("water",0.75),("kwh",0.6),("meter",0.55),("billing",0.5)],
+    "utility_bill_jp": [("ご使用量",1.0),("電気",0.85),("ガス",0.8),("水道",0.75),("検針",0.6),("請求額",0.55),("契約",0.5)],
+    "insurance_claim_en": [("claim",1.0),("policy",0.85),("insured",0.75),("coverage",0.65),("adjuster",0.55),("deductible",0.5)],
+    "insurance_claim_jp": [("保険金請求",1.0),("被保険者",0.85),("保険証券",0.75),("事故日",0.65),("給付",0.55),("診断書",0.5)],
+    "tax_form_en": [("tax",1.0),("return",0.9),("irs",0.8),("deduction",0.7),("withholding",0.6),("income",0.6)],
+    "tax_form_jp": [("確定申告",1.0),("所得税",0.9),("控除",0.75),("課税",0.65),("源泉",0.6),("扶養",0.5)],
+    "payslip_en": [("payslip",1.0),("payroll",0.9),("gross",0.75),("net pay",0.7),("deductions",0.65),("hours",0.55)],
+    "payslip_jp": [("給与明細",1.0),("支給額",0.9),("控除",0.75),("差引支給額",0.7),("残業",0.6),("社会保険料",0.55)]
 }
 
 DOMAIN_DEFAULTS = {
@@ -1781,7 +1791,17 @@ DOMAIN_DEFAULTS = {
     "estimate_en": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
     "receipt": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
     "receipt_jp": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
-    "receipt_en": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60}
+    "receipt_en": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "bank_statement_en": {"lambda_shape": 4.1, "w_kw": 0.58, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "bank_statement_jp": {"lambda_shape": 4.2, "w_kw": 0.6, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "utility_bill_en": {"lambda_shape": 3.9, "w_kw": 0.52, "w_img": 0.22, "ocr_min_conf": 0.58},
+    "utility_bill_jp": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.22, "ocr_min_conf": 0.58},
+    "insurance_claim_en": {"lambda_shape": 4.4, "w_kw": 0.6, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "insurance_claim_jp": {"lambda_shape": 4.5, "w_kw": 0.62, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "tax_form_en": {"lambda_shape": 4.6, "w_kw": 0.63, "w_img": 0.22, "ocr_min_conf": 0.60},
+    "tax_form_jp": {"lambda_shape": 4.6, "w_kw": 0.65, "w_img": 0.22, "ocr_min_conf": 0.60},
+    "payslip_en": {"lambda_shape": 3.9, "w_kw": 0.58, "w_img": 0.2, "ocr_min_conf": 0.62},
+    "payslip_jp": {"lambda_shape": 4.0, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.62}
 }
 
 _DOMAIN_ALIAS = {
@@ -1789,8 +1809,52 @@ _DOMAIN_ALIAS = {
     "contract": "contract_jp_v2",
     "delivery": "delivery_jp",
     "estimate": "estimate_jp",
-    "receipt": "receipt_jp"
+    "receipt": "receipt_jp",
+    "bank_statement": "bank_statement_en",
+    "utility_bill": "utility_bill_en",
+    "insurance_claim": "insurance_claim_en",
+    "tax_form": "tax_form_en",
+    "tax_return": "tax_form_en",
+    "payslip": "payslip_en"
 }
+
+DOMAIN_SUGGESTED_QUERIES = {
+    "invoice_jp_v2": ["合計 金額", "消費税", "支払期日", "請求先 住所"],
+    "invoice_en": ["total amount", "tax amount", "due date", "billing address"],
+    "invoice_fr": ["montant total", "tva", "échéance", "adresse de facturation"],
+    "purchase_order": ["po number", "vendor", "ship date", "total"],
+    "expense": ["employee", "category", "reimbursement", "amount"],
+    "timesheet": ["hours", "project", "overtime", "approval"],
+    "shipping_notice": ["tracking number", "carrier", "ship date", "items"],
+    "medical_receipt": ["診療点数", "保険", "自己負担", "調剤"],
+    "contract_jp_v2": ["契約期間", "甲", "乙", "締結日"],
+    "contract_en": ["effective date", "party", "term", "signature"],
+    "delivery_jp": ["納品日", "数量", "品番", "受領印"],
+    "estimate_jp": ["見積金額", "有効期限", "数量", "単価"],
+    "receipt_jp": ["領収金額", "発行日", "支払方法", "住所"],
+    "bank_statement_en": ["ending balance", "transaction", "deposit", "withdrawal"],
+    "bank_statement_jp": ["残高", "入金", "出金", "取引日"],
+    "utility_bill_en": ["meter reading", "usage", "billing period", "due date"],
+    "utility_bill_jp": ["ご使用量", "検針日", "請求額", "支払期限"],
+    "insurance_claim_en": ["claim number", "policy", "incident date", "payout"],
+    "insurance_claim_jp": ["保険金請求", "事故日", "被保険者", "支払額"],
+    "tax_form_en": ["taxable income", "deduction", "withholding", "refund"],
+    "tax_form_jp": ["課税所得", "控除", "源泉徴収", "還付金"],
+    "payslip_en": ["gross pay", "net pay", "deductions", "hours"],
+    "payslip_jp": ["支給額", "控除", "差引支給額", "残業時間"],
+    "default": ["total amount", "date", "company", "reference number"]
+}
+
+
+def _normalize_text(val: Optional[Any]) -> str:
+    if val is None:
+        return ""
+    if not isinstance(val, str):
+        val = str(val)
+    val = val.strip()
+    if not val:
+        return ""
+    return re.sub(r"\s+", " ", val)
 
 def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
     scores: Dict[str, float] = {k: 0.0 for k in DOMAIN_KW.keys()}
@@ -2087,6 +2151,288 @@ CREATE TABLE IF NOT EXISTS {prefix}_cells (
 """
     open(schema_path,"w",encoding="utf-8").write(schema)
     return {"csv":csv_path,"schema":schema_path}
+
+
+def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
+                      summary: Optional[Dict[str, Any]]=None, limit_per_section: int=40) -> Dict[str, Any]:
+    """Generate a multi-view RAG bundle (cells / sections / tables / markdown)."""
+    if not os.path.exists(jsonl):
+        raise FileNotFoundError(jsonl)
+    os.makedirs(outdir, exist_ok=True)
+    cells_path = os.path.join(outdir, "cells.jsonl")
+    sections_path = os.path.join(outdir, "sections.jsonl")
+    tables_path = os.path.join(outdir, "tables.json")
+    manifest_path = os.path.join(outdir, "manifest.json")
+    markdown_path = os.path.join(outdir, "bundle.md")
+
+    resolved = None
+    if domain:
+        resolved = _DOMAIN_ALIAS.get(domain, domain)
+    if not resolved:
+        resolved = "invoice_jp_v2"
+    suggested = DOMAIN_SUGGESTED_QUERIES.get(resolved, DOMAIN_SUGGESTED_QUERIES["default"])
+
+    doc_ids: set = set()
+    languages: set = set()
+    page_sections: Dict[int, Dict[str, Any]] = {}
+    tables: Dict[str, Dict[str, Any]] = {}
+    cells_written = 0
+
+    with open(jsonl, "r", encoding="utf-8") as fr, open(cells_path, "w", encoding="utf-8") as fw:
+        for idx, line in enumerate(fr):
+            try:
+                ob = json.loads(line)
+            except Exception:
+                continue
+            doc_ids.add(ob.get("doc_id"))
+            meta = (ob.get("meta") or {})
+            filters = (meta.get("filters") or {})
+            lang = meta.get("lang") or ob.get("lang")
+            if isinstance(lang, str) and lang:
+                languages.add(lang)
+            text = ob.get("text") or ""
+            normalized = _normalize_text(text)
+            synth = _normalize_text(ob.get("synthesis_window") or "")
+            cell_id = ob.get("cell_id") or ob.get("id") or f"cell_{idx:05d}"
+            page = int(ob.get("page") or 0)
+            table_idx = meta.get("table_id", ob.get("table_index"))
+            row_idx = ob.get("row")
+            col_idx = ob.get("col")
+            bbox = ob.get("bbox") or [None, None, None, None]
+
+            embedding_pieces: List[str] = []
+            for piece in (normalized, synth):
+                if piece:
+                    embedding_pieces.append(piece)
+            for key in ("amount","date","company","address","tax_id","postal_code","phone","tax_rate",
+                        "qty","unit","subtotal","tax_amount","corporate_id"):
+                val = filters.get(key)
+                if val is None:
+                    continue
+                emb_val = _normalize_text(val)
+                if emb_val:
+                    embedding_pieces.append(f"{key}:{emb_val}")
+            seen_kw: List[str] = []
+            for kw, _w in DOMAIN_KW.get(resolved, []):
+                if not kw:
+                    continue
+                low_kw = kw.lower()
+                if kw in text or kw in synth or low_kw in normalized.lower():
+                    if kw not in seen_kw:
+                        seen_kw.append(kw)
+            embedding_hint = " | ".join(dict.fromkeys(embedding_pieces))
+
+            cell_payload = {
+                "cell_id": cell_id,
+                "doc_id": ob.get("doc_id"),
+                "page": page,
+                "table_index": table_idx,
+                "row": row_idx,
+                "col": col_idx,
+                "text": text,
+                "normalized": normalized,
+                "synthesis_window": ob.get("synthesis_window"),
+                "filters": filters,
+                "meta": {k: v for k, v in meta.items() if k != "filters"},
+                "bbox": bbox,
+                "confidence": (meta.get("confidence") if isinstance(meta, dict) else None),
+                "low_conf": (meta.get("low_conf") if isinstance(meta, dict) else None),
+                "embedding_hint": embedding_hint,
+                "domain": resolved,
+                "domain_hits": seen_kw,
+            }
+            fw.write(json.dumps(cell_payload, ensure_ascii=False) + "\n")
+            cells_written += 1
+
+            section = page_sections.setdefault(page, {
+                "section_id": f"page-{page:03d}",
+                "page": page,
+                "title": f"Page {page}",
+                "cells": [],
+                "body": []
+            })
+            section["cells"].append(cell_id)
+            if normalized:
+                section["body"].append(f"[{cell_id}] {normalized}")
+
+            if table_idx is not None:
+                tkey = str(table_idx)
+                table = tables.setdefault(tkey, {
+                    "table_id": tkey,
+                    "cells": [],
+                    "rows": {}
+                })
+                table["cells"].append(cell_id)
+                if row_idx is not None and col_idx is not None:
+                    row_key = str(row_idx)
+                    col_key = str(col_idx)
+                    table.setdefault("rows", {})
+                    row_bucket = table["rows"].setdefault(row_key, {})
+                    row_bucket[col_key] = {
+                        "cell_id": cell_id,
+                        "text": text,
+                        "normalized": normalized,
+                        "filters": filters,
+                    }
+
+    def _sorted_numeric(keys: List[str]) -> List[str]:
+        def _key(k: str):
+            try:
+                return (0, int(k))
+            except Exception:
+                return (1, k)
+        return sorted(keys, key=_key)
+
+    with open(sections_path, "w", encoding="utf-8") as fw:
+        for page in sorted(page_sections.keys()):
+            sec = page_sections[page]
+            body_lines = sec.get("body", [])
+            if limit_per_section and len(body_lines) > limit_per_section:
+                body_lines = body_lines[:limit_per_section] + ["..."]
+            payload = {
+                "section_id": sec["section_id"],
+                "title": sec["title"],
+                "page": sec["page"],
+                "cells": sec["cells"],
+                "body": "\n".join(body_lines)
+            }
+            fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        for table_id in _sorted_numeric(list(tables.keys())):
+            table = tables[table_id]
+            rows_out = []
+            for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
+                cols = table["rows"][row_key]
+                ordered = []
+                for col_key in _sorted_numeric(list(cols.keys())):
+                    cell_info = cols[col_key]
+                    ordered.append({
+                        "cell_id": cell_info.get("cell_id"),
+                        "col": col_key,
+                        "text": cell_info.get("text"),
+                        "normalized": cell_info.get("normalized"),
+                        "filters": cell_info.get("filters"),
+                    })
+                rows_out.append({"row_index": row_key, "cells": ordered})
+            payload = {
+                "section_id": f"table-{table_id}",
+                "title": f"Table {table_id}",
+                "table_id": table_id,
+                "cells": table["cells"],
+                "rows": rows_out
+            }
+            fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    tables_payload = []
+    for table_id in _sorted_numeric(list(tables.keys())):
+        table = tables[table_id]
+        rows_out = []
+        for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
+            cols = table["rows"][row_key]
+            ordered = []
+            for col_key in _sorted_numeric(list(cols.keys())):
+                cell_info = cols[col_key]
+                ordered.append({
+                    "cell_id": cell_info.get("cell_id"),
+                    "row": row_key,
+                    "col": col_key,
+                    "text": cell_info.get("text"),
+                    "normalized": cell_info.get("normalized"),
+                })
+            rows_out.append({"row_index": row_key, "cells": ordered})
+        tables_payload.append({"table_id": table_id, "rows": rows_out})
+    with open(tables_path, "w", encoding="utf-8") as tf:
+        json.dump(tables_payload, tf, ensure_ascii=False, indent=2)
+
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    languages_list = sorted(languages)
+    doc_ids_list = sorted([d for d in doc_ids if d])
+
+    manifest: Dict[str, Any] = {
+        "bundle_dir": os.path.abspath(outdir),
+        "generated_at": now,
+        "source_jsonl": jsonl,
+        "domain": domain,
+        "resolved_domain": resolved,
+        "cell_count": cells_written,
+        "page_sections": len(page_sections),
+        "table_sections": len(tables),
+        "doc_ids": doc_ids_list,
+        "languages": languages_list,
+        "paths": {
+            "cells": cells_path,
+            "sections": sections_path,
+            "tables": tables_path,
+            "markdown": markdown_path,
+        },
+        "suggested_queries": suggested,
+        "embedding_fields": ["text", "normalized", "synthesis_window", "filters", "meta"],
+    }
+    if summary:
+        manifest["summary_snapshot"] = {
+            k: summary.get(k)
+            for k in ("contextual_jsonl", "mm_jsonl", "sql_csv", "sql_schema", "monitor_csv")
+        }
+
+    with open(manifest_path, "w", encoding="utf-8") as mf:
+        json.dump(manifest, mf, ensure_ascii=False, indent=2)
+    manifest["manifest"] = manifest_path
+
+    md_lines = ["# Z-OCR RAG Bundle / バンドル概要", "",
+                f"- Generated / 生成日時: {now}",
+                f"- Domain / ドメイン: {resolved}",
+                f"- Cells / セル数: {cells_written}",
+                f"- Pages / ページ: {len(page_sections)}",
+                f"- Tables / テーブル: {len(tables)}"]
+    if doc_ids_list:
+        md_lines.append("- Document IDs / 文書ID: " + ", ".join(doc_ids_list))
+    if languages_list:
+        md_lines.append("- Languages / 言語: " + ", ".join(languages_list))
+    md_lines.append("")
+    if suggested:
+        md_lines.append("## Suggested queries / 推奨クエリ")
+        md_lines.append("```")
+        for q in suggested:
+            md_lines.append(q)
+        md_lines.append("```")
+        md_lines.append("")
+
+    def _append_section_preview(title: str, lines: List[str]):
+        if not lines:
+            return
+        preview = lines
+        if limit_per_section and len(preview) > limit_per_section:
+            preview = preview[:limit_per_section] + ["..."]
+        md_lines.append(title)
+        md_lines.append("```")
+        md_lines.extend(preview)
+        md_lines.append("```")
+        md_lines.append("")
+
+    for page in sorted(page_sections.keys()):
+        sec = page_sections[page]
+        _append_section_preview(f"### Page {page} / ページ {page}", sec.get("body", []))
+    for table_id in _sorted_numeric(list(tables.keys())):
+        table = tables[table_id]
+        body_lines: List[str] = []
+        for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
+            cols = table["rows"][row_key]
+            parts = []
+            for col_key in _sorted_numeric(list(cols.keys())):
+                cell_info = cols[col_key]
+                parts.append(f"[{col_key}] {cell_info.get('normalized') or cell_info.get('text') or ''}")
+            body_lines.append(f"row {row_key}: " + " | ".join(parts))
+        _append_section_preview(f"### Table {table_id} / テーブル {table_id}", body_lines)
+
+    with open(markdown_path, "w", encoding="utf-8") as mf:
+        mf.write("\n".join(md_lines))
+
+    manifest.update({
+        "cells": cells_path,
+        "sections": sections_path,
+        "tables_json": tables_path,
+        "markdown": markdown_path,
+    })
+    return manifest
 
 # --------------- Monitoring (KPI) ----------------------
 def _read_views_log(views_log: str) -> Dict[str,set]:
@@ -3370,6 +3716,25 @@ def _patched_run_full_pipeline(
     except Exception as e:
         print("SQL export skipped:", e)
     _call("post_sql", sql_csv=summary.get("sql_csv"), sql_schema=summary.get("sql_schema"))
+
+    try:
+        rag_dir = os.path.join(outdir, "rag")
+        rag_manifest = zocr_multidomain_core.export_rag_bundle(
+            mm_jsonl,
+            rag_dir,
+            domain=prof.get("domain"),
+            summary=summary,
+        )
+        summary["rag_manifest"] = rag_manifest.get("manifest")
+        summary["rag_bundle"] = rag_manifest.get("bundle_dir")
+        summary["rag_cells"] = rag_manifest.get("cells")
+        summary["rag_sections"] = rag_manifest.get("sections")
+        summary["rag_tables_json"] = rag_manifest.get("tables_json")
+        summary["rag_markdown"] = rag_manifest.get("markdown")
+        summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
+    except Exception as e:
+        print("RAG bundle export skipped:", e)
+    _call("post_rag", manifest=summary.get("rag_manifest"), bundle=summary.get("rag_bundle"))
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]

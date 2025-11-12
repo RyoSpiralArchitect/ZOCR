@@ -40,6 +40,9 @@ python zocr_allinone_merged_plus.py plugins
 
 # HTML レポート生成 / Generate HTML report / Générer un rapport HTML
 python zocr_allinone_merged_plus.py report --outdir out_allinone --open
+
+# RAG バンドル確認 / Inspect RAG bundle / Vérifier le bundle RAG
+python zocr_allinone_merged_plus.py summary --outdir out_allinone --keys rag_manifest rag_markdown rag_suggested_queries
 ```
 
 ## 仕組み / Mechanics / Fonctionnement
@@ -70,9 +73,14 @@ python zocr_allinone_merged_plus.py report --outdir out_allinone --open
 - **[FR]** Le dossier `views/` contient désormais une mosaïque microscope en quatre panneaux (brut ×3, renforcement des contours, binarisation Otsu, carte thermique de gradient) ainsi qu'une superposition faux-couleur de type rayon X appliquée à l'image d'origine.
 
 ## 対応ドメイン / Supported domains / Domaines pris en charge
-- **[JA]** インボイス（日・英・仏）、見積書、納品書、領収書、契約書、購入注文書、経費精算、タイムシート、出荷案内、医療領収書などを検出・最適化用プリセットとして収録しています。
-- **[EN]** Domain presets span invoices (JP / EN / FR), estimates, delivery slips, receipts, contracts, purchase orders, expenses, timesheets, shipping notices, and Japanese medical receipts for automatic detection and tuning.
-- **[FR]** Les préréglages de domaine couvrent factures (JP / EN / FR), devis, bons de livraison, reçus, contrats, bons de commande, notes de frais, feuilles de temps, avis d'expédition et reçus médicaux japonais pour la détection et l'optimisation automatiques.
+- **[JA]** インボイス（日・英・仏）、見積書、納品書、領収書、契約書、購入注文書に加え、経費精算、タイムシート、出荷案内、医療領収書、銀行取引明細、公共料金請求書、保険金請求、確定申告/税申告、給与明細などを検出・最適化するプリセットを収録しました。
+- **[EN]** Domain presets now cover invoices (JP / EN / FR), estimates, delivery slips, receipts, contracts, purchase orders, expenses, timesheets, shipping notices, Japanese medical receipts, bank statements, utility bills, insurance claims, tax returns, and payslips with tuned heuristics.
+- **[FR]** Les préréglages s'étendent aux factures (JP / EN / FR), devis, bons de livraison, reçus, contrats, bons de commande, notes de frais, feuilles de temps, avis d'expédition, reçus médicaux japonais, relevés bancaires, factures de services publics, demandes d'indemnisation, déclarations fiscales et bulletins de paie.
+
+## RAG バンドル / RAG bundle / Paquet RAG
+- **[JA]** `rag/` ディレクトリにセル別 JSONL、ページ/テーブル別セクション、Markdown ダイジェスト、推奨クエリを含むマニフェストを自動生成し、下流の Retrieval-Augmented Generation エージェントに柔軟に受け渡せます。
+- **[EN]** Each run emits a `rag/` bundle with cell-level JSONL, section listings, table snapshots, a Markdown digest, and suggested queries so downstream RAG agents can ingest the corpus without extra wrangling.
+- **[FR]** Chaque exécution produit un dossier `rag/` contenant JSONL par cellule, sections par page/table, résumé Markdown et requêtes suggérées afin de faciliter l'alimentation d'agents RAG en aval.
 
 ## 依存関係 / Dependencies / Dépendances
 - Python 3.9+
@@ -83,7 +91,7 @@ python zocr_allinone_merged_plus.py report --outdir out_allinone --open
 ## スナップショットとプラグイン / Snapshots & Plugins / Instantanés & Plugins
 - `--snapshot` を付けると `pipeline_meta.json` にハッシュやバージョン情報を保存します。
 - `--resume` により `pipeline_history.jsonl` を参照して途中段階から再開できます。
-- `zocr_pipeline_allinone.register(stage)` でプラグインを登録し、`post_export` や `post_sql` などのフックでカスタム処理を差し込めます。
+- `zocr_pipeline_allinone.register(stage)` でプラグインを登録し、`post_export` や `post_sql`、`post_rag` などのフックでカスタム処理を差し込めます。
 - `history` / `summary` / `plugins` サブコマンドで、実行履歴や生成物、登録済みフックを CLI から参照できます。
 - `report` サブコマンドまたは自動生成される `pipeline_report.html` により、三言語の HTML ダッシュボードで成果物と履歴を振り返れます / Use the `report` subcommand or the auto-generated `pipeline_report.html` to review artifacts and history via a trilingual HTML dashboard / Le sous-commande `report` ou le fichier `pipeline_report.html` généré automatiquement offrent un tableau de bord HTML trilingue pour revoir artefacts et historique.
 
