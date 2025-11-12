@@ -104,6 +104,7 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
 - `sql/` — `sql_export` で生成される CSV とスキーマ（`trace` 列で doc/page/table/row/col を Excel から参照可能）。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
+- `reanalyze/` — 低信頼セルの再解析 JSONL / Reanalysis JSONL for low-confidence cells / Ré-analyses JSONL des cellules peu fiables。
 - `pipeline_summary.json` — すべての成果物と依存診断をまとめた要約（`rag_*`, `sql_*`, `views`, `dependencies`, `report_path` など）。
 - `rag_trace_schema`, `rag_fact_tag_example` — サマリー内で RAG トレーサの仕様と `<fact ...>` タグ例を公開。
 - `monitor.csv` — UTF-8 (BOM 付き) で出力し、Excel/Numbers でも文字化けなく開けます。
