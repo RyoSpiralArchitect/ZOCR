@@ -857,7 +857,53 @@ def _should_toy_self_correct(
         if runtime_replay >= 3.0:
             details["reasons"].append("runtime_replay")
 
-    return (len(details["reasons"]) > 0), details
+    severity = len(details["reasons"])
+    details["severity"] = severity
+    if severity:
+        plan_levels: List[Dict[str, Any]] = []
+        base_expand = 10
+        if low_conf_ratio is not None and low_conf_ratio >= 0.28:
+            base_expand += 8
+        if review_ratio is not None and review_ratio >= 0.3:
+            base_expand += 4
+        base_step = 10
+        recog_low = details["metrics"].get("recognition_low_conf_ratio") if isinstance(details.get("metrics"), dict) else None
+        if isinstance(recog_low, (int, float)) and recog_low >= 0.3:
+            base_step = 8
+        recog_high = details["metrics"].get("recognition_high_surprisal_ratio") if isinstance(details.get("metrics"), dict) else None
+        if isinstance(recog_high, (int, float)) and recog_high >= 0.18:
+            base_step = 8
+        fine_step = 6 if (high_surprisal_ratio is not None and high_surprisal_ratio >= 0.16) else 0
+        extra_spread = 0
+        runtime_replay = details["metrics"].get("runtime_replay_improved") if isinstance(details.get("metrics"), dict) else None
+        if isinstance(runtime_replay, (int, float)) and runtime_replay >= 3.0:
+            extra_spread = 4
+        passes = min(3, max(1, severity + (1 if recog_high and recog_high >= 0.22 else 0)))
+        for idx in range(passes):
+            level_cfg: Dict[str, Any] = {
+                "level": idx + 1,
+                "threshold_expand": base_expand + idx * 6,
+                "threshold_step": max(6, base_step - idx * 2),
+                "target_confidence": 0.56 + 0.04 * min(idx + 1, 3),
+                "extra_augment_passes": 1 + idx,
+            }
+            if fine_step:
+                level_cfg["fine_threshold_step"] = max(3, fine_step - idx)
+            if extra_spread:
+                level_cfg["extra_local_spread"] = extra_spread + idx * 2
+            if "high_surprisal_ratio" in details["reasons"] or "recognition_high_surprisal" in details["reasons"]:
+                level_cfg.setdefault("force_augment", True)
+                level_cfg.setdefault("extra_rotations", [-5, -2, 2, 5])
+            if review_ratio is not None and review_ratio >= 0.32:
+                level_cfg.setdefault("augment_filter_sizes", [7])
+            plan_levels.append(level_cfg)
+        details["plan"] = {
+            "levels": plan_levels,
+            "stop_on_improvement": True,
+            "require_improvement": bool(review_ratio is not None and review_ratio >= 0.42),
+            "severity": severity,
+        }
+    return (severity > 0), details
 
 
 def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]:
@@ -1438,6 +1484,7 @@ def _patched_run_full_pipeline(
 
     reanalysis_summary: Optional[Dict[str, Any]] = None
     reanalysis_reasons_done: Set[str] = set()
+    reanalysis_last_execs: List[Dict[str, Any]] = []
     learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
     toy_snapshot: Optional[Dict[str, Any]] = None
     if isinstance(effective_ocr_engine, str) and effective_ocr_engine.lower().startswith("toy"):
@@ -1447,51 +1494,114 @@ def _patched_run_full_pipeline(
             except Exception:
                 toy_snapshot = None
 
-    def _run_learning_reanalysis(step_label: str, reason: str, resume_key: Optional[str] = None) -> bool:
-        nonlocal reanalysis_summary, jsonl_path, export_signals
+    def _run_learning_reanalysis(
+        step_label: str,
+        reason: str,
+        resume_key: Optional[str] = None,
+        toy_plan: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        nonlocal reanalysis_summary, jsonl_path, export_signals, reanalysis_last_execs
         if not learning_jsonl_path:
             return False
         if reason in reanalysis_reasons_done:
             return False
         re_dir = os.path.join(outdir, "reanalyze")
         ensure_dir(re_dir)
-        cache_summary: Optional[Dict[str, Any]] = None
-        hist_key = resume_key or step_label
-        if hist_key in ok:
-            print(f"[SKIP] {step_label} (resume)")
-            _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
-            try:
-                with open(summary_path, "r", encoding="utf-8") as fr:
-                    loaded = json.load(fr)
-                    if isinstance(loaded, dict):
-                        cache_summary = loaded
-            except Exception:
-                cache_summary = None
-        if cache_summary is None:
-            try:
-                re_limit = int(prof.get("reanalyze_limit") or 64)
-            except Exception:
-                re_limit = 64
-            result = _safe_step(
-                step_label,
-                zocr_onefile_consensus.reanalyze_learning_jsonl,
-                learning_jsonl_path,
-                re_dir,
-                re_limit,
-                ocr_engine=effective_ocr_engine,
-            )
-            _append_hist(outdir, result)
-            if not result.get("ok"):
-                return False
-            out = result.get("out")
-            cache_summary = out if isinstance(out, dict) else None
-        if not isinstance(cache_summary, dict):
+        reanalysis_last_execs = []
+        plan_levels: List[Optional[Dict[str, Any]]] = []
+        stop_on_improvement = True
+        require_improvement = False
+        if isinstance(toy_plan, dict):
+            raw_levels = toy_plan.get("levels")
+            if isinstance(raw_levels, list):
+                for entry in raw_levels:
+                    plan_levels.append(entry if isinstance(entry, dict) else None)
+            stop_on_improvement = bool(toy_plan.get("stop_on_improvement", True))
+            require_improvement = bool(toy_plan.get("require_improvement", False))
+        if not plan_levels:
+            plan_levels = [None]
+        executed_runs: List[Dict[str, Any]] = []
+        selected_summary: Optional[Dict[str, Any]] = None
+        best_metric: Tuple[int, float] = (-1, -1.0)
+        for idx, level_cfg in enumerate(plan_levels):
+            pass_label = step_label if idx == 0 else f"{step_label}.pass{idx+1}"
+            hist_base = resume_key or step_label
+            hist_key = f"{hist_base}#{idx}" if hist_base else pass_label
+            cache_summary: Optional[Dict[str, Any]] = None
+            if hist_key in ok:
+                print(f"[SKIP] {pass_label} (resume)")
+                _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
+                try:
+                    with open(summary_path, "r", encoding="utf-8") as fr:
+                        loaded = json.load(fr)
+                        if isinstance(loaded, dict):
+                            cache_summary = loaded
+                except Exception:
+                    cache_summary = None
+            if cache_summary is None:
+                try:
+                    re_limit = int(prof.get("reanalyze_limit") or 64)
+                except Exception:
+                    re_limit = 64
+                runner = zocr_onefile_consensus.reanalyze_learning_jsonl
+                context_manager = getattr(zocr_onefile_consensus, "toy_self_correction_scope", None)
+                if callable(context_manager) and level_cfg:
+                    with context_manager(level_cfg):
+                        result = _safe_step(
+                            pass_label,
+                            runner,
+                            learning_jsonl_path,
+                            re_dir,
+                            re_limit,
+                            ocr_engine=effective_ocr_engine,
+                        )
+                else:
+                    result = _safe_step(
+                        pass_label,
+                        runner,
+                        learning_jsonl_path,
+                        re_dir,
+                        re_limit,
+                        ocr_engine=effective_ocr_engine,
+                    )
+                _append_hist(outdir, result)
+                if not result.get("ok"):
+                    executed_runs.append({"label": pass_label, "ok": False, "config": level_cfg})
+                    continue
+                out = result.get("out")
+                cache_summary = out if isinstance(out, dict) else None
+            if not isinstance(cache_summary, dict):
+                executed_runs.append({"label": pass_label, "ok": False, "config": level_cfg})
+                continue
+            run_record: Dict[str, Any] = {
+                "label": pass_label,
+                "ok": True,
+                "config": level_cfg,
+                "summary": cache_summary,
+            }
+            executed_runs.append(run_record)
+            improved = int(cache_summary.get("improved") or 0)
+            avg_delta = float(cache_summary.get("avg_confidence_delta") or 0.0)
+            metric = (improved, avg_delta)
+            if cache_summary.get("toy_self_correction") and level_cfg:
+                # ensure we persist the effective config used
+                run_record["effective_config"] = cache_summary.get("toy_self_correction")
+            if improved > 0 and stop_on_improvement:
+                selected_summary = cache_summary
+                break
+            if metric > best_metric or selected_summary is None:
+                best_metric = metric
+                selected_summary = cache_summary
+        reanalysis_last_execs = executed_runs
+        if not isinstance(selected_summary, dict):
             return False
-        reanalysis_summary = cache_summary
+        reanalysis_summary = selected_summary
         reanalysis_reasons_done.add(reason)
-        summary.setdefault("reanalysis_runs", []).append(_json_ready({"step": step_label, "reason": reason}))
-        summary["reanalyze_learning"] = _json_ready(cache_summary)
-        output_jsonl = cache_summary.get("output_jsonl")
+        summary.setdefault("reanalysis_runs", []).append(
+            _json_ready({"step": step_label, "reason": reason, "passes": len(executed_runs)})
+        )
+        summary["reanalyze_learning"] = _json_ready(selected_summary)
+        output_jsonl = selected_summary.get("output_jsonl")
         if output_jsonl:
             summary["learning_reanalyzed_jsonl"] = output_jsonl
             jsonl_path = _apply_reanalysis_to_contextual_jsonl(
@@ -1503,6 +1613,9 @@ def _patched_run_full_pipeline(
                 export_signals.get("surprisal_threshold") if export_signals else None,
             )
             export_signals = summary.get("export_signals", export_signals)
+        improved_total = int(selected_summary.get("improved") or 0)
+        if require_improvement and improved_total <= 0:
+            return False
         return True
 
     re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
@@ -1514,7 +1627,38 @@ def _patched_run_full_pipeline(
     if learning_jsonl_path and toy_snapshot is not None:
         toy_triggered, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
         if toy_triggered:
-            toy_executed = _run_learning_reanalysis("ReanalyzeLearningAuto", "toy_self_correction")
+            plan = toy_self_correction_details.get("plan") if isinstance(toy_self_correction_details, dict) else None
+            toy_executed = _run_learning_reanalysis(
+                "ReanalyzeLearningAuto",
+                "toy_self_correction",
+                toy_plan=plan if isinstance(plan, dict) else None,
+            )
+            if reanalysis_last_execs and isinstance(toy_self_correction_details, dict):
+                toy_executed = True
+                exec_payload: List[Dict[str, Any]] = []
+                for rec in reanalysis_last_execs:
+                    entry: Dict[str, Any] = {
+                        "label": rec.get("label"),
+                        "ok": bool(rec.get("ok")),
+                    }
+                    if rec.get("config") is not None:
+                        entry["config"] = _json_ready(rec.get("config"))
+                    if rec.get("effective_config") is not None:
+                        entry["effective_config"] = _json_ready(rec.get("effective_config"))
+                    summary_obj = rec.get("summary")
+                    if isinstance(summary_obj, dict):
+                        entry["improved"] = int(summary_obj.get("improved") or 0)
+                        entry["avg_confidence_delta"] = float(summary_obj.get("avg_confidence_delta") or 0.0)
+                        entry["output_jsonl"] = summary_obj.get("output_jsonl")
+                    exec_payload.append(entry)
+                if exec_payload:
+                    toy_self_correction_details["executions"] = exec_payload
+                result_info = {
+                    "improved_total": int((reanalysis_summary or {}).get("improved") or 0),
+                    "avg_confidence_delta": float((reanalysis_summary or {}).get("avg_confidence_delta") or 0.0),
+                }
+                result_info["success"] = bool(result_info["improved_total"] > 0)
+                toy_self_correction_details["result"] = result_info
     if toy_self_correction_details is None and toy_snapshot is not None:
         _, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
     if toy_self_correction_details is not None:

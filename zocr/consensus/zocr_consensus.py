@@ -13,7 +13,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -35,6 +35,61 @@ from html.parser import HTMLParser
 _OCR_BACKEND_CACHE: Dict[str, Callable[["Image.Image"], Tuple[str, float]]] = {}
 _OCR_BACKEND_WARNED: Set[str] = set()
 _EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
+
+_TOY_SELF_CORRECTION_STACK: List[Dict[str, Any]] = []
+
+
+def _normalize_self_correction_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    if not isinstance(config, dict):
+        return normalized
+    for key, value in config.items():
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            normalized[key] = value
+        elif isinstance(value, (list, tuple)):
+            normalized[key] = [v for v in value]
+        elif isinstance(value, dict):
+            normalized[key] = {k: v for k, v in value.items()}
+    return normalized
+
+
+def push_toy_self_correction(config: Optional[Dict[str, Any]]) -> None:
+    """Push a new toy OCR self-correction configuration onto the active stack."""
+
+    _TOY_SELF_CORRECTION_STACK.append(_normalize_self_correction_config(config))
+
+
+def pop_toy_self_correction() -> None:
+    """Pop the most recent toy OCR self-correction configuration."""
+
+    if _TOY_SELF_CORRECTION_STACK:
+        _TOY_SELF_CORRECTION_STACK.pop()
+
+
+def current_toy_self_correction() -> Dict[str, Any]:
+    """Return the merged toy OCR self-correction configuration."""
+
+    merged: Dict[str, Any] = {}
+    for cfg in _TOY_SELF_CORRECTION_STACK:
+        for key, value in cfg.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                combined = dict(merged[key])  # type: ignore[index]
+                combined.update(value)
+                merged[key] = combined
+            else:
+                merged[key] = value
+    return merged
+
+
+@contextlib.contextmanager
+def toy_self_correction_scope(config: Optional[Dict[str, Any]]):
+    """Context manager helper to apply a temporary toy self-correction config."""
+
+    push_toy_self_correction(config)
+    try:
+        yield
+    finally:
+        pop_toy_self_correction()
 
 _thomas = None
 try:
@@ -1971,6 +2026,7 @@ def _update_ngram_model(text: str) -> None:
 
 def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> List[Tuple["np.ndarray", Dict[str, Any]]]:
     variants: List[Tuple["np.ndarray", Dict[str, Any]]] = []
+    cfg = current_toy_self_correction()
     try:
         gray_img = Image.fromarray(arr.astype(np.uint8)) if arr is not None else None
     except Exception:
@@ -1978,17 +2034,51 @@ def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> L
     if best_bw is not None:
         try:
             bw_img = Image.fromarray(best_bw.astype(np.uint8))
-            for size in (3, 5):
+            filter_sizes: List[int] = [3, 5]
+            if cfg and isinstance(cfg.get("augment_filter_sizes"), (list, tuple)):
+                for candidate in cfg.get("augment_filter_sizes", []):  # type: ignore[assignment]
+                    try:
+                        filt_size = int(round(float(candidate)))
+                    except Exception:
+                        continue
+                    if filt_size % 2 == 0 or filt_size <= 0:
+                        continue
+                    filter_sizes.append(filt_size)
+            max_filter = int(cfg.get("max_filter_size", 9)) if isinstance(cfg, dict) else 9
+            norm_sizes = sorted({s for s in filter_sizes if 1 <= s <= max_filter})
+            if not norm_sizes:
+                norm_sizes = [3, 5]
+            for size in norm_sizes:
                 try:
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MaxFilter(size)), dtype=np.uint8), {"type": "augment_max", "size": size}))
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MinFilter(size)), dtype=np.uint8), {"type": "augment_min", "size": size}))
                 except Exception:
                     continue
+            if cfg and cfg.get("augment_invert"):
+                try:
+                    inverted = 255 - np.asarray(bw_img, dtype=np.uint8)
+                    variants.append((inverted, {"type": "augment_invert"}))
+                except Exception:
+                    pass
         except Exception:
             pass
     if gray_img is not None:
         fill = int(float(np.median(arr))) if arr.size else 0
-        for angle in (-3, -1, 1, 3):
+        rotations = [-3, -1, 1, 3]
+        if cfg and isinstance(cfg.get("extra_rotations"), (list, tuple)):
+            limit = int(cfg.get("rotation_limit", 12))
+            for candidate in cfg.get("extra_rotations", []):  # type: ignore[assignment]
+                try:
+                    rot = int(round(float(candidate)))
+                except Exception:
+                    continue
+                if -limit <= rot <= limit:
+                    rotations.append(rot)
+        rotations = sorted({int(r) for r in rotations if -30 <= int(r) <= 30}) or [-3, -1, 1, 3]
+        if cfg and cfg.get("include_zero_rotation"):
+            rotations.append(0)
+            rotations = sorted({int(r) for r in rotations if -30 <= int(r) <= 30}) or [-3, -1, 1, 3]
+        for angle in rotations:
             try:
                 rotated = gray_img.rotate(angle, resample=Image.BILINEAR, fillcolor=fill)
                 rot_arr = np.asarray(rotated, dtype=np.uint8)
@@ -2520,6 +2610,18 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     g = ImageOps.autocontrast(crop_img.convert("L"))
     g = g.filter(ImageFilter.MedianFilter(3))
     arr = _np.asarray(g, dtype=_np.uint8)
+    cfg = current_toy_self_correction()
+    if isinstance(cfg.get("bin_k_override"), (int, float)):
+        try:
+            bin_k = max(3, int(round(float(cfg["bin_k_override"]))))
+        except Exception:
+            pass
+    elif isinstance(cfg.get("bin_k_scale"), (int, float)):
+        try:
+            scale = float(cfg.get("bin_k_scale"))
+            bin_k = max(3, int(round(bin_k * scale)))
+        except Exception:
+            pass
     if arr.size == 0:
         return "", 0.0
     arr_f = arr.astype(_np.float32)
@@ -2573,12 +2675,31 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     thr_otsu = _otsu_threshold_toy(arr)
     _add_candidate((arr < thr_otsu).astype(_np.uint8) * 255, {"type": "otsu", "thr": thr_otsu})
     _add_candidate((arr > thr_otsu).astype(_np.uint8) * 255, {"type": "otsu_inv", "thr": thr_otsu})
-    thr_min = max(16, thr_med - 60)
-    thr_max = min(240, thr_med + 70)
-    for thr_candidate in range(thr_min, thr_max + 1, 10):
+    threshold_expand = int(cfg.get("threshold_expand", 0)) if isinstance(cfg, dict) else 0
+    threshold_step = int(cfg.get("threshold_step", 10)) if isinstance(cfg, dict) else 10
+    fine_step = int(cfg.get("fine_threshold_step", 0)) if isinstance(cfg, dict) else 0
+    threshold_step = max(2, min(24, threshold_step or 10))
+    fine_step = max(0, min(threshold_step, fine_step))
+    thr_min = max(16, thr_med - 60 - threshold_expand)
+    thr_max = min(240, thr_med + 70 + threshold_expand)
+    for thr_candidate in range(thr_min, thr_max + 1, threshold_step):
         _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep", "thr": thr_candidate})
-    spread = int(max(6, arr.std()))
-    for delta in (-spread, spread):
+    if fine_step and fine_step < threshold_step:
+        for thr_candidate in range(thr_min, thr_max + 1, fine_step):
+            _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep_fine", "thr": thr_candidate})
+    spread_base = int(max(6, arr.std()))
+    extra_spread = int(cfg.get("extra_local_spread", 0)) if isinstance(cfg, dict) else 0
+    spread = max(6, spread_base + max(0, extra_spread))
+    local_offsets: List[int] = [-spread, spread]
+    if isinstance(cfg, dict) and isinstance(cfg.get("local_sweep_offsets"), (list, tuple)):
+        for candidate in cfg.get("local_sweep_offsets", []):  # type: ignore[assignment]
+            try:
+                offset = int(round(float(candidate)))
+            except Exception:
+                continue
+            if offset not in local_offsets:
+                local_offsets.append(offset)
+    for delta in local_offsets:
         thr_val = int(_np.clip(thr_med + delta, 16, 240))
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
 
@@ -2602,11 +2723,19 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         return total
 
     _evaluate_from(0)
-    if best_conf < 0.5:
+    target_conf = float(cfg.get("target_confidence", 0.5)) if isinstance(cfg, dict) else 0.5
+    force_augment = bool(cfg.get("force_augment")) if isinstance(cfg, dict) else False
+    extra_augment_passes = int(cfg.get("extra_augment_passes", 0)) if isinstance(cfg, dict) else 0
+    extra_augment_passes = max(0, extra_augment_passes)
+    need_augment = force_augment or (best_conf < target_conf)
+    augment_cycles = max(1, 1 + extra_augment_passes) if need_augment else extra_augment_passes
+    for _ in range(augment_cycles):
         start_len = len(candidates)
         for bw_aug, meta_aug in _self_augment_views(arr, best_bw):
             _add_candidate(bw_aug, meta_aug)
         _evaluate_from(start_len)
+        if not force_augment and best_conf >= target_conf:
+            break
 
     if best_meta and best_meta.get("thr") is not None:
         _threshold_memory_store(key, int(best_meta["thr"]))
@@ -3197,6 +3326,9 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "fallback_transform_usage": {},
         "ocr_engine": ocr_engine,
     }
+    active_cfg = current_toy_self_correction()
+    if active_cfg:
+        summary["toy_self_correction"] = _normalize_self_correction_config(active_cfg)
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
         return summary
