@@ -3125,6 +3125,277 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
 
     return summary
 
+
+def apply_reanalysis_to_jsonl(
+    contextual_jsonl_path: str,
+    reanalyzed_jsonl_path: str,
+    dest_jsonl_path: Optional[str] = None,
+    ocr_min_conf: float = 0.58,
+    surprisal_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "input_jsonl": contextual_jsonl_path,
+        "reanalyzed_jsonl": reanalyzed_jsonl_path,
+        "output_jsonl": dest_jsonl_path or contextual_jsonl_path,
+        "written": False,
+        "copied": False,
+        "base_records": 0,
+        "matched_records": 0,
+        "applied_records": 0,
+        "text_changed": 0,
+        "confidence_improved": 0,
+        "confidence_regressed": 0,
+        "confidence_unchanged": 0,
+        "avg_confidence_delta": 0.0,
+        "low_conf_cleared": 0,
+        "low_conf_new": 0,
+        "high_surprisal_cleared": 0,
+        "high_surprisal_new": 0,
+    }
+    if not contextual_jsonl_path or not os.path.exists(contextual_jsonl_path):
+        summary["error"] = "contextual_missing"
+        return summary
+    if not reanalyzed_jsonl_path or not os.path.exists(reanalyzed_jsonl_path):
+        summary["error"] = "reanalyzed_missing"
+        return summary
+
+    try:
+        with open(reanalyzed_jsonl_path, "r", encoding="utf-8") as fr:
+            updates: Dict[str, Dict[str, Any]] = {}
+            for raw in fr:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                trace = rec.get("trace_id") or rec.get("meta", {}).get("trace")
+                if not trace:
+                    continue
+                if trace in updates:
+                    try:
+                        prev_conf = float(updates[trace].get("reanalyzed_confidence") or 0.0)
+                    except Exception:
+                        prev_conf = 0.0
+                    try:
+                        new_conf = float(rec.get("reanalyzed_confidence") or 0.0)
+                    except Exception:
+                        new_conf = prev_conf
+                    if new_conf < prev_conf:
+                        continue
+                updates[trace] = rec
+    except Exception as exc:
+        summary["error"] = f"reanalyzed_read_error: {exc}"
+        return summary
+
+    if not updates:
+        summary["error"] = "reanalyzed_empty"
+        return summary
+
+    summary["matched_records"] = len(updates)
+
+    dest = dest_jsonl_path or contextual_jsonl_path
+    ensure_dir(os.path.dirname(dest) or ".")
+    tmp_dest = dest + ".tmp"
+
+    if surprisal_threshold is None:
+        surprisal_threshold = (
+            float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
+            if _NGRAM_SURPRISAL_REVIEW_THRESHOLD is not None
+            else 0.0
+        )
+
+    applied = 0
+    changed = 0
+    improved = 0
+    regressed = 0
+    unchanged = 0
+    delta_sum = 0.0
+    low_conf_cleared = 0
+    low_conf_new = 0
+    high_surprisal_cleared = 0
+    high_surprisal_new = 0
+    base_records = 0
+
+    try:
+        with open(contextual_jsonl_path, "r", encoding="utf-8") as fr, \
+             open(tmp_dest, "w", encoding="utf-8") as fw:
+            for raw in fr:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                base_records += 1
+                meta = rec.get("meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                    rec["meta"] = meta
+                trace = meta.get("trace")
+                if not trace and isinstance(meta.get("filters"), dict):
+                    trace = meta["filters"].get("trace_id")
+                info = updates.get(trace) if trace else None
+                if info:
+                    applied += 1
+                    try:
+                        new_conf = float(info.get("reanalyzed_confidence") or 0.0)
+                    except Exception:
+                        new_conf = 0.0
+                    try:
+                        old_conf = float(meta.get("confidence") or 0.0)
+                    except Exception:
+                        old_conf = 0.0
+                    delta = new_conf - old_conf
+                    delta_sum += delta
+                    if delta > 0.01:
+                        improved += 1
+                    elif delta < -0.01:
+                        regressed += 1
+                    else:
+                        unchanged += 1
+                    old_text = rec.get("text")
+                    new_text = info.get("reanalyzed_text", old_text)
+                    if new_text != old_text:
+                        changed += 1
+                    rec["text"] = new_text
+                    if rec.get("search_unit") == old_text or not rec.get("search_unit"):
+                        rec["search_unit"] = new_text
+                    if rec.get("synthesis_window") == old_text or not rec.get("synthesis_window"):
+                        rec["synthesis_window"] = new_text
+                    meta.setdefault("reanalysis", {})
+                    meta["reanalysis"] = {
+                        "trace_id": trace,
+                        "text_before": old_text,
+                        "text_after": new_text,
+                        "confidence_before": old_conf,
+                        "confidence_after": new_conf,
+                        "delta": delta,
+                        "improved": bool(info.get("improved")),
+                        "regressed": bool(info.get("regressed")),
+                        "source": info.get("source"),
+                    }
+                    meta["confidence"] = new_conf
+                    prev_low = bool(meta.get("low_conf"))
+                    new_low = bool(new_conf < ocr_min_conf)
+                    if prev_low and not new_low:
+                        low_conf_cleared += 1
+                    elif (not prev_low) and new_low:
+                        low_conf_new += 1
+                    meta["low_conf"] = new_low
+                    coherence = _ngram_coherence(new_text) if new_text else 0.0
+                    surprisal = _ngram_surprisal(new_text) if new_text else 0.0
+                    meta["ngram_coherence"] = float(coherence)
+                    meta["ngram_surprisal"] = float(surprisal)
+                    review_reasons = meta.get("review_reasons")
+                    if isinstance(review_reasons, list):
+                        filtered = [
+                            str(r) for r in review_reasons
+                            if isinstance(r, str) and r not in {"low_conf", "high_surprisal"}
+                        ]
+                    else:
+                        filtered = []
+                    if new_low:
+                        filtered.append("low_conf")
+                    high_surprisal_flag = bool(surprisal_threshold and surprisal >= float(surprisal_threshold))
+                    prev_high = False
+                    if isinstance(review_reasons, list):
+                        prev_high = any(r == "high_surprisal" for r in review_reasons if isinstance(r, str))
+                    if prev_high and not high_surprisal_flag:
+                        high_surprisal_cleared += 1
+                    if high_surprisal_flag and not prev_high:
+                        high_surprisal_new += 1
+                    if high_surprisal_flag:
+                        filtered.append("high_surprisal")
+                    if filtered:
+                        meta["review_reasons"] = filtered
+                        meta["needs_review"] = True
+                    else:
+                        meta.pop("review_reasons", None)
+                        meta["needs_review"] = bool(meta.get("hypotheses"))
+                fw.write(json.dumps(_json_ready(rec), ensure_ascii=False) + "\n")
+    except Exception as exc:
+        summary["error"] = f"contextual_rewrite_failed: {exc}"
+        try:
+            if os.path.exists(tmp_dest):
+                os.remove(tmp_dest)
+        except Exception:
+            pass
+        return summary
+
+    if not applied:
+        try:
+            os.remove(tmp_dest)
+        except Exception:
+            pass
+        summary["base_records"] = base_records
+        summary["applied_records"] = 0
+        return summary
+
+    try:
+        os.replace(tmp_dest, dest)
+    except Exception as exc:
+        summary["error"] = f"contextual_replace_failed: {exc}"
+        try:
+            os.remove(tmp_dest)
+        except Exception:
+            pass
+        return summary
+
+    summary.update({
+        "output_jsonl": dest,
+        "written": True,
+        "base_records": base_records,
+        "applied_records": applied,
+        "text_changed": changed,
+        "confidence_improved": improved,
+        "confidence_regressed": regressed,
+        "confidence_unchanged": unchanged,
+        "avg_confidence_delta": delta_sum / float(max(1, applied)),
+        "low_conf_cleared": low_conf_cleared,
+        "low_conf_new": low_conf_new,
+        "high_surprisal_cleared": high_surprisal_cleared,
+        "high_surprisal_new": high_surprisal_new,
+    })
+
+    def _write_signals(path: str) -> None:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fr:
+                    payload = json.load(fr)
+                    existing = payload if isinstance(payload, dict) else {}
+            else:
+                existing = {}
+        except Exception:
+            existing = {}
+        existing.setdefault("applied_reanalysis", {})
+        existing["applied_reanalysis"] = {
+            "applied_records": int(applied),
+            "text_changed": int(changed),
+            "avg_confidence_delta": float(summary["avg_confidence_delta"]),
+            "low_conf_cleared": int(low_conf_cleared),
+            "high_surprisal_cleared": int(high_surprisal_cleared),
+        }
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(_json_ready(existing), fw, ensure_ascii=False, indent=2)
+
+    signals_src = contextual_jsonl_path + ".signals.json"
+    signals_dest = dest + ".signals.json"
+    try:
+        if os.path.abspath(signals_dest) == os.path.abspath(signals_src):
+            _write_signals(signals_dest)
+        else:
+            if os.path.exists(signals_src):
+                shutil.copyfile(signals_src, signals_dest)
+            _write_signals(signals_dest)
+            summary["copied"] = True
+    except Exception:
+        summary.setdefault("warnings", []).append("signals_update_failed")
+
+    return summary
+
 # ---------- Minimal local hybrid search ----------
 def _tokenize(s: str) -> List[str]:
     s = (s or "").lower()
@@ -6270,6 +6541,48 @@ def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]
     return output, output + ".summary.json"
 
 
+def _apply_reanalysis_to_contextual_jsonl(
+    contextual_jsonl: str,
+    reanalyzed_jsonl: str,
+    outdir: str,
+    summary: Dict[str, Any],
+    ocr_min_conf: float,
+    surprisal_threshold: Optional[float] = None,
+) -> str:
+    if not reanalyzed_jsonl or not os.path.exists(reanalyzed_jsonl):
+        return contextual_jsonl
+    base_dir = os.path.dirname(contextual_jsonl) or outdir
+    base_name = os.path.basename(contextual_jsonl)
+    if base_name.endswith(".jsonl"):
+        base_name = base_name[:-6]
+    if base_name.endswith(".reanalyzed"):
+        dest_path = contextual_jsonl
+    else:
+        dest_path = os.path.join(base_dir, f"{base_name}.reanalyzed.jsonl")
+    rewrite = apply_reanalysis_to_jsonl(
+        contextual_jsonl,
+        reanalyzed_jsonl,
+        dest_path,
+        ocr_min_conf=ocr_min_conf,
+        surprisal_threshold=surprisal_threshold,
+    )
+    if rewrite.get("written"):
+        applied_entry = _json_ready(rewrite)
+        summary.setdefault("reanalysis_applied", [])
+        summary["reanalysis_applied"].append(applied_entry)
+        if os.path.abspath(dest_path) != os.path.abspath(contextual_jsonl):
+            summary.setdefault("contextual_jsonl_original", contextual_jsonl)
+        new_jsonl = applied_entry.get("output_jsonl") or dest_path
+        new_signals = _load_export_signals(new_jsonl)
+        if new_signals:
+            summary["export_signals"] = new_signals
+        summary["contextual_jsonl"] = new_jsonl
+        return new_jsonl
+    if rewrite.get("error"):
+        summary.setdefault("reanalysis_errors", []).append(str(rewrite.get("error")))
+    return contextual_jsonl
+
+
 def _profile_snapshot(prof: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(prof))
 
@@ -6579,6 +6892,15 @@ def _patched_run_full_pipeline(
             summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
             if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
                 summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
+                jsonl_path = _apply_reanalysis_to_contextual_jsonl(
+                    jsonl_path,
+                    reanalysis_summary.get("output_jsonl"),
+                    outdir,
+                    summary,
+                    prof.get("ocr_min_conf", 0.58),
+                    export_signals.get("surprisal_threshold") if export_signals else None,
+                )
+                export_signals = summary.get("export_signals", export_signals)
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None
@@ -6776,6 +7098,15 @@ def _patched_run_full_pipeline(
                 summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
                 if reanalysis_summary.get("output_jsonl"):
                     summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
+                    jsonl_path = _apply_reanalysis_to_contextual_jsonl(
+                        jsonl_path,
+                        reanalysis_summary.get("output_jsonl"),
+                        outdir,
+                        summary,
+                        prof.get("ocr_min_conf", 0.58),
+                        export_signals.get("surprisal_threshold") if export_signals else None,
+                    )
+                    export_signals = summary.get("export_signals", export_signals)
     if intent_runs:
         summary["intent_runs"] = intent_runs
 

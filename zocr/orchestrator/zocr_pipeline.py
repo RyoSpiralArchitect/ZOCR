@@ -739,6 +739,48 @@ def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]
     return output, output + ".summary.json"
 
 
+def _apply_reanalysis_to_contextual_jsonl(
+    contextual_jsonl: str,
+    reanalyzed_jsonl: str,
+    outdir: str,
+    summary: Dict[str, Any],
+    ocr_min_conf: float,
+    surprisal_threshold: Optional[float] = None,
+) -> str:
+    if not reanalyzed_jsonl or not os.path.exists(reanalyzed_jsonl):
+        return contextual_jsonl
+    base_dir = os.path.dirname(contextual_jsonl) or outdir
+    base_name = os.path.basename(contextual_jsonl)
+    if base_name.endswith(".jsonl"):
+        base_name = base_name[:-6]
+    if base_name.endswith(".reanalyzed"):
+        dest_path = contextual_jsonl
+    else:
+        dest_path = os.path.join(base_dir, f"{base_name}.reanalyzed.jsonl")
+    rewrite = zocr_onefile_consensus.apply_reanalysis_to_jsonl(
+        contextual_jsonl,
+        reanalyzed_jsonl,
+        dest_path,
+        ocr_min_conf=ocr_min_conf,
+        surprisal_threshold=surprisal_threshold,
+    )
+    if rewrite.get("written"):
+        applied_entry = _json_ready(rewrite)
+        summary.setdefault("reanalysis_applied", [])
+        summary["reanalysis_applied"].append(applied_entry)
+        if os.path.abspath(dest_path) != os.path.abspath(contextual_jsonl):
+            summary.setdefault("contextual_jsonl_original", contextual_jsonl)
+        new_jsonl = applied_entry.get("output_jsonl") or dest_path
+        new_signals = _load_export_signals(new_jsonl)
+        if new_signals:
+            summary["export_signals"] = new_signals
+        summary["contextual_jsonl"] = new_jsonl
+        return new_jsonl
+    if rewrite.get("error"):
+        summary.setdefault("reanalysis_errors", []).append(str(rewrite.get("error")))
+    return contextual_jsonl
+
+
 def _profile_snapshot(prof: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(prof))
 
@@ -1049,6 +1091,15 @@ def _patched_run_full_pipeline(
             summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
             if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
                 summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
+                jsonl_path = _apply_reanalysis_to_contextual_jsonl(
+                    jsonl_path,
+                    reanalysis_summary.get("output_jsonl"),
+                    outdir,
+                    summary,
+                    prof.get("ocr_min_conf", 0.58),
+                    export_signals.get("surprisal_threshold") if export_signals else None,
+                )
+                export_signals = summary.get("export_signals", export_signals)
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None
@@ -1246,6 +1297,15 @@ def _patched_run_full_pipeline(
                 summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
                 if reanalysis_summary.get("output_jsonl"):
                     summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
+                    jsonl_path = _apply_reanalysis_to_contextual_jsonl(
+                        jsonl_path,
+                        reanalysis_summary.get("output_jsonl"),
+                        outdir,
+                        summary,
+                        prof.get("ocr_min_conf", 0.58),
+                        export_signals.get("surprisal_threshold") if export_signals else None,
+                    )
+                    export_signals = summary.get("export_signals", export_signals)
     if intent_runs:
         summary["intent_runs"] = intent_runs
 
