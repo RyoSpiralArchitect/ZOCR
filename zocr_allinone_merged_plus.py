@@ -3152,6 +3152,11 @@ from html import escape
 import zocr_onefile_consensus
 import zocr_multidomain_core
 
+try:
+    import numpy as _np  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    _np = None  # type: ignore
+
 PLUGINS = {}
 def register(stage):
     def deco(fn):
@@ -3163,6 +3168,20 @@ def _call(stage, **kw):
             fn(**kw)
         except Exception as e:
             print(f"[PLUGIN:{stage}] {fn.__name__} -> {e}")
+
+def _json_ready(obj: Any):
+    if isinstance(obj, dict):
+        return {k: _json_ready(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(v) for v in obj]
+    if isinstance(obj, set):
+        return [_json_ready(v) for v in obj]
+    if _np is not None:
+        if isinstance(obj, _np.generic):  # type: ignore[attr-defined]
+            return obj.item()
+        if isinstance(obj, _np.ndarray):  # type: ignore[attr-defined]
+            return obj.tolist()
+    return obj
 
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -3184,7 +3203,7 @@ def _append_hist(outdir: str, rec: dict):
     rec = dict(rec)
     rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with open(os.path.join(outdir, "pipeline_history.jsonl"), "a", encoding="utf-8") as fw:
-        fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fw.write(json.dumps(_json_ready(rec), ensure_ascii=False) + "\n")
 
 def _load_history(outdir: str) -> List[Dict[str, Any]]:
     path = os.path.join(outdir, "pipeline_history.jsonl")
@@ -3755,7 +3774,7 @@ def _patched_run_full_pipeline(
     summary["report_html"] = report_path
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
 
     try:
         _generate_report(outdir, dest=report_path, summary=summary, history=history_records, meta=_read_meta(outdir))
