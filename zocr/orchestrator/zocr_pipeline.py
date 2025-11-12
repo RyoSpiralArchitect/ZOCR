@@ -13,7 +13,7 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from html import escape
 
 try:
@@ -313,6 +313,7 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
     teds = _coerce_float((aggregate or {}).get("teds_mean"))
     row_out = _coerce_float((aggregate or {}).get("row_outlier_rate_med"))
     hit_mean = _coerce_float(monitor.get("hit_mean") or monitor.get("hit_mean_gt"))
+    trust_mean = _coerce_float(monitor.get("trust_mean"))
     if col_over is not None or teds is not None or row_out is not None:
         parts: List[str] = []
         if col_over is not None:
@@ -327,6 +328,12 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
         elif hit_mean is not None:
             msg += f"。Hit@K≈{hit_mean*100:.0f}% まで見えているのでヘッダ/Total補完でさらに伸ばせます"
         insights.append(msg)
+
+    if trust_mean is not None:
+        if trust_mean >= 0.98:
+            insights.append(f"Trust@K≈{trust_mean*100:.0f}%：trace付きセルとシンボリック検索で幻覚率ほぼゼロ化")
+        else:
+            insights.append(f"Trust@K≈{trust_mean*100:.0f}%：trace/filters の補完を確認すると幻覚率をさらに抑えられます")
 
     gate_flag = monitor.get("gate_pass")
     gate_pass = bool(gate_flag) if isinstance(gate_flag, bool) else str(gate_flag).lower() == "true"

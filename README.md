@@ -93,6 +93,9 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 ## モニタリング洞察 / Monitoring Insights / Analyse de la surveillance
 - `pipeline_summary.json` の `insights` は構造・ゲート・プロファイルの3本立てで、over/under・TEDS・行外れ率や Hit@K を数値付きで提示します。
 - インボイス系ドメインはゲートを緩和し、`hit_amount` が基準を満たせば `hit_date=0` でも「amount hit (date optional)」として PASS します。
+- **[JA]** `monitor.csv` には `trust_amount` / `trust_date` / `trust_mean` を追加し、Top-K に混入した非出典セルの比率を観測できます。
+- **[EN]** `monitor.csv` now records `trust_amount`, `trust_date`, and `trust_mean`, exposing how many Top-K hits carry proper provenance.
+- **[FR]** `monitor.csv` consigne désormais `trust_amount`, `trust_date` et `trust_mean`, ce qui mesure la part des résultats Top-K dotés de provenance.
 - autotune / `learn_from_monitor` が更新した `w_kw` / `w_img` / `ocr_min_conf` / `lambda_shape` を拾い、ヘッダ補完や再走査の微調整ヒントを返します。
 
 ## 対応ドメイン / Supported Domains / Domaines pris en charge

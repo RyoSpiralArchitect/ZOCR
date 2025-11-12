@@ -3530,27 +3530,46 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
 
     if not os.path.exists(index_pkl): build_index(jsonl, index_pkl)
     G=_read_gt(gt_jsonl)
-    def _hit(label, q):
-        res=query(index_pkl, jsonl, q, None, topk=k, domain=domain)
-        if G[label]:
-            for s,ob in res:
-                key=(ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col"))
-                if key in G[label]: return 1
-            return 0
-        else:
-            for s,ob in res:
-                filt=(ob.get("meta") or {}).get("filters",{})
-                if label=="amount" and filt.get("amount"): return 1
-                if label=="date" and filt.get("date"): return 1
-            return 0
+    def _score(label: str, q: str) -> Tuple[int, Optional[float]]:
+        res = query(index_pkl, jsonl, q, None, topk=k, domain=domain)
+        if not res:
+            return 0, None
+
+        rel = G.get(label) or set()
+        good = 0
+        hit = 0
+        for _score, ob in res:
+            key = (
+                ob.get("doc_id"),
+                ob.get("page"),
+                ob.get("table_index"),
+                ob.get("row"),
+                ob.get("col"),
+            )
+            filt = (ob.get("meta") or {}).get("filters", {})
+            if rel:
+                if key in rel:
+                    hit = 1
+                    good += 1
+            else:
+                if label == "amount" and filt.get("amount") is not None:
+                    hit = 1
+                    good += 1
+                elif label == "date" and filt.get("date"):
+                    hit = 1
+                    good += 1
+        trust = good / len(res) if res else None
+        return hit, trust
     q_amount="合計 金額 消費税 円 2023 2024 2025"
     q_date="請求日 発行日 2023 2024 2025"
     if domain=="contract_jp_v2":
         q_amount="契約金額 代金 支払"
         q_date="契約日 締結日 開始日 終了日"
-    hit_amount=_hit("amount", q_amount)
-    hit_date=_hit("date", q_date)
+    hit_amount, trust_amount = _score("amount", q_amount)
+    hit_date, trust_date = _score("date", q_date)
     hit_mean=(hit_amount+hit_date)/2.0
+    trust_vals = [v for v in (trust_amount, trust_date) if v is not None]
+    trust_mean = sum(trust_vals)/len(trust_vals) if trust_vals else None
 
     # tax check fail
     tax_fail=0; tax_cov=0
@@ -3582,6 +3601,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
          "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
          "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
          "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95,
+         "trust_amount":trust_amount,"trust_date":trust_date,"trust_mean":trust_mean,
          "gate_pass":gate_pass,"gate_reason":gate_reason,"gate_score":gate_score}
     hdr=not os.path.exists(out_csv)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
@@ -3624,7 +3644,7 @@ def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile
         numeric_keys = [
             "low_conf_rate", "reprocess_rate", "reprocess_success_rate",
             "hit_amount", "hit_date", "hit_mean", "p95_ms", "tax_fail_rate",
-            "corporate_match_rate",
+            "corporate_match_rate", "trust_amount", "trust_date", "trust_mean",
         ]
         for key in numeric_keys:
             if key in metrics:
@@ -3690,7 +3710,7 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from html import escape
 
 try:
@@ -3990,6 +4010,7 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
     teds = _coerce_float((aggregate or {}).get("teds_mean"))
     row_out = _coerce_float((aggregate or {}).get("row_outlier_rate_med"))
     hit_mean = _coerce_float(monitor.get("hit_mean") or monitor.get("hit_mean_gt"))
+    trust_mean = _coerce_float(monitor.get("trust_mean"))
     if col_over is not None or teds is not None or row_out is not None:
         parts: List[str] = []
         if col_over is not None:
@@ -4004,6 +4025,12 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
         elif hit_mean is not None:
             msg += f"。Hit@K≈{hit_mean*100:.0f}% まで見えているのでヘッダ/Total補完でさらに伸ばせます"
         insights.append(msg)
+
+    if trust_mean is not None:
+        if trust_mean >= 0.98:
+            insights.append(f"Trust@K≈{trust_mean*100:.0f}%：trace付きセルとシンボリック検索で幻覚率ほぼゼロ化")
+        else:
+            insights.append(f"Trust@K≈{trust_mean*100:.0f}%：trace/filters の補完を確認すると幻覚率をさらに抑えられます")
 
     gate_flag = monitor.get("gate_pass")
     gate_pass = bool(gate_flag) if isinstance(gate_flag, bool) else str(gate_flag).lower() == "true"
