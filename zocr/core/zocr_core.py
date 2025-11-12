@@ -30,7 +30,8 @@ ZOCR Multi‑Domain Core (single file)
 """
 
 import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys
-from typing import List, Optional, Dict, Any, Tuple
+from collections import defaultdict, Counter
+from typing import List, Optional, Dict, Any, Tuple, Set
 from PIL import Image, ImageOps
 import numpy as np
 
@@ -1105,7 +1106,7 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
     return manifest
 
 # --------------- Monitoring (KPI) ----------------------
-def _read_views_log(views_log: str) -> Dict[str,set]:
+def _read_views_log(views_log: str) -> Dict[str, Set]:
     """
     JSONL 形式の Views/補完ログを読む。
     戻り値: {"reprocess": set(cell_keys), "success": set(cell_keys)}
@@ -1125,23 +1126,39 @@ def _read_views_log(views_log: str) -> Dict[str,set]:
                 continue
     return {"reprocess":R, "success":S}
 
-def _load_gt(gt_jsonl: str) -> Dict[str,set]:
-    """
-    line: {doc_id,page,table_index,row,col,label}
-    戻り: {"amount": set(keys), "date": set(keys)}
-    """
-    G={"amount":set(),"date":set()}
-    if not gt_jsonl or not os.path.exists(gt_jsonl): return G
-    with open(gt_jsonl,"r",encoding="utf-8") as f:
+def _read_views_sets(views_log: Optional[str]) -> Tuple[Set, Set]:
+    """Return (reprocess_set, success_set) from a Views JSONL log."""
+    if not views_log:
+        return set(), set()
+    try:
+        logs = _read_views_log(views_log)
+        return set(logs.get("reprocess", set())), set(logs.get("success", set()))
+    except Exception:
+        return set(), set()
+
+def _read_gt(gt_jsonl: Optional[str]) -> Dict[str, Set]:
+    """Load ground-truth cell identifiers grouped by semantic label."""
+    labels: Dict[str, Set] = {"amount": set(), "date": set()}
+    if not gt_jsonl or not os.path.exists(gt_jsonl):
+        return labels
+    with open(gt_jsonl, "r", encoding="utf-8") as f:
         for line in f:
             try:
-                ob=json.loads(line)
-                key=(ob.get("doc_id"), int(ob.get("page")), int(ob.get("table_index")), int(ob.get("row")), int(ob.get("col")))
-                lab=str(ob.get("label","")).lower()
-                if lab in G: G[lab].add(key)
+                ob = json.loads(line)
             except Exception:
                 continue
-    return G
+            lab = str(ob.get("label", "")).lower()
+            if lab not in labels:
+                continue
+            key = (
+                ob.get("doc_id"),
+                int(ob.get("page", 0)),
+                int(ob.get("table_index", 0)),
+                int(ob.get("row", 0)),
+                int(ob.get("col", 0)),
+            )
+            labels[lab].add(key)
+    return labels
 
 def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, domain: str="invoice",
             views_log: Optional[str]=None, gt_jsonl: Optional[str]=None):
@@ -1168,7 +1185,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, domain: str="invoi
     if not os.path.exists(index_pkl):
         build_index(jsonl, index_pkl)
     # strict Hit@K (GT cell id match)
-    G=_load_gt(gt_jsonl)
+    G=_read_gt(gt_jsonl)
     def _idset(res):
         S=set()
         for s,ob in res:
@@ -1551,6 +1568,87 @@ def _second_diff_energy(vec: np.ndarray) -> float:
         v += float(d*d)
     return v / float(vec.shape[0]-2)
 
+def metric_col_over_under_rate(jsonl_mm: str) -> float:
+    """Estimate how often table rows deviate from the dominant column count."""
+    meta_values: List[float] = []
+    table_rows: Dict[Tuple[Any, Any, Any], Dict[Any, Set[int]]] = defaultdict(lambda: defaultdict(set))
+    if not os.path.exists(jsonl_mm):
+        return 1.0
+    with open(jsonl_mm, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                ob = json.loads(line)
+            except Exception:
+                continue
+            meta = ob.get("meta") or {}
+            val = meta.get("col_over_under")
+            if isinstance(val, (int, float)):
+                meta_values.append(float(val))
+            key = (ob.get("doc_id"), ob.get("page"), ob.get("table_index"))
+            row = ob.get("row")
+            col = ob.get("col")
+            if row is None or col is None:
+                continue
+            try:
+                r = int(row)
+                c = int(col)
+            except Exception:
+                continue
+            table_rows[key][r].add(c)
+    if meta_values:
+        return max(0.01, float(sum(meta_values) / max(1, len(meta_values))))
+
+    diff_sum = 0.0
+    count = 0
+    for rows in table_rows.values():
+        lengths = [len(cols) for cols in rows.values() if cols]
+        if not lengths:
+            continue
+        freq = Counter(lengths)
+        mode_len = freq.most_common(1)[0][0]
+        for L in lengths:
+            count += 1
+            diff_sum += abs(L - mode_len) / max(1, mode_len)
+    if count == 0:
+        return 1.0
+    return max(0.01, diff_sum / count)
+
+def metric_chunk_consistency(jsonl_mm: str) -> float:
+    """Measure how consistently cells stay within the same logical chunks/sections."""
+    chunk_map: Dict[Tuple[Any, Any], Counter] = defaultdict(Counter)
+    if not os.path.exists(jsonl_mm):
+        return 1.0
+    with open(jsonl_mm, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                ob = json.loads(line)
+            except Exception:
+                continue
+            meta = ob.get("meta") or {}
+            chunk = (
+                meta.get("chunk_id")
+                or meta.get("chunk")
+                or meta.get("section_id")
+                or meta.get("section_key")
+                or ob.get("chunk_id")
+                or ob.get("chunk")
+            )
+            if chunk is None:
+                continue
+            key = (ob.get("doc_id"), ob.get("page"))
+            chunk_map[key][str(chunk)] += 1
+    total = 0
+    aligned = 0
+    for counter in chunk_map.values():
+        vals = list(counter.values())
+        if not vals:
+            continue
+        total += sum(vals)
+        aligned += counter.most_common(1)[0][1]
+    if total == 0:
+        return 1.0
+    return float(aligned) / float(total)
+
 def metric_col_alignment_energy_cached(tbl_cache: List[Dict[str,Any]], lambda_shape: float, height_ref: float=1000.0, exp: float=0.7) -> float:
     """
     Return ratio E_after/E_before (<=1.0 is better). If no curvature, returns 1.0 (neutral).
@@ -1787,3 +1885,62 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
     else:
         print("GATE: FAIL (Hit@K)")
     return row
+
+def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile_json_out: Optional[str]=None,
+                       domain_hint: Optional[str]=None, ema: float=0.5) -> Dict[str, Any]:
+    """Blend the latest monitor metrics back into the auto profile."""
+    if profile_json_out is None:
+        profile_json_out = profile_json_in
+
+    profile: Dict[str, Any] = {}
+    if profile_json_in and os.path.exists(profile_json_in):
+        try:
+            with open(profile_json_in, "r", encoding="utf-8") as fr:
+                profile = json.load(fr)
+        except Exception:
+            profile = {}
+
+    metrics: Dict[str, Any] = {}
+    if monitor_csv and os.path.exists(monitor_csv):
+        try:
+            import csv
+            with open(monitor_csv, "r", encoding="utf-8", newline="") as fr:
+                rows = list(csv.DictReader(fr))
+            if rows:
+                metrics = rows[-1]
+        except Exception:
+            metrics = {}
+
+    if metrics:
+        numeric_keys = [
+            "low_conf_rate", "reprocess_rate", "reprocess_success_rate",
+            "hit_amount", "hit_date", "hit_mean", "p95_ms", "tax_fail_rate",
+            "corporate_match_rate",
+        ]
+        for key in numeric_keys:
+            if key in metrics:
+                try:
+                    metrics[key] = float(metrics[key]) if metrics[key] not in (None, "") else None
+                except Exception:
+                    metrics[key] = None
+        profile.setdefault("domain", domain_hint or profile.get("domain"))
+        profile["last_monitor"] = metrics
+
+        if "ocr_min_conf" in profile and isinstance(profile["ocr_min_conf"], (int, float)):
+            target = float(profile["ocr_min_conf"])
+            if metrics.get("low_conf_rate") is not None:
+                target = max(0.1, min(0.99, target - 0.25*(metrics["low_conf_rate"] - 0.1)))
+            profile["ocr_min_conf"] = round((1.0 - ema) * float(profile["ocr_min_conf"]) + ema * target, 4)
+
+    if profile_json_out:
+        try:
+            with open(profile_json_out, "w", encoding="utf-8") as fw:
+                json.dump(profile, fw, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    return {
+        "profile_json": profile_json_out,
+        "profile": profile,
+        "monitor": metrics or None,
+    }
