@@ -29,7 +29,7 @@ ZOCR Multi‑Domain Core (single file)
 ※ 依存：標準 Python + Pillow + numpy（Numba があれば自動使用。無ければフォールバック）。
 """
 
-import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys
+import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys, html
 from collections import defaultdict, Counter
 from typing import List, Optional, Dict, Any, Tuple, Set
 from PIL import Image, ImageOps
@@ -514,6 +514,9 @@ DOMAIN_DEFAULTS = {
     "grant_application_en": {"lambda_shape": 4.0, "w_kw": 0.6, "w_img": 0.22, "ocr_min_conf": 0.58},
     "boarding_pass_en": {"lambda_shape": 3.5, "w_kw": 0.5, "w_img": 0.3, "ocr_min_conf": 0.55}
 }
+
+for _dom_conf in DOMAIN_DEFAULTS.values():
+    _dom_conf.setdefault("w_sym", 0.45)
 
 _DOMAIN_ALIAS = {
     "invoice": "invoice_jp_v2",
@@ -1070,8 +1073,47 @@ def _kw_meta_boost(ob: Dict[str,Any], q_toks: List[str], domain:str="invoice") -
         if kw in text: s+=w
     return s
 
+def _symbolic_match_score(filters: Dict[str, Any], q_text: str, tokens: List[str]) -> float:
+    if not filters or not q_text:
+        return 0.0
+    q_norm = _normalize_text(q_text)
+    if not isinstance(tokens, list):
+        tokens = list(tokens)
+    digits = re.findall(r"\d+(?:[.,]\d+)?", q_text)
+    score = 0.0
+    seen_keys = set()
+    for key, val in filters.items():
+        if key in (None, "trace"):
+            continue
+        if val is None:
+            continue
+        val_str = str(val)
+        if not val_str:
+            continue
+        val_norm = _normalize_text(val_str)
+        if not val_norm:
+            continue
+        key_hits = 0.0
+        if q_norm and val_norm in q_norm:
+            key_hits += 2.0
+        for tok in tokens:
+            if tok and tok in val_norm:
+                key_hits += 1.0
+        for d in digits:
+            dd = d.replace(",", "").replace(".", "")
+            if dd and dd in re.sub(r"\D", "", val_str):
+                key_hits += 1.5
+        if key_hits > 0:
+            seen_keys.add(key)
+            score += key_hits
+    if seen_keys:
+        score += min(len(seen_keys), 4) * 0.5
+    return float(score)
+
+
 def query(index_pkl: str, jsonl: str, q_text: str="", q_image: Optional[str]=None, topk:int=10,
-          w_bm25:float=1.0, w_kw:float=0.6, w_img:float=0.3, domain:str="invoice"):
+          w_bm25:float=1.0, w_kw:float=0.6, w_img:float=0.3, w_sym:float=0.45,
+          domain:str="invoice"):
     with open(index_pkl,"rb") as f: ix=pickle.load(f)
     vocab=ix["vocab"]; df=np.array(ix["df"], dtype=np.int32); N=int(ix["N"]); avgdl=float(ix["avgdl"])
     raws=[]
@@ -1091,8 +1133,20 @@ def query(index_pkl: str, jsonl: str, q_text: str="", q_image: Optional[str]=Non
         ob = raws[i]
         sk = _kw_meta_boost(ob, toks, domain)
         si = _phash_sim(q_image, (ob.get("meta") or {}).get("phash64") or 0)
-        s = w_bm25*sb + w_kw*sk + w_img*si
-        results.append((s, ob))
+        filters = ((ob.get("meta") or {}).get("filters") or {})
+        sym = _symbolic_match_score(filters, q_text or "", list(toks))
+        score = w_bm25*sb + w_kw*sk + w_img*si + w_sym*sym
+        enriched = dict(ob)
+        meta = dict(enriched.get("meta") or {})
+        meta.setdefault("filters", filters)
+        meta["retrieval_scores"] = {
+            "bm25": float(sb),
+            "keyword": float(sk),
+            "image": float(si),
+            "symbolic": float(sym),
+        }
+        enriched["meta"] = meta
+        results.append((score, enriched))
     results.sort(key=lambda x:-x[0])
     return results[:topk]
 
@@ -1104,7 +1158,7 @@ def sql_export(jsonl: str, outdir: str, prefix: str="invoice"):
     cols=["doc_id","page","table_index","row","col","text","search_unit","synthesis_window",
           "amount","date","company","address","tax_id","postal_code","phone",
           "tax_rate","qty","unit","subtotal","tax_amount","corporate_id",
-          "bbox_x1","bbox_y1","bbox_x2","bbox_y2","confidence","low_conf","phash64","lambda_shape"]
+          "bbox_x1","bbox_y1","bbox_x2","bbox_y2","confidence","low_conf","phash64","lambda_shape","trace"]
     with open(csv_path,"w",encoding="utf-8-sig",newline="") as fw:
         wr=csv.writer(fw); wr.writerow(cols)
         with open(jsonl,"r",encoding="utf-8") as fr:
@@ -1115,7 +1169,8 @@ def sql_export(jsonl: str, outdir: str, prefix: str="invoice"):
                              ob.get("text"),ob.get("search_unit"),ob.get("synthesis_window"),
                              filt.get("amount"),filt.get("date"),filt.get("company"),filt.get("address"),filt.get("tax_id"),
                              filt.get("postal_code"),filt.get("phone"),filt.get("tax_rate"),filt.get("qty"),filt.get("unit"),filt.get("subtotal"),filt.get("tax_amount"),filt.get("corporate_id"),
-                             x1,y1,x2,y2, meta.get("confidence"), meta.get("low_conf"), meta.get("phash64"), meta.get("lambda_shape")])
+                             x1,y1,x2,y2, meta.get("confidence"), meta.get("low_conf"), meta.get("phash64"), meta.get("lambda_shape"),
+                             filt.get("trace")])
     schema=f"""
 CREATE TABLE IF NOT EXISTS {prefix}_cells (
   doc_id TEXT, page INT, table_index INT, row INT, col INT,
@@ -1123,12 +1178,45 @@ CREATE TABLE IF NOT EXISTS {prefix}_cells (
   amount BIGINT, date TEXT, company TEXT, address TEXT, tax_id TEXT,
   postal_code TEXT, phone TEXT, tax_rate REAL, qty BIGINT, unit TEXT, subtotal BIGINT, tax_amount BIGINT, corporate_id TEXT,
   bbox_x1 INT, bbox_y1 INT, bbox_x2 INT, bbox_y2 INT,
-  confidence REAL, low_conf BOOLEAN, phash64 BIGINT, lambda_shape REAL
+  confidence REAL, low_conf BOOLEAN, phash64 BIGINT, lambda_shape REAL, trace TEXT
 );
 -- COPY {prefix}_cells FROM '{csv_path}' WITH CSV HEADER;
 """
     open(schema_path,"w",encoding="utf-8").write(schema)
     return {"csv":csv_path,"schema":schema_path}
+
+
+def _build_trace(doc_id: Optional[str], page: int, table_idx: Optional[int],
+                 row_idx: Optional[int], col_idx: Optional[int], bbox: List[Any]) -> Tuple[Dict[str, Any], str]:
+    trace_dict = {
+        "doc_id": doc_id,
+        "page": int(page) if page is not None else None,
+        "table_index": int(table_idx) if table_idx is not None else None,
+        "row": int(row_idx) if row_idx is not None else None,
+        "col": int(col_idx) if col_idx is not None else None,
+        "bbox": bbox,
+    }
+    label_parts = [
+        f"doc={doc_id if doc_id is not None else 'NA'}",
+        f"page={page if page is not None else 'NA'}",
+        f"table={table_idx if table_idx is not None else 'NA'}",
+        f"row={row_idx if row_idx is not None else 'NA'}",
+        f"col={col_idx if col_idx is not None else 'NA'}",
+    ]
+    trace_label = ";".join(label_parts)
+    return trace_dict, trace_label
+
+
+def _fact_tag(text: str, trace_label: str, lang: Optional[str]) -> str:
+    payload = {
+        "trace": trace_label,
+        "lang": lang or "",
+    }
+    attrs = " ".join(
+        f"{k}={html.escape(str(v), quote=True)!r}" for k, v in payload.items() if v is not None
+    )
+    body = html.escape(text or "", quote=False)
+    return f"<fact {attrs}>{body}</fact>"
 
 
 def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
@@ -1164,7 +1252,7 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 continue
             doc_ids.add(ob.get("doc_id"))
             meta = (ob.get("meta") or {})
-            filters = (meta.get("filters") or {})
+            filters = dict(meta.get("filters") or {})
             lang = meta.get("lang") or ob.get("lang")
             if isinstance(lang, str) and lang:
                 languages.add(lang)
@@ -1177,6 +1265,10 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
             row_idx = ob.get("row")
             col_idx = ob.get("col")
             bbox = ob.get("bbox") or [None, None, None, None]
+            trace_dict, trace_label = _build_trace(ob.get("doc_id"), page, table_idx, row_idx, col_idx, bbox)
+            filters.setdefault("trace", trace_label)
+            base_meta = {k: v for k, v in meta.items() if k != "filters"}
+            base_meta.setdefault("trace", trace_dict)
 
             embedding_pieces: List[str] = []
             for piece in (normalized, synth):
@@ -1211,13 +1303,16 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 "normalized": normalized,
                 "synthesis_window": ob.get("synthesis_window"),
                 "filters": filters,
-                "meta": {k: v for k, v in meta.items() if k != "filters"},
+                "meta": base_meta,
                 "bbox": bbox,
                 "confidence": (meta.get("confidence") if isinstance(meta, dict) else None),
                 "low_conf": (meta.get("low_conf") if isinstance(meta, dict) else None),
                 "embedding_hint": embedding_hint,
                 "domain": resolved,
                 "domain_hits": seen_kw,
+                "trace": trace_label,
+                "trace_dict": trace_dict,
+                "fact_tag": _fact_tag(text, trace_label, lang if isinstance(lang, str) else None),
             }
             fw.write(json.dumps(cell_payload, ensure_ascii=False) + "\n")
             cells_written += 1
@@ -1227,20 +1322,24 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 "page": page,
                 "title": f"Page {page}",
                 "cells": [],
-                "body": []
+                "body": [],
+                "facts": [],
             })
             section["cells"].append(cell_id)
             if normalized:
                 section["body"].append(f"[{cell_id}] {normalized}")
+            section["facts"].append(cell_payload["fact_tag"])
 
             if table_idx is not None:
                 tkey = str(table_idx)
                 table = tables.setdefault(tkey, {
                     "table_id": tkey,
                     "cells": [],
-                    "rows": {}
+                    "rows": {},
+                    "facts": [],
                 })
                 table["cells"].append(cell_id)
+                table["facts"].append(cell_payload["fact_tag"])
                 if row_idx is not None and col_idx is not None:
                     row_key = str(row_idx)
                     col_key = str(col_idx)
@@ -1251,6 +1350,7 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                         "text": text,
                         "normalized": normalized,
                         "filters": filters,
+                        "trace": trace_label,
                     }
 
     def _sorted_numeric(keys: List[str]) -> List[str]:
@@ -1272,7 +1372,8 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 "title": sec["title"],
                 "page": sec["page"],
                 "cells": sec["cells"],
-                "body": "\n".join(body_lines)
+                "body": "\n".join(body_lines),
+                "fact_tags": sec.get("facts", []),
             }
             fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
         for table_id in _sorted_numeric(list(tables.keys())):
@@ -1289,6 +1390,7 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                         "text": cell_info.get("text"),
                         "normalized": cell_info.get("normalized"),
                         "filters": cell_info.get("filters"),
+                        "trace": cell_info.get("trace"),
                     })
                 rows_out.append({"row_index": row_key, "cells": ordered})
             payload = {
@@ -1296,7 +1398,8 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 "title": f"Table {table_id}",
                 "table_id": table_id,
                 "cells": table["cells"],
-                "rows": rows_out
+                "rows": rows_out,
+                "fact_tags": table.get("facts", []),
             }
             fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -1315,9 +1418,10 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                     "col": col_key,
                     "text": cell_info.get("text"),
                     "normalized": cell_info.get("normalized"),
+                    "trace": cell_info.get("trace"),
                 })
             rows_out.append({"row_index": row_key, "cells": ordered})
-        tables_payload.append({"table_id": table_id, "rows": rows_out})
+        tables_payload.append({"table_id": table_id, "rows": rows_out, "fact_tags": table.get("facts", [])})
     with open(tables_path, "w", encoding="utf-8") as tf:
         json.dump(tables_payload, tf, ensure_ascii=False, indent=2)
 
@@ -1344,6 +1448,12 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         },
         "suggested_queries": suggested,
         "embedding_fields": ["text", "normalized", "synthesis_window", "filters", "meta"],
+        "trace_schema": {
+            "label": "doc/page/table/row/col locator",
+            "format": "doc=<id>;page=<int>;table=<int|NA>;row=<int|NA>;col=<int|NA>",
+            "fields": ["doc_id", "page", "table_index", "row", "col", "bbox"],
+        },
+        "fact_tag_example": _fact_tag("Total", "doc=DEMO;page=1;table=NA;row=NA;col=NA", None),
     }
     if summary:
         manifest["summary_snapshot"] = {
@@ -1389,6 +1499,7 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
     for page in sorted(page_sections.keys()):
         sec = page_sections[page]
         _append_section_preview(f"### Page {page} / ページ {page}", sec.get("body", []))
+        _append_section_preview(f"### Page {page} facts / ページ{page} ファクトタグ", sec.get("facts", []))
     for table_id in _sorted_numeric(list(tables.keys())):
         table = tables[table_id]
         body_lines: List[str] = []
@@ -1400,6 +1511,7 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 parts.append(f"[{col_key}] {cell_info.get('normalized') or cell_info.get('text') or ''}")
             body_lines.append(f"row {row_key}: " + " | ".join(parts))
         _append_section_preview(f"### Table {table_id} / テーブル {table_id}", body_lines)
+        _append_section_preview(f"### Table {table_id} facts / テーブル{table_id} ファクトタグ", table.get("facts", []))
 
     with open(markdown_path, "w", encoding="utf-8") as mf:
         mf.write("\n".join(md_lines))
@@ -1512,6 +1624,7 @@ def main():
     sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
     sp.add_argument("--q", default=""); sp.add_argument("--image", default=None); sp.add_argument("--topk", type=int, default=10)
     sp.add_argument("--w-bm25", type=float, default=1.0); sp.add_argument("--w-kw", type=float, default=0.6); sp.add_argument("--w-img", type=float, default=0.3)
+    sp.add_argument("--w-sym", type=float, default=0.45)
     sp.add_argument("--domain", default="invoice")
 
     sp=sub.add_parser("sql"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True); sp.add_argument("--prefix", default="invoice")
@@ -1531,10 +1644,11 @@ def main():
     if args.cmd=="index":
         build_index(args.jsonl, args.index); print(f"Indexed -> {args.index}"); return
     if args.cmd=="query":
-        res=query(args.index, args.jsonl, args.q, args.image, args.topk, args.w_bm25, args.w_kw, args.w_img, args.domain)
+        res=query(args.index, args.jsonl, args.q, args.image, args.topk, args.w_bm25, args.w_kw, args.w_img, args.w_sym, args.domain)
         for i,(s,ob) in enumerate(res,1):
             f=(ob.get("meta") or {}).get("filters",{})
-            print(f"{i:2d}. {s:.3f} page={ob.get('page')} r={ob.get('row')} c={ob.get('col')} "
+            scores=(ob.get("meta") or {}).get("retrieval_scores", {})
+            print(f"{i:2d}. {s:.3f} page={ob.get('page')} r={ob.get('row')} c={ob.get('col')} sym={scores.get('symbolic',0):.2f} "
                   f"amt={f.get('amount')} date={f.get('date')} tax={f.get('tax_rate')} "
                   f"qty={f.get('qty')} unit={f.get('unit')} sub={f.get('subtotal')} tax_amt={f.get('tax_amount')} "
                   f"corp={f.get('corporate_id')} text='{(ob.get('text') or '')[:40]}'")
@@ -1568,10 +1682,12 @@ def _preload_index_and_raws(index_pkl: str, jsonl: str):
             raws.append(json.loads(line))
     return ix, raws
 
-def _query_scores_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], q_text: str, domain: Optional[str], w_kw: float, w_img: float) -> float:
+def _query_scores_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], q_text: str,
+                            domain: Optional[str], w_kw: float, w_img: float, w_sym: float) -> float:
     """Return only the max score (top-1) to emulate typical scoring cost while reducing allocation."""
     vocab=ix["vocab"]; df=np.array(ix["df"], dtype=np.int32); N=int(ix["N"]); avgdl=float(ix["avgdl"])
-    q_ids=[vocab[t] for t in tokenize_jp(q_text or "") if t in vocab]
+    tokens = tokenize_jp(q_text or "")
+    q_ids=[vocab[t] for t in tokens if t in vocab]
     if not q_ids: q_ids=[-1]
     q_ids=np.array(q_ids, dtype=np.int32)
     best=-1e9
@@ -1580,13 +1696,17 @@ def _query_scores_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], q_text
         dl=len(doc_ids)
         sb = (_bm25_numba_score(N, avgdl, df, dl, q_ids, di) if _HAS_NUMBA else _bm25_py_score(N, avgdl, df, dl, q_ids, di))
         ob=raws[i]
-        sk=_kw_meta_boost(ob, tokenize_jp(q_text or ""), domain)
+        sk=_kw_meta_boost(ob, tokens, domain)
+        filters = ((ob.get("meta") or {}).get("filters") or {})
+        sym = _symbolic_match_score(filters, q_text or "", tokens)
         # no q_image for timing; pHash sim is 0
-        s=(1.0*sb + w_kw*sk + w_img*0.0)
+        s=(1.0*sb + w_kw*sk + w_img*0.0 + w_sym*sym)
         if s>best: best=s
     return float(best)
 
-def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain: Optional[str], w_kw: float, w_img: float, trials: int = 60, warmup: int = 8) -> Dict[str,float]:
+def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain: Optional[str],
+                            w_kw: float, w_img: float, w_sym: float,
+                            trials: int = 60, warmup: int = 8) -> Dict[str,float]:
     """Warm-up + fixed number of trials for robust p95."""
     import time, random
     queries = {
@@ -1627,7 +1747,7 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
     for t in range(total):
         q = " ".join(rnd.sample(dom_q, min(3,len(dom_q))))
         t0=time.perf_counter()
-        _ = _query_scores_preloaded(ix, raws, q_text=q, domain=domain, w_kw=w_kw, w_img=w_img)
+        _ = _query_scores_preloaded(ix, raws, q_text=q, domain=domain, w_kw=w_kw, w_img=w_img, w_sym=w_sym)
         dt=(time.perf_counter()-t0)*1000.0
         if t>=warmup:
             lat.append(dt)
@@ -1836,19 +1956,21 @@ def autotune_unlabeled(jsonl_mm: str, index_pkl: str, outdir: str, method: str="
             lam = float(np.random.uniform(1.0, 6.0))
             wkw = float(np.random.uniform(0.3, 0.8))
             wimg= float(np.random.uniform(0.0, 0.5))
+            wsym= float(np.random.uniform(0.3, 0.7))
             ocr = float(np.random.uniform(0.4, 0.8))
         else:
             lam = float(np.clip(np.random.normal(center["lambda_shape"], 0.5*scale), 1.0, 6.0))
             wkw = float(np.clip(np.random.normal(center["w_kw"], 0.1*scale), 0.2, 0.9))
             wimg= float(np.clip(np.random.normal(center["w_img"],0.1*scale), 0.0, 0.6))
+            wsym= float(np.clip(np.random.normal(center.get("w_sym", base.get("w_sym", 0.45)), 0.08*scale), 0.2, 0.85))
             ocr = float(np.clip(np.random.normal(center["ocr_min_conf"],0.05*scale),0.3,0.9))
-        return {"lambda_shape":lam,"w_kw":wkw,"w_img":wimg,"ocr_min_conf":ocr}
+        return {"lambda_shape":lam,"w_kw":wkw,"w_img":wimg,"w_sym":wsym,"ocr_min_conf":ocr}
 
     # Stage 1: random init
     n_init = max(8, min(15, budget//2))
     for i in range(n_init):
         params = sample()
-        lat = _time_queries_preloaded(ix, raws, domain, params["w_kw"], params["w_img"], trials=48, warmup=8)
+        lat = _time_queries_preloaded(ix, raws, domain, params["w_kw"], params["w_img"], params["w_sym"], trials=48, warmup=8)
         score, f_align=_score(lat["p95"], params["lambda_shape"])
         row={"iter":i,"phase":"init","domain":domain,"col_rate":col_rate,"chunk_c":chunk_c,"p95":lat["p95"],"score":score,"align_factor":f_align,**params}
         log_rows.append(row)
@@ -1859,7 +1981,7 @@ def autotune_unlabeled(jsonl_mm: str, index_pkl: str, outdir: str, method: str="
     remain = max(0, budget - n_init)
     for j in range(remain):
         params = sample(center=best, scale=max(0.5, 1.5*(remain-j)/max(1,remain)))
-        lat = _time_queries_preloaded(ix, raws, domain, params["w_kw"], params["w_img"], trials=48, warmup=8)
+        lat = _time_queries_preloaded(ix, raws, domain, params["w_kw"], params["w_img"], params["w_sym"], trials=48, warmup=8)
         score, f_align=_score(lat["p95"], params["lambda_shape"])
         row={"iter":n_init+j,"phase":"refine","domain":domain,"col_rate":col_rate,"chunk_c":chunk_c,"p95":lat["p95"],"score":score,"align_factor":f_align,**params}
         log_rows.append(row)
@@ -1868,7 +1990,7 @@ def autotune_unlabeled(jsonl_mm: str, index_pkl: str, outdir: str, method: str="
 
     # save log
     csv_path=os.path.join(outdir, "autotune_log.csv")
-    hdr= ["iter","phase","domain","lambda_shape","w_kw","w_img","ocr_min_conf","col_rate","chunk_c","p95","align_factor","score"]
+    hdr= ["iter","phase","domain","lambda_shape","w_kw","w_img","w_sym","ocr_min_conf","col_rate","chunk_c","p95","align_factor","score"]
     with open(csv_path,"w",encoding="utf-8-sig",newline="") as fw:
         wr=csv.DictWriter(fw, fieldnames=hdr); wr.writeheader()
         for r in log_rows: wr.writerow({k:r.get(k) for k in hdr})
@@ -1885,6 +2007,7 @@ def autotune_unlabeled(jsonl_mm: str, index_pkl: str, outdir: str, method: str="
         "w_bm25": 1.0,
         "w_kw": float(best["w_kw"]),
         "w_img": float(best["w_img"]),
+        "w_sym": float(best.get("w_sym", base.get("w_sym", 0.45))),
         "ocr_min_conf": float(best["ocr_min_conf"]),
         "tune_col_rate": float(col_rate),
         "tune_chunk_c": float(chunk_c),
@@ -1902,7 +2025,7 @@ def _compute_p95_if_needed(jsonl: str, index_pkl: str, domain: Optional[str]) ->
         ix, raws = _preload_index_and_raws(index_pkl, jsonl)
         d = domain or detect_domain_on_jsonl(jsonl)[0]
         base = DOMAIN_DEFAULTS.get(d, DOMAIN_DEFAULTS["invoice_jp_v2"])
-        lat = _time_queries_preloaded(ix, raws, d, base["w_kw"], base["w_img"], trials=60, warmup=8)
+        lat = _time_queries_preloaded(ix, raws, d, base["w_kw"], base["w_img"], base.get("w_sym", 0.45), trials=60, warmup=8)
         return float(lat["p95"]) if lat["p95"] is not None else None
     except Exception:
         return None

@@ -872,9 +872,19 @@ def _patched_run_full_pipeline(
         summary["rag_tables_json"] = rag_manifest.get("tables_json")
         summary["rag_markdown"] = rag_manifest.get("markdown")
         summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
+        summary["rag_trace_schema"] = rag_manifest.get("trace_schema")
+        summary["rag_fact_tag_example"] = rag_manifest.get("fact_tag_example")
     except Exception as e:
         print("RAG bundle export skipped:", e)
-    _call("post_rag", manifest=summary.get("rag_manifest"), bundle=summary.get("rag_bundle"))
+        summary["rag_trace_schema"] = summary.get("rag_trace_schema") or None
+        summary["rag_fact_tag_example"] = summary.get("rag_fact_tag_example") or None
+    _call(
+        "post_rag",
+        manifest=summary.get("rag_manifest"),
+        bundle=summary.get("rag_bundle"),
+        trace_schema=summary.get("rag_trace_schema"),
+        fact_tag_example=summary.get("rag_fact_tag_example"),
+    )
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]

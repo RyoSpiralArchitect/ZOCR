@@ -69,6 +69,9 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - **[JA]** Export 段階では合議フェーズで得た `row_bands` を再利用し、行分割の精度を維持したままセル OCR を行います。
 - **[EN]** During export we reuse the consensus `row_bands` so OCR crops stay aligned with the reconstructed rows.
 - **[FR]** Pendant l'export, les `row_bands` issus du consensus sont réutilisés afin d'aligner l'OCR sur les lignes reconstruites.
+- **[JA]** 検索レイヤーは BM25 + キーワード + 画像類似に加え、`filters` に含まれる数値やキーを直接照合するシンボリックスコアを併用し、Trust@K を押し上げます。
+- **[EN]** The retrieval layer now blends BM25 + keyword + image similarity with a symbolic scorer that inspects the structured `filters`, improving Trust@K for downstream RAG agents.
+- **[FR]** La couche de recherche combine BM25 + mots-clés + similarité d'image avec un scoreur symbolique basé sur `filters`, ce qui renforce le Trust@K pour les agents RAG.
 
 ## 自動ドメイン検出 / Automatic Domain Detection / Détection automatique du domaine
 - **[JA]** ファイル名（`samples/invoice/...` など）からトークンを抽出し、`DOMAIN_KW` / `_DOMAIN_ALIAS` の別名と突き合わせて初期候補を生成します。OCR 後は JSONL 内テキストとフィルターを走査し、キーワード一致度とヒット率から信頼度を算出します。`pipeline_summary.json` の `domain_autodetect` に推論経路・信頼度・採用ソースを記録します。
@@ -79,9 +82,10 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `doc.zocr.json` — OCR & consensus の主 JSON。
 - `doc.mm.jsonl` — マルチモーダル JSONL（RAG / BM25 共用）。
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
-- `sql/` — `sql_export` で生成される CSV とスキーマ。
+- `sql/` — `sql_export` で生成される CSV とスキーマ（`trace` 列で doc/page/table/row/col を Excel から参照可能）。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
 - `pipeline_summary.json` — すべての成果物をまとめた要約（`rag_*`, `sql_*`, `views`, `report_path` など）。
+- `rag_trace_schema`, `rag_fact_tag_example` — サマリー内で RAG トレーサの仕様と `<fact ...>` タグ例を公開。
 - `monitor.csv` — UTF-8 (BOM 付き) で出力し、Excel/Numbers でも文字化けなく開けます。
 - `pipeline_meta.json` — `--snapshot` 有効時の環境情報。
 - `pipeline_report.html` — trilingual ダッシュボード（`report` サブコマンドでも再生成可）。
@@ -100,6 +104,9 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `export_rag_bundle` が Markdown ダイジェスト、セル JSONL、テーブル別セクション、推奨クエリを `rag/manifest.json` にまとめます。
 - サマリー (`summary` サブコマンド) から `rag_markdown` や `rag_suggested_queries` を取得し、下流エージェントに渡せます。
 - `post_rag` フックでカスタム転送やストレージ連携を差し込めます。
+- **[JA]** 各セルは `trace`（`doc=...;page=...;row=...`）と `<fact trace="...">text</fact>` を保持し、`rag_trace_schema` / `rag_fact_tag_example` で下流 LLM へ「出典必須」のプロンプトを構築できます。
+- **[EN]** Each cell now ships with a `trace` string (`doc=...;page=...;row=...`) plus an immutable `<fact trace="...">…</fact>` tag so RAG/LLM stacks can demand provenance; see `rag_trace_schema` and `rag_fact_tag_example` in the summary.
+- **[FR]** Chaque cellule fournit désormais une `trace` (`doc=...;page=...;row=...`) et une balise `<fact trace="...">…</fact>` pour imposer la provenance côté LLM ; consultez `rag_trace_schema` et `rag_fact_tag_example` dans le résumé.
 
 ## ビジュアライゼーション / Visualisation / Visualisation
 - 4 パネルのマイクロスコープ（原画、シャープ、二値、勾配）と X-Ray オーバーレイを自動生成。
