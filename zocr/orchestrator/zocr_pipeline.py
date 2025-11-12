@@ -1392,7 +1392,8 @@ def _patched_run_full_pipeline(
             except Exception:
                 re_limit = 64
             r = _safe_step("ReanalyzeLearning", zocr_onefile_consensus.reanalyze_learning_jsonl,
-                           learning_jsonl_path, re_dir, re_limit)
+                           learning_jsonl_path, re_dir, re_limit,
+                           ocr_engine=effective_ocr_engine)
             _append_hist(outdir, r)
             if r.get("ok"):
                 reanalysis_summary = r.get("out")
@@ -1619,7 +1620,8 @@ def _patched_run_full_pipeline(
         except Exception:
             re_limit = 64
         r = _safe_step("ReanalyzeLearningIntent", zocr_onefile_consensus.reanalyze_learning_jsonl,
-                       learning_jsonl_path, re_dir, re_limit)
+                       learning_jsonl_path, re_dir, re_limit,
+                       ocr_engine=effective_ocr_engine)
         _append_hist(outdir, r)
         if r.get("ok"):
             intent_runs.append("reanalyze_learning")

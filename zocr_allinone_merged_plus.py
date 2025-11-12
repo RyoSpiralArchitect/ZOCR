@@ -89,7 +89,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 
 from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict, deque
 
@@ -106,6 +106,10 @@ except Exception:  # pragma: no cover - optional dependency
     pytesseract = None  # type: ignore
     _PYTESS_OUTPUT = None  # type: ignore
 from html.parser import HTMLParser
+
+_OCR_BACKEND_CACHE: Dict[str, Callable[["Image.Image"], Tuple[str, float]]] = {}
+_OCR_BACKEND_WARNED: Set[str] = set()
+_EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
 
 _thomas = None
 try:
@@ -140,6 +144,12 @@ def _toy_memory_series_paths(path: str) -> Tuple[str, str]:
 
 
 def _series_tail(history: Sequence[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    """Return a light-weight tail of the toy memory history.
+
+    The trimmed representation keeps the most recent ``limit`` epochs with just the
+    statistics that operators tend to inspect when validating learning progress.
+    """
+
     tail: List[Dict[str, Any]] = []
     if limit <= 0:
         return tail
@@ -165,6 +175,8 @@ def _series_tail(history: Sequence[Dict[str, Any]], limit: int = 5) -> List[Dict
 
 
 def _toy_memory_series_stats(history: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute aggregate metrics describing the versioned toy memory history."""
+
     stats: Dict[str, Any] = {"epochs": len(history)}
     if not history:
         return stats
@@ -259,7 +271,6 @@ def _load_toy_memory_series_payload(path: str) -> Tuple[Optional[Dict[str, Any]]
         return None, info
     info["summary"] = summary_payload
     return payload, info
-
 
 def clamp(x, lo, hi): return lo if x<lo else (hi if x>hi else x)
 
@@ -1399,6 +1410,8 @@ _TOY_RECOGNITION_STATS: Dict[str, Any] = _blank_recognition_stats()
 
 
 def reset_toy_recognition_stats() -> None:
+    """Clear per-run toy OCR recognition diagnostics."""
+
     global _TOY_RECOGNITION_STATS
     _TOY_RECOGNITION_STATS = _blank_recognition_stats()
     _GLYPH_RUNTIME_STATS.clear()
@@ -1429,6 +1442,8 @@ def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal:
 
 
 def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
+    """Return aggregate diagnostics gathered during toy OCR recognition."""
+
     stats = _TOY_RECOGNITION_STATS
     cells = int(stats.get("cells", 0))
     result: Dict[str, Any] = {
@@ -1546,6 +1561,8 @@ def _toy_memory_snapshot_internal() -> Dict[str, Any]:
 
 
 def toy_memory_snapshot() -> Dict[str, Any]:
+    """Return aggregate statistics describing the current toy OCR memory."""
+
     return dict(_toy_memory_snapshot_internal())
 
 
@@ -2687,6 +2704,167 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
 
+
+def _normalize_confidence(value: Any) -> float:
+    try:
+        conf = float(value)
+    except Exception:
+        conf = 0.0
+    if not math.isfinite(conf):
+        conf = 0.0
+    return float(max(0.0, min(1.0, conf)))
+
+
+def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple[str, float]]:
+    normalized = (name or "toy").strip()
+    cache_key = normalized.lower() or "toy"
+    cached = _OCR_BACKEND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    engine_name, _, engine_extra = normalized.partition(":")
+    engine_key = (engine_name or "toy").strip().lower() or "toy"
+    extra = engine_extra.strip()
+
+    runner: Callable[["Image.Image"], Tuple[str, float]]
+
+    if engine_key in ("toy", "mock", "demo"):
+        runner = toy_ocr_text_from_cell
+    elif engine_key.startswith("tess"):
+        if pytesseract is None or _PYTESS_OUTPUT is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract not available; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            lang = extra or os.environ.get("ZOCR_TESS_LANG", os.environ.get("TESS_LANG", "jpn+eng"))
+            psm = os.environ.get("ZOCR_TESS_PSM", "6")
+            oem = os.environ.get("ZOCR_TESS_OEM")
+            config_parts = []
+            if psm:
+                config_parts.append(f"--psm {psm}")
+            if oem:
+                config_parts.append(f"--oem {oem}")
+            tess_config = " ".join(config_parts)
+
+            def _tesseract_runner(img: "Image.Image") -> Tuple[str, float]:
+                try:
+                    target = img if getattr(img, "mode", "") in ("L", "RGB") else img.convert("RGB")
+                except Exception:
+                    target = img
+                try:
+                    data = pytesseract.image_to_data(  # type: ignore[arg-type]
+                        target,
+                        lang=lang or None,
+                        config=tess_config or "",
+                        output_type=_PYTESS_OUTPUT.DICT,
+                    )
+                except Exception:
+                    data = None
+                words: List[str] = []
+                confs: List[float] = []
+                if isinstance(data, dict):
+                    texts = data.get("text") or []
+                    conf_vals = data.get("conf") or []
+                    for raw_txt, raw_conf in zip(texts, conf_vals):
+                        txt = str(raw_txt or "").strip()
+                        if not txt:
+                            continue
+                        try:
+                            conf_val = float(raw_conf)
+                        except Exception:
+                            conf_val = -1.0
+                        if conf_val < 0:
+                            continue
+                        words.append(txt)
+                        confs.append(max(0.0, min(100.0, conf_val)))
+                if not words:
+                    try:
+                        raw = pytesseract.image_to_string(  # type: ignore[arg-type]
+                            target,
+                            lang=lang or None,
+                            config=tess_config or "",
+                        )
+                    except Exception:
+                        raw = None
+                    text_raw = (raw or "").strip()
+                    if text_raw:
+                        words.append(text_raw)
+                        confs.append(62.0)
+                if not words:
+                    return "", 0.0
+                conf_avg = (sum(confs) / len(confs)) / 100.0 if confs else 0.0
+                return " ".join(words), _normalize_confidence(conf_avg)
+
+            runner = _tesseract_runner
+    elif engine_key.startswith("easy"):
+        if np is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] easyocr requested but numpy is unavailable; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            try:
+                import easyocr  # type: ignore
+            except Exception:
+                if cache_key not in _OCR_BACKEND_WARNED:
+                    print("[WARN] easyocr not available; falling back to toy OCR")
+                    _OCR_BACKEND_WARNED.add(cache_key)
+                runner = toy_ocr_text_from_cell
+            else:
+                langs_raw = extra or os.environ.get("ZOCR_EASYOCR_LANGS", "ja,en")
+                langs = [tok.strip() for tok in langs_raw.split(",") if tok.strip()]
+                if not langs:
+                    langs = ["ja", "en"]
+                gpu_flag = (os.environ.get("ZOCR_EASYOCR_GPU", "").strip().lower())
+                gpu = gpu_flag not in ("0", "false", "no", "off")
+                reader_key = (tuple(langs), gpu)
+                reader = _EASYOCR_READER_CACHE.get(reader_key)
+                if reader is None:
+                    reader = easyocr.Reader(langs, gpu=gpu)
+                    _EASYOCR_READER_CACHE[reader_key] = reader
+
+                def _easyocr_runner(img: "Image.Image") -> Tuple[str, float]:
+                    try:
+                        target = img if getattr(img, "mode", "") == "RGB" else img.convert("RGB")
+                        arr = np.asarray(target)
+                    except Exception:
+                        return "", 0.0
+                    try:
+                        results = reader.readtext(arr, detail=1)
+                    except Exception:
+                        return "", 0.0
+                    texts: List[str] = []
+                    confs: List[float] = []
+                    for item in results:
+                        if not isinstance(item, (list, tuple)):
+                            continue
+                        text_val = item[1] if len(item) > 1 else ""
+                        conf_val = item[2] if len(item) > 2 else 0.0
+                        txt = str(text_val or "").strip()
+                        if not txt:
+                            continue
+                        texts.append(txt)
+                        try:
+                            conf_float = float(conf_val)
+                        except Exception:
+                            conf_float = 0.0
+                        confs.append(max(0.0, min(1.0, conf_float)))
+                    if not texts:
+                        return "", 0.0
+                    conf_avg = sum(confs) / len(confs) if confs else 0.0
+                    return " ".join(texts), _normalize_confidence(conf_avg)
+
+                runner = _easyocr_runner
+    else:
+        if cache_key not in _OCR_BACKEND_WARNED:
+            print(f"[WARN] Unknown OCR engine '{name}', falling back to toy OCR")
+            _OCR_BACKEND_WARNED.add(cache_key)
+        runner = toy_ocr_text_from_cell
+
+    _OCR_BACKEND_CACHE[cache_key] = runner
+    return runner
+
 def _keywords_from_row(row_cells: List[str]) -> List[str]:
     kws = set()
     rx_num = re.compile(r"[+\-]?\d[\d,]*(\.\d+)?")
@@ -2807,6 +2985,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         page_lookup = {i: path for i, path in enumerate(seq)}
         default_image_path = seq[0] if seq else None
     image_cache: Dict[str, Image.Image] = {}
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
@@ -2829,6 +3008,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
             image_cache[target] = loaded
             return loaded
         return None
+
     count = 0
     learning_signals: List[Dict[str, Any]] = []
     low_conf_samples = 0
@@ -2903,12 +3083,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_w, cx2 + right_pad),
                             min(page_h, cy2 + pad_y)
                         ))
-                        if ocr_engine=="toy":
-                            txt, conf = toy_ocr_text_from_cell(crop)
-                        else:
-                            txt, conf = ("", 0.0)
+                        txt, conf = ocr_runner(crop)
+                        if not isinstance(txt, str):
+                            txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
-                        grid_conf[r][c] = conf
+                        grid_conf[r][c] = _normalize_confidence(conf)
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -2926,11 +3105,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 min(page_w, cx2),
                                 min(page_h, cy2 + pad_y)
                             ))
-                            alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
+                            alt_txt, alt_conf = ocr_runner(crop)
                             m = _NUMERIC_RX.search(alt_txt or "")
                             if m:
                                 grid_text[r][target_col] = m.group(0)
-                                grid_conf[r][target_col] = max(grid_conf[r][target_col], alt_conf)
+                                grid_conf[r][target_col] = max(
+                                    grid_conf[r][target_col], _normalize_confidence(alt_conf)
+                                )
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
                 headers = grid_text[0] if contextual else []
@@ -3070,7 +3251,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
 def reanalyze_learning_jsonl(learning_jsonl_path: str,
                              out_dir: Optional[str] = None,
                              limit: int = 64,
-                             rotate: bool = True) -> Dict[str, Any]:
+                             rotate: bool = True,
+                             ocr_engine: str = "toy") -> Dict[str, Any]:
+    """Re-run the selected OCR backend over low-confidence cells to propose improved readings."""
     summary: Dict[str, Any] = {
         "input": learning_jsonl_path,
         "limit": int(limit),
@@ -3087,10 +3270,13 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "ambiguous_variants": 0,
         "fallback_variant_count": 0,
         "fallback_transform_usage": {},
+        "ocr_engine": ocr_engine,
     }
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
         return summary
+
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
     ensure_dir(dest_dir)
@@ -3182,21 +3368,24 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 crop = page_img.crop((x1, y1, x2, y2))
 
                 observed_text = sig.get("observed_text")
-                try:
-                    observed_conf = float(sig.get("confidence")) if sig.get("confidence") is not None else 0.0
-                except Exception:
-                    observed_conf = 0.0
+                observed_conf = _normalize_confidence(sig.get("confidence"))
 
                 variants_map: Dict[str, Dict[str, Any]] = {}
 
-                def _merge_variant(text: str, conf: float, transform: str) -> None:
+                def _merge_variant(text: Any, conf: Any, transform: str) -> None:
                     nonlocal ambiguous_total, fallback_used
-                    key = text or ""
-                    conf_f = float(conf or 0.0)
+                    if isinstance(text, str):
+                        normalized_text = text
+                    elif text is None:
+                        normalized_text = ""
+                    else:
+                        normalized_text = str(text)
+                    key = normalized_text
+                    conf_f = _normalize_confidence(conf)
                     created = key not in variants_map
                     if created:
                         variants_map[key] = {
-                            "text": text,
+                            "text": normalized_text,
                             "confidence": conf_f,
                             "transforms": [transform],
                         }
@@ -3225,20 +3414,27 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     elif transform.startswith("ambiguous") and created:
                         ambiguous_total += 1
 
-                base_text, base_conf = toy_ocr_text_from_cell(crop)
-                _merge_variant(base_text, base_conf, "base")
+                base_text_raw, base_conf_raw = ocr_runner(crop)
+                base_conf = _normalize_confidence(base_conf_raw)
+                _merge_variant(base_text_raw, base_conf, "base")
+                if isinstance(base_text_raw, str):
+                    base_text = base_text_raw
+                elif base_text_raw is None:
+                    base_text = ""
+                else:
+                    base_text = str(base_text_raw)
 
                 try:
                     bright_enhancer = ImageEnhance.Brightness(crop)
-                    txt_b1, conf_b1 = toy_ocr_text_from_cell(bright_enhancer.enhance(1.1))
+                    txt_b1, conf_b1 = ocr_runner(bright_enhancer.enhance(1.1))
                     _merge_variant(txt_b1, conf_b1, "brightness_1.1")
-                    txt_b2, conf_b2 = toy_ocr_text_from_cell(bright_enhancer.enhance(0.9))
+                    txt_b2, conf_b2 = ocr_runner(bright_enhancer.enhance(0.9))
                     _merge_variant(txt_b2, conf_b2, "brightness_0.9")
                 except Exception:
                     pass
                 try:
                     contrast_enhancer = ImageEnhance.Contrast(crop)
-                    txt_c, conf_c = toy_ocr_text_from_cell(contrast_enhancer.enhance(1.2))
+                    txt_c, conf_c = ocr_runner(contrast_enhancer.enhance(1.2))
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
@@ -3257,7 +3453,7 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                             rotated = crop.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
                         except Exception:
                             continue
-                        text_r, conf_r = toy_ocr_text_from_cell(rotated)
+                        text_r, conf_r = ocr_runner(rotated)
                         _merge_variant(text_r, conf_r, f"rotate_{angle:+.1f}")
 
                 if observed_text:
@@ -3371,6 +3567,7 @@ def apply_reanalysis_to_jsonl(
     ocr_min_conf: float = 0.58,
     surprisal_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Rewrite contextual JSONL records with improved readings from reanalysis."""
     summary: Dict[str, Any] = {
         "input_jsonl": contextual_jsonl_path,
         "reanalyzed_jsonl": reanalyzed_jsonl_path,
@@ -3412,6 +3609,7 @@ def apply_reanalysis_to_jsonl(
                 if not trace:
                     continue
                 if trace in updates:
+                    # keep the best confidence if duplicates appear
                     try:
                         prev_conf = float(updates[trace].get("reanalyzed_confidence") or 0.0)
                     except Exception:
@@ -3600,6 +3798,7 @@ def apply_reanalysis_to_jsonl(
 
     def _write_signals(path: str) -> None:
         try:
+            existing: Dict[str, Any]
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as fr:
                     payload = json.load(fr)
@@ -6291,14 +6490,14 @@ def _discover_demo_input_targets() -> List[str]:
     """Locate real demo input directories/files to honour `--input demo`."""
 
     env_override = os.environ.get("ZOCR_DEMO_INPUTS")
-    env_candidates: List[str] = []
+    env_candidates = []
     if env_override:
         for segment in env_override.split(os.pathsep):
             segment = segment.strip()
             if segment:
                 env_candidates.append(segment)
 
-    here = os.path.abspath(os.path.dirname(__file__))
+    here = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
     search_roots = [os.getcwd(), here]
     seen_roots = set()
     uniq_roots: List[str] = []
@@ -7041,7 +7240,7 @@ def _apply_reanalysis_to_contextual_jsonl(
         dest_path = contextual_jsonl
     else:
         dest_path = os.path.join(base_dir, f"{base_name}.reanalyzed.jsonl")
-    rewrite = apply_reanalysis_to_jsonl(
+    rewrite = zocr_onefile_consensus.apply_reanalysis_to_jsonl(
         contextual_jsonl,
         reanalyzed_jsonl,
         dest_path,
@@ -7432,12 +7631,13 @@ def _patched_run_full_pipeline(
     ok = _read_ok_steps(outdir) if resume else set()
 
     toy_memory_path = _resolve_toy_memory_path(outdir)
-    toy_memory_info_load = load_toy_memory(toy_memory_path)
+    toy_memory_info_load = zocr_onefile_consensus.load_toy_memory(toy_memory_path)
     toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
-    reset_toy_recognition_stats()
+    if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
+        zocr_onefile_consensus.reset_toy_recognition_stats()
 
     if len(inputs) == 1 and inputs[0].lower() == "demo":
-        real_demo_targets: List[str] = []
+        real_demo_targets = []
         if os.path.exists(inputs[0]):
             real_demo_targets = [inputs[0]]
         else:
@@ -7508,10 +7708,10 @@ def _patched_run_full_pipeline(
 
     prof.setdefault("ocr_engine", effective_ocr_engine)
 
-    toy_memory_run_baseline = toy_memory_after_load or toy_memory_snapshot()
+    toy_memory_run_baseline = toy_memory_after_load or zocr_onefile_consensus.toy_memory_snapshot()
     toy_memory_after_run: Optional[Dict[str, Any]] = None
     toy_memory_delta_run: Optional[Dict[str, Any]] = None
-    toy_recognition_stats_payload: Optional[Dict[str, Any]] = None
+    toy_recognition_stats: Optional[Dict[str, Any]] = None
 
     domain_hints = _prepare_domain_hints(inputs, list(page_images.values()))
     content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
@@ -7611,8 +7811,9 @@ def _patched_run_full_pipeline(
                 re_limit = int(prof.get("reanalyze_limit") or 64)
             except Exception:
                 re_limit = 64
-            r = _safe_step("ReanalyzeLearning", reanalyze_learning_jsonl,
-                           learning_jsonl_path, re_dir, re_limit)
+            r = _safe_step("ReanalyzeLearning", zocr_onefile_consensus.reanalyze_learning_jsonl,
+                           learning_jsonl_path, re_dir, re_limit,
+                           ocr_engine=effective_ocr_engine)
             _append_hist(outdir, r)
             if r.get("ok"):
                 reanalysis_summary = r.get("out")
@@ -7765,12 +7966,11 @@ def _patched_run_full_pipeline(
     summary["learn"] = learn_row
     summary["insights"] = _derive_insights(summary)
 
-    toy_memory_after_run = toy_memory_snapshot()
-    toy_memory_delta_run = toy_memory_delta(toy_memory_run_baseline, toy_memory_after_run)
-    try:
-        toy_recognition_stats_payload = toy_recognition_stats(reset=False)
-    except Exception:
-        toy_recognition_stats_payload = None
+    toy_memory_after_run = zocr_onefile_consensus.toy_memory_snapshot()
+    toy_memory_delta_run = zocr_onefile_consensus.toy_memory_delta(
+        toy_memory_run_baseline, toy_memory_after_run
+    )
+    toy_recognition_stats = zocr_onefile_consensus.toy_recognition_stats(reset=False)
 
     prof_after = _load_profile(outdir, prof.get("domain"))
     profile_diff = _profile_diff(profile_before_feedback, prof_after)
@@ -7779,13 +7979,13 @@ def _patched_run_full_pipeline(
         export_signals,
         prof_after,
         toy_memory_delta_run,
-        toy_recognition_stats_payload,
+        toy_recognition_stats,
     )
     summary["intent"] = intent
     simulations = _simulate_param_shift(
         summary.get("monitor_row"),
         export_signals,
-        toy_recognition_stats_payload,
+        toy_recognition_stats,
         toy_memory_delta_run,
         prof_after,
     )
@@ -7839,8 +8039,9 @@ def _patched_run_full_pipeline(
             re_limit = int(prof_after.get("reanalyze_limit") or 64)
         except Exception:
             re_limit = 64
-        r = _safe_step("ReanalyzeLearningIntent", reanalyze_learning_jsonl,
-                       learning_jsonl_path, re_dir, re_limit)
+        r = _safe_step("ReanalyzeLearningIntent", zocr_onefile_consensus.reanalyze_learning_jsonl,
+                       learning_jsonl_path, re_dir, re_limit,
+                       ocr_engine=effective_ocr_engine)
         _append_hist(outdir, r)
         if r.get("ok"):
             intent_runs.append("reanalyze_learning")
@@ -7924,18 +8125,19 @@ def _patched_run_full_pipeline(
     summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
     summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
     summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
-    if toy_recognition_stats_payload is not None:
-        summary["toy_memory"]["recognition"] = _json_ready(toy_recognition_stats_payload)
-        try:
-            reset_toy_recognition_stats()
-        except Exception:
-            pass
-    else:
+    if toy_recognition_stats is not None:
+        summary["toy_memory"]["recognition"] = _json_ready(toy_recognition_stats)
+        if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
+            try:
+                zocr_onefile_consensus.reset_toy_recognition_stats()
+            except Exception:
+                pass
+    elif hasattr(zocr_onefile_consensus, "toy_recognition_stats"):
         summary["toy_memory"]["recognition"] = _json_ready(
-            toy_recognition_stats(reset=True)
+            zocr_onefile_consensus.toy_recognition_stats(reset=True)
         )
 
-    toy_memory_saved = save_toy_memory(toy_memory_path)
+    toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
     summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:

@@ -14,7 +14,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 
 from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict, deque
 
@@ -31,6 +31,10 @@ except Exception:  # pragma: no cover - optional dependency
     pytesseract = None  # type: ignore
     _PYTESS_OUTPUT = None  # type: ignore
 from html.parser import HTMLParser
+
+_OCR_BACKEND_CACHE: Dict[str, Callable[["Image.Image"], Tuple[str, float]]] = {}
+_OCR_BACKEND_WARNED: Set[str] = set()
+_EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
 
 _thomas = None
 try:
@@ -2625,6 +2629,167 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
 
+
+def _normalize_confidence(value: Any) -> float:
+    try:
+        conf = float(value)
+    except Exception:
+        conf = 0.0
+    if not math.isfinite(conf):
+        conf = 0.0
+    return float(max(0.0, min(1.0, conf)))
+
+
+def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple[str, float]]:
+    normalized = (name or "toy").strip()
+    cache_key = normalized.lower() or "toy"
+    cached = _OCR_BACKEND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    engine_name, _, engine_extra = normalized.partition(":")
+    engine_key = (engine_name or "toy").strip().lower() or "toy"
+    extra = engine_extra.strip()
+
+    runner: Callable[["Image.Image"], Tuple[str, float]]
+
+    if engine_key in ("toy", "mock", "demo"):
+        runner = toy_ocr_text_from_cell
+    elif engine_key.startswith("tess"):
+        if pytesseract is None or _PYTESS_OUTPUT is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract not available; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            lang = extra or os.environ.get("ZOCR_TESS_LANG", os.environ.get("TESS_LANG", "jpn+eng"))
+            psm = os.environ.get("ZOCR_TESS_PSM", "6")
+            oem = os.environ.get("ZOCR_TESS_OEM")
+            config_parts = []
+            if psm:
+                config_parts.append(f"--psm {psm}")
+            if oem:
+                config_parts.append(f"--oem {oem}")
+            tess_config = " ".join(config_parts)
+
+            def _tesseract_runner(img: "Image.Image") -> Tuple[str, float]:
+                try:
+                    target = img if getattr(img, "mode", "") in ("L", "RGB") else img.convert("RGB")
+                except Exception:
+                    target = img
+                try:
+                    data = pytesseract.image_to_data(  # type: ignore[arg-type]
+                        target,
+                        lang=lang or None,
+                        config=tess_config or "",
+                        output_type=_PYTESS_OUTPUT.DICT,
+                    )
+                except Exception:
+                    data = None
+                words: List[str] = []
+                confs: List[float] = []
+                if isinstance(data, dict):
+                    texts = data.get("text") or []
+                    conf_vals = data.get("conf") or []
+                    for raw_txt, raw_conf in zip(texts, conf_vals):
+                        txt = str(raw_txt or "").strip()
+                        if not txt:
+                            continue
+                        try:
+                            conf_val = float(raw_conf)
+                        except Exception:
+                            conf_val = -1.0
+                        if conf_val < 0:
+                            continue
+                        words.append(txt)
+                        confs.append(max(0.0, min(100.0, conf_val)))
+                if not words:
+                    try:
+                        raw = pytesseract.image_to_string(  # type: ignore[arg-type]
+                            target,
+                            lang=lang or None,
+                            config=tess_config or "",
+                        )
+                    except Exception:
+                        raw = None
+                    text_raw = (raw or "").strip()
+                    if text_raw:
+                        words.append(text_raw)
+                        confs.append(62.0)
+                if not words:
+                    return "", 0.0
+                conf_avg = (sum(confs) / len(confs)) / 100.0 if confs else 0.0
+                return " ".join(words), _normalize_confidence(conf_avg)
+
+            runner = _tesseract_runner
+    elif engine_key.startswith("easy"):
+        if np is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] easyocr requested but numpy is unavailable; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            try:
+                import easyocr  # type: ignore
+            except Exception:
+                if cache_key not in _OCR_BACKEND_WARNED:
+                    print("[WARN] easyocr not available; falling back to toy OCR")
+                    _OCR_BACKEND_WARNED.add(cache_key)
+                runner = toy_ocr_text_from_cell
+            else:
+                langs_raw = extra or os.environ.get("ZOCR_EASYOCR_LANGS", "ja,en")
+                langs = [tok.strip() for tok in langs_raw.split(",") if tok.strip()]
+                if not langs:
+                    langs = ["ja", "en"]
+                gpu_flag = (os.environ.get("ZOCR_EASYOCR_GPU", "").strip().lower())
+                gpu = gpu_flag not in ("0", "false", "no", "off")
+                reader_key = (tuple(langs), gpu)
+                reader = _EASYOCR_READER_CACHE.get(reader_key)
+                if reader is None:
+                    reader = easyocr.Reader(langs, gpu=gpu)
+                    _EASYOCR_READER_CACHE[reader_key] = reader
+
+                def _easyocr_runner(img: "Image.Image") -> Tuple[str, float]:
+                    try:
+                        target = img if getattr(img, "mode", "") == "RGB" else img.convert("RGB")
+                        arr = np.asarray(target)
+                    except Exception:
+                        return "", 0.0
+                    try:
+                        results = reader.readtext(arr, detail=1)
+                    except Exception:
+                        return "", 0.0
+                    texts: List[str] = []
+                    confs: List[float] = []
+                    for item in results:
+                        if not isinstance(item, (list, tuple)):
+                            continue
+                        text_val = item[1] if len(item) > 1 else ""
+                        conf_val = item[2] if len(item) > 2 else 0.0
+                        txt = str(text_val or "").strip()
+                        if not txt:
+                            continue
+                        texts.append(txt)
+                        try:
+                            conf_float = float(conf_val)
+                        except Exception:
+                            conf_float = 0.0
+                        confs.append(max(0.0, min(1.0, conf_float)))
+                    if not texts:
+                        return "", 0.0
+                    conf_avg = sum(confs) / len(confs) if confs else 0.0
+                    return " ".join(texts), _normalize_confidence(conf_avg)
+
+                runner = _easyocr_runner
+    else:
+        if cache_key not in _OCR_BACKEND_WARNED:
+            print(f"[WARN] Unknown OCR engine '{name}', falling back to toy OCR")
+            _OCR_BACKEND_WARNED.add(cache_key)
+        runner = toy_ocr_text_from_cell
+
+    _OCR_BACKEND_CACHE[cache_key] = runner
+    return runner
+
 def _keywords_from_row(row_cells: List[str]) -> List[str]:
     kws = set()
     rx_num = re.compile(r"[+\-]?\d[\d,]*(\.\d+)?")
@@ -2745,6 +2910,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         page_lookup = {i: path for i, path in enumerate(seq)}
         default_image_path = seq[0] if seq else None
     image_cache: Dict[str, Image.Image] = {}
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
@@ -2842,12 +3008,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_w, cx2 + right_pad),
                             min(page_h, cy2 + pad_y)
                         ))
-                        if ocr_engine=="toy":
-                            txt, conf = toy_ocr_text_from_cell(crop)
-                        else:
-                            txt, conf = ("", 0.0)
+                        txt, conf = ocr_runner(crop)
+                        if not isinstance(txt, str):
+                            txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
-                        grid_conf[r][c] = conf
+                        grid_conf[r][c] = _normalize_confidence(conf)
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -2865,11 +3030,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 min(page_w, cx2),
                                 min(page_h, cy2 + pad_y)
                             ))
-                            alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
+                            alt_txt, alt_conf = ocr_runner(crop)
                             m = _NUMERIC_RX.search(alt_txt or "")
                             if m:
                                 grid_text[r][target_col] = m.group(0)
-                                grid_conf[r][target_col] = max(grid_conf[r][target_col], alt_conf)
+                                grid_conf[r][target_col] = max(
+                                    grid_conf[r][target_col], _normalize_confidence(alt_conf)
+                                )
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
                 headers = grid_text[0] if contextual else []
@@ -3009,8 +3176,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
 def reanalyze_learning_jsonl(learning_jsonl_path: str,
                              out_dir: Optional[str] = None,
                              limit: int = 64,
-                             rotate: bool = True) -> Dict[str, Any]:
-    """Re-run toy OCR over low-confidence cells to propose improved readings."""
+                             rotate: bool = True,
+                             ocr_engine: str = "toy") -> Dict[str, Any]:
+    """Re-run the selected OCR backend over low-confidence cells to propose improved readings."""
     summary: Dict[str, Any] = {
         "input": learning_jsonl_path,
         "limit": int(limit),
@@ -3027,10 +3195,13 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "ambiguous_variants": 0,
         "fallback_variant_count": 0,
         "fallback_transform_usage": {},
+        "ocr_engine": ocr_engine,
     }
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
         return summary
+
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
     ensure_dir(dest_dir)
@@ -3122,21 +3293,24 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 crop = page_img.crop((x1, y1, x2, y2))
 
                 observed_text = sig.get("observed_text")
-                try:
-                    observed_conf = float(sig.get("confidence")) if sig.get("confidence") is not None else 0.0
-                except Exception:
-                    observed_conf = 0.0
+                observed_conf = _normalize_confidence(sig.get("confidence"))
 
                 variants_map: Dict[str, Dict[str, Any]] = {}
 
-                def _merge_variant(text: str, conf: float, transform: str) -> None:
+                def _merge_variant(text: Any, conf: Any, transform: str) -> None:
                     nonlocal ambiguous_total, fallback_used
-                    key = text or ""
-                    conf_f = float(conf or 0.0)
+                    if isinstance(text, str):
+                        normalized_text = text
+                    elif text is None:
+                        normalized_text = ""
+                    else:
+                        normalized_text = str(text)
+                    key = normalized_text
+                    conf_f = _normalize_confidence(conf)
                     created = key not in variants_map
                     if created:
                         variants_map[key] = {
-                            "text": text,
+                            "text": normalized_text,
                             "confidence": conf_f,
                             "transforms": [transform],
                         }
@@ -3165,20 +3339,27 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     elif transform.startswith("ambiguous") and created:
                         ambiguous_total += 1
 
-                base_text, base_conf = toy_ocr_text_from_cell(crop)
-                _merge_variant(base_text, base_conf, "base")
+                base_text_raw, base_conf_raw = ocr_runner(crop)
+                base_conf = _normalize_confidence(base_conf_raw)
+                _merge_variant(base_text_raw, base_conf, "base")
+                if isinstance(base_text_raw, str):
+                    base_text = base_text_raw
+                elif base_text_raw is None:
+                    base_text = ""
+                else:
+                    base_text = str(base_text_raw)
 
                 try:
                     bright_enhancer = ImageEnhance.Brightness(crop)
-                    txt_b1, conf_b1 = toy_ocr_text_from_cell(bright_enhancer.enhance(1.1))
+                    txt_b1, conf_b1 = ocr_runner(bright_enhancer.enhance(1.1))
                     _merge_variant(txt_b1, conf_b1, "brightness_1.1")
-                    txt_b2, conf_b2 = toy_ocr_text_from_cell(bright_enhancer.enhance(0.9))
+                    txt_b2, conf_b2 = ocr_runner(bright_enhancer.enhance(0.9))
                     _merge_variant(txt_b2, conf_b2, "brightness_0.9")
                 except Exception:
                     pass
                 try:
                     contrast_enhancer = ImageEnhance.Contrast(crop)
-                    txt_c, conf_c = toy_ocr_text_from_cell(contrast_enhancer.enhance(1.2))
+                    txt_c, conf_c = ocr_runner(contrast_enhancer.enhance(1.2))
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
@@ -3197,7 +3378,7 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                             rotated = crop.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
                         except Exception:
                             continue
-                        text_r, conf_r = toy_ocr_text_from_cell(rotated)
+                        text_r, conf_r = ocr_runner(rotated)
                         _merge_variant(text_r, conf_r, f"rotate_{angle:+.1f}")
 
                 if observed_text:
