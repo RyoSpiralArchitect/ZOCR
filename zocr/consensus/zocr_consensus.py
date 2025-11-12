@@ -961,11 +961,50 @@ _ASCII_SET = (
 )
 
 _GLYPH_VARIANT_LIMIT = 6
-_THRESHOLD_MEMORY_LIMIT = 2048
+
+
+def _parse_threshold_limit(value: str, default: int) -> int:
+    try:
+        limit = int(str(value).strip())
+    except Exception:
+        return default
+    return int(max(0, min(65536, limit)))
+
+
+def _determine_threshold_limit(default: int = 2048) -> int:
+    for env_key in (
+        "ZOCR_THRESHOLD_CACHE_LIMIT",
+        "ZOCR_THR_CACHE_LIMIT",
+        "ZOCR_THRESHOLD_MEMORY_LIMIT",
+    ):
+        env_val = os.environ.get(env_key)
+        if env_val is not None:
+            return _parse_threshold_limit(env_val, default)
+    return default
+
+
+_THRESHOLD_MEMORY_LIMIT = _determine_threshold_limit(2048)
 _THRESHOLD_MEMORY: "OrderedDict[Tuple[int, int, int], int]" = OrderedDict()
 
 
+def _threshold_memory_trim(limit: int) -> None:
+    if limit <= 0:
+        if _THRESHOLD_MEMORY:
+            _THRESHOLD_MEMORY.clear()
+        return
+    if len(_THRESHOLD_MEMORY) <= limit:
+        return
+    try:
+        while len(_THRESHOLD_MEMORY) > limit:
+            _THRESHOLD_MEMORY.popitem(last=False)
+    except Exception:
+        while len(_THRESHOLD_MEMORY) > limit:
+            _THRESHOLD_MEMORY.popitem()
+
+
 def _threshold_memory_lookup(key: Tuple[int, int, int]) -> Optional[int]:
+    if _THRESHOLD_MEMORY_LIMIT <= 0:
+        return None
     if key in _THRESHOLD_MEMORY:
         try:
             _THRESHOLD_MEMORY.move_to_end(key)
@@ -976,19 +1015,16 @@ def _threshold_memory_lookup(key: Tuple[int, int, int]) -> Optional[int]:
 
 
 def _threshold_memory_store(key: Tuple[int, int, int], value: int) -> None:
+    if _THRESHOLD_MEMORY_LIMIT <= 0:
+        if _THRESHOLD_MEMORY:
+            _THRESHOLD_MEMORY.clear()
+        return
     try:
         _THRESHOLD_MEMORY[key] = int(value)
         _THRESHOLD_MEMORY.move_to_end(key)
     except Exception:
         _THRESHOLD_MEMORY[key] = int(value)
-    if len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
-        try:
-            while len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
-                _THRESHOLD_MEMORY.popitem(last=False)
-        except Exception:
-            # fallback: clear if OrderedDict semantics unavailable
-            while len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
-                _THRESHOLD_MEMORY.popitem()
+    _threshold_memory_trim(_THRESHOLD_MEMORY_LIMIT)
 
 _NGRAM_COUNTS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 _NGRAM_TOTALS: Dict[str, int] = defaultdict(int)
