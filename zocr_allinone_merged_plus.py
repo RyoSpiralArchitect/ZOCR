@@ -91,7 +91,7 @@ from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re
 from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
-from collections import Counter
+from collections import Counter, defaultdict
 
 try:
     import numpy as np
