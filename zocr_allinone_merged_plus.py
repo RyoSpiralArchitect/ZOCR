@@ -2264,54 +2264,70 @@ def build_index(jsonl: str, out_pkl: str):
     pad=-1
     arr=np.full((N, maxlen), pad, dtype=np.int32)
     lengths=np.zeros(N, dtype=np.int32)
+    uniq_docs=[]
+    uniq_maxlen=0
     for i,(ids,_) in enumerate(docs):
         lengths[i]=len(ids)
-        if ids: arr[i,:len(ids)] = np.array(ids, dtype=np.int32)
+        if ids:
+            arr[i,:len(ids)] = np.array(ids, dtype=np.int32)
+        seen=set()
+        uniq=[]
+        for tid in ids:
+            if tid not in seen:
+                seen.add(tid)
+                uniq.append(tid)
+        uniq_docs.append(uniq)
+        if len(uniq)>uniq_maxlen:
+            uniq_maxlen=len(uniq)
+
+    uniq_pad=-1
+    uniq_shape=max(1, uniq_maxlen) if N else 0
+    arr_unique=np.full((N, uniq_shape), uniq_pad, dtype=np.int32)
+    uniq_lengths=np.zeros(N, dtype=np.int32)
+    for i,uniq in enumerate(uniq_docs):
+        L=len(uniq)
+        uniq_lengths[i]=L
+        if L:
+            arr_unique[i,:L] = np.array(uniq, dtype=np.int32)
 
     @njit(cache=True)
-    def _compute_df(arr, lengths, V):
-        n=arr.shape[0]
+    def _compute_df(arr_unique, lengths, V):
+        n=arr_unique.shape[0]
         df=np.zeros(V, dtype=np.int64)
-        seen=np.zeros(V, dtype=np.int64)
         for i in range(n):
-            mark=i+1
             for j in range(lengths[i]):
-                tid=arr[i,j]
-                if tid<0: break
-                if seen[tid]!=mark:
-                    seen[tid]=mark
-                    df[tid]+=1
+                tid=arr_unique[i,j]
+                if tid<0:
+                    break
+                df[tid]+=1
         return df
 
     @njit(parallel=True, cache=True)
-    def _compute_df_parallel(arr, lengths, V):
-        n=arr.shape[0]
+    def _compute_df_parallel(arr_unique, lengths, V):
+        n=arr_unique.shape[0]
         df=np.zeros(V, dtype=np.int64)
-        seen=np.full(V, -1, dtype=np.int64)
         for i in prange(n):
             L=lengths[i]
             for j in range(L):
-                tid=arr[i,j]
+                tid=arr_unique[i,j]
                 if tid<0:
                     break
-                if seen[tid]!=i:
-                    seen[tid]=i
-                    atomic.add(df, tid, 1)
+                atomic.add(df, tid, 1)
         return df
 
     df=None
     if _HAS_NUMBA:
         try:
             if V <= 200000:
-                df=_compute_df_parallel(arr, lengths, V)
+                df=_compute_df_parallel(arr_unique, uniq_lengths, V)
             else:
-                df=_compute_df(arr, lengths, V)
+                df=_compute_df(arr_unique, uniq_lengths, V)
         except Exception:
             df=None
     if df is None:
         df=np.zeros(V, dtype=np.int64)
-        for ids,_ in docs:
-            for tid in set(ids):
+        for uniq in uniq_docs:
+            for tid in uniq:
                 df[tid]+=1
     avgdl = float(lengths.sum())/max(1,N)
     ix={"vocab":vocab, "df":df, "avgdl":avgdl, "N":N, "lengths":lengths.tolist(), "docs_tokens":[d[0] for d in docs]}
@@ -2781,105 +2797,10 @@ def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_sc
         return True, "hit_mean>=0.95", mean
     return False, "hit_mean<0.95", mean
 
-def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, domain: str="invoice",
-            views_log: Optional[str]=None, gt_jsonl: Optional[str]=None):
-    # load data
-    raws=[]
-    with open(jsonl,"r",encoding="utf-8") as f:
-        for line in f:
-            raws.append(json.loads(line))
-    # low_conf_rate
-    total=len(raws); low_keys=set()
-    low=sum(1 for ob in raws if (ob.get("meta") or {}).get("low_conf"))
-    for ob in raws:
-        if (ob.get("meta") or {}).get("low_conf"):
-            key=(ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col"))
-            low_keys.add(key)
-    low_rate = low/max(1,total)
-    # reprocess rates
-    logs=_read_views_log(views_log) if views_log else {"reprocess":set(),"success":set()}
-    n_re= len([1 for key in logs["reprocess"] if key in low_keys])
-    reprocess_rate = n_re / max(1,len(low_keys))
-    n_succ = len([1 for key in logs["success"] if key in logs["reprocess"]])
-    reprocess_success_rate = n_succ / max(1, len(logs["reprocess"]))
-    # build index if missing
-    if not os.path.exists(index_pkl):
-        build_index(jsonl, index_pkl)
-    # strict Hit@K (GT cell id match)
-    G=_read_gt(gt_jsonl)
-    def _idset(res):
-        S=set()
-        for s,ob in res:
-            S.add((ob.get("doc_id"), ob.get("page"), ob.get("table_index"), ob.get("row"), ob.get("col")))
-        return S
-    # seeds for queries
-    q_amount = "合計 金額 小計 税抜 消費税 円 total amount"
-    q_date   = "請求日 発行日 支払期日 日付 date 2023 2024 2025"
-    res_amt = query(index_pkl, jsonl, q_amount, None, topk=k, domain=domain)
-    res_dat = query(index_pkl, jsonl, q_date,   None, topk=k, domain=domain)
-    top_amt = _idset(res_amt); top_dat = _idset(res_dat)
-    # If no GT provided, fallback to proxy
-    if len(G["amount"])>0:
-        hit_amount_gt = len(G["amount"] & top_amt) / max(1, len(G["amount"]))
-    else:
-        hit_amount_gt = 1.0 if any(((ob.get("meta") or {}).get("filters",{})).get("amount") for _,ob in res_amt) else 0.0
-    if len(G["date"])>0:
-        hit_date_gt = len(G["date"] & top_dat) / max(1, len(G["date"]))
-    else:
-        hit_date_gt = 1.0 if any(((ob.get("meta") or {}).get("filters",{})).get("date") for _,ob in res_dat) else 0.0
-    hit_mean = (hit_amount_gt + hit_date_gt)/2.0
-    # p95
-    p95=None
-    agg=os.path.join(os.path.dirname(jsonl),"metrics_aggregate.csv")
-    if os.path.exists(agg):
-        try:
-            import pandas as pd
-            df=pd.read_csv(agg)
-            if "latency_p95_ms" in df.columns:
-                p95=float(df["latency_p95_ms"].iloc[0])
-        except Exception:
-            p95=None
-    # tax check fail rate
-    tax_total=0; tax_fail=0
-    for ob in raws:
-        f=(ob.get("meta") or {}).get("filters",{})
-        if f.get("tax_rate") is not None and f.get("subtotal") is not None:
-            tax_total += 1
-            calc=int(round(float(f["subtotal"])*float(f["tax_rate"])))
-            seen=f.get("tax_amount")
-            if seen is None:
-                # try to parse from synthesis_window
-                swin = ob.get("synthesis_window") or ""
-                m = re.search(r"(消費税|税額)[:=]?\s*([¥￥$]?\s*\d[\d,]*)", swin)
-                if m:
-                    try: seen = int(m.group(2).replace("¥","").replace("￥","").replace("$","").replace(",","").strip())
-                    except: seen = None
-            if seen is not None and abs(calc - int(seen)) > 1:
-                tax_fail += 1
-    tax_check_fail_rate = (tax_fail / max(1, tax_total)) if tax_total>0 else None
-
-    gate_pass, gate_reason, gate_score = _evaluate_gate(domain, hit_amount_gt, hit_date_gt)
-    row={
-        "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
-        "jsonl": jsonl, "K": k, "domain": domain,
-        "low_conf_rate": low_rate, "reprocess_rate": reprocess_rate,
-        "reprocess_success_rate": reprocess_success_rate,
-        "hit_amount_gt": hit_amount_gt, "hit_date_gt": hit_date_gt, "hit_mean": hit_mean,
-        "p95_ms": p95, "tax_check_fail_rate": tax_check_fail_rate,
-        "gate_pass": gate_pass, "gate_reason": gate_reason, "gate_score": gate_score,
-    }
-    write_header=not os.path.exists(out_csv)
-    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-    with open(out_csv,"a",encoding="utf-8-sig",newline="") as fw:
-        wr=csv.DictWriter(fw, fieldnames=list(row.keys()))
-        if write_header: wr.writeheader()
-        wr.writerow(row)
-    return row
-
 # --------------- CLI ----------------------------------
 def main():
     import argparse
-    ap=argparse.ArgumentParser("ZOCR Multi‑Domain Core")
+    ap=argparse.ArgumentParser("ZOCR Multi‑Domain Core (all-in-one)")
     sub=ap.add_subparsers(dest="cmd")
 
     sp=sub.add_parser("buildc"); sp.add_argument("--outdir", default="out_lib")
@@ -2889,12 +2810,12 @@ def main():
     sp.add_argument("--lambda-shape", type=float, default=4.5)
     sp.add_argument("--lambda-refheight", type=int, default=1000)
     sp.add_argument("--lambda-alpha", type=float, default=0.7)
-    sp.add_argument("--org-dict", default=None)  # {"法人番号13桁": "正規会社名", ...}
+    sp.add_argument("--org-dict", default=None)
     sp.add_argument("--domain", default="invoice")
 
     sp=sub.add_parser("index"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
 
-    sp=sub.add_parser("query"); 
+    sp=sub.add_parser("query")
     sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
     sp.add_argument("--q", default=""); sp.add_argument("--image", default=None); sp.add_argument("--topk", type=int, default=10)
     sp.add_argument("--w-bm25", type=float, default=1.0); sp.add_argument("--w-kw", type=float, default=0.6); sp.add_argument("--w-img", type=float, default=0.3)
@@ -2928,7 +2849,8 @@ def main():
     if args.cmd=="sql":
         p=sql_export(args.jsonl, args.outdir, args.prefix); print("SQL:", p); return
     if args.cmd=="monitor":
-        row=monitor(args.jsonl, args.index, args.k, args.out, args.domain, args.views_log, args.gt_jsonl)
+        row=monitor(args.jsonl, args.index, args.k, args.out,
+                    views_log=args.views_log, gt_jsonl=args.gt_jsonl, domain=args.domain)
         print("Monitor:", row)
         if row.get("gate_pass"):
             print(f"GATE: PASS ({row.get('gate_reason')})")
@@ -2938,142 +2860,6 @@ def main():
 
     ap.print_help()
 
-if __name__=="__main__":
-    main()
-
-
-# ===================== ONE-CALL ORCHESTRATION =====================
-
-def auto_all(jsonl_in: str, outdir: str, org_dict: Optional[str]=None, gt_jsonl: Optional[str]=None,
-             views_log: Optional[str]=None, k:int=10, tune_budget:int=24, domain_hint: Optional[str]=None,
-             learn_ema: float=0.5, cluster: bool=False) -> Dict[str,Any]:
-    """
-    これ1つで：auto -> tune(unlabeled) -> monitor -> learn(EMA) まで一括。
-    cluster=True なら mixedコーパスを自動分割して各ドメインで独立実行。
-    """
-    os.makedirs(outdir, exist_ok=True)
-    if cluster:
-        # domain split + per-domain pipeline
-        results = auto_process_mixed(jsonl_in, outdir, org_dict=org_dict, gt_jsonl=gt_jsonl, views_log=views_log, k=k)
-        return {"mode":"mixed", "domains": list(results.keys()), "results": results}
-
-    # 1) autopilot
-    auto_res = autopilot(jsonl_in=jsonl_in, outdir=outdir, org_dict=org_dict, gt_jsonl=gt_jsonl, views_log=views_log, k=k, domain_hint=domain_hint)
-    mm = auto_res["mm_jsonl"]; idx = auto_res["index"]
-    # 2) unlabeled tune
-    tune_dir = os.path.join(outdir, "tune")
-    tune_res = autotune_unlabeled(jsonl_mm=mm, index_pkl=idx, outdir=tune_dir, method="random", budget=tune_budget, domain_hint=domain_hint)
-    # 3) monitor (追記)
-    mon_csv = auto_res["monitor_csv"]
-    monitor(mm, idx, k, mon_csv, views_log=views_log, gt_jsonl=gt_jsonl, domain=auto_res["profile"]["domain"])
-    # 4) learn (EMA的にプロファイルを微修正)
-    #    NOTE: learn_from_monitor は monitor.csv の差分で w/λ/閾値を小さくドリフト
-    learn_out = learn_from_monitor(monitor_csv=mon_csv, profile_json_in=auto_res["profile_json"], profile_json_out=None, domain_hint=domain_hint)
-
-    return {
-        "mode":"single",
-        "auto": auto_res,
-        "tune": tune_res,
-        "learn": learn_out,
-        "artifacts": {
-            "profile_json": auto_res["profile_json"],
-            "tuned_profile_json": os.path.join(tune_dir, "auto_profile.json"),
-            "monitor_csv": mon_csv,
-            "index": idx,
-            "mm_jsonl": mm
-        }
-    }
-
-# ---------------------- CLI: auto-all ----------------------
-def _cli_auto_all(args):
-    out = auto_all(jsonl_in=args.jsonl, outdir=args.outdir, org_dict=args.org_dict,
-                   gt_jsonl=args.gt_jsonl, views_log=args.views_log, k=args.k,
-                   tune_budget=args.tune_budget, domain_hint=args.domain_hint,
-                   learn_ema=args.learn_ema, cluster=args.cluster)
-    print("AUTO_ALL:", json.dumps(out["artifacts"] if out.get("artifacts") else out, ensure_ascii=False, indent=2))
-
-# Patch CLI
-_old_main2 = main
-def main():
-    import argparse
-    ap=argparse.ArgumentParser("ZOCR Multi-Domain Core + Autopilot + Autotune + One-Call")
-    sub=ap.add_subparsers(dest="cmd")
-
-    sp=sub.add_parser("buildc"); sp.add_argument("--outdir", default="out_lib")
-
-    sp=sub.add_parser("augment"); sp.add_argument("--jsonl", required=True); sp.add_argument("--out", required=True)
-    sp.add_argument("--org-dict", default=None); sp.add_argument("--lambda-shape", type=float, default=4.5)
-
-    sp=sub.add_parser("index"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
-
-    sp=sub.add_parser("query"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
-    sp.add_argument("--q", default=""); sp.add_argument("--image", default=None); sp.add_argument("--topk", type=int, default=10)
-    sp.add_argument("--w-bm25", type=float, default=1.0); sp.add_argument("--w-kw", type=float, default=0.6); sp.add_argument("--w-img", type=float, default=0.3)
-    sp.add_argument("--domain", default=None)
-
-    sp=sub.add_parser("sql"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True); sp.add_argument("--prefix", default="invoice")
-
-    sp=sub.add_parser("monitor"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True)
-    sp.add_argument("--k", type=int, default=10); sp.add_argument("--views-log", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--out", required=True); sp.add_argument("--domain", default=None)
-
-    sp=sub.add_parser("smooth"); sp.add_argument("--in-json", required=True); sp.add_argument("--out-json", required=True)
-    sp.add_argument("--lambda-shape", type=float, default=4.5); sp.add_argument("--height-ref", type=float, default=1000.0); sp.add_argument("--lambda-exp", type=float, default=0.7)
-
-    sp=sub.add_parser("auto"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True)
-    sp.add_argument("--org-dict", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--views-log", default=None)
-    sp.add_argument("--k", type=int, default=10); sp.add_argument("--domain-hint", default=None)
-
-    sp=sub.add_parser("tune"); sp.add_argument("--jsonl", required=True); sp.add_argument("--index", required=True); sp.add_argument("--outdir", required=True)
-    sp.add_argument("--method", default="random"); sp.add_argument("--budget", type=int, default=30); sp.add_argument("--domain", default=None); sp.add_argument("--seed", type=int, default=0)
-
-    sp=sub.add_parser("learn"); sp.add_argument("--monitor-csv", required=True); sp.add_argument("--profile-json", required=True)
-    sp.add_argument("--out-profile", default=None); sp.add_argument("--domain", default=None)
-
-    sp=sub.add_parser("auto-mixed"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True)
-    sp.add_argument("--org-dict", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--views-log", default=None); sp.add_argument("--k", type=int, default=10)
-
-    # new: auto-all
-    sp=sub.add_parser("auto-all"); sp.add_argument("--jsonl", required=True); sp.add_argument("--outdir", required=True)
-    sp.add_argument("--org-dict", default=None); sp.add_argument("--gt-jsonl", default=None); sp.add_argument("--views-log", default=None)
-    sp.add_argument("--k", type=int, default=10); sp.add_argument("--domain-hint", default=None)
-    sp.add_argument("--tune-budget", type=int, default=24); sp.add_argument("--learn-ema", type=float, default=0.5)
-    sp.add_argument("--cluster", action="store_true")
-
-    args=ap.parse_args()
-
-    if args.cmd=="buildc":
-        L, path = _build_ctypes_lib(args.outdir); print("Built:" if L else "Build failed; Python fallbacks will be used.", path if L else ""); return
-    if args.cmd=="augment":
-        n=augment(args.jsonl, args.out, args.org_dict, lambda_shape=args.lambda_shape); print(f"Augmented {n} -> {args.out}"); return
-    if args.cmd=="index":
-        build_index(args.jsonl, args.index); print(f"Indexed -> {args.index}"); return
-    if args.cmd=="query":
-        res=query(args.index, args.jsonl, args.q, args.image, args.topk, args.w_bm25, args.w_kw, args.w_img, args.domain)
-        for i,(s,ob) in enumerate(res,1):
-            filt=(ob.get('meta') or {}).get('filters',{})
-            print(f"{i:2d}. {s:.3f} page={ob.get('page')} r={ob.get('row')} c={ob.get('col')} "
-                  f"amt={filt.get('amount')} date={filt.get('date')} tax={filt.get('tax_rate')} "
-                  f"qty={filt.get('qty')} unit={filt.get('unit')} sub={filt.get('subtotal')} "
-                  f"text='{(ob.get('text') or '')[:40]}'"); return
-    if args.cmd=="sql":
-        p=sql_export(args.jsonl, args.outdir, args.prefix); print("SQL:",p); return
-    if args.cmd=="monitor":
-        monitor(args.jsonl, args.index, args.k, args.out, args.views_log, args.gt_jsonl, args.domain); return
-    if args.cmd=="smooth":
-        smooth_columns(args.in_json, args.out_json, args.lambda_shape, args.height_ref, args.lambda_exp); return
-    if args.cmd=="auto":
-        out = autopilot(args.jsonl, args.outdir, args.org_dict, args.gt_jsonl, args.views_log, args.k, args.domain_hint)
-        print("AUTO:", json.dumps({k:out[k] for k in ["mm_jsonl","index","monitor_csv","profile_json"]}, ensure_ascii=False, indent=2))
-        print("PROFILE:", json.dumps(out["profile"], ensure_ascii=False, indent=2))
-        print("MONITOR_ROW:", json.dumps(out["monitor_row"], ensure_ascii=False, indent=2)); return
-    if args.cmd=="tune": _cli_autotune(args); return
-    if args.cmd=="learn": _cli_learn(args); return
-    if args.cmd=="auto-mixed": _cli_auto_mixed(args); return
-    if args.cmd=="auto-all": _cli_auto_all(args); return
-
-    ap.print_help()
-
-# ensure new main is used
 if __name__=="__main__":
     main()
 
@@ -3286,7 +3072,7 @@ def metric_col_alignment_energy_cached(tbl_cache: List[Dict[str,Any]], lambda_sh
     num=0.0; den=0.0
     for tb in tbl_cache:
         H=tb["H"]
-        lam_eff=lambda_schedule(lambda_shape, H, height_ref, exp)
+        lam_eff=lambda_schedule(H, lambda_shape, height_ref, exp)
         for mat in [tb["left"], tb["right"]]:
             # iterate columns
             max_r = len(mat)
@@ -3428,7 +3214,6 @@ def _compute_p95_if_needed(jsonl: str, index_pkl: str, domain: Optional[str]) ->
         return None
 
 # Patch monitor to fallback p95
-_old_monitor = monitor
 def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optional[str]=None, gt_jsonl: Optional[str]=None, domain: Optional[str]=None):
     total=0; low=0; corp_hits=0; corp_total=0
     lc_keys=set()
