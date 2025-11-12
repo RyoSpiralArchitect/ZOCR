@@ -1441,7 +1441,7 @@ def _text_from_binary(bw):
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
 
-def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[str, float]:
+def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[str, float]:
     """Very small OCR to work with the demo font. Returns (text, confidence)."""
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
@@ -1554,7 +1554,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
 
-def _keywords_from_row(row_cells: list[str]) -> list[str]:
+def _keywords_from_row(row_cells: List[str]) -> List[str]:
     kws = set()
     rx_num = re.compile(r"[+\-]?\d[\d,]*(\.\d+)?")
     rx_date = re.compile(r"\b(20\d{2}|19\d{2})[/-](0?[1-9]|1[0-2])([/-](0?[1-9]|[12][0-9]|3[01]))?\b")
@@ -1565,14 +1565,14 @@ def _keywords_from_row(row_cells: list[str]) -> list[str]:
         if any(sym in t for sym in ["$", "¥", "円"]): kws.add("currency")
     return sorted(kws)[:12]
 
-def _context_line_from_row(headers: list[str], row: list[str]) -> str:
+def _context_line_from_row(headers: List[str], row: List[str]) -> str:
     if headers and len(headers)==len(row):
         pairs = [f"{h.strip()}={row[i].strip()}" for i,h in enumerate(headers)]
         return " | ".join(pairs)
     else:
         return " | ".join([x.strip() for x in row if x.strip()])
 
-def _conceptual_tags(text: str, headers: list[str], row: list[str]) -> List[str]:
+def _conceptual_tags(text: str, headers: List[str], row: List[str]) -> List[str]:
     tags: Set[str] = set()
     t = (text or "").strip()
     if not t:
@@ -1617,7 +1617,7 @@ def _conceptual_tags(text: str, headers: list[str], row: list[str]) -> List[str]
     return sorted(tags)
 
 
-def _hypothesize_from_text(text: str, headers: list[str], concepts: List[str]) -> List[Dict[str, Any]]:
+def _hypothesize_from_text(text: str, headers: List[str], concepts: List[str]) -> List[Dict[str, Any]]:
     if not text:
         text = ""
     hyps: List[Dict[str, Any]] = []
@@ -1836,7 +1836,7 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
     return count
 
 # ---------- Minimal local hybrid search ----------
-def _tokenize(s: str) -> list[str]:
+def _tokenize(s: str) -> List[str]:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\-\._]+", " ", s)
     return [t for t in s.split() if t]
