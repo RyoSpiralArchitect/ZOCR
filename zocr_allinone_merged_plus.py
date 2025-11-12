@@ -1163,6 +1163,119 @@ def _render_glyphs(font=None, size=16):
 
 _GLYPH_ATLAS, _GLYPH_FEATS = _render_glyphs()
 
+
+def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "glyph_atlas": {},
+        "glyph_feats": {},
+        "ngram_counts": {},
+        "ngram_totals": {},
+    }
+    for ch, imgs in _GLYPH_ATLAS.items():
+        serialised: List[List[List[int]]] = []
+        for img in imgs[:_GLYPH_VARIANT_LIMIT]:
+            try:
+                arr = np.asarray(img, dtype=np.uint8)
+                serialised.append(arr.tolist())
+            except Exception:
+                continue
+        if serialised:
+            payload["glyph_atlas"][ch] = serialised
+    for ch, feats in _GLYPH_FEATS.items():
+        if not isinstance(feats, dict):
+            continue
+        safe = {
+            "aspect": float(feats.get("aspect", 1.0)),
+            "density": float(feats.get("density", 0.0)),
+            "symmetry": float(feats.get("symmetry", 0.0)),
+            "count": int(feats.get("count", 1)),
+        }
+        payload["glyph_feats"][ch] = safe
+    for prev, mapping in _NGRAM_COUNTS.items():
+        if not mapping:
+            continue
+        items = sorted(mapping.items(), key=lambda kv: kv[1], reverse=True)
+        trimmed = items[:limit_ngram]
+        payload["ngram_counts"][prev] = {ch: int(count) for ch, count in trimmed if count}
+    payload["ngram_totals"] = {prev: int(total) for prev, total in _NGRAM_TOTALS.items() if total}
+    return payload
+
+
+def save_toy_memory(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        payload = _toy_memory_payload()
+        ensure_dir(os.path.dirname(path) or ".")
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def load_toy_memory(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception:
+        return False
+    changed = False
+    try:
+        glyph_payload = payload.get("glyph_atlas", {})
+        if isinstance(glyph_payload, dict):
+            for ch, arrs in glyph_payload.items():
+                if not isinstance(arrs, list):
+                    continue
+                atlas_list: List[Image.Image] = []
+                for arr in arrs[:_GLYPH_VARIANT_LIMIT]:
+                    try:
+                        np_arr = np.asarray(arr, dtype=np.uint8)
+                        if np_arr.ndim != 2:
+                            continue
+                        atlas_list.append(Image.fromarray(np_arr, mode="L"))
+                    except Exception:
+                        continue
+                if atlas_list:
+                    _GLYPH_ATLAS[ch] = atlas_list
+                    changed = True
+        feats_payload = payload.get("glyph_feats", {})
+        if isinstance(feats_payload, dict):
+            for ch, feats in feats_payload.items():
+                if not isinstance(feats, dict):
+                    continue
+                safe = {
+                    "aspect": float(feats.get("aspect", 1.0)),
+                    "density": float(feats.get("density", 0.0)),
+                    "symmetry": float(feats.get("symmetry", 0.0)),
+                    "count": int(feats.get("count", len(_GLYPH_ATLAS.get(ch, [])) or 1)),
+                }
+                _GLYPH_FEATS[ch] = safe
+        counts_payload = payload.get("ngram_counts", {})
+        if isinstance(counts_payload, dict):
+            for prev, mapping in counts_payload.items():
+                if not isinstance(mapping, dict):
+                    continue
+                target = _NGRAM_COUNTS.setdefault(prev, defaultdict(int))
+                for ch, val in mapping.items():
+                    try:
+                        target[ch] += int(val)
+                    except Exception:
+                        continue
+        totals_payload = payload.get("ngram_totals", {})
+        if isinstance(totals_payload, dict):
+            for prev, total in totals_payload.items():
+                try:
+                    _NGRAM_TOTALS[prev] = max(_NGRAM_TOTALS.get(prev, 0), int(total))
+                except Exception:
+                    continue
+        return changed
+    except Exception:
+        return False
+
 def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
     if not feats:
         return
@@ -5016,6 +5129,13 @@ _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
+def _resolve_toy_memory_path(outdir: str) -> str:
+    env_path = os.environ.get("ZOCR_TOY_MEMORY")
+    if env_path:
+        return env_path
+    return os.path.join(outdir, "toy_memory.json")
+
+
 def _collect_dependency_diagnostics() -> Dict[str, Any]:
     """Summarise optional dependencies so operators can self-check the environment."""
     diag: Dict[str, Any] = {}
@@ -5583,6 +5703,21 @@ def _write_pipeline_meta(outdir: str, seed: int):
             meta["files"][mod.__name__] = {"path": p, "sha256": _sha256(p)}
         except Exception:
             pass
+    bundle_dir = getattr(zocr_onefile_consensus, "_BUNDLE_DIR", None)
+    if bundle_dir and os.path.isdir(bundle_dir):
+        bundle_meta: Dict[str, Any] = {}
+        for root, _dirs, files in os.walk(bundle_dir):
+            for fn in sorted(f for f in files if f.endswith(".py")):
+                full = os.path.join(root, fn)
+                try:
+                    bundle_meta[os.path.relpath(full, bundle_dir)] = {
+                        "sha256": _sha256(full),
+                        "size": os.path.getsize(full),
+                    }
+                except Exception:
+                    continue
+        if bundle_meta:
+            meta["bundle_files"] = bundle_meta
     for name in ("numpy", "Pillow"):
         try:
             meta["versions"][name] = importlib.import_module(name).__version__
@@ -5814,6 +5949,9 @@ def _patched_run_full_pipeline(
 
     ok = _read_ok_steps(outdir) if resume else set()
 
+    toy_memory_path = _resolve_toy_memory_path(outdir)
+    toy_memory_loaded = load_toy_memory(toy_memory_path)
+
     if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
@@ -5848,6 +5986,10 @@ def _patched_run_full_pipeline(
         "resume_steps": sorted(str(s) for s in ok if s is not None),
         "snapshot": bool(snapshot),
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
+        "toy_memory": {
+            "path": toy_memory_path,
+            "loaded": bool(toy_memory_loaded),
+        },
     }
 
     domain_hints = _prepare_domain_hints(inputs)
@@ -6125,6 +6267,27 @@ def _patched_run_full_pipeline(
     if feedback_passes:
         summary["feedback_passes"] = feedback_passes
 
+    intent_runs: List[str] = []
+    if intent.get("action") == "reanalyze_cells" and learning_jsonl_path and not summary.get("reanalyze_learning"):
+        re_dir = os.path.join(outdir, "reanalyze")
+        ensure_dir(re_dir)
+        try:
+            re_limit = int(prof_after.get("reanalyze_limit") or 64)
+        except Exception:
+            re_limit = 64
+        r = _safe_step("ReanalyzeLearningIntent", reanalyze_learning_jsonl,
+                       learning_jsonl_path, re_dir, re_limit)
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            intent_runs.append("reanalyze_learning")
+            reanalysis_summary = r.get("out")
+            if isinstance(reanalysis_summary, dict):
+                summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
+                if reanalysis_summary.get("output_jsonl"):
+                    summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
+    if intent_runs:
+        summary["intent_runs"] = intent_runs
+
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
                                                      prefix=(prof.get("domain") or "invoice"))
@@ -6183,6 +6346,10 @@ def _patched_run_full_pipeline(
     summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
+
+    toy_memory_saved = save_toy_memory(toy_memory_path)
+    summary.setdefault("toy_memory", {})
+    summary["toy_memory"]["saved"] = bool(toy_memory_saved)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)

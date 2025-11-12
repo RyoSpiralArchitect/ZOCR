@@ -1088,6 +1088,119 @@ def _render_glyphs(font=None, size=16):
 
 _GLYPH_ATLAS, _GLYPH_FEATS = _render_glyphs()
 
+
+def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "glyph_atlas": {},
+        "glyph_feats": {},
+        "ngram_counts": {},
+        "ngram_totals": {},
+    }
+    for ch, imgs in _GLYPH_ATLAS.items():
+        serialised: List[List[List[int]]] = []
+        for img in imgs[:_GLYPH_VARIANT_LIMIT]:
+            try:
+                arr = np.asarray(img, dtype=np.uint8)
+                serialised.append(arr.tolist())
+            except Exception:
+                continue
+        if serialised:
+            payload["glyph_atlas"][ch] = serialised
+    for ch, feats in _GLYPH_FEATS.items():
+        if not isinstance(feats, dict):
+            continue
+        safe = {
+            "aspect": float(feats.get("aspect", 1.0)),
+            "density": float(feats.get("density", 0.0)),
+            "symmetry": float(feats.get("symmetry", 0.0)),
+            "count": int(feats.get("count", 1)),
+        }
+        payload["glyph_feats"][ch] = safe
+    for prev, mapping in _NGRAM_COUNTS.items():
+        if not mapping:
+            continue
+        items = sorted(mapping.items(), key=lambda kv: kv[1], reverse=True)
+        trimmed = items[:limit_ngram]
+        payload["ngram_counts"][prev] = {ch: int(count) for ch, count in trimmed if count}
+    payload["ngram_totals"] = {prev: int(total) for prev, total in _NGRAM_TOTALS.items() if total}
+    return payload
+
+
+def save_toy_memory(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        payload = _toy_memory_payload()
+        ensure_dir(os.path.dirname(path) or ".")
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def load_toy_memory(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception:
+        return False
+    changed = False
+    try:
+        glyph_payload = payload.get("glyph_atlas", {})
+        if isinstance(glyph_payload, dict):
+            for ch, arrs in glyph_payload.items():
+                if not isinstance(arrs, list):
+                    continue
+                atlas_list: List[Image.Image] = []
+                for arr in arrs[:_GLYPH_VARIANT_LIMIT]:
+                    try:
+                        np_arr = np.asarray(arr, dtype=np.uint8)
+                        if np_arr.ndim != 2:
+                            continue
+                        atlas_list.append(Image.fromarray(np_arr, mode="L"))
+                    except Exception:
+                        continue
+                if atlas_list:
+                    _GLYPH_ATLAS[ch] = atlas_list
+                    changed = True
+        feats_payload = payload.get("glyph_feats", {})
+        if isinstance(feats_payload, dict):
+            for ch, feats in feats_payload.items():
+                if not isinstance(feats, dict):
+                    continue
+                safe = {
+                    "aspect": float(feats.get("aspect", 1.0)),
+                    "density": float(feats.get("density", 0.0)),
+                    "symmetry": float(feats.get("symmetry", 0.0)),
+                    "count": int(feats.get("count", len(_GLYPH_ATLAS.get(ch, [])) or 1)),
+                }
+                _GLYPH_FEATS[ch] = safe
+        counts_payload = payload.get("ngram_counts", {})
+        if isinstance(counts_payload, dict):
+            for prev, mapping in counts_payload.items():
+                if not isinstance(mapping, dict):
+                    continue
+                target = _NGRAM_COUNTS.setdefault(prev, defaultdict(int))
+                for ch, val in mapping.items():
+                    try:
+                        target[ch] += int(val)
+                    except Exception:
+                        continue
+        totals_payload = payload.get("ngram_totals", {})
+        if isinstance(totals_payload, dict):
+            for prev, total in totals_payload.items():
+                try:
+                    _NGRAM_TOTALS[prev] = max(_NGRAM_TOTALS.get(prev, 0), int(total))
+                except Exception:
+                    continue
+        return changed
+    except Exception:
+        return False
+
 def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
     if not feats:
         return
