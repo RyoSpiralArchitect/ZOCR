@@ -89,6 +89,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** toy OCR はエッジ輝度を検知して白地黒字/黒地白字を自動判別し、低信頼セルを削減します。
 - **[EN]** The toy OCR now inspects edge brightness to auto-detect inverted text (white-on-black) and cuts down low-confidence cells.
 - **[FR]** Le toy OCR détecte désormais automatiquement les inversions (texte clair sur fond sombre) via la brillance des arêtes, réduisant les cellules peu fiables.
+- **[JA]** 再解析 (`reanalyze_learning_jsonl`) は Tesseract がインストールされていれば追加エンジンとして併用し、文字のゆらぎ辞書で `??I` → `771` などの揺れも補正します。利用可能な外部エンジン数と生成候補はサマリーに記録されます。
+- **[EN]** The reanalysis stage (`reanalyze_learning_jsonl`) now taps Tesseract when available and applies an ambiguity map so glyph noise like `??I` can normalize to `771`; the summary reports which external engines supplied fixes.
+- **[FR]** La phase de réanalyse (`reanalyze_learning_jsonl`) exploite Tesseract lorsqu’il est présent et applique une carte d’ambiguïtés pour transformer des bruits tels que `??I` en `771`; le résumé liste les moteurs externes utilisés.
 - **[JA]** 検索レイヤーは BM25 + キーワード + 画像類似に加え、`filters` に含まれる数値やキーを直接照合するシンボリックスコアを併用し、Trust@K を押し上げます。
 - **[EN]** The retrieval layer now blends BM25 + keyword + image similarity with a symbolic scorer that inspects the structured `filters`, improving Trust@K for downstream RAG agents.
 - **[FR]** La couche de recherche combine BM25 + mots-clés + similarité d'image avec un scoreur symbolique basé sur `filters`, ce qui renforce le Trust@K pour les agents RAG.

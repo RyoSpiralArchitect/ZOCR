@@ -24,6 +24,12 @@ except Exception:
     np = None
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
+try:
+    import pytesseract  # type: ignore
+    from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    pytesseract = None  # type: ignore
+    _PYTESS_OUTPUT = None  # type: ignore
 from html.parser import HTMLParser
 
 _thomas = None
@@ -1271,6 +1277,97 @@ _TOTAL_LABEL_HINTS = [
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
 
+_AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
+    "?": ("7", "1", "2"),
+    "I": ("1", "l"),
+    "l": ("1",),
+    "|": ("1",),
+    "O": ("0",),
+    "o": ("0",),
+    "S": ("5",),
+    "s": ("5",),
+    "$": ("5",),
+    "B": ("8",),
+    "b": ("6",),
+    "g": ("9",),
+    "Z": ("2",),
+    "z": ("2",),
+}
+
+
+def _ambiguous_variants(text: Optional[str]) -> List[str]:
+    if not text:
+        return []
+    candidates: Set[str] = set()
+    chars = list(text)
+    for idx, ch in enumerate(chars):
+        repls = _AMBIGUOUS_CHAR_MAP.get(ch)
+        if not repls:
+            continue
+        for repl in repls:
+            if repl == ch:
+                continue
+            mutated = chars[:]
+            mutated[idx] = repl
+            candidate = "".join(mutated)
+            if candidate != text:
+                candidates.add(candidate)
+    return sorted(candidates)
+
+
+def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    if pytesseract is None or _PYTESS_OUTPUT is None:
+        return []
+    variants: List[Tuple[str, float, str]] = []
+    config = "--psm 6"
+    try:
+        data = pytesseract.image_to_data(img, output_type=_PYTESS_OUTPUT.DICT, config=config)  # type: ignore[arg-type]
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        words: List[str] = []
+        confs: List[float] = []
+        texts = data.get("text", [])
+        confidences = data.get("conf", [])
+        for raw_txt, raw_conf in zip(texts, confidences):
+            txt = (raw_txt or "").strip()
+            if txt:
+                words.append(txt)
+            try:
+                c = float(raw_conf)
+            except Exception:
+                c = -1.0
+            if c >= 0.0:
+                confs.append(c / 100.0)
+        if words:
+            joined = " ".join(words)
+            conf_val = max(confs) if confs else 0.6
+            variants.append((joined, float(max(0.0, min(1.0, conf_val))), "engine:pytesseract_data"))
+    try:
+        raw = pytesseract.image_to_string(img, config=config)  # type: ignore[arg-type]
+    except Exception:
+        raw = None
+    if raw:
+        txt = raw.strip()
+        if txt:
+            conf_guess = 0.62
+            variants.append((txt, conf_guess, "engine:pytesseract"))
+    return variants
+
+
+def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    variants: List[Tuple[str, float, str]] = []
+    variants.extend(_pytesseract_variants(img))
+    if pytesseract is not None and variants:
+        try:
+            inverted = ImageOps.invert(img.convert("RGB"))
+        except Exception:
+            inverted = None
+        if inverted is not None:
+            for txt, conf, transform in _pytesseract_variants(inverted):
+                variants.append((txt, conf, f"{transform}+invert"))
+    return variants
+
 def _normalize_total_token(text: str) -> str:
     base = (text or "").lower()
     base = re.sub(r"[\s:_\-]+", "", base)
@@ -1914,6 +2011,8 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "regressed": 0,
         "unchanged": 0,
         "avg_confidence_delta": 0.0,
+        "external_engines": {},
+        "ambiguous_variants": 0,
     }
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
@@ -1944,6 +2043,8 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
 
     records: List[Dict[str, Any]] = []
     delta_sum = 0.0
+    engine_usage: Dict[str, int] = defaultdict(int)
+    ambiguous_total = 0
 
     try:
         with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
@@ -1992,9 +2093,11 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 variants_map: Dict[str, Dict[str, Any]] = {}
 
                 def _merge_variant(text: str, conf: float, transform: str) -> None:
+                    nonlocal ambiguous_total
                     key = text or ""
                     conf_f = float(conf or 0.0)
-                    if key not in variants_map:
+                    created = key not in variants_map
+                    if created:
                         variants_map[key] = {
                             "text": text,
                             "confidence": conf_f,
@@ -2004,8 +2107,15 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                         rec = variants_map[key]
                         if conf_f > rec.get("confidence", 0.0):
                             rec["confidence"] = conf_f
-                        if transform not in rec.get("transforms", []):
-                            rec.setdefault("transforms", []).append(transform)
+                        transforms = rec.setdefault("transforms", [])
+                        if transform not in transforms:
+                            transforms.append(transform)
+                    rec = variants_map[key]
+                    if transform.startswith("engine:"):
+                        engine_name = transform.split(":", 1)[1] if ":" in transform else "unknown"
+                        engine_usage[engine_name or "unknown"] += 1
+                    elif transform.startswith("ambiguous") and created:
+                        ambiguous_total += 1
 
                 base_text, base_conf = toy_ocr_text_from_cell(crop)
                 _merge_variant(base_text, base_conf, "base")
@@ -2024,6 +2134,15 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
+                for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
+                    _merge_variant(txt_ext, conf_ext, transform_ext)
+                seen_ambiguous: Set[str] = set()
+                for candidate in _ambiguous_variants(observed_text) + _ambiguous_variants(base_text):
+                    if not candidate or candidate in seen_ambiguous:
+                        continue
+                    seen_ambiguous.add(candidate)
+                    conf_guess = max(observed_conf, base_conf, 0.52)
+                    _merge_variant(candidate, conf_guess, "ambiguous_map")
                 if rotate:
                     for angle in (-2.5, -1.0, 1.0, 2.5):
                         try:
@@ -2102,6 +2221,9 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
     except Exception as exc:
         summary["error"] = f"reanalyze_failed: {exc}"
         records = []
+
+    summary["ambiguous_variants"] = int(ambiguous_total)
+    summary["external_engines"] = {k: int(v) for k, v in sorted(engine_usage.items()) if v}
 
     if records:
         summary["output_jsonl"] = output_jsonl
