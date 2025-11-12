@@ -91,7 +91,7 @@ from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
-from collections import Counter, defaultdict, OrderedDict
+from collections import Counter, defaultdict, OrderedDict, deque
 
 try:
     import numpy as np
@@ -1111,8 +1111,134 @@ def _threshold_memory_store(key: Tuple[int, int, int], value: int) -> None:
         _THRESHOLD_MEMORY[key] = int(value)
     _threshold_memory_trim(_THRESHOLD_MEMORY_LIMIT)
 
-_NGRAM_COUNTS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-_NGRAM_TOTALS: Dict[str, int] = defaultdict(int)
+
+def _glyph_signature(arr: "np.ndarray") -> Optional[Tuple[int, int, str]]:
+    try:
+        if arr.ndim != 2:
+            return None
+        h, w = arr.shape
+        if h <= 0 or w <= 0:
+            return None
+        digest = hashlib.sha1(arr.tobytes()).hexdigest()
+        return (int(h), int(w), digest)
+    except Exception:
+        return None
+
+
+def _glyph_runtime_trim(limit: int) -> None:
+    if limit <= 0:
+        if _GLYPH_RUNTIME_CACHE:
+            _GLYPH_RUNTIME_CACHE.clear()
+        return
+    while len(_GLYPH_RUNTIME_CACHE) > limit:
+        _GLYPH_RUNTIME_CACHE.popitem(last=False)
+
+
+def _glyph_pending_trim(limit: int) -> None:
+    if limit <= 0:
+        if _GLYPH_RUNTIME_PENDING:
+            _GLYPH_RUNTIME_PENDING.clear()
+        return
+    while len(_GLYPH_RUNTIME_PENDING) > limit:
+        _GLYPH_RUNTIME_PENDING.popleft()
+
+
+def _glyph_runtime_lookup(sig: Optional[Tuple[int, int, str]]) -> Optional[Tuple[str, float]]:
+    if sig is None:
+        _GLYPH_RUNTIME_STATS["cache_miss"] += 1.0
+        return None
+    rec = _GLYPH_RUNTIME_CACHE.get(sig)
+    if rec is None:
+        _GLYPH_RUNTIME_STATS["cache_miss"] += 1.0
+        return None
+    try:
+        _GLYPH_RUNTIME_CACHE.move_to_end(sig)
+    except Exception:
+        pass
+    _GLYPH_RUNTIME_STATS["cache_hit"] += 1.0
+    text = rec.get("text")
+    conf = rec.get("confidence")
+    if isinstance(text, str) and isinstance(conf, (int, float)):
+        return text, float(conf)
+    return None
+
+
+def _glyph_runtime_store(sig: Optional[Tuple[int, int, str]], text: str, conf: float) -> None:
+    if sig is None:
+        return
+    if not isinstance(text, str):
+        return
+    _GLYPH_RUNTIME_CACHE[sig] = {"text": text, "confidence": float(conf)}
+    try:
+        _GLYPH_RUNTIME_CACHE.move_to_end(sig)
+    except Exception:
+        pass
+    _glyph_runtime_trim(_GLYPH_RUNTIME_CACHE_LIMIT)
+    _GLYPH_RUNTIME_STATS["cache_size"] = float(len(_GLYPH_RUNTIME_CACHE))
+
+
+def _glyph_pending_enqueue(sig: Optional[Tuple[int, int, str]], arr: "np.ndarray", baseline_conf: float) -> None:
+    if sig is None:
+        return
+    try:
+        arr_u8 = np.asarray(arr, dtype=np.uint8)
+    except Exception:
+        return
+    if arr_u8.size == 0:
+        return
+    _GLYPH_RUNTIME_PENDING.append({
+        "sig": sig,
+        "arr": arr_u8.copy(),
+        "confidence": float(baseline_conf),
+    })
+    _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
+    if len(_GLYPH_RUNTIME_PENDING) > _GLYPH_RUNTIME_PENDING_LIMIT:
+        _glyph_pending_trim(_GLYPH_RUNTIME_PENDING_LIMIT)
+
+
+def _glyph_runtime_replay(limit: int = 8) -> int:
+    if not _GLYPH_RUNTIME_PENDING:
+        return 0
+    processed = 0
+    improved = 0
+    survivors: "deque[Dict[str, Any]]" = deque()
+    while _GLYPH_RUNTIME_PENDING and processed < max(1, limit):
+        rec = _GLYPH_RUNTIME_PENDING.popleft()
+        processed += 1
+        sig = rec.get("sig")
+        arr = rec.get("arr")
+        baseline_conf = float(rec.get("confidence", 0.0))
+        if sig is None or arr is None:
+            continue
+        try:
+            img = Image.fromarray(np.asarray(arr, dtype=np.uint8), mode="L")
+        except Exception:
+            continue
+        ch, conf = _match_glyph(img, _GLYPH_ATLAS)
+        if ch and ch != "?" and conf >= baseline_conf + 0.05:
+            _glyph_runtime_store(sig, ch, conf)
+            improved += 1
+        else:
+            survivors.append(rec)
+    if survivors:
+        survivors.extend(_GLYPH_RUNTIME_PENDING)
+        _GLYPH_RUNTIME_PENDING.clear()
+        _GLYPH_RUNTIME_PENDING.extend(survivors)
+    _glyph_pending_trim(_GLYPH_RUNTIME_PENDING_LIMIT)
+    _GLYPH_RUNTIME_STATS["replay_attempts"] += float(processed)
+    _GLYPH_RUNTIME_STATS["replay_improved"] += float(improved)
+    _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
+    return improved
+
+_NGRAM_COUNTS: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+_NGRAM_TOTALS: Dict[str, float] = defaultdict(float)
+_NGRAM_DECAY_ALPHA = float(os.environ.get("ZOCR_NGRAM_EMA_ALPHA", "0.05") or 0.0)
+
+_GLYPH_RUNTIME_CACHE_LIMIT = int(os.environ.get("ZOCR_GLYPH_CACHE_LIMIT", "384") or 0)
+_GLYPH_RUNTIME_PENDING_LIMIT = int(os.environ.get("ZOCR_GLYPH_PENDING_LIMIT", "256") or 0)
+_GLYPH_RUNTIME_CACHE: "OrderedDict[Tuple[int, int, str], Dict[str, Any]]" = OrderedDict()
+_GLYPH_RUNTIME_PENDING: "deque[Dict[str, Any]]" = deque()
+_GLYPH_RUNTIME_STATS: Dict[str, float] = defaultdict(float)
 
 
 def _blank_recognition_stats() -> Dict[str, Any]:
@@ -1134,6 +1260,9 @@ _TOY_RECOGNITION_STATS: Dict[str, Any] = _blank_recognition_stats()
 def reset_toy_recognition_stats() -> None:
     global _TOY_RECOGNITION_STATS
     _TOY_RECOGNITION_STATS = _blank_recognition_stats()
+    _GLYPH_RUNTIME_STATS.clear()
+    _GLYPH_RUNTIME_STATS["cache_size"] = float(len(_GLYPH_RUNTIME_CACHE))
+    _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
 
 
 def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal: float) -> None:
@@ -1180,6 +1309,13 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
             for ex in stats.get("examples", [])[:12]
         ],
     }
+    result["runtime_cache_hits"] = int(_GLYPH_RUNTIME_STATS.get("cache_hit", 0))
+    result["runtime_cache_misses"] = int(_GLYPH_RUNTIME_STATS.get("cache_miss", 0))
+    result["runtime_cache_size"] = int(len(_GLYPH_RUNTIME_CACHE))
+    result["runtime_pending"] = int(len(_GLYPH_RUNTIME_PENDING))
+    result["runtime_replay_attempts"] = int(_GLYPH_RUNTIME_STATS.get("replay_attempts", 0))
+    result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
+    result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
     if reset:
         reset_toy_recognition_stats()
     return result
@@ -1204,7 +1340,7 @@ _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
 def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
     arr_f = np.asarray(arr, dtype=np.float32)
     if arr_f.size == 0:
-        return {"aspect": 1.0, "density": 0.0, "symmetry": 0.0, "count": 0}
+        return {"aspect": 1.0, "density": 0.0, "symmetry": 0.0, "style_var": 0.0, "count": 0}
     if arr_f.max() > 1.5:
         arr_f = arr_f / 255.0
     h, w = arr_f.shape
@@ -1212,7 +1348,13 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
     density = float(arr_f.mean())
     flipped = np.flip(arr_f, axis=1) if arr_f.ndim == 2 else arr_f
     symmetry = 1.0 - float(np.mean(np.abs(arr_f - flipped))) if arr_f.size else 0.0
-    return {"aspect": aspect, "density": density, "symmetry": symmetry, "count": 1}
+    if arr_f.ndim == 2:
+        row_profile = arr_f.mean(axis=1)
+        col_profile = arr_f.mean(axis=0)
+        style_var = float(np.var(row_profile) + np.var(col_profile))
+    else:
+        style_var = 0.0
+    return {"aspect": aspect, "density": density, "symmetry": symmetry, "style_var": style_var, "count": 1}
 
 def _render_glyphs(font=None, size=16):
     # PIL's default bitmap font via ImageFont.load_default() matches our demo
@@ -1247,7 +1389,7 @@ def _toy_memory_snapshot_internal() -> Dict[str, Any]:
         if mapping:
             ngram_contexts += 1
             ngram_transitions += len(mapping)
-    ngram_observations = int(sum(_NGRAM_TOTALS.values()))
+    ngram_observations = float(sum(_NGRAM_TOTALS.values()))
     snapshot: Dict[str, Any] = {
         "glyph_chars": int(glyph_chars),
         "glyph_variants": int(glyph_variants),
@@ -1256,6 +1398,8 @@ def _toy_memory_snapshot_internal() -> Dict[str, Any]:
         "ngram_transitions": int(ngram_transitions),
         "ngram_observations": ngram_observations,
         "avg_ngram_branching": float(ngram_transitions / ngram_contexts) if ngram_contexts else 0.0,
+        "runtime_cache": int(len(_GLYPH_RUNTIME_CACHE)),
+        "runtime_pending": int(len(_GLYPH_RUNTIME_PENDING)),
     }
     return snapshot
 
@@ -1308,6 +1452,7 @@ def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
             "aspect": float(feats.get("aspect", 1.0)),
             "density": float(feats.get("density", 0.0)),
             "symmetry": float(feats.get("symmetry", 0.0)),
+            "style_var": float(feats.get("style_var", 0.0)),
             "count": int(feats.get("count", 1)),
         }
         payload["glyph_feats"][ch] = safe
@@ -1316,8 +1461,8 @@ def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
             continue
         items = sorted(mapping.items(), key=lambda kv: kv[1], reverse=True)
         trimmed = items[:limit_ngram]
-        payload["ngram_counts"][prev] = {ch: int(count) for ch, count in trimmed if count}
-    payload["ngram_totals"] = {prev: int(total) for prev, total in _NGRAM_TOTALS.items() if total}
+        payload["ngram_counts"][prev] = {ch: float(count) for ch, count in trimmed if count}
+    payload["ngram_totals"] = {prev: float(total) for prev, total in _NGRAM_TOTALS.items() if total}
     return payload
 
 
@@ -1388,6 +1533,7 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
                     "aspect": float(feats.get("aspect", 1.0)),
                     "density": float(feats.get("density", 0.0)),
                     "symmetry": float(feats.get("symmetry", 0.0)),
+                    "style_var": float(feats.get("style_var", 0.0)),
                     "count": int(feats.get("count", len(_GLYPH_ATLAS.get(ch, [])) or 1)),
                 }
                 _GLYPH_FEATS[ch] = safe
@@ -1396,19 +1542,22 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
             for prev, mapping in counts_payload.items():
                 if not isinstance(mapping, dict):
                     continue
-                target = _NGRAM_COUNTS.setdefault(prev, defaultdict(int))
+                target = _NGRAM_COUNTS.setdefault(prev, defaultdict(float))
                 for ch, val in mapping.items():
                     try:
-                        target[ch] += int(val)
-                        changed = True
+                        new_val = float(val)
                     except Exception:
                         continue
+                    if new_val <= 0:
+                        continue
+                    target[ch] = max(target.get(ch, 0.0), new_val)
+                    changed = True
         totals_payload = payload.get("ngram_totals", {})
         if isinstance(totals_payload, dict):
             for prev, total in totals_payload.items():
                 try:
-                    current = _NGRAM_TOTALS.get(prev, 0)
-                    new_total = int(total)
+                    current = float(_NGRAM_TOTALS.get(prev, 0.0))
+                    new_total = float(total)
                     if new_total > current:
                         _NGRAM_TOTALS[prev] = new_total
                         changed = True
@@ -1432,14 +1581,20 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
 def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
     if not feats:
         return
-    cur = _GLYPH_FEATS.setdefault(ch, {"aspect": feats.get("aspect", 1.0),
-                                        "density": feats.get("density", 0.0),
-                                        "symmetry": feats.get("symmetry", 0.0),
-                                        "count": feats.get("count", 1) or 1})
+    cur = _GLYPH_FEATS.setdefault(
+        ch,
+        {
+            "aspect": feats.get("aspect", 1.0),
+            "density": feats.get("density", 0.0),
+            "symmetry": feats.get("symmetry", 0.0),
+            "style_var": feats.get("style_var", 0.0),
+            "count": feats.get("count", 1) or 1,
+        },
+    )
     count = max(1, int(cur.get("count", 1)))
     new_count = min(_GLYPH_VARIANT_LIMIT, count + 1)
     alpha = 1.0 / float(min(count + 1, _GLYPH_VARIANT_LIMIT))
-    for key in ("aspect", "density", "symmetry"):
+    for key in ("aspect", "density", "symmetry", "style_var"):
         current_val = cur.get(key, feats.get(key, 0.0))
         target_val = feats.get(key, current_val)
         cur[key] = current_val + (target_val - current_val) * alpha
@@ -1467,6 +1622,9 @@ def _adapt_glyph(ch: str, img: "Image.Image") -> None:
         atlas_list.pop(0)
     feats = _compute_glyph_features_from_array(arr)
     _blend_glyph_features(ch, feats)
+    _GLYPH_RUNTIME_STATS["learned_variants"] += 1.0
+    if _GLYPH_RUNTIME_PENDING:
+        _glyph_runtime_replay()
 
 def _generate_contextual_variants(text: str) -> Set[str]:
     variants: Set[str] = set()
@@ -1603,9 +1761,24 @@ def _update_ngram_model(text: str) -> None:
     if not text:
         return
     prev = "\0"
+    decay = float(_NGRAM_DECAY_ALPHA)
+    decay = 0.0 if math.isnan(decay) else max(0.0, min(0.95, decay))
     for ch in text:
-        _NGRAM_COUNTS[prev][ch] += 1
-        _NGRAM_TOTALS[prev] += 1
+        mapping = _NGRAM_COUNTS[prev]
+        if decay > 0.0 and mapping:
+            factor = 1.0 - decay
+            to_delete: List[str] = []
+            for key, val in list(mapping.items()):
+                new_val = float(val) * factor
+                if new_val < 1e-4:
+                    to_delete.append(key)
+                else:
+                    mapping[key] = new_val
+            for key in to_delete:
+                mapping.pop(key, None)
+        mapping[ch] = float(mapping.get(ch, 0.0) + 1.0)
+        total = float(sum(mapping.values())) if mapping else 0.0
+        _NGRAM_TOTALS[prev] = total
         prev = ch
 
 def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> List[Tuple["np.ndarray", Dict[str, Any]]]:
@@ -2000,6 +2173,13 @@ def _match_glyph(cell_bin, atlas):
     cell_norm = (cell_arr - cell_arr.mean()) / (cell_arr.std() + 1e-6)
     cell_density = float((cell_arr > 0).mean())
     cell_aspect = float(cw) / float(ch or 1)
+    cell_scaled = cell_arr / 255.0 if cell_arr.max() > 1.5 else cell_arr
+    if cell_scaled.ndim == 2 and cell_scaled.size:
+        row_profile = cell_scaled.mean(axis=1)
+        col_profile = cell_scaled.mean(axis=0)
+        cell_style = float(_np.var(row_profile) + _np.var(col_profile))
+    else:
+        cell_style = 0.0
     best_ch, best_score = "", -1.0
     for ch_key, tpl in atlas.items():
         tpl_list = tpl if isinstance(tpl, (list, tuple)) else [tpl]
@@ -2025,6 +2205,7 @@ def _match_glyph(cell_bin, atlas):
         glyph_aspect = feats.get("aspect", 1.0) or 1.0
         glyph_density = feats.get("density", 0.5)
         glyph_sym = feats.get("symmetry", 0.0)
+        glyph_style = feats.get("style_var", 0.0)
         aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
         density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
         if glyph_sym > 0.5:
@@ -2032,7 +2213,8 @@ def _match_glyph(cell_bin, atlas):
             symmetry_penalty = 0.8 + 0.2 * max(0.0, sym_cell)
         else:
             symmetry_penalty = 1.0
-        variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty
+        style_penalty = 1.0 - min(0.35, abs(cell_style - glyph_style) * 0.8)
+        variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty * max(0.45, style_penalty)
         if variant_best > best_score:
             best_score = variant_best
             best_ch = ch_key
@@ -2105,10 +2287,33 @@ def _text_from_binary(bw):
     text = []
     scores = []
     for (x1, y1, x2, y2, _) in refined:
-        patch = Image.fromarray(bw[y1:y2, x1:x2])
-        ch, sc = _match_glyph(patch, atlas)
+        sub = bw[y1:y2, x1:x2]
+        if sub.size == 0:
+            continue
+        try:
+            arr = np.asarray(sub, dtype=np.uint8)
+        except Exception:
+            arr = sub
+        sig = _glyph_signature(arr)
+        cached = _glyph_runtime_lookup(sig)
+        if cached is not None:
+            ch, sc = cached
+        else:
+            try:
+                patch = Image.fromarray(arr, mode="L")
+            except Exception:
+                patch = Image.fromarray(sub)
+            ch, sc = _match_glyph(patch, atlas)
+            _glyph_runtime_store(sig, ch, sc)
+            if not ch or ch == "?" or sc < 0.6:
+                _glyph_pending_enqueue(sig, arr, sc)
         if ch and ch != "?" and sc > 0.6:
-            _adapt_glyph(ch, patch)
+            try:
+                patch_img = Image.fromarray(arr, mode="L")
+            except Exception:
+                patch_img = None
+            if patch_img is not None:
+                _adapt_glyph(ch, patch_img)
         text.append(ch)
         scores.append(sc)
     if not text:
