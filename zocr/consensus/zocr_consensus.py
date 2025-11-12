@@ -13,7 +13,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
 from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
 from collections import Counter, defaultdict
