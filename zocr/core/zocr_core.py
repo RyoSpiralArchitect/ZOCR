@@ -1612,13 +1612,14 @@ def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_sc
     amt = float(amount_score) if amount_score is not None else 0.0
     dt = float(date_score) if date_score is not None else None
     if resolved in _INVOICE_GATE_DOMAINS:
-        if amt >= 0.8:
-            note = "amount+date hit" if dt is not None and dt >= 0.5 else "amount hit (date optional)"
-            return True, note, amt
-        if amt >= 0.7 and (dt is None or dt >= 0.3):
-            note = "amount hit (date optional)" if dt is None or dt < 0.5 else "amount+date hit"
-            return True, note, amt
-        return False, "amount below gate", amt
+        if dt is None:
+            return False, "date missing", min(amt, 0.0)
+        if amt < 0.8:
+            return False, "amount below gate", amt
+        if dt < 0.5:
+            return False, "date below gate", dt
+        score = min(amt, dt)
+        return True, "amount+date hit", score
     if amount_score is None or date_score is None:
         return False, "insufficient metrics", 0.0
     mean = (float(amount_score) + float(date_score)) / 2.0
@@ -2069,7 +2070,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 corp_total+=1
                 if filt.get("company_canonical"): corp_hits+=1
     low_conf_rate = low/max(1,total)
-    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else None
+    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else 0.0
 
     S_reproc, S_success = _read_views_sets(views_log)
     reprocess_rate = len(S_reproc & lc_keys)/max(1,len(lc_keys)) if lc_keys else 0.0
@@ -2127,7 +2128,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 tax_cov+=1
                 if abs(int(filt["tax_amount"])-int(filt["tax_amount_expected"]))>1:
                     tax_fail+=1
-    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else None
+    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else 0.0
 
     p95=None
     agg=os.path.join(os.path.dirname(jsonl),"metrics_aggregate.csv")
@@ -2147,7 +2148,9 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
          "domain": domain or "auto",
          "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
          "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
-         "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95,
+         "tax_fail_rate":tax_fail_rate,"tax_coverage":tax_cov,
+         "corporate_match_rate":corporate_match_rate,"corporate_coverage":corp_total,
+         "p95_ms":p95,
          "trust_amount":trust_amount,"trust_date":trust_date,"trust_mean":trust_mean,
          "gate_pass":gate_pass,"gate_reason":gate_reason,"gate_score":gate_score}
     hdr=not os.path.exists(out_csv)
@@ -2192,7 +2195,8 @@ def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile
         numeric_keys = [
             "low_conf_rate", "reprocess_rate", "reprocess_success_rate",
             "hit_amount", "hit_date", "hit_mean", "p95_ms", "tax_fail_rate",
-            "corporate_match_rate", "trust_amount", "trust_date", "trust_mean",
+            "tax_coverage", "corporate_match_rate", "corporate_coverage",
+            "trust_amount", "trust_date", "trust_mean",
         ]
         for key in numeric_keys:
             if key in metrics:
