@@ -12,7 +12,7 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob
 from typing import Any, Dict, List, Optional
 from html import escape
 
@@ -63,6 +63,7 @@ def _json_ready(obj: Any):
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
 def _is_auto_domain(value: Optional[str]) -> bool:
@@ -580,16 +581,41 @@ def _write_pipeline_meta(outdir: str, seed: int):
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def _collect_pages(inputs: List[str], dpi: int) -> List[str]:
-    pages = []
-    for it in inputs:
-        ext = os.path.splitext(it)[1].lower()
+    pages: List[str] = []
+    def _handle_path(path: str):
+        nonlocal pages
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()
+                for fn in sorted(files):
+                    full = os.path.join(root, fn)
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext == ".pdf":
+                        try:
+                            pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(full, dpi=dpi))
+                        except Exception as e:
+                            raise RuntimeError(f"PDF rasterization failed for {full}: {e}")
+                    elif ext in _IMAGE_EXTS:
+                        pages.append(full)
+            return
+        ext = os.path.splitext(path)[1].lower()
         if ext == ".pdf":
             try:
-                pages += zocr_onefile_consensus.pdf_to_images_via_poppler(it, dpi=dpi)
+                pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(path, dpi=dpi))
             except Exception as e:
-                raise RuntimeError(f"PDF rasterization failed for {it}: {e}")
-        else:
-            pages.append(it)
+                raise RuntimeError(f"PDF rasterization failed for {path}: {e}")
+        elif ext in _IMAGE_EXTS or not ext:
+            pages.append(path)
+
+    for raw in inputs:
+        candidates = [raw]
+        if any(ch in raw for ch in "*?[]"):
+            candidates = sorted(glob.glob(raw)) or [raw]
+        for cand in candidates:
+            if os.path.exists(cand):
+                _handle_path(cand)
+            else:
+                pages.append(cand)
     return pages
 
 def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:

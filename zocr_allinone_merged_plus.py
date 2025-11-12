@@ -88,8 +88,8 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math
-from typing import Any, Dict, List, Optional, Tuple
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re
+from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
 from collections import Counter
 
@@ -101,10 +101,22 @@ except Exception:
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
 from html.parser import HTMLParser
 
+_thomas = None
 try:
-    from zocr_multidomain_core import thomas_tridiag as _thomas
+    from zocr.core import zocr_core as _core_mod  # type: ignore
 except Exception:
-    _thomas = None
+    _core_mod = None
+else:
+    _thomas = getattr(_core_mod, "thomas_tridiag", None)
+
+if _thomas is None:
+    try:
+        from zocr_multidomain_core import thomas_tridiag as _thomas  # type: ignore
+    except Exception:
+        _thomas = None
+
+if __name__.startswith("zocr."):
+    sys.modules.setdefault("zocr_onefile_consensus", sys.modules[__name__])
 
 # ----------------- Utils -----------------
 def ensure_dir(p: str) -> None:
@@ -1022,6 +1034,35 @@ def _render_glyphs(font=None, size=16):
         atlas[ch] = crop
     return atlas
 
+_GLYPH_ATLAS = _render_glyphs()
+
+_TOTAL_LABEL_HINTS = [
+    "total", "grandtotal", "amountdue", "balancedue", "totaldue", "subtotal",
+    "totaltax", "totaltaxes", "totals", "dueamount", "amountpayable",
+    "合計", "総計", "総額", "小計", "税込合計", "税込総額", "請求額", "ご請求額", "支払金額", "合算", "合計金額"
+]
+_TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
+_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
+
+def _normalize_total_token(text: str) -> str:
+    base = (text or "").lower()
+    base = re.sub(r"[\s:_\-]+", "", base)
+    return base
+
+def _is_total_row(cells: List[str]) -> bool:
+    joined = _normalize_total_token(" ".join(cells))
+    if any(tok in joined for tok in _TOTAL_LABEL_HINTS):
+        return True
+    for cell in cells[:3]:
+        norm = _normalize_total_token(cell)
+        if not norm:
+            continue
+        if norm in _TOTAL_LABEL_HINTS:
+            return True
+        if any(norm.startswith(pref) for pref in _TOTAL_PREFIXES):
+            return True
+    return False
+
 def _resize_keep_ar(im, w, h):
     im = im.convert("L")
     iw, ih = im.size
@@ -1052,28 +1093,79 @@ def _match_glyph(cell_bin, atlas):
     conf = (best_score+1)/2  # [-1,1] -> [0,1]
     return (best_ch if conf>=0.52 else "?"), float(conf)
 
-def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[str, float]:
-    """Very small OCR to work with the demo font. Returns (text, confidence)."""
-    # binarize
-    g = ImageOps.grayscale(crop_img)
-    # simple threshold by Otsu-like heuristic (median)
+def _otsu_threshold(arr):
     import numpy as _np
-    arr = _np.asarray(g, dtype=_np.uint8)
-    thr = int(_np.clip(_np.median(arr), 64, 192))
-    bw = (arr < thr).astype(_np.uint8)*255
-    # CC via our RLE CC (reuse by converting to np)
+    hist = _np.bincount(arr.reshape(-1), minlength=256).astype(_np.float64)
+    total = hist.sum()
+    if total <= 0:
+        return int(_np.median(arr))
+    sum_total = _np.dot(hist, _np.arange(256, dtype=_np.float64))
+    weight_bg = 0.0
+    sum_bg = 0.0
+    var_max = -1.0
+    threshold = int(_np.median(arr))
+    for i in range(256):
+        weight_bg += hist[i]
+        if weight_bg <= 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg <= 0:
+            break
+        sum_bg += hist[i] * i
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+        var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var_between > var_max:
+            var_max = var_between
+            threshold = i
+    return int(threshold)
+
+def _text_from_binary(bw):
     cc = _cc_label_rle(bw)
-    cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]  # drop tiny specks
+    cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
+    if not cc:
+        return "", 0.0
     cc.sort(key=lambda b: b[0])
-    atlas = _render_glyphs()
-    text = []; scores = []
-    for (x1,y1,x2,y2,_) in cc:
+    atlas = _GLYPH_ATLAS
+    text = []
+    scores = []
+    for (x1, y1, x2, y2, _) in cc:
         patch = Image.fromarray(bw[y1:y2, x1:x2])
         ch, sc = _match_glyph(patch, atlas)
-        text.append(ch); scores.append(sc)
+        text.append(ch)
+        scores.append(sc)
     if not text:
         return "", 0.0
     return "".join(text), float(sum(scores)/len(scores))
+
+def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[str, float]:
+    """Very small OCR to work with the demo font. Returns (text, confidence)."""
+    import numpy as _np
+    g = ImageOps.autocontrast(crop_img.convert("L"))
+    arr = _np.asarray(g, dtype=_np.uint8)
+    thr_med = int(_np.clip(_np.median(arr), 48, 208))
+    bw = (arr < thr_med).astype(_np.uint8) * 255
+    text, conf = _text_from_binary(bw)
+    if text:
+        return text, conf
+    thr_otsu = _otsu_threshold(arr)
+    bw2 = (arr < thr_otsu).astype(_np.uint8) * 255
+    text, conf = _text_from_binary(bw2)
+    if text:
+        return text, conf
+    bw3 = (arr > thr_otsu).astype(_np.uint8) * 255
+    text, conf = _text_from_binary(bw3)
+    if text:
+        return text, conf
+    try:
+        expanded = Image.fromarray(bw).filter(ImageFilter.MaxFilter(3))
+        bw4 = _np.asarray(expanded, dtype=_np.uint8)
+        text, conf = _text_from_binary(bw4)
+        if text:
+            return text, conf
+    except Exception:
+        pass
+    return "", 0.0
 
 def _keywords_from_row(row_cells: list[str]) -> list[str]:
     kws = set()
@@ -1134,6 +1226,11 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                     baselines.extend([[] for _ in range(R - len(baselines))])
                 elif len(baselines) > R:
                     baselines = baselines[:R]
+                table_w = max(1, x2 - x1)
+                table_h = max(1, y2 - y1)
+                pad_edge_x = max(2, int(round(table_w * 0.04)))
+                pad_inner_x = max(1, int(round(table_w * 0.01)))
+                pad_y = max(1, int(round(table_h * 0.02)))
                 # OCR pass across grid
                 grid_text = [["" for _ in range(C)] for __ in range(R)]
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
@@ -1141,14 +1238,44 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]
                         cx2 = x1 + col_bounds[c+1]
+                        left_pad = pad_edge_x if c == 0 else pad_inner_x
+                        right_pad = pad_edge_x if c == C-1 else pad_inner_x
                         cy1, cy2 = row_bands[r]
-                        crop = im.crop((cx1, cy1, cx2, cy2))
+                        crop = im.crop((
+                            max(0, cx1 - left_pad),
+                            max(0, cy1 - pad_y),
+                            min(im.width, cx2 + right_pad),
+                            min(im.height, cy2 + pad_y)
+                        ))
                         if ocr_engine=="toy":
                             txt, conf = toy_ocr_text_from_cell(crop)
                         else:
                             txt, conf = ("", 0.0)
                         grid_text[r][c] = txt
                         grid_conf[r][c] = conf
+                footer_rows: Set[int] = set()
+                fallback_notes: Dict[Tuple[int, int], str] = {}
+                for r in range(R):
+                    if _is_total_row(grid_text[r]):
+                        footer_rows.add(r)
+                        has_numeric = any(_NUMERIC_RX.search(grid_text[r][c] or "") for c in range(C))
+                        if not has_numeric and C > 0:
+                            target_col = C-1
+                            cy1, cy2 = row_bands[r]
+                            cx1 = x1 + col_bounds[target_col]
+                            cx2 = x1 + col_bounds[target_col+1] + pad_edge_x * 2
+                            crop = im.crop((
+                                max(0, cx1 - pad_inner_x),
+                                max(0, cy1 - pad_y),
+                                min(im.width, cx2),
+                                min(im.height, cy2 + pad_y)
+                            ))
+                            alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
+                            m = _NUMERIC_RX.search(alt_txt or "")
+                            if m:
+                                grid_text[r][target_col] = m.group(0)
+                                grid_conf[r][target_col] = max(grid_conf[r][target_col], alt_conf)
+                                fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
                 headers = grid_text[0] if contextual else []
                 for r in range(R):
@@ -1162,6 +1289,18 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
                         kws = _keywords_from_row(row_texts) if contextual and r>0 else []
                         low_conf = (conf is not None and conf < ocr_min_conf)
+                        trace_id = f"page={pidx},table={ti},row={r},col={c}"
+                        filters = {
+                            "has_currency": ("currency" in kws),
+                            "row_index": r,
+                            "col_index": c,
+                            "trace_id": trace_id
+                        }
+                        if r in footer_rows:
+                            filters["row_role"] = "footer"
+                        note = fallback_notes.get((r, c))
+                        if note:
+                            filters["linked"] = note
                         rec = {
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
@@ -1175,12 +1314,12 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                                 "keywords": kws,
                                 "confidence": conf,
                                 "low_conf": bool(low_conf),
-                                "filters": {
-                                    "has_currency": ("currency" in kws),
-                                    "row_index": r, "col_index": c
-                                }
+                                "trace": trace_id,
+                                "filters": filters
                             }
                         }
+                        if note:
+                            rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         count += 1
     return count
@@ -3550,17 +3689,27 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob
 from typing import Any, Dict, List, Optional
 from html import escape
-
-import zocr_onefile_consensus
-import zocr_multidomain_core
 
 try:
     import numpy as _np  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     _np = None  # type: ignore
+
+try:
+    from ..consensus import zocr_consensus as zocr_onefile_consensus  # type: ignore
+except Exception:
+    import zocr_onefile_consensus  # type: ignore
+
+try:
+    from ..core import zocr_core as zocr_multidomain_core  # type: ignore
+except Exception:
+    import zocr_multidomain_core  # type: ignore
+
+if __name__.startswith("zocr."):
+    sys.modules.setdefault("zocr_pipeline_allinone", sys.modules[__name__])
 
 PLUGINS = {}
 def register(stage):
@@ -3591,6 +3740,7 @@ def _json_ready(obj: Any):
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
 def _is_auto_domain(value: Optional[str]) -> bool:
@@ -3668,7 +3818,6 @@ def _apply_domain_defaults(prof: Dict[str, Any], domain: Optional[str]) -> None:
     prof.setdefault("domain", domain)
     if prof.get("w_bm25") is None:
         prof["w_bm25"] = 1.0
-
 def _read_ok_steps(outdir: str) -> set:
     path = os.path.join(outdir, "pipeline_history.jsonl")
     done = set()
@@ -3776,9 +3925,7 @@ def _render_table(data: Dict[str, Any], title: str, keys: Optional[List[str]] = 
 def _render_history_table(records: List[Dict[str, Any]]) -> str:
     if not records:
         return "<p class=\"muted\">(no history recorded)</p>"
-    header = (
-        "<thead><tr><th>timestamp</th><th>step</th><th>status</th><th>elapsed</th><th>note</th></tr></thead>"
-    )
+    header = "<thead><tr><th>timestamp</th><th>step</th><th>status</th><th>elapsed</th><th>note</th></tr></thead>"
     body_rows = []
     for rec in records:
         status = "ok" if rec.get("ok") else ("fail" if rec.get("ok") is False else "skip")
@@ -3794,9 +3941,8 @@ def _render_history_table(records: List[Dict[str, Any]]) -> str:
             elapsed_s = escape(str(elapsed)) if elapsed is not None else "–"
         note = rec.get("error") or ""
         out = rec.get("out")
-        if not note and isinstance(out, dict):
-            if out.get("path"):
-                note = str(out.get("path"))
+        if not note and isinstance(out, dict) and out.get("path"):
+            note = str(out.get("path"))
         body_rows.append(
             "<tr class=\"{cls}\"><td>{ts}</td><td>{step}</td><td><span class=\"badge {cls}\">{status}</span></td><td>{elapsed}</td><td>{note}</td></tr>".format(
                 cls=cls,
@@ -4112,16 +4258,41 @@ def _write_pipeline_meta(outdir: str, seed: int):
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def _collect_pages(inputs: List[str], dpi: int) -> List[str]:
-    pages = []
-    for it in inputs:
-        ext = os.path.splitext(it)[1].lower()
+    pages: List[str] = []
+    def _handle_path(path: str):
+        nonlocal pages
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()
+                for fn in sorted(files):
+                    full = os.path.join(root, fn)
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext == ".pdf":
+                        try:
+                            pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(full, dpi=dpi))
+                        except Exception as e:
+                            raise RuntimeError(f"PDF rasterization failed for {full}: {e}")
+                    elif ext in _IMAGE_EXTS:
+                        pages.append(full)
+            return
+        ext = os.path.splitext(path)[1].lower()
         if ext == ".pdf":
             try:
-                pages += zocr_onefile_consensus.pdf_to_images_via_poppler(it, dpi=dpi)
+                pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(path, dpi=dpi))
             except Exception as e:
-                raise RuntimeError(f"PDF rasterization failed for {it}: {e}")
-        else:
-            pages.append(it)
+                raise RuntimeError(f"PDF rasterization failed for {path}: {e}")
+        elif ext in _IMAGE_EXTS or not ext:
+            pages.append(path)
+
+    for raw in inputs:
+        candidates = [raw]
+        if any(ch in raw for ch in "*?[]"):
+            candidates = sorted(glob.glob(raw)) or [raw]
+        for cand in candidates:
+            if os.path.exists(cand):
+                _handle_path(cand)
+            else:
+                pages.append(cand)
     return pages
 
 def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:
@@ -4226,7 +4397,7 @@ def _patched_run_full_pipeline(
         except Exception:
             selected_confidence = None
     summary["domain_autodetect"] = domain_auto_summary
-
+    
     if "OCR" in ok:
         print("[SKIP] OCR (resume)")
         try:
@@ -4438,7 +4609,6 @@ def _patched_run_full_pipeline(
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
-
     try:
         _generate_report(outdir, dest=report_path, summary=summary, history=history_records, meta=_read_meta(outdir))
     except Exception as e:
