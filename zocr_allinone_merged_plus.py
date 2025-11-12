@@ -4372,6 +4372,59 @@ _DOMAIN_ALIAS = {
     "boarding_pass": "boarding_pass_en"
 }
 
+_DOMAIN_HEADER_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
+    "invoice_jp_v2": [
+        ("請求書", 1.2),
+        ("請求書番号", 0.8),
+        ("合計", 0.8),
+        ("消費税", 0.75),
+        ("小計", 0.6),
+        ("請求日", 0.55),
+        ("発行日", 0.55),
+    ],
+    "invoice": [
+        ("invoice", 1.0),
+        ("total", 0.8),
+        ("tax", 0.7),
+        ("subtotal", 0.6),
+        ("due date", 0.55),
+    ],
+    "invoice_en": [
+        ("invoice", 1.1),
+        ("total", 0.85),
+        ("tax", 0.75),
+        ("subtotal", 0.65),
+        ("due date", 0.55),
+    ],
+    "invoice_fr": [
+        ("facture", 1.1),
+        ("total", 0.85),
+        ("tva", 0.75),
+        ("sous-total", 0.6),
+    ],
+}
+
+_HEADER_CONCEPT_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
+    "header:total": [
+        ("invoice_jp_v2", 0.6),
+        ("invoice_en", 0.55),
+        ("invoice", 0.55),
+        ("invoice_fr", 0.5),
+    ],
+    "header:tax": [
+        ("invoice_jp_v2", 0.6),
+        ("invoice_en", 0.55),
+        ("invoice", 0.55),
+        ("invoice_fr", 0.45),
+    ],
+    "header:subtotal": [
+        ("invoice_jp_v2", 0.5),
+        ("invoice_en", 0.45),
+        ("invoice", 0.45),
+        ("invoice_fr", 0.4),
+    ],
+}
+
 DOMAIN_SUGGESTED_QUERIES = {
     "invoice_jp_v2": ["合計 金額", "消費税", "支払期日", "請求先 住所"],
     "invoice_en": ["total amount", "tax amount", "due date", "billing address"],
@@ -4421,11 +4474,21 @@ def _normalize_text(val: Optional[Any]) -> str:
         return ""
     return re.sub(r"\s+", " ", val)
 
-def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
+def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[Sequence[Any]] = None) -> Tuple[str, Dict[str, Any]]:
     scores: Dict[str, float] = {k: 0.0 for k in DOMAIN_KW.keys()}
     hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
     token_hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
+    header_hits: Dict[str, int] = {}
+    concept_hits: Dict[str, int] = {}
+    token_source_hits: Dict[str, Dict[str, int]] = {}
     total_cells = 0
+    header_samples: List[List[str]] = []
+
+    def _bump_token_source(dom: str, origin: Optional[str]) -> None:
+        key = (origin or "unknown").strip().lower() or "unknown"
+        bucket = token_source_hits.setdefault(key, {})
+        bucket[dom] = bucket.get(dom, 0) + 1
+
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fr:
             for line in fr:
@@ -4452,13 +4515,79 @@ def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]]
                     if score > 0.0:
                         scores[dom] += score
                         hits[dom] += 1
+
+                headers_val = meta.get("headers")
+                header_values: List[str] = []
+                if isinstance(headers_val, (list, tuple)):
+                    for hv in headers_val:
+                        hv_str = str(hv).strip() if hv is not None else ""
+                        if hv_str:
+                            header_values.append(hv_str)
+                if header_values:
+                    if len(header_samples) < 4:
+                        header_samples.append(header_values)
+                    header_joined = " ".join(header_values)
+                    header_joined_lower = header_joined.lower()
+                    for dom, signals in _DOMAIN_HEADER_SIGNALS.items():
+                        for kw, weight in signals:
+                            if not kw:
+                                continue
+                            kw_lower = kw.lower()
+                            if kw in header_joined or kw_lower in header_joined_lower:
+                                scores[dom] += float(weight)
+                                hits[dom] += 1
+                                header_hits[dom] = header_hits.get(dom, 0) + 1
+
+                concepts_val = meta.get("concepts") or []
+                if isinstance(concepts_val, (list, tuple)):
+                    for concept in concepts_val:
+                        concept_key = str(concept or "").strip()
+                        if not concept_key:
+                            continue
+                        for dom, weight in _HEADER_CONCEPT_SIGNALS.get(concept_key, []):
+                            scores[dom] += float(weight)
+                            hits[dom] += 1
+                            concept_hits[dom] = concept_hits.get(dom, 0) + 1
     except FileNotFoundError:
         pass
 
+    normalized_tokens: List[Tuple[str, Optional[str]]] = []
+    token_trace_detail: List[Dict[str, Any]] = []
     if filename_tokens:
+        for entry in filename_tokens:
+            token_raw: Any = None
+            origin: Optional[str] = None
+            path: Optional[str] = None
+            if isinstance(entry, dict):
+                token_raw = entry.get("token")
+                origin = entry.get("source")
+                path = entry.get("path")
+            elif isinstance(entry, (list, tuple)):
+                if not entry:
+                    continue
+                token_raw = entry[0]
+                if len(entry) > 1:
+                    origin = entry[1]
+                if len(entry) > 2:
+                    path = entry[2]
+            else:
+                token_raw = entry
+            token_str = str(token_raw or "").strip()
+            if not token_str:
+                continue
+            token_norm = token_str.lower()
+            normalized_tokens.append((token_norm, origin if isinstance(origin, str) else None))
+            token_trace_detail.append({
+                "token": token_norm,
+                "raw": token_str,
+                "source": origin,
+                "path": path,
+            })
+
+    if normalized_tokens:
         lookup: Dict[str, List[str]] = {}
 
-        def _register(key: str, target: str):
+        def _register(key: str, target: str) -> None:
             key = key.strip().lower()
             if not key:
                 return
@@ -4478,8 +4607,8 @@ def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]]
                 if part:
                     _register(part, target)
 
-        for token in filename_tokens:
-            token_l = (token or "").strip().lower()
+        for token_norm, origin in normalized_tokens:
+            token_l = token_norm.strip()
             if not token_l:
                 continue
             matched = False
@@ -4487,6 +4616,7 @@ def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]]
                 scores[dom] += 0.6
                 hits[dom] += 1
                 token_hits[dom] += 1
+                _bump_token_source(dom, origin)
                 matched = True
             if matched:
                 continue
@@ -4496,6 +4626,7 @@ def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]]
                         scores[dom] += 0.3
                         hits[dom] += 1
                         token_hits[dom] += 1
+                        _bump_token_source(dom, origin)
                     break
 
     def _score_key(dom: str) -> Tuple[float, int]:
@@ -4507,16 +4638,29 @@ def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]]
     resolved = _DOMAIN_ALIAS.get(best_dom, best_dom)
     score_total = sum(max(0.0, s) for s in scores.values())
     confidence = scores.get(best_dom, 0.0) / score_total if score_total > 0 else 0.0
-    detail = {
-        "scores": scores,
-        "hits": hits,
-        "token_hits": token_hits,
+    detail: Dict[str, Any] = {
+        "scores": {k: float(v) for k, v in scores.items()},
+        "hits": {k: int(v) for k, v in hits.items()},
+        "token_hits": {k: int(v) for k, v in token_hits.items()},
         "total_cells": total_cells,
         "resolved": resolved,
         "raw_best": best_dom,
         "confidence": confidence,
         "filename_tokens": filename_tokens or [],
     }
+    if token_trace_detail:
+        detail["filename_token_trace"] = token_trace_detail
+    if token_source_hits:
+        detail["token_hits_by_source"] = {
+            src: {dom: int(val) for dom, val in dom_map.items()}
+            for src, dom_map in token_source_hits.items()
+        }
+    if header_hits:
+        detail["header_hits"] = {k: int(v) for k, v in header_hits.items()}
+    if concept_hits:
+        detail["concept_hits"] = {k: int(v) for k, v in concept_hits.items()}
+    if header_samples:
+        detail["header_samples"] = header_samples
     return resolved, detail
 
 # --------------- Augment (pHash + Filters + λ) ---------------
@@ -5401,10 +5545,20 @@ def _read_gt(gt_jsonl: Optional[str]) -> Dict[str, Set]:
 _INVOICE_GATE_DOMAINS = {"invoice", "invoice_jp_v2", "invoice_en", "invoice_fr"}
 
 
-def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_score: Optional[float]) -> Tuple[bool, str, float]:
-    resolved = _DOMAIN_ALIAS.get(domain or "", domain or "") if '_DOMAIN_ALIAS' in globals() else (domain or "")
+def _evaluate_gate(
+    domain: Optional[str],
+    amount_score: Optional[float],
+    date_score: Optional[float],
+    due_score: Optional[float],
+    corporate_rate: Optional[float],
+    tax_fail_rate: Optional[float],
+) -> Tuple[bool, str, float]:
+    resolved = _DOMAIN_ALIAS.get(domain or "", domain or "")
     amt = float(amount_score) if amount_score is not None else 0.0
     dt = float(date_score) if date_score is not None else None
+    due = float(due_score) if due_score is not None else None
+    corp = float(corporate_rate) if corporate_rate is not None else None
+    tax_fail = float(tax_fail_rate) if tax_fail_rate is not None else None
     if resolved in _INVOICE_GATE_DOMAINS:
         if dt is None:
             return False, "date missing", min(amt, 0.0)
@@ -5412,8 +5566,19 @@ def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_sc
             return False, "amount below gate", amt
         if dt < 0.5:
             return False, "date below gate", dt
-        score = min(amt, dt)
-        return True, "amount+date hit", score
+        if due is None:
+            return False, "due missing", min(amt, dt)
+        if due < 0.4:
+            return False, "due below gate", due
+        if corp is None or corp < 0.6:
+            return False, "corporate match low", corp or 0.0
+        if tax_fail is not None and tax_fail > 0.15:
+            return False, "tax mismatch high", 1.0 - tax_fail
+        components = [amt, dt, due, corp if corp is not None else 1.0]
+        if tax_fail is not None:
+            components.append(max(0.0, 1.0 - tax_fail))
+        score = min(components)
+        return True, "amount+date+due+corp", score
     if amount_score is None or date_score is None:
         return False, "insufficient metrics", 0.0
     mean = (float(amount_score) + float(date_score)) / 2.0
@@ -5898,17 +6063,26 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 elif label == "date" and filt.get("date"):
                     hit = 1
                     good += 1
+                elif label == "due" and (filt.get("due_date") or filt.get("due") or filt.get("payment_due") or filt.get("deadline")):
+                    hit = 1
+                    good += 1
         trust = good / len(res) if res else None
         return hit, trust
     q_amount="合計 金額 消費税 円 2023 2024 2025"
     q_date="請求日 発行日 2023 2024 2025"
+    q_due="支払期日 支払期限 期日 支払日"
     if domain=="contract_jp_v2":
         q_amount="契約金額 代金 支払"
         q_date="契約日 締結日 開始日 終了日"
+        q_due="契約期間 支払期日 締結日"
     hit_amount, trust_amount = _score("amount", q_amount)
     hit_date, trust_date = _score("date", q_date)
-    hit_mean=(hit_amount+hit_date)/2.0
-    trust_vals = [v for v in (trust_amount, trust_date) if v is not None]
+    hit_due, trust_due = _score("due", q_due)
+    metrics = [hit_amount, hit_date]
+    if hit_due is not None:
+        metrics.append(hit_due)
+    hit_mean = sum(metrics)/len(metrics) if metrics else 0.0
+    trust_vals = [v for v in (trust_amount, trust_date, trust_due) if v is not None]
     trust_mean = sum(trust_vals)/len(trust_vals) if trust_vals else None
 
     # tax check fail
@@ -5935,15 +6109,22 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
     if p95 is None:
         p95=_compute_p95_if_needed(jsonl, index_pkl, domain)
 
-    gate_pass, gate_reason, gate_score = _evaluate_gate(domain, hit_amount, hit_date)
+    gate_pass, gate_reason, gate_score = _evaluate_gate(
+        domain,
+        hit_amount,
+        hit_date,
+        hit_due,
+        corporate_match_rate,
+        tax_fail_rate,
+    )
     row={"timestamp":datetime.datetime.utcnow().isoformat()+"Z","jsonl":jsonl,"K":k,
          "domain": domain or "auto",
          "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
-         "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
+         "hit_amount":hit_amount,"hit_date":hit_date,"hit_due":hit_due,"hit_mean":hit_mean,
          "tax_fail_rate":tax_fail_rate,"tax_coverage":tax_cov,
          "corporate_match_rate":corporate_match_rate,"corporate_coverage":corp_total,
          "p95_ms":p95,
-         "trust_amount":trust_amount,"trust_date":trust_date,"trust_mean":trust_mean,
+         "trust_amount":trust_amount,"trust_date":trust_date,"trust_due":trust_due,"trust_mean":trust_mean,
          "gate_pass":gate_pass,"gate_reason":gate_reason,"gate_score":gate_score}
     hdr=not os.path.exists(out_csv)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
@@ -5985,9 +6166,9 @@ def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile
     if metrics:
         numeric_keys = [
             "low_conf_rate", "reprocess_rate", "reprocess_success_rate",
-            "hit_amount", "hit_date", "hit_mean", "p95_ms", "tax_fail_rate",
+            "hit_amount", "hit_date", "hit_due", "hit_mean", "p95_ms", "tax_fail_rate",
             "tax_coverage", "corporate_match_rate", "corporate_coverage",
-            "trust_amount", "trust_date", "trust_mean",
+            "trust_amount", "trust_date", "trust_due", "trust_mean",
         ]
         for key in numeric_keys:
             if key in metrics:
@@ -6221,10 +6402,13 @@ def _is_auto_domain(value: Optional[str]) -> bool:
     return False
 
 
-def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
+def _prepare_domain_hints(inputs: List[str], extra_paths: Optional[List[str]] = None) -> Dict[str, Any]:
     tokens_raw: List[str] = []
+    token_trace: List[Dict[str, Any]] = []
     per_input: Dict[str, List[str]] = {}
-    for raw in inputs:
+    extra_tokens: Dict[str, List[str]] = {}
+
+    def _ingest(raw: str, bucket: Dict[str, List[str]], source: str) -> None:
         norm = os.path.normpath(raw)
         seg_tokens: List[str] = []
         parts = norm.replace("\\", "/").split("/")
@@ -6237,9 +6421,16 @@ def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
                 if not tok or tok in _STOP_TOKENS or tok.isdigit() or len(tok) < 2:
                     continue
                 tokens_raw.append(tok)
+                token_trace.append({"token": tok, "source": source, "path": raw})
                 seg_tokens.append(tok)
         if seg_tokens:
-            per_input[raw] = seg_tokens
+            bucket[raw] = seg_tokens
+
+    for raw in inputs:
+        _ingest(raw, per_input, "input")
+    if extra_paths:
+        for raw in extra_paths:
+            _ingest(raw, extra_tokens, "page")
     unique_tokens = sorted(set(tokens_raw))
     domain_kw = getattr(zocr_multidomain_core, "DOMAIN_KW", {})
     alias_map = getattr(zocr_multidomain_core, "_DOMAIN_ALIAS", {})
@@ -6263,8 +6454,10 @@ def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
             best_score = score
     return {
         "tokens_raw": tokens_raw,
+        "token_trace": token_trace,
         "tokens": unique_tokens,
         "per_input": per_input,
+        "extra_paths": extra_tokens,
         "guess": best_dom,
         "best_score": best_score,
         "scores": {k: float(v) for k, v in candidate_scores.items() if v > 0.0},
@@ -6592,6 +6785,7 @@ def _generate_report(
     info_table = _render_table(
         {
             "inputs": summary.get("inputs"),
+            "page_images": summary.get("page_images"),
             "pages": summary.get("page_count"),
             "domain": summary.get("domain"),
             "seed": summary.get("seed"),
@@ -7273,6 +7467,8 @@ def _patched_run_full_pipeline(
     if not pages:
         raise RuntimeError("No input pages provided")
 
+    page_images = {idx: page for idx, page in enumerate(pages)}
+
     pipe = zocr_onefile_consensus.Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
 
     doc_json_path = os.path.join(outdir, "doc.zocr.json")
@@ -7295,6 +7491,7 @@ def _patched_run_full_pipeline(
         "history": os.path.join(outdir, "pipeline_history.jsonl"),
         "inputs": inputs[:],
         "page_count": len(pages),
+        "page_images": page_images,
         "domain": prof.get("domain"),
         "seed": seed,
         "resume_requested": bool(resume),
@@ -7316,7 +7513,7 @@ def _patched_run_full_pipeline(
     toy_memory_delta_run: Optional[Dict[str, Any]] = None
     toy_recognition_stats_payload: Optional[Dict[str, Any]] = None
 
-    domain_hints = _prepare_domain_hints(inputs)
+    domain_hints = _prepare_domain_hints(inputs, list(page_images.values()))
     content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
     domain_auto_summary: Dict[str, Any] = {
         "provided": domain_hint,
@@ -7325,6 +7522,8 @@ def _patched_run_full_pipeline(
             "best_score": float(domain_hints.get("best_score") or 0.0) if domain_hints.get("best_score") else None,
             "tokens": domain_hints.get("tokens"),
             "per_input": domain_hints.get("per_input"),
+            "extra_paths": domain_hints.get("extra_paths"),
+            "token_trace": domain_hints.get("token_trace"),
             "scores": domain_hints.get("scores"),
         },
         "initial_profile": prof.get("domain"),
@@ -7375,7 +7574,7 @@ def _patched_run_full_pipeline(
             "Export",
             zocr_onefile_consensus.export_jsonl_with_ocr,
             doc_json_path,
-            pages,
+            page_images,
             jsonl_path,
             effective_ocr_engine,
             True,
@@ -7436,7 +7635,8 @@ def _patched_run_full_pipeline(
     if os.path.exists(jsonl_path):
         try:
             detected_domain, autodetect_detail = zocr_multidomain_core.detect_domain_on_jsonl(
-                jsonl_path, domain_hints.get("tokens_raw")
+                jsonl_path,
+                domain_hints.get("token_trace") or domain_hints.get("tokens_raw"),
             )
         except Exception as e:
             autodetect_error = str(e)
