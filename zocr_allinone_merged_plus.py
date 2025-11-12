@@ -1113,6 +1113,76 @@ def _threshold_memory_store(key: Tuple[int, int, int], value: int) -> None:
 
 _NGRAM_COUNTS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 _NGRAM_TOTALS: Dict[str, int] = defaultdict(int)
+
+
+def _blank_recognition_stats() -> Dict[str, Any]:
+    return {
+        "cells": 0,
+        "characters": 0,
+        "conf_sum": 0.0,
+        "coherence_sum": 0.0,
+        "surprisal_sum": 0.0,
+        "low_conf_cells": 0,
+        "high_surprisal_cells": 0,
+        "examples": [],
+    }
+
+
+_TOY_RECOGNITION_STATS: Dict[str, Any] = _blank_recognition_stats()
+
+
+def reset_toy_recognition_stats() -> None:
+    global _TOY_RECOGNITION_STATS
+    _TOY_RECOGNITION_STATS = _blank_recognition_stats()
+
+
+def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal: float) -> None:
+    stats = _TOY_RECOGNITION_STATS
+    stats["cells"] = int(stats.get("cells", 0) + 1)
+    stats["characters"] = int(stats.get("characters", 0) + len(text))
+    stats["conf_sum"] = float(stats.get("conf_sum", 0.0) + float(conf))
+    stats["coherence_sum"] = float(stats.get("coherence_sum", 0.0) + float(coherence))
+    stats["surprisal_sum"] = float(stats.get("surprisal_sum", 0.0) + float(surprisal))
+    if conf < 0.6:
+        stats["low_conf_cells"] = int(stats.get("low_conf_cells", 0) + 1)
+    if surprisal > 1.6:
+        stats["high_surprisal_cells"] = int(stats.get("high_surprisal_cells", 0) + 1)
+        examples: List[Dict[str, Any]] = stats.setdefault("examples", [])  # type: ignore[assignment]
+        if len(examples) < 12:
+            examples.append({
+                "text": text,
+                "confidence": float(conf),
+                "coherence": float(coherence),
+                "surprisal": float(surprisal),
+                "length": len(text),
+            })
+
+
+def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
+    stats = _TOY_RECOGNITION_STATS
+    cells = int(stats.get("cells", 0))
+    result: Dict[str, Any] = {
+        "cells": cells,
+        "characters": int(stats.get("characters", 0)),
+        "avg_confidence": float(stats.get("conf_sum", 0.0) / cells) if cells else 0.0,
+        "avg_coherence": float(stats.get("coherence_sum", 0.0) / cells) if cells else 0.0,
+        "avg_surprisal": float(stats.get("surprisal_sum", 0.0) / cells) if cells else 0.0,
+        "low_conf_cells": int(stats.get("low_conf_cells", 0)),
+        "high_surprisal_cells": int(stats.get("high_surprisal_cells", 0)),
+        "examples": [
+            {
+                "text": ex.get("text"),
+                "confidence": float(ex.get("confidence", 0.0)),
+                "coherence": float(ex.get("coherence", 0.0)),
+                "surprisal": float(ex.get("surprisal", 0.0)),
+                "length": int(ex.get("length", 0)),
+            }
+            for ex in stats.get("examples", [])[:12]
+        ],
+    }
+    if reset:
+        reset_toy_recognition_stats()
+    return result
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "0": ("O", "D"),
     "O": ("0",),
@@ -1439,28 +1509,51 @@ def _looks_like_numeric_token(text: str) -> bool:
 def _looks_like_upper_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
 
+def _ngram_probability(prev: str, ch: str) -> float:
+    counts = _NGRAM_COUNTS.get(prev)
+    totals = _NGRAM_TOTALS.get(prev, 0)
+    if counts and totals:
+        vocab = max(len(counts), 8)
+        denom = float(totals + vocab)
+        return float((counts.get(ch, 0) + 1.0) / denom)
+    if counts:
+        vocab = max(len(counts), 8)
+        return float((counts.get(ch, 0) + 1.0) / float(vocab * 2))
+    vocab = max(len(_ASCII_SET), 8)
+    return float(1.0 / vocab)
+
+
 def _ngram_coherence(text: str) -> float:
     if len(text) < 2 or not _NGRAM_TOTALS:
         return 0.0
     prev = "\0"
     total_pairs = 0
     log_sum = 0.0
-    vocab = len(_ASCII_SET) + 4
     for ch in text:
-        totals = _NGRAM_TOTALS.get(prev, 0)
-        counts = _NGRAM_COUNTS.get(prev)
-        prob = None
-        if counts and totals:
-            prob = (counts.get(ch, 0) + 1.0) / (totals + vocab)
-        elif counts:
-            prob = (counts.get(ch, 0) + 1.0) / (len(counts) + vocab)
-        if prob is not None:
+        prob = _ngram_probability(prev, ch)
+        if prob > 0:
             log_sum += math.log(prob)
             total_pairs += 1
         prev = ch
     if total_pairs == 0:
         return 0.0
     return float(math.exp(log_sum / total_pairs))
+
+
+def _ngram_surprisal(text: str) -> float:
+    if not text or not _NGRAM_TOTALS:
+        return 0.0
+    prev = "\0"
+    total_pairs = 0
+    accum = 0.0
+    for ch in text:
+        prob = max(_ngram_probability(prev, ch), 1e-9)
+        accum += -math.log(prob, 2)
+        total_pairs += 1
+        prev = ch
+    if total_pairs == 0:
+        return 0.0
+    return float(accum / total_pairs)
 
 def _score_candidate_with_context(text: str, base_conf: float) -> float:
     score = max(0.0, min(1.0, base_conf))
@@ -1477,6 +1570,11 @@ def _score_candidate_with_context(text: str, base_conf: float) -> float:
     coherence = _ngram_coherence(text)
     if coherence > 0:
         score = max(score, min(1.0, base_conf * (0.85 + 0.15 * coherence) + 0.05 * coherence))
+    surprisal = _ngram_surprisal(text)
+    if surprisal > 0:
+        penalty = max(0.0, min(0.2, (surprisal - 1.2) * 0.12))
+        if penalty:
+            score = max(0.0, score - penalty)
     return min(1.0, score)
 
 def _contextual_rerank_candidates(candidates: Dict[str, float]) -> Tuple[str, float]:
@@ -2131,8 +2229,10 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
                 final_text, final_conf = reranked_text, reranked_conf
 
     if final_text:
+        coherence = _ngram_coherence(final_text)
+        surprisal = _ngram_surprisal(final_text)
+        _record_toy_recognition(final_text, float(final_conf), coherence, surprisal)
         _update_ngram_model(final_text)
-    if final_text:
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
 
@@ -6035,6 +6135,7 @@ def _patched_run_full_pipeline(
     toy_memory_path = _resolve_toy_memory_path(outdir)
     toy_memory_info_load = load_toy_memory(toy_memory_path)
     toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
+    reset_toy_recognition_stats()
 
     if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
@@ -6439,6 +6540,9 @@ def _patched_run_full_pipeline(
     summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
     summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
     summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
+    summary["toy_memory"]["recognition"] = _json_ready(
+        toy_recognition_stats(reset=True)
+    )
 
     toy_memory_saved = save_toy_memory(toy_memory_path)
     summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)

@@ -889,6 +889,8 @@ def _patched_run_full_pipeline(
     toy_memory_path = _resolve_toy_memory_path(outdir)
     toy_memory_info_load = zocr_onefile_consensus.load_toy_memory(toy_memory_path)
     toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
+    if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
+        zocr_onefile_consensus.reset_toy_recognition_stats()
 
     if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
@@ -1293,6 +1295,10 @@ def _patched_run_full_pipeline(
     summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
     summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
     summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
+    if hasattr(zocr_onefile_consensus, "toy_recognition_stats"):
+        summary["toy_memory"]["recognition"] = _json_ready(
+            zocr_onefile_consensus.toy_recognition_stats(reset=True)
+        )
 
     toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
     summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
