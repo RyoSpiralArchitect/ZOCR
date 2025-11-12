@@ -1158,6 +1158,14 @@ def _glyph_runtime_replay(limit: int = 8) -> int:
 _NGRAM_COUNTS: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 _NGRAM_TOTALS: Dict[str, float] = defaultdict(float)
 _NGRAM_DECAY_ALPHA = float(os.environ.get("ZOCR_NGRAM_EMA_ALPHA", "0.05") or 0.0)
+try:
+    _NGRAM_SURPRISAL_REVIEW_THRESHOLD = float(
+        os.environ.get("ZOCR_SURPRISAL_REVIEW_THRESHOLD", "1.65") or 0.0
+    )
+except Exception:
+    _NGRAM_SURPRISAL_REVIEW_THRESHOLD = 0.0
+if not (_NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0):
+    _NGRAM_SURPRISAL_REVIEW_THRESHOLD = 0.0
 
 _GLYPH_RUNTIME_CACHE_LIMIT = int(os.environ.get("ZOCR_GLYPH_CACHE_LIMIT", "384") or 0)
 _GLYPH_RUNTIME_PENDING_LIMIT = int(os.environ.get("ZOCR_GLYPH_PENDING_LIMIT", "256") or 0)
@@ -2517,6 +2525,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
 
     count = 0
     learning_signals: List[Dict[str, Any]] = []
+    low_conf_samples = 0
+    surprisal_samples = 0
+    surprisal_threshold = (
+        float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
+        if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
+        else 0.0
+    )
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
         for enum_idx, p in enumerate(doc["pages"]):
             pidx = p.get("index")
@@ -2624,6 +2639,18 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
                         kws = _keywords_from_row(row_texts) if contextual and r>0 else []
                         low_conf = (conf is not None and conf < ocr_min_conf)
+                        coherence = _ngram_coherence(txt) if txt else 0.0
+                        surprisal = _ngram_surprisal(txt) if txt else 0.0
+                        review_reasons: List[str] = []
+                        if low_conf:
+                            review_reasons.append("low_conf")
+                            low_conf_samples += 1
+                        high_surprisal = bool(
+                            surprisal_threshold > 0.0 and surprisal >= surprisal_threshold
+                        )
+                        if high_surprisal:
+                            review_reasons.append("high_surprisal")
+                            surprisal_samples += 1
                         trace_id = f"page={pidx},table={ti},row={r},col={c}"
                         filters = {
                             "has_currency": ("currency" in kws),
@@ -2640,6 +2667,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         hypotheses: List[Dict[str, Any]] = []
                         if low_conf:
                             hypotheses = _hypothesize_from_text(txt, headers, concepts)
+                        needs_review = bool(review_reasons)
                         rec = {
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
@@ -2653,6 +2681,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "keywords": kws,
                                 "confidence": conf,
                                 "low_conf": bool(low_conf),
+                                "ngram_coherence": float(coherence),
+                                "ngram_surprisal": float(surprisal),
                                 "trace": trace_id,
                                 "filters": filters
                             }
@@ -2661,8 +2691,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             rec["meta"]["concepts"] = concepts
                         if hypotheses:
                             rec["meta"]["hypotheses"] = hypotheses
+                            needs_review = True
+                        if review_reasons:
+                            rec["meta"]["review_reasons"] = review_reasons
+                        if needs_review or hypotheses:
                             rec["meta"]["needs_review"] = True
-                            learning_signals.append({
+                            signal_reasons = list(review_reasons)
+                            if hypotheses and "hypothesis" not in signal_reasons:
+                                signal_reasons.append("hypothesis")
+                            signal = {
                                 "trace_id": trace_id,
                                 "page": pidx,
                                 "table_index": ti,
@@ -2675,22 +2712,35 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "headers": headers,
                                 "observed_text": txt,
                                 "confidence": conf,
-                                "hypotheses": hypotheses,
                                 "concepts": concepts,
-                                "intent": "reanalyze_cell"
-                            })
+                                "intent": "reanalyze_cell",
+                                "ngram_coherence": float(coherence),
+                                "ngram_surprisal": float(surprisal),
+                                "coherence": float(coherence),
+                                "surprisal": float(surprisal),
+                                "reasons": signal_reasons or (["hypothesis"] if hypotheses else []),
+                            }
+                            if hypotheses:
+                                signal["hypotheses"] = hypotheses
+                            learning_signals.append(signal)
                         if note:
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         count += 1
     signals_path = out_jsonl_path + ".signals.json"
     learn_path = out_jsonl_path + ".learning.jsonl"
-    summary_payload = {
+    summary_payload: Dict[str, Any] = {
         "total_records": count,
         "learning_samples": len(learning_signals),
         "learning_jsonl": learn_path if learning_signals else None,
-        "low_conf_ratio": (len(learning_signals) / float(max(1, count)))
+        "low_conf_samples": int(low_conf_samples),
+        "high_surprisal_samples": int(surprisal_samples),
+        "low_conf_ratio": float(low_conf_samples / float(max(1, count))),
+        "high_surprisal_ratio": float(surprisal_samples / float(max(1, count))),
+        "review_ratio": float(len(learning_signals) / float(max(1, count))),
     }
+    if surprisal_threshold > 0.0:
+        summary_payload["surprisal_threshold"] = float(surprisal_threshold)
     try:
         with open(signals_path, "w", encoding="utf-8") as fw_sig:
             json.dump(summary_payload, fw_sig, ensure_ascii=False, indent=2)
@@ -2766,6 +2816,11 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
     ambiguous_total = 0
     fallback_used = False
     fallback_transform_usage: Dict[str, int] = defaultdict(int)
+    reason_counts: Dict[str, int] = defaultdict(int)
+    surprisal_sum = 0.0
+    surprisal_count = 0
+    surprisal_min: Optional[float] = None
+    surprisal_max: Optional[float] = None
 
     try:
         with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
@@ -2780,6 +2835,22 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 except Exception:
                     summary["skipped"] += 1
                     continue
+                raw_reasons = sig.get("reasons")
+                if isinstance(raw_reasons, list):
+                    for reason in raw_reasons:
+                        if isinstance(reason, str) and reason:
+                            reason_counts[reason] += 1
+                sig_surprisal = sig.get("ngram_surprisal", sig.get("surprisal"))
+                if sig_surprisal is not None:
+                    try:
+                        val = float(sig_surprisal)
+                    except Exception:
+                        val = None
+                    if val is not None and math.isfinite(val):
+                        surprisal_sum += val
+                        surprisal_count += 1
+                        surprisal_min = val if surprisal_min is None else min(surprisal_min, val)
+                        surprisal_max = val if surprisal_max is None else max(surprisal_max, val)
                 summary["total_seen"] += 1
                 bbox = sig.get("bbox")
                 if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
@@ -2963,6 +3034,15 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         summary["fallback_transform_usage"] = {k: int(v) for k, v in ordered}
     else:
         summary["fallback_transform_usage"] = {}
+    if reason_counts:
+        summary["reason_counts"] = {k: int(v) for k, v in sorted(reason_counts.items())}
+    if surprisal_count > 0:
+        summary["input_surprisal"] = {
+            "avg": float(surprisal_sum / float(max(1, surprisal_count))),
+            "min": float(surprisal_min) if surprisal_min is not None else None,
+            "max": float(surprisal_max) if surprisal_max is not None else None,
+            "count": int(surprisal_count),
+        }
 
     if records:
         summary["output_jsonl"] = output_jsonl

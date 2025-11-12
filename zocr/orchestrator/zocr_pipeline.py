@@ -770,6 +770,13 @@ def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[s
         low_conf_ratio = float(export_signals.get("low_conf_ratio")) if export_signals else None
     except Exception:
         low_conf_ratio = None
+    high_surprisal_ratio = None
+    try:
+        high_surprisal_ratio = (
+            float(export_signals.get("high_surprisal_ratio")) if export_signals else None
+        )
+    except Exception:
+        high_surprisal_ratio = None
     if hit_mean is None:
         intent = {"action": "recover", "reason": "monitor missing", "priority": "high"}
     elif hit_mean < 0.8:
@@ -777,13 +784,25 @@ def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[s
     elif p95 is not None and p95 > 400.0:
         intent = {"action": "optimize_speed", "reason": f"p95_ms={p95:.1f} > 400", "priority": "medium"}
     elif low_conf_ratio is not None and low_conf_ratio > 0.2:
-        intent = {"action": "reanalyze_cells", "reason": f"low_conf_ratio={low_conf_ratio:.2f}", "priority": "medium"}
+        intent = {
+            "action": "reanalyze_cells",
+            "reason": f"low_conf_ratio={low_conf_ratio:.2f}",
+            "priority": "medium",
+        }
+    elif high_surprisal_ratio is not None and high_surprisal_ratio > 0.12:
+        intent = {
+            "action": "reanalyze_cells",
+            "reason": f"high_surprisal_ratio={high_surprisal_ratio:.2f}",
+            "priority": "medium",
+        }
     else:
         intent = {"action": "explore_footer", "reason": "metrics nominal", "priority": "low"}
     intent["signals"] = {
         "hit_mean": hit_mean,
         "p95_ms": p95,
         "low_conf_ratio": low_conf_ratio,
+        "high_surprisal_ratio": high_surprisal_ratio,
+        "surprisal_threshold": export_signals.get("surprisal_threshold") if export_signals else None,
         "learning_samples": export_signals.get("learning_samples") if export_signals else None,
     }
     intent["profile_domain"] = profile.get("domain")
