@@ -346,7 +346,7 @@ def phash64(img: Image.Image) -> int:
     a = np.nan_to_num(a, copy=False)
     basis = _dct_basis_32()
     d=basis@a@basis.T
-    d=np.nan_to_num(d, copy=False, posinf=0.0, neginf=0.0)
+    d=np.nan_to_num(d, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     d += 1e-9
     blk=d[:8,:8].copy(); blk[0,0]=0.0
     m=float(np.median(blk)); bits=(blk>m).astype(np.uint8).reshape(-1)
