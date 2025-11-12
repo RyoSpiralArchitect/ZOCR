@@ -831,10 +831,10 @@ class Pipeline:
         with open(out_json,"w",encoding="utf-8") as f: json.dump(results,f,ensure_ascii=False,indent=2)
         # CSVs
         import csv
-        with open(os.path.join(out_dir,"metrics_by_table.csv"),"w",newline="",encoding="utf-8") as f:
+        with open(os.path.join(out_dir,"metrics_by_table.csv"),"w",newline="",encoding="utf-8-sig") as f:
             w=csv.DictWriter(f, fieldnames=list(per_page_metrics[0].keys()))
             w.writeheader(); [w.writerow(m) for m in per_page_metrics]
-        with open(os.path.join(out_dir,"metrics_aggregate.csv"),"w",newline="",encoding="utf-8") as f:
+        with open(os.path.join(out_dir,"metrics_aggregate.csv"),"w",newline="",encoding="utf-8-sig") as f:
             w=csv.DictWriter(f, fieldnames=list(agg.keys())); w.writeheader(); w.writerow(agg)
         return results, out_json
 
@@ -1631,11 +1631,15 @@ def lambda_schedule(page_height: int, base_lambda: float, ref_height: int=1000, 
 # --------------- pHash / Tiny vec ----------------------
 def phash64(img: Image.Image) -> int:
     g = ImageOps.grayscale(img).resize((32,32), Image.BICUBIC)
-    a = np.asarray(g, dtype=np.float32)
+    a = np.asarray(g, dtype=np.float64)
+    a = np.nan_to_num(a, copy=False)
     N=32
-    x=np.arange(N,dtype=np.float32); k=np.arange(N,dtype=np.float32).reshape(-1,1)
-    basis=np.cos((math.pi/N)*(x+0.5)*k)
+    x=np.arange(N,dtype=np.float64); k=np.arange(N,dtype=np.float64).reshape(-1,1)
+    basis=np.cos((math.pi/N)*(x+0.5)*k).astype(np.float64, copy=False)
+    basis = np.nan_to_num(basis, copy=False)
     d=basis@a@basis.T
+    d=np.nan_to_num(d, copy=False, posinf=0.0, neginf=0.0)
+    d += 1e-9
     blk=d[:8,:8].copy(); blk[0,0]=0.0
     m=float(np.median(blk)); bits=(blk>m).astype(np.uint8).reshape(-1)
     v=0
@@ -1768,7 +1772,18 @@ DOMAIN_KW = {
     "tax_form_en": [("tax",1.0),("return",0.9),("irs",0.8),("deduction",0.7),("withholding",0.6),("income",0.6)],
     "tax_form_jp": [("確定申告",1.0),("所得税",0.9),("控除",0.75),("課税",0.65),("源泉",0.6),("扶養",0.5)],
     "payslip_en": [("payslip",1.0),("payroll",0.9),("gross",0.75),("net pay",0.7),("deductions",0.65),("hours",0.55)],
-    "payslip_jp": [("給与明細",1.0),("支給額",0.9),("控除",0.75),("差引支給額",0.7),("残業",0.6),("社会保険料",0.55)]
+    "payslip_jp": [("給与明細",1.0),("支給額",0.9),("控除",0.75),("差引支給額",0.7),("残業",0.6),("社会保険料",0.55)],
+    "rental_agreement_en": [("rental",1.0),("lease",0.95),("tenant",0.75),("landlord",0.7),("premises",0.6)],
+    "rental_agreement_jp": [("賃貸借",1.0),("賃料",0.9),("借主",0.75),("貸主",0.75),("物件",0.6),("契約期間",0.5)],
+    "loan_statement_en": [("loan",1.0),("interest",0.9),("principal",0.85),("installment",0.7),("statement",0.6),("balance",0.6)],
+    "loan_statement_jp": [("返済",1.0),("借入",0.9),("利息",0.85),("元金",0.75),("残高",0.65),("明細",0.55)],
+    "travel_itinerary_en": [("itinerary",1.0),("flight",0.9),("departure",0.85),("arrival",0.85),("hotel",0.7),("booking",0.6)],
+    "travel_itinerary_jp": [("旅程",1.0),("出発",0.9),("到着",0.9),("航空券",0.75),("宿泊",0.65),("予約",0.6)],
+    "medical_bill_en": [("medical",1.0),("invoice",0.9),("patient",0.85),("procedure",0.7),("amount",0.6),("insurance",0.55)],
+    "medical_bill_jp": [("診療",1.0),("請求",0.9),("患者",0.8),("保険",0.75),("点数",0.65),("金額",0.6)],
+    "customs_declaration_en": [("customs",1.0),("declaration",0.95),("tariff",0.75),("shipment",0.7),("origin",0.6),("duty",0.55)],
+    "grant_application_en": [("grant",1.0),("fund",0.9),("proposal",0.8),("budget",0.7),("milestone",0.6)],
+    "boarding_pass_en": [("boarding",1.0),("flight",0.95),("seat",0.85),("gate",0.7),("departure",0.65),("passenger",0.6)]
 }
 
 DOMAIN_DEFAULTS = {
@@ -1802,7 +1817,18 @@ DOMAIN_DEFAULTS = {
     "tax_form_en": {"lambda_shape": 4.6, "w_kw": 0.63, "w_img": 0.22, "ocr_min_conf": 0.60},
     "tax_form_jp": {"lambda_shape": 4.6, "w_kw": 0.65, "w_img": 0.22, "ocr_min_conf": 0.60},
     "payslip_en": {"lambda_shape": 3.9, "w_kw": 0.58, "w_img": 0.2, "ocr_min_conf": 0.62},
-    "payslip_jp": {"lambda_shape": 4.0, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.62}
+    "payslip_jp": {"lambda_shape": 4.0, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.62},
+    "rental_agreement_en": {"lambda_shape": 4.2, "w_kw": 0.6, "w_img": 0.22, "ocr_min_conf": 0.60},
+    "rental_agreement_jp": {"lambda_shape": 4.2, "w_kw": 0.63, "w_img": 0.22, "ocr_min_conf": 0.60},
+    "loan_statement_en": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "loan_statement_jp": {"lambda_shape": 4.2, "w_kw": 0.62, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "travel_itinerary_en": {"lambda_shape": 3.8, "w_kw": 0.55, "w_img": 0.26, "ocr_min_conf": 0.58},
+    "travel_itinerary_jp": {"lambda_shape": 3.9, "w_kw": 0.58, "w_img": 0.26, "ocr_min_conf": 0.58},
+    "medical_bill_en": {"lambda_shape": 4.8, "w_kw": 0.64, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "medical_bill_jp": {"lambda_shape": 4.9, "w_kw": 0.66, "w_img": 0.24, "ocr_min_conf": 0.60},
+    "customs_declaration_en": {"lambda_shape": 4.2, "w_kw": 0.58, "w_img": 0.22, "ocr_min_conf": 0.58},
+    "grant_application_en": {"lambda_shape": 4.0, "w_kw": 0.6, "w_img": 0.22, "ocr_min_conf": 0.58},
+    "boarding_pass_en": {"lambda_shape": 3.5, "w_kw": 0.5, "w_img": 0.3, "ocr_min_conf": 0.55}
 }
 
 _DOMAIN_ALIAS = {
@@ -1816,7 +1842,19 @@ _DOMAIN_ALIAS = {
     "insurance_claim": "insurance_claim_en",
     "tax_form": "tax_form_en",
     "tax_return": "tax_form_en",
-    "payslip": "payslip_en"
+    "payslip": "payslip_en",
+    "rental_agreement": "rental_agreement_en",
+    "lease_contract": "rental_agreement_en",
+    "loan_statement": "loan_statement_en",
+    "loan_summary": "loan_statement_en",
+    "travel_itinerary": "travel_itinerary_en",
+    "travel_plan": "travel_itinerary_en",
+    "medical_bill": "medical_bill_en",
+    "medical_invoice": "medical_bill_en",
+    "customs_declaration": "customs_declaration_en",
+    "customs_form": "customs_declaration_en",
+    "grant_application": "grant_application_en",
+    "boarding_pass": "boarding_pass_en"
 }
 
 DOMAIN_SUGGESTED_QUERIES = {
@@ -1843,6 +1881,17 @@ DOMAIN_SUGGESTED_QUERIES = {
     "tax_form_jp": ["課税所得", "控除", "源泉徴収", "還付金"],
     "payslip_en": ["gross pay", "net pay", "deductions", "hours"],
     "payslip_jp": ["支給額", "控除", "差引支給額", "残業時間"],
+    "rental_agreement_en": ["monthly rent", "lease term", "deposit", "premises"],
+    "rental_agreement_jp": ["賃料", "契約期間", "敷金", "物件住所"],
+    "loan_statement_en": ["principal balance", "interest paid", "payment date", "installment"],
+    "loan_statement_jp": ["元金残高", "利息", "返済日", "返済額"],
+    "travel_itinerary_en": ["departure time", "arrival gate", "hotel confirmation", "booking reference"],
+    "travel_itinerary_jp": ["出発時刻", "到着ゲート", "宿泊先", "予約番号"],
+    "medical_bill_en": ["patient", "total amount", "insurance", "procedure"],
+    "medical_bill_jp": ["患者", "請求金額", "保険", "診療"],
+    "customs_declaration_en": ["tariff code", "country of origin", "declared value", "duty"],
+    "grant_application_en": ["project title", "requested amount", "milestone", "deliverable"],
+    "boarding_pass_en": ["flight number", "seat", "gate", "boarding time"],
     "default": ["total amount", "date", "company", "reference number"]
 }
 
@@ -1907,6 +1956,181 @@ def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
     return resolved, detail
 
 # --------------- Augment (pHash + Filters + λ) ---------------
+def _inject_structural_placeholders(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from collections import defaultdict
+
+    tables: Dict[Tuple[Any, Any, Any], Dict[str, Any]] = defaultdict(lambda: {
+        "cells": [],
+        "rows": defaultdict(dict),
+        "template": None,
+    })
+
+    def _is_weak_cell(ob: Dict[str, Any]) -> bool:
+        meta = ob.get("meta") or {}
+        text = (ob.get("text") or "").strip()
+        if not text:
+            return True
+        if meta.get("low_conf"):
+            return True
+        conf = meta.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else None
+        except Exception:
+            conf_f = None
+        return conf_f is not None and conf_f < 0.55
+
+    def _key(ob: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+        return (
+            ob.get("doc_id"),
+            ob.get("page"),
+            ob.get("table_index"),
+        )
+
+    for ob in records:
+        key = _key(ob)
+        tbl = tables[key]
+        tbl["cells"].append(ob)
+        if tbl["template"] is None:
+            tbl["template"] = ob
+        try:
+            r = int(ob.get("row"))
+            c = int(ob.get("col"))
+        except Exception:
+            continue
+        tbl["rows"].setdefault(r, {})[c] = ob
+
+    def _contains_cjk(text: str) -> bool:
+        return any(ord(ch) > 127 for ch in text or "")
+
+    families = [
+        ("Item", "品目"),
+        ("Qty", "数量"),
+        ("Unit Price", "単価"),
+        ("Amount", "金額"),
+    ]
+    total_variants = ["Total", "Total Amount", "合計", "税込合計"]
+
+    def _make_cell(template: Dict[str, Any], row: int, col: int, text: str, role: str) -> Dict[str, Any]:
+        base_meta = dict(template.get("meta") or {})
+        filters = dict(base_meta.get("filters") or {})
+        filters.setdefault("row_role", role)
+        base_meta["filters"] = filters
+        base_meta["synthetic"] = True
+        base_meta["synthetic_role"] = role
+        base_meta.setdefault("confidence", 0.0)
+        base_meta.setdefault("low_conf", False)
+        return {
+            "doc_id": template.get("doc_id"),
+            "page": template.get("page"),
+            "table_index": template.get("table_index"),
+            "row": row,
+            "col": col,
+            "text": text,
+            "search_unit": text,
+            "synthesis_window": template.get("synthesis_window") or "",
+            "bbox": template.get("bbox") or [0, 0, 0, 0],
+            "meta": base_meta,
+        }
+
+    synthetic: List[Dict[str, Any]] = []
+    for key, tbl in tables.items():
+        if not tbl["cells"]:
+            continue
+        rows = tbl["rows"]
+        template = tbl["template"]
+        header_row = min(rows.keys()) if rows else 0
+        header_cells = rows.get(header_row, {})
+        header_text = " ".join((header_cells[c].get("text") or "") for c in sorted(header_cells))
+        use_jp = _contains_cjk(header_text)
+        max_col = -1
+        for cols in rows.values():
+            for c in cols.keys():
+                if c > max_col:
+                    max_col = c
+        header_lower = header_text.lower()
+        for family in families:
+            jp_variant = family[1]
+            en_variant = family[0]
+            present = False
+            for variant in family:
+                if variant.lower() in header_lower:
+                    present = True
+                    break
+            if present:
+                continue
+            text_val = jp_variant if use_jp else en_variant
+            replacement = None
+            for col_idx in sorted(header_cells.keys()):
+                cell = header_cells[col_idx]
+                if _is_weak_cell(cell):
+                    replacement = (col_idx, cell)
+                    break
+            if replacement is not None:
+                col_idx, cell = replacement
+                meta = dict(cell.get("meta") or {})
+                filters = dict(meta.get("filters") or {})
+                filters.setdefault("row_role", "header")
+                meta.update({
+                    "filters": filters,
+                    "synthetic": True,
+                    "synthetic_role": "header",
+                    "low_conf": False,
+                    "confidence": max(0.55, float(meta.get("confidence") or 0.0)) if isinstance(meta.get("confidence"), (int, float)) else 0.55,
+                })
+                cell.update({
+                    "text": text_val,
+                    "search_unit": text_val,
+                    "synthesis_window": cell.get("synthesis_window") or text_val,
+                    "meta": meta,
+                })
+            else:
+                max_col += 1
+                new_cell = _make_cell(template, header_row, max_col, text_val, "header")
+                rows.setdefault(header_row, {})[max_col] = new_cell
+                tbl["cells"].append(new_cell)
+                synthetic.append(new_cell)
+                header_cells[max_col] = new_cell
+
+        total_present = False
+        weak_total = None
+        for ob in tbl["cells"]:
+            txt = ((ob.get("text") or "") + " " + (ob.get("synthesis_window") or "")).lower()
+            if any(variant.lower() in txt for variant in total_variants):
+                total_present = True
+                if _is_weak_cell(ob):
+                    weak_total = ob
+                break
+        footer_text = "合計" if any(_contains_cjk((ob.get("text") or "")) for ob in tbl["cells"]) else "Total"
+        if weak_total is not None:
+            meta = dict(weak_total.get("meta") or {})
+            filters = dict(meta.get("filters") or {})
+            filters.setdefault("row_role", "footer")
+            meta.update({
+                "filters": filters,
+                "synthetic": True,
+                "synthetic_role": "footer",
+                "low_conf": False,
+                "confidence": max(0.55, float(meta.get("confidence") or 0.0)) if isinstance(meta.get("confidence"), (int, float)) else 0.55,
+            })
+            weak_total.update({
+                "text": footer_text,
+                "search_unit": footer_text,
+                "synthesis_window": weak_total.get("synthesis_window") or footer_text,
+                "meta": meta,
+            })
+        elif not total_present:
+            footer_row = (max(rows.keys()) if rows else header_row) + 1
+            footer_col = max_col if max_col >= 0 else 0
+            new_footer = _make_cell(template, footer_row, footer_col, footer_text, "footer")
+            rows.setdefault(footer_row, {})[footer_col] = new_footer
+            tbl["cells"].append(new_footer)
+            synthetic.append(new_footer)
+
+    if synthetic:
+        records = records + synthetic
+    return records
+
+
 def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refheight: int=1000, lambda_alpha: float=0.7, org_dict_path: Optional[str]=None):
     org_dict=None
     if org_dict_path and os.path.exists(org_dict_path):
@@ -1915,9 +2139,9 @@ def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refhe
                 org_dict=json.load(f)
         except Exception:
             org_dict=None
-    n=0
+    records: List[Dict[str, Any]] = []
     cur=None; img=None
-    with open(jsonl_in,"r",encoding="utf-8") as fr, open(jsonl_out,"w",encoding="utf-8") as fw:
+    with open(jsonl_in,"r",encoding="utf-8") as fr:
         for line in fr:
             ob=json.loads(line)
             ip=ob.get("image_path"); bbox=ob.get("bbox",[0,0,0,0])
@@ -1929,14 +2153,14 @@ def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refhe
                 x1,y1,x2,y2=[int(v) for v in bbox]
                 x1=max(0,x1);y1=max(0,y1);x2=min(img.width,x2);y2=min(img.height,y2)
                 crop=img.crop((x1,y1,x2,y2))
-                try: ph=phash64(crop)
-                except Exception: ph=0
+                try:
+                    ph=phash64(crop)
+                except Exception:
+                    ph=0
                 vec=tiny_vec(crop,16).tolist()
                 ob.setdefault("meta",{}); ob["meta"]["phash64"]=ph; ob["meta"]["img16"]=vec
-                # λ scheduling
                 if page_h:
                     ob["meta"]["lambda_shape"] = lambda_schedule(page_h, lambda_shape, lambda_refheight, lambda_alpha)
-            # filters
             txt=(ob.get("text") or "")+" "+(ob.get("synthesis_window") or "")
             swin=(ob.get("synthesis_window") or "")
             filt=(ob.get("meta") or {}).get("filters",{})
@@ -1950,17 +2174,20 @@ def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refhe
             if comp: filt["company"]=comp
             if corp_id: filt["corporate_id"]=corp_id
             if addr: filt["address"]=addr
-            # row-based fields
             rowf = infer_row_fields(swin)
             for k,v in rowf.items():
                 if filt.get(k) is None: filt[k]=v
-            # derived tax_amount if possible
             if filt.get("tax_amount") is None and filt.get("tax_rate") is not None and filt.get("subtotal") is not None:
                 filt["tax_amount"] = int(round(float(filt["subtotal"]) * float(filt["tax_rate"])))
             ob["meta"]["filters"]=filt
+            records.append(ob)
+
+    records = _inject_structural_placeholders(records)
+
+    with open(jsonl_out,"w",encoding="utf-8") as fw:
+        for ob in records:
             fw.write(json.dumps(ob, ensure_ascii=False)+"\n")
-            n+=1
-    return n
+    return len(records)
 
 # --------------- BM25 + Fusion Search -----------------
 def tokenize_jp(s: str) -> List[str]:
@@ -2128,7 +2355,7 @@ def sql_export(jsonl: str, outdir: str, prefix: str="invoice"):
           "amount","date","company","address","tax_id","postal_code","phone",
           "tax_rate","qty","unit","subtotal","tax_amount","corporate_id",
           "bbox_x1","bbox_y1","bbox_x2","bbox_y2","confidence","low_conf","phash64","lambda_shape"]
-    with open(csv_path,"w",encoding="utf-8",newline="") as fw:
+    with open(csv_path,"w",encoding="utf-8-sig",newline="") as fw:
         wr=csv.writer(fw); wr.writerow(cols)
         with open(jsonl,"r",encoding="utf-8") as fr:
             for line in fr:
@@ -2482,6 +2709,29 @@ def _read_gt(gt_jsonl: Optional[str]) -> Dict[str, Set]:
             G[lab].add(key)
     return G
 
+
+_INVOICE_GATE_DOMAINS = {"invoice", "invoice_jp_v2", "invoice_en", "invoice_fr"}
+
+
+def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_score: Optional[float]) -> Tuple[bool, str, float]:
+    resolved = _DOMAIN_ALIAS.get(domain or "", domain or "") if '_DOMAIN_ALIAS' in globals() else (domain or "")
+    amt = float(amount_score) if amount_score is not None else 0.0
+    dt = float(date_score) if date_score is not None else None
+    if resolved in _INVOICE_GATE_DOMAINS:
+        if amt >= 0.8:
+            note = "amount+date hit" if dt is not None and dt >= 0.5 else "amount hit (date optional)"
+            return True, note, amt
+        if amt >= 0.7 and (dt is None or dt >= 0.3):
+            note = "amount hit (date optional)" if dt is None or dt < 0.5 else "amount+date hit"
+            return True, note, amt
+        return False, "amount below gate", amt
+    if amount_score is None or date_score is None:
+        return False, "insufficient metrics", 0.0
+    mean = (float(amount_score) + float(date_score)) / 2.0
+    if mean >= 0.95:
+        return True, "hit_mean>=0.95", mean
+    return False, "hit_mean<0.95", mean
+
 def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, domain: str="invoice",
             views_log: Optional[str]=None, gt_jsonl: Optional[str]=None):
     # load data
@@ -2559,17 +2809,19 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, domain: str="invoi
                 tax_fail += 1
     tax_check_fail_rate = (tax_fail / max(1, tax_total)) if tax_total>0 else None
 
+    gate_pass, gate_reason, gate_score = _evaluate_gate(domain, hit_amount_gt, hit_date_gt)
     row={
         "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
         "jsonl": jsonl, "K": k, "domain": domain,
         "low_conf_rate": low_rate, "reprocess_rate": reprocess_rate,
         "reprocess_success_rate": reprocess_success_rate,
         "hit_amount_gt": hit_amount_gt, "hit_date_gt": hit_date_gt, "hit_mean": hit_mean,
-        "p95_ms": p95, "tax_check_fail_rate": tax_check_fail_rate
+        "p95_ms": p95, "tax_check_fail_rate": tax_check_fail_rate,
+        "gate_pass": gate_pass, "gate_reason": gate_reason, "gate_score": gate_score,
     }
     write_header=not os.path.exists(out_csv)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-    with open(out_csv,"a",encoding="utf-8",newline="") as fw:
+    with open(out_csv,"a",encoding="utf-8-sig",newline="") as fw:
         wr=csv.DictWriter(fw, fieldnames=list(row.keys()))
         if write_header: wr.writeheader()
         wr.writerow(row)
@@ -2629,10 +2881,10 @@ def main():
     if args.cmd=="monitor":
         row=monitor(args.jsonl, args.index, args.k, args.out, args.domain, args.views_log, args.gt_jsonl)
         print("Monitor:", row)
-        if row["hit_mean"] is not None and row["hit_mean"]>=0.95:
-            print("GATE: PASS (Hit@K)")
+        if row.get("gate_pass"):
+            print(f"GATE: PASS ({row.get('gate_reason')})")
         else:
-            print("GATE: FAIL (Hit@K)")
+            print(f"GATE: FAIL ({row.get('gate_reason')})")
         return
 
     ap.print_help()
@@ -2810,7 +3062,7 @@ def _query_scores_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], q_text
 def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain: Optional[str], w_kw: float, w_img: float, trials: int = 60, warmup: int = 8) -> Dict[str,float]:
     """Warm-up + fixed number of trials for robust p95."""
     import time, random
-    dom_q = {
+    queries = {
         "invoice":        ["合計","金額","消費税","小計","請求","振込"],
         "invoice_jp_v2": ["合計","金額","消費税","小計","請求日","発行日"],
         "invoice_en":    ["invoice total", "amount due", "tax", "balance", "payment"],
@@ -2831,8 +3083,16 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
         "receipt_en":    ["receipt", "paid", "total", "tax", "cash"],
         "contract":      ["契約", "締結", "署名", "条", "甲"],
         "contract_jp_v2":["契約", "甲", "乙", "条", "締結日", "署名"],
-        "contract_en":   ["contract", "signature", "party", "term", "agreement"]
-    }.get(domain or "invoice_jp_v2", ["合計","金額","消費税"])
+        "contract_en":   ["contract", "signature", "party", "term", "agreement"],
+        "rental_agreement_en": ["monthly rent", "lease", "tenant", "landlord", "deposit"],
+        "rental_agreement_jp": ["賃貸借", "賃料", "借主", "貸主", "敷金"],
+        "loan_statement_en": ["loan", "interest", "principal", "installment", "balance"],
+        "loan_statement_jp": ["返済", "利息", "元金", "残高", "返済日"],
+        "travel_itinerary_en": ["itinerary", "flight", "departure", "arrival", "hotel"],
+        "travel_itinerary_jp": ["旅程", "出発", "到着", "航空券", "宿泊"],
+    }
+    fallback = queries["invoice_jp_v2"]
+    dom_q = queries.get(domain or "invoice_jp_v2", fallback)
     # deterministic seed for reproducibility
     rnd = random.Random(0x5A17)
     lat=[]
@@ -3080,7 +3340,7 @@ def autotune_unlabeled(jsonl_mm: str, index_pkl: str, outdir: str, method: str="
     # save log
     csv_path=os.path.join(outdir, "autotune_log.csv")
     hdr= ["iter","phase","domain","lambda_shape","w_kw","w_img","ocr_min_conf","col_rate","chunk_c","p95","align_factor","score"]
-    with open(csv_path,"w",encoding="utf-8",newline="") as fw:
+    with open(csv_path,"w",encoding="utf-8-sig",newline="") as fw:
         wr=csv.DictWriter(fw, fieldnames=hdr); wr.writeheader()
         for r in log_rows: wr.writerow({k:r.get(k) for k in hdr})
 
@@ -3188,22 +3448,24 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
     if p95 is None:
         p95=_compute_p95_if_needed(jsonl, index_pkl, domain)
 
+    gate_pass, gate_reason, gate_score = _evaluate_gate(domain, hit_amount, hit_date)
     row={"timestamp":datetime.datetime.utcnow().isoformat()+"Z","jsonl":jsonl,"K":k,
          "domain": domain or "auto",
          "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
          "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
-         "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95}
+         "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95,
+         "gate_pass":gate_pass,"gate_reason":gate_reason,"gate_score":gate_score}
     hdr=not os.path.exists(out_csv)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-    with open(out_csv,"a",encoding="utf-8",newline="") as fw:
+    with open(out_csv,"a",encoding="utf-8-sig",newline="") as fw:
         wr=csv.DictWriter(fw, fieldnames=list(row.keys()))
         if hdr: wr.writeheader()
         wr.writerow(row)
     print("Monitor:", row)
-    if hit_mean is not None and hit_mean >= 0.95:
-        print("GATE: PASS (Hit@K)")
+    if gate_pass:
+        print(f"GATE: PASS ({gate_reason})")
     else:
-        print("GATE: FAIL (Hit@K)")
+        print(f"GATE: FAIL ({gate_reason})")
     return row
 
 def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile_json_out: Optional[str]=None,
@@ -3223,7 +3485,7 @@ def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile
     if monitor_csv and os.path.exists(monitor_csv):
         try:
             import csv
-            with open(monitor_csv, "r", encoding="utf-8", newline="") as fr:
+            with open(monitor_csv, "r", encoding="utf-8-sig", newline="") as fr:
                 rows = list(csv.DictReader(fr))
             if rows:
                 metrics = rows[-1]
@@ -3470,6 +3732,90 @@ def _render_history_table(records: List[Dict[str, Any]]) -> str:
             )
         )
     return "<table class=\"history\">" + header + "<tbody>" + "".join(body_rows) + "</tbody></table>"
+
+
+def _coerce_float(val: Any) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        if isinstance(val, str) and not val.strip():
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _derive_insights(summary: Dict[str, Any]) -> List[str]:
+    insights: List[str] = []
+    monitor = summary.get("monitor_row") or {}
+    tune = summary.get("tune") or {}
+    learn = summary.get("learn") or {}
+    metrics = summary.get("consensus_metrics") or {}
+    aggregate = metrics.get("aggregate") if isinstance(metrics, dict) else {}
+
+    best = tune.get("best") if isinstance(tune, dict) else {}
+    profile = learn.get("profile") if isinstance(learn, dict) else {}
+
+    def pick(source: Dict[str, Any], *keys: str) -> Optional[float]:
+        for key in keys:
+            if isinstance(source, dict) and key in source:
+                v = _coerce_float(source.get(key))
+                if v is not None:
+                    return v
+        return None
+
+    col_over = _coerce_float((aggregate or {}).get("col_over_under_med"))
+    teds = _coerce_float((aggregate or {}).get("teds_mean"))
+    row_out = _coerce_float((aggregate or {}).get("row_outlier_rate_med"))
+    hit_mean = _coerce_float(monitor.get("hit_mean") or monitor.get("hit_mean_gt"))
+    if col_over is not None or teds is not None or row_out is not None:
+        parts: List[str] = []
+        if col_over is not None:
+            parts.append(f"列数一致（over/under≈{col_over:.2f}）")
+        if teds is not None:
+            parts.append(f"TEDS≈{teds:.2f}")
+        msg = "構造は概ね取れている"
+        if parts:
+            msg += "：" + "、".join(parts)
+        if row_out is not None:
+            msg += f"。残課題はヘッダ/末尾Totalの検出で、行外れ≈{row_out:.2f}を詰めればHit@Kも上がる見込み"
+        elif hit_mean is not None:
+            msg += f"。Hit@K≈{hit_mean*100:.0f}% まで見えているのでヘッダ/Total補完でさらに伸ばせます"
+        insights.append(msg)
+
+    gate_flag = monitor.get("gate_pass")
+    gate_pass = bool(gate_flag) if isinstance(gate_flag, bool) else str(gate_flag).lower() == "true"
+    gate_reason = monitor.get("gate_reason") if isinstance(monitor, dict) else None
+    hit_date = _coerce_float(monitor.get("hit_date") or monitor.get("hit_date_gt"))
+    if gate_pass:
+        if gate_reason:
+            insights.append(f"ゲートは {gate_reason} で通過。Date/TAX の期待値は運用要件に合わせて任意指定にできます")
+    else:
+        msg = "ゲート落ちの主因はスキーマ期待値"
+        if gate_reason:
+            msg = f"ゲート落ちの主因は {gate_reason}"
+        if hit_date is not None:
+            msg += f" (hit_date≈{hit_date:.2f})"
+        msg += "。Date を任意扱いにするか、請求書タイプを明細のみ/メタ付きで分岐させると安定"
+        insights.append(msg)
+
+    weights_source = best or profile or {}
+    w_kw = pick(weights_source, "w_kw")
+    w_img = pick(weights_source, "w_img")
+    ocr_min = pick(weights_source, "ocr_min_conf")
+    lam = pick(weights_source, "lambda_shape")
+    if w_kw is not None and w_img is not None:
+        msg = f"現プロファイルの方向性: w_kw={w_kw:.2f} > w_img={w_img:.2f} でキーワード寄り"
+        tweaks: List[str] = []
+        if ocr_min is not None:
+            tweaks.append(f"ocr_min_conf≈{ocr_min:.2f}")
+        if lam is not None:
+            tweaks.append(f"λ_shape≈{lam:.2f}")
+        if tweaks:
+            msg += "。ヘッダ補完を入れるなら " + " と ".join(tweaks) + " を少し下げて再走査すると早い"
+        insights.append(msg)
+
+    return insights
 
 def _generate_report(
     outdir: str,
@@ -3779,13 +4125,22 @@ def _patched_run_full_pipeline(
 
     if "OCR" in ok:
         print("[SKIP] OCR (resume)")
+        try:
+            with open(doc_json_path, "r", encoding="utf-8") as fr:
+                doc_payload = json.load(fr)
+                if isinstance(doc_payload, dict):
+                    summary["consensus_metrics"] = _json_ready(doc_payload.get("metrics"))
+        except Exception:
+            pass
     else:
         r = _safe_step("OCR", pipe.run, "doc", pages, outdir, annos)
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("OCR failed")
         try:
-            _, doc_json_path = r.get("out", (None, doc_json_path))
+            pipe_res, doc_json_path = r.get("out", (None, doc_json_path))
+            if isinstance(pipe_res, dict):
+                summary["consensus_metrics"] = _json_ready(pipe_res.get("metrics"))
         except Exception:
             pass
 
@@ -3831,7 +4186,7 @@ def _patched_run_full_pipeline(
     if monitor_row is None and os.path.exists(mon_csv):
         try:
             import csv
-            with open(mon_csv, "r", encoding="utf-8", newline="") as fr:
+            with open(mon_csv, "r", encoding="utf-8-sig", newline="") as fr:
                 rows = list(csv.DictReader(fr))
                 if rows:
                     monitor_row = rows[-1]
@@ -3859,7 +4214,7 @@ def _patched_run_full_pipeline(
         if monitor_row is None and os.path.exists(mon_csv):
             try:
                 import csv
-                with open(mon_csv, "r", encoding="utf-8", newline="") as fr:
+                with open(mon_csv, "r", encoding="utf-8-sig", newline="") as fr:
                     rows = list(csv.DictReader(fr))
                     if rows:
                         monitor_row = rows[-1]
@@ -3872,6 +4227,7 @@ def _patched_run_full_pipeline(
             print("Learn-from-monitor skipped:", e)
     summary["tune"] = tune_row
     summary["learn"] = learn_row
+    summary["insights"] = _derive_insights(summary)
 
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),

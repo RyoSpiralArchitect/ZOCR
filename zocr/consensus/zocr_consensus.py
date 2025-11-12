@@ -768,10 +768,10 @@ class Pipeline:
         with open(out_json,"w",encoding="utf-8") as f: json.dump(results,f,ensure_ascii=False,indent=2)
         # CSVs
         import csv
-        with open(os.path.join(out_dir,"metrics_by_table.csv"),"w",newline="",encoding="utf-8") as f:
+        with open(os.path.join(out_dir,"metrics_by_table.csv"),"w",newline="",encoding="utf-8-sig") as f:
             w=csv.DictWriter(f, fieldnames=list(per_page_metrics[0].keys()))
             w.writeheader(); [w.writerow(m) for m in per_page_metrics]
-        with open(os.path.join(out_dir,"metrics_aggregate.csv"),"w",newline="",encoding="utf-8") as f:
+        with open(os.path.join(out_dir,"metrics_aggregate.csv"),"w",newline="",encoding="utf-8-sig") as f:
             w=csv.DictWriter(f, fieldnames=list(agg.keys())); w.writeheader(); w.writerow(agg)
         return results, out_json
 

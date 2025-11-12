@@ -73,13 +73,19 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `sql/` — `sql_export` で生成される CSV とスキーマ。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
 - `pipeline_summary.json` — すべての成果物をまとめた要約（`rag_*`, `sql_*`, `views`, `report_path` など）。
+- `monitor.csv` — UTF-8 (BOM 付き) で出力し、Excel/Numbers でも文字化けなく開けます。
 - `pipeline_meta.json` — `--snapshot` 有効時の環境情報。
 - `pipeline_report.html` — trilingual ダッシュボード（`report` サブコマンドでも再生成可）。
 
+## モニタリング洞察 / Monitoring Insights / Analyse de la surveillance
+- `pipeline_summary.json` の `insights` は構造・ゲート・プロファイルの3本立てで、over/under・TEDS・行外れ率や Hit@K を数値付きで提示します。
+- インボイス系ドメインはゲートを緩和し、`hit_amount` が基準を満たせば `hit_date=0` でも「amount hit (date optional)」として PASS します。
+- autotune / `learn_from_monitor` が更新した `w_kw` / `w_img` / `ocr_min_conf` / `lambda_shape` を拾い、ヘッダ補完や再走査の微調整ヒントを返します。
+
 ## 対応ドメイン / Supported Domains / Domaines pris en charge
-- インボイス (JP/EN/FR)、見積書、納品書、領収書、契約書、購入注文書。
-- 経費精算、タイムシート、出荷案内、医療領収書、銀行明細、公共料金請求書。
-- 保険金請求、税申告、給与明細など。各プリセットはキーワードと RAG 向け推奨クエリを含みます。
+- インボイス (JP/EN/FR)、見積書、納品書、領収書、契約書、購入注文書、経費精算、タイムシート、出荷案内、銀行明細、公共料金請求書。
+- 医療領収書に加え **医療請求 (medical_bill)**、**通関申告 (customs_declaration)**、**助成金申請 (grant_application)**、**搭乗券 (boarding_pass)** を新たに追加。既存の **賃貸借契約**、**ローン明細**、**旅行行程** も強化済みです。
+- 各ドメインは `DOMAIN_KW`/`DOMAIN_DEFAULTS`/`DOMAIN_SUGGESTED_QUERIES` を共有し、RAG 推奨クエリやウォームアップ検索を自動設定します。
 
 ## RAG 連携 / RAG Integration / Intégration RAG
 - `export_rag_bundle` が Markdown ダイジェスト、セル JSONL、テーブル別セクション、推奨クエリを `rag/manifest.json` にまとめます。
@@ -94,6 +100,7 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `samples/demo_inputs/` にファイルを配置すると、`--input demo` がそれらを取り込みます。
 - フォルダは空でも構いません。クローン直後は同梱の合成サンプルが利用されます。
 - `samples/README.md` に多言語で手順をまとめています。
+- `samples/invoice/`, `samples/purchase_order/`, `samples/medical_bill/`, `samples/customs_declaration/`, `samples/grant_application/`, `samples/boarding_pass/` を新設。既存の `rental_agreement/`, `loan_statement/`, `travel_itinerary/` とあわせて README がドメイン指定や期待フィールドを案内します。
 
 ## 依存関係 / Dependencies / Dépendances
 - Python 3.9+
