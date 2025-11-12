@@ -4150,7 +4150,7 @@ def phash64(img: Image.Image) -> int:
     a = np.nan_to_num(a, copy=False)
     basis = _dct_basis_32()
     d=basis@a@basis.T
-    d=np.nan_to_num(d, copy=False, posinf=0.0, neginf=0.0)
+    d=np.nan_to_num(d, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     d += 1e-9
     blk=d[:8,:8].copy(); blk[0,0]=0.0
     m=float(np.median(blk)); bits=(blk>m).astype(np.uint8).reshape(-1)
@@ -7172,6 +7172,7 @@ def _patched_run_full_pipeline(
     resume: bool = False,
     seed: int = 24601,
     snapshot: bool = False,
+    ocr_engine: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     random.seed(seed)
@@ -7209,6 +7210,9 @@ def _patched_run_full_pipeline(
     prof_path = os.path.join(outdir, "auto_profile.json")
     prof = _load_profile(outdir, domain_hint)
 
+    env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
+    effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
         "mm_jsonl": mm_jsonl,
@@ -7225,11 +7229,14 @@ def _patched_run_full_pipeline(
         "resume_steps": sorted(str(s) for s in ok if s is not None),
         "snapshot": bool(snapshot),
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
+        "ocr_engine": effective_ocr_engine,
         "toy_memory": {
             "path": toy_memory_path,
             "load": _json_ready(toy_memory_info_load),
         },
     }
+
+    prof.setdefault("ocr_engine", effective_ocr_engine)
 
     toy_memory_run_baseline = toy_memory_after_load or toy_memory_snapshot()
     toy_memory_after_run: Optional[Dict[str, Any]] = None
@@ -7290,8 +7297,17 @@ def _patched_run_full_pipeline(
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
-        r = _safe_step("Export", zocr_onefile_consensus.export_jsonl_with_ocr,
-                       doc_json_path, pages, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
+        ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
+        r = _safe_step(
+            "Export",
+            zocr_onefile_consensus.export_jsonl_with_ocr,
+            doc_json_path,
+            pages,
+            jsonl_path,
+            effective_ocr_engine,
+            True,
+            ocr_min_conf,
+        )
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
@@ -7755,6 +7771,11 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=24601)
     ap.add_argument("--snapshot", action="store_true")
+    ap.add_argument(
+        "--ocr-engine",
+        default=None,
+        help="OCR backend to use (e.g. toy, tesseract, easyocr). Overrides ZOCR_OCR_ENGINE.",
+    )
     args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
@@ -7773,6 +7794,7 @@ def main():
             resume=args.resume,
             seed=args.seed,
             snapshot=args.snapshot,
+            ocr_engine=args.ocr_engine,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
