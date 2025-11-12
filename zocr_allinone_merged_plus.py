@@ -26,7 +26,7 @@
 """
 
 # Auto-generated single-file bundle
-# Generated: 2025-11-10T06:47:54.250029Z
+# Generated: 2025-11-12T15:43:19.121504+00:00
 # Purpose : Merge upstream (onefile consensus OCR) -> pipe (orchestrator) -> downstream (core augment/index/query) -> watchdog (monitor)
 #           into a self-contained Python script without omitting any source code.
 # How it works:
@@ -89,7 +89,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 
 from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict
 
@@ -99,6 +99,12 @@ except Exception:
     np = None
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
+try:
+    import pytesseract  # type: ignore
+    from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    pytesseract = None  # type: ignore
+    _PYTESS_OUTPUT = None  # type: ignore
 from html.parser import HTMLParser
 
 _thomas = None
@@ -827,7 +833,11 @@ class Pipeline:
                 rows_gt, cols_gt = _rows_cols_from_html(html_gt)
             else:
                 html_gt=None; teds=compute_teds(html_pred,None); rows_gt=cols_gt=None
-            results["pages"].append({"index":i+1,"tables":[{"bbox":tbl_bbox,"html":html_pred,"dbg":dbg,"teds":teds}]})
+            results["pages"].append({
+                "index": i + 1,
+                "image_path": os.path.abspath(page_path),
+                "tables": [{"bbox": tbl_bbox, "html": html_pred, "dbg": dbg, "teds": teds}],
+            })
             latencies_sorted=sorted(latencies)
             p50 = latencies_sorted[len(latencies_sorted)//2]
             p95 = latencies_sorted[max(0,int(len(latencies_sorted)*0.95)-1)]
@@ -1103,6 +1113,76 @@ def _threshold_memory_store(key: Tuple[int, int, int], value: int) -> None:
 
 _NGRAM_COUNTS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 _NGRAM_TOTALS: Dict[str, int] = defaultdict(int)
+
+
+def _blank_recognition_stats() -> Dict[str, Any]:
+    return {
+        "cells": 0,
+        "characters": 0,
+        "conf_sum": 0.0,
+        "coherence_sum": 0.0,
+        "surprisal_sum": 0.0,
+        "low_conf_cells": 0,
+        "high_surprisal_cells": 0,
+        "examples": [],
+    }
+
+
+_TOY_RECOGNITION_STATS: Dict[str, Any] = _blank_recognition_stats()
+
+
+def reset_toy_recognition_stats() -> None:
+    global _TOY_RECOGNITION_STATS
+    _TOY_RECOGNITION_STATS = _blank_recognition_stats()
+
+
+def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal: float) -> None:
+    stats = _TOY_RECOGNITION_STATS
+    stats["cells"] = int(stats.get("cells", 0) + 1)
+    stats["characters"] = int(stats.get("characters", 0) + len(text))
+    stats["conf_sum"] = float(stats.get("conf_sum", 0.0) + float(conf))
+    stats["coherence_sum"] = float(stats.get("coherence_sum", 0.0) + float(coherence))
+    stats["surprisal_sum"] = float(stats.get("surprisal_sum", 0.0) + float(surprisal))
+    if conf < 0.6:
+        stats["low_conf_cells"] = int(stats.get("low_conf_cells", 0) + 1)
+    if surprisal > 1.6:
+        stats["high_surprisal_cells"] = int(stats.get("high_surprisal_cells", 0) + 1)
+        examples: List[Dict[str, Any]] = stats.setdefault("examples", [])  # type: ignore[assignment]
+        if len(examples) < 12:
+            examples.append({
+                "text": text,
+                "confidence": float(conf),
+                "coherence": float(coherence),
+                "surprisal": float(surprisal),
+                "length": len(text),
+            })
+
+
+def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
+    stats = _TOY_RECOGNITION_STATS
+    cells = int(stats.get("cells", 0))
+    result: Dict[str, Any] = {
+        "cells": cells,
+        "characters": int(stats.get("characters", 0)),
+        "avg_confidence": float(stats.get("conf_sum", 0.0) / cells) if cells else 0.0,
+        "avg_coherence": float(stats.get("coherence_sum", 0.0) / cells) if cells else 0.0,
+        "avg_surprisal": float(stats.get("surprisal_sum", 0.0) / cells) if cells else 0.0,
+        "low_conf_cells": int(stats.get("low_conf_cells", 0)),
+        "high_surprisal_cells": int(stats.get("high_surprisal_cells", 0)),
+        "examples": [
+            {
+                "text": ex.get("text"),
+                "confidence": float(ex.get("confidence", 0.0)),
+                "coherence": float(ex.get("coherence", 0.0)),
+                "surprisal": float(ex.get("surprisal", 0.0)),
+                "length": int(ex.get("length", 0)),
+            }
+            for ex in stats.get("examples", [])[:12]
+        ],
+    }
+    if reset:
+        reset_toy_recognition_stats()
+    return result
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "0": ("O", "D"),
     "O": ("0",),
@@ -1153,6 +1233,202 @@ def _render_glyphs(font=None, size=16):
 
 _GLYPH_ATLAS, _GLYPH_FEATS = _render_glyphs()
 
+
+def _toy_memory_snapshot_internal() -> Dict[str, Any]:
+    glyph_chars = 0
+    glyph_variants = 0
+    for variants in _GLYPH_ATLAS.values():
+        if variants:
+            glyph_chars += 1
+            glyph_variants += len(variants)
+    ngram_contexts = 0
+    ngram_transitions = 0
+    for mapping in _NGRAM_COUNTS.values():
+        if mapping:
+            ngram_contexts += 1
+            ngram_transitions += len(mapping)
+    ngram_observations = int(sum(_NGRAM_TOTALS.values()))
+    snapshot: Dict[str, Any] = {
+        "glyph_chars": int(glyph_chars),
+        "glyph_variants": int(glyph_variants),
+        "avg_variants_per_char": float(glyph_variants / glyph_chars) if glyph_chars else 0.0,
+        "ngram_contexts": int(ngram_contexts),
+        "ngram_transitions": int(ngram_transitions),
+        "ngram_observations": ngram_observations,
+        "avg_ngram_branching": float(ngram_transitions / ngram_contexts) if ngram_contexts else 0.0,
+    }
+    return snapshot
+
+
+def toy_memory_snapshot() -> Dict[str, Any]:
+    return dict(_toy_memory_snapshot_internal())
+
+
+def toy_memory_delta(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    if before is None:
+        before = {}
+    if after is None:
+        after = {}
+    delta: Dict[str, float] = {}
+    keys = set(k for k, v in after.items() if isinstance(v, (int, float))) | set(
+        k for k, v in before.items() if isinstance(v, (int, float))
+    )
+    for key in sorted(keys):
+        a = after.get(key)
+        b = before.get(key)
+        if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+            aval = float(a) if isinstance(a, (int, float)) else 0.0
+            bval = float(b) if isinstance(b, (int, float)) else 0.0
+            delta[key] = aval - bval
+    return delta
+
+
+def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "version": 1,
+        "glyph_atlas": {},
+        "glyph_feats": {},
+        "ngram_counts": {},
+        "ngram_totals": {},
+    }
+    for ch, imgs in _GLYPH_ATLAS.items():
+        serialised: List[List[List[int]]] = []
+        for img in imgs[:_GLYPH_VARIANT_LIMIT]:
+            try:
+                arr = np.asarray(img, dtype=np.uint8)
+                serialised.append(arr.tolist())
+            except Exception:
+                continue
+        if serialised:
+            payload["glyph_atlas"][ch] = serialised
+    for ch, feats in _GLYPH_FEATS.items():
+        if not isinstance(feats, dict):
+            continue
+        safe = {
+            "aspect": float(feats.get("aspect", 1.0)),
+            "density": float(feats.get("density", 0.0)),
+            "symmetry": float(feats.get("symmetry", 0.0)),
+            "count": int(feats.get("count", 1)),
+        }
+        payload["glyph_feats"][ch] = safe
+    for prev, mapping in _NGRAM_COUNTS.items():
+        if not mapping:
+            continue
+        items = sorted(mapping.items(), key=lambda kv: kv[1], reverse=True)
+        trimmed = items[:limit_ngram]
+        payload["ngram_counts"][prev] = {ch: int(count) for ch, count in trimmed if count}
+    payload["ngram_totals"] = {prev: int(total) for prev, total in _NGRAM_TOTALS.items() if total}
+    return payload
+
+
+def save_toy_memory(path: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "path": path,
+        "saved": False,
+        "snapshot": toy_memory_snapshot(),
+    }
+    if not path:
+        return info
+    try:
+        payload = _toy_memory_payload()
+        ensure_dir(os.path.dirname(path) or ".")
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+        info["saved"] = True
+        try:
+            info["bytes"] = os.path.getsize(path)
+        except Exception:
+            pass
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    info["snapshot"] = toy_memory_snapshot()
+    return info
+
+
+def load_toy_memory(path: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "path": path,
+        "loaded": False,
+        "changed": False,
+        "snapshot_before": toy_memory_snapshot(),
+    }
+    if not path or not os.path.exists(path):
+        return info
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return info
+    changed = False
+    try:
+        glyph_payload = payload.get("glyph_atlas", {})
+        if isinstance(glyph_payload, dict):
+            for ch, arrs in glyph_payload.items():
+                if not isinstance(arrs, list):
+                    continue
+                atlas_list: List[Image.Image] = []
+                for arr in arrs[:_GLYPH_VARIANT_LIMIT]:
+                    try:
+                        np_arr = np.asarray(arr, dtype=np.uint8)
+                        if np_arr.ndim != 2:
+                            continue
+                        atlas_list.append(Image.fromarray(np_arr, mode="L"))
+                    except Exception:
+                        continue
+                if atlas_list:
+                    _GLYPH_ATLAS[ch] = atlas_list
+                    changed = True
+        feats_payload = payload.get("glyph_feats", {})
+        if isinstance(feats_payload, dict):
+            for ch, feats in feats_payload.items():
+                if not isinstance(feats, dict):
+                    continue
+                safe = {
+                    "aspect": float(feats.get("aspect", 1.0)),
+                    "density": float(feats.get("density", 0.0)),
+                    "symmetry": float(feats.get("symmetry", 0.0)),
+                    "count": int(feats.get("count", len(_GLYPH_ATLAS.get(ch, [])) or 1)),
+                }
+                _GLYPH_FEATS[ch] = safe
+        counts_payload = payload.get("ngram_counts", {})
+        if isinstance(counts_payload, dict):
+            for prev, mapping in counts_payload.items():
+                if not isinstance(mapping, dict):
+                    continue
+                target = _NGRAM_COUNTS.setdefault(prev, defaultdict(int))
+                for ch, val in mapping.items():
+                    try:
+                        target[ch] += int(val)
+                        changed = True
+                    except Exception:
+                        continue
+        totals_payload = payload.get("ngram_totals", {})
+        if isinstance(totals_payload, dict):
+            for prev, total in totals_payload.items():
+                try:
+                    current = _NGRAM_TOTALS.get(prev, 0)
+                    new_total = int(total)
+                    if new_total > current:
+                        _NGRAM_TOTALS[prev] = new_total
+                        changed = True
+                except Exception:
+                    continue
+        info["loaded"] = True
+        info["changed"] = bool(changed)
+        info["snapshot_after"] = toy_memory_snapshot()
+        info["delta"] = toy_memory_delta(info.get("snapshot_before"), info.get("snapshot_after"))
+        try:
+            info["bytes"] = os.path.getsize(path)
+        except Exception:
+            pass
+        return info
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        info["snapshot_after"] = toy_memory_snapshot()
+        info["delta"] = toy_memory_delta(info.get("snapshot_before"), info.get("snapshot_after"))
+        return info
+
 def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
     if not feats:
         return
@@ -1179,6 +1455,7 @@ def _adapt_glyph(ch: str, img: "Image.Image") -> None:
     if arr.size == 0:
         return
     atlas_list = _GLYPH_ATLAS.setdefault(ch, [])
+    # avoid duplicates
     for tpl in atlas_list:
         try:
             if np.array_equal(np.asarray(tpl, dtype=np.uint8), arr):
@@ -1205,6 +1482,7 @@ def _generate_contextual_variants(text: str) -> Set[str]:
             variant = chars[:]
             variant[i] = alt
             variants.add("".join(variant))
+    # second pass for two-position swaps (limited to keep combinatorics small)
     limited_positions = [i for i, ch in enumerate(chars) if _AMBIGUOUS_CHAR_MAP.get(ch)]
     if len(limited_positions) >= 2:
         for i in limited_positions[:3]:
@@ -1231,28 +1509,51 @@ def _looks_like_numeric_token(text: str) -> bool:
 def _looks_like_upper_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
 
+def _ngram_probability(prev: str, ch: str) -> float:
+    counts = _NGRAM_COUNTS.get(prev)
+    totals = _NGRAM_TOTALS.get(prev, 0)
+    if counts and totals:
+        vocab = max(len(counts), 8)
+        denom = float(totals + vocab)
+        return float((counts.get(ch, 0) + 1.0) / denom)
+    if counts:
+        vocab = max(len(counts), 8)
+        return float((counts.get(ch, 0) + 1.0) / float(vocab * 2))
+    vocab = max(len(_ASCII_SET), 8)
+    return float(1.0 / vocab)
+
+
 def _ngram_coherence(text: str) -> float:
     if len(text) < 2 or not _NGRAM_TOTALS:
         return 0.0
     prev = "\0"
     total_pairs = 0
     log_sum = 0.0
-    vocab = len(_ASCII_SET) + 4
     for ch in text:
-        totals = _NGRAM_TOTALS.get(prev, 0)
-        counts = _NGRAM_COUNTS.get(prev)
-        prob = None
-        if counts and totals:
-            prob = (counts.get(ch, 0) + 1.0) / (totals + vocab)
-        elif counts:
-            prob = (counts.get(ch, 0) + 1.0) / (len(counts) + vocab)
-        if prob is not None:
+        prob = _ngram_probability(prev, ch)
+        if prob > 0:
             log_sum += math.log(prob)
             total_pairs += 1
         prev = ch
     if total_pairs == 0:
         return 0.0
     return float(math.exp(log_sum / total_pairs))
+
+
+def _ngram_surprisal(text: str) -> float:
+    if not text or not _NGRAM_TOTALS:
+        return 0.0
+    prev = "\0"
+    total_pairs = 0
+    accum = 0.0
+    for ch in text:
+        prob = max(_ngram_probability(prev, ch), 1e-9)
+        accum += -math.log(prob, 2)
+        total_pairs += 1
+        prev = ch
+    if total_pairs == 0:
+        return 0.0
+    return float(accum / total_pairs)
 
 def _score_candidate_with_context(text: str, base_conf: float) -> float:
     score = max(0.0, min(1.0, base_conf))
@@ -1269,11 +1570,17 @@ def _score_candidate_with_context(text: str, base_conf: float) -> float:
     coherence = _ngram_coherence(text)
     if coherence > 0:
         score = max(score, min(1.0, base_conf * (0.85 + 0.15 * coherence) + 0.05 * coherence))
+    surprisal = _ngram_surprisal(text)
+    if surprisal > 0:
+        penalty = max(0.0, min(0.2, (surprisal - 1.2) * 0.12))
+        if penalty:
+            score = max(0.0, score - penalty)
     return min(1.0, score)
 
 def _contextual_rerank_candidates(candidates: Dict[str, float]) -> Tuple[str, float]:
     if not candidates:
         return "", 0.0
+    # base choice by confidence
     base_text, base_conf = max(candidates.items(), key=lambda kv: kv[1])
     enriched: Dict[str, float] = dict(candidates)
     for text, conf in list(enriched.items()):
@@ -1338,6 +1645,307 @@ _TOTAL_LABEL_HINTS = [
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
+
+_AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
+    "?": ("7", "1", "2"),
+    "I": ("1", "l"),
+    "l": ("1",),
+    "|": ("1",),
+    "O": ("0",),
+    "o": ("0",),
+    "S": ("5",),
+    "s": ("5",),
+    "$": ("5",),
+    "B": ("8",),
+    "b": ("6",),
+    "g": ("9",),
+    "Z": ("2",),
+    "z": ("2",),
+}
+
+
+def _ambiguous_variants(text: Optional[str]) -> List[str]:
+    if not text:
+        return []
+    candidates: Set[str] = set()
+    chars = list(text)
+    for idx, ch in enumerate(chars):
+        repls = _AMBIGUOUS_CHAR_MAP.get(ch)
+        if not repls:
+            continue
+        for repl in repls:
+            if repl == ch:
+                continue
+            mutated = chars[:]
+            mutated[idx] = repl
+            candidate = "".join(mutated)
+            if candidate != text:
+                candidates.add(candidate)
+    return sorted(candidates)
+
+
+def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    if pytesseract is None or _PYTESS_OUTPUT is None:
+        return []
+    variants: List[Tuple[str, float, str]] = []
+    config = "--psm 6"
+    try:
+        data = pytesseract.image_to_data(img, output_type=_PYTESS_OUTPUT.DICT, config=config)  # type: ignore[arg-type]
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        words: List[str] = []
+        confs: List[float] = []
+        texts = data.get("text", [])
+        confidences = data.get("conf", [])
+        for raw_txt, raw_conf in zip(texts, confidences):
+            txt = (raw_txt or "").strip()
+            if txt:
+                words.append(txt)
+            try:
+                c = float(raw_conf)
+            except Exception:
+                c = -1.0
+            if c >= 0.0:
+                confs.append(c / 100.0)
+        if words:
+            joined = " ".join(words)
+            conf_val = max(confs) if confs else 0.6
+            variants.append((joined, float(max(0.0, min(1.0, conf_val))), "engine:pytesseract_data"))
+    try:
+        raw = pytesseract.image_to_string(img, config=config)  # type: ignore[arg-type]
+    except Exception:
+        raw = None
+    if raw:
+        txt = raw.strip()
+        if txt:
+            conf_guess = 0.62
+            variants.append((txt, conf_guess, "engine:pytesseract"))
+    return variants
+
+
+def _synthetic_external_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    variants: List[Tuple[str, float, str]] = []
+    try:
+        base = ImageOps.autocontrast(img.convert("L"))
+    except Exception:
+        try:
+            base = img.convert("L")
+        except Exception:
+            return variants
+
+    work_gray = ImageOps.expand(base, border=1, fill=255)
+    try:
+        work_rgb = work_gray.convert("RGB")
+    except Exception:
+        work_rgb = work_gray
+    seen: Set[Tuple[str, str]] = set()
+
+    def _emit_variant(im: "Image.Image", label: str, boost: float = 0.0) -> None:
+        if im is None:
+            return
+        try:
+            rgb = im.convert("RGB")
+        except Exception:
+            rgb = im
+        try:
+            text, conf = toy_ocr_text_from_cell(rgb)
+        except Exception:
+            return
+        if not text:
+            return
+        key = (text, label)
+        if key in seen:
+            return
+        seen.add(key)
+        conf_adj = float(max(0.0, min(1.0, conf + boost)))
+        variants.append((text, conf_adj, f"engine:faux_tess/{label}"))
+
+    def _emit_manual(text: str, conf: float, label: str, boost: float = 0.0) -> None:
+        if not text:
+            return
+        key = (text, label)
+        if key in seen:
+            return
+        seen.add(key)
+        conf_adj = float(max(0.0, min(1.0, (conf or 0.0) + boost)))
+        variants.append((text, conf_adj, f"engine:faux_tess/{label}"))
+
+    _emit_variant(work_rgb, "autocontrast", 0.03)
+    _emit_variant(ImageOps.equalize(work_rgb), "equalize")
+    _emit_variant(ImageOps.expand(work_rgb, border=2, fill=255), "pad2", 0.03)
+    try:
+        _emit_variant(ImageEnhance.Sharpness(work_rgb).enhance(1.6), "sharp_1.6", 0.03)
+        _emit_variant(ImageEnhance.Sharpness(work_rgb).enhance(2.2), "sharp_2.2", 0.04)
+    except Exception:
+        pass
+    for filt, label in ((ImageFilter.MedianFilter(5), "median5"),
+                        (ImageFilter.ModeFilter(size=3), "mode3"),
+                        (ImageFilter.DETAIL, "detail"),
+                        (ImageFilter.SMOOTH_MORE, "smooth")):
+        try:
+            _emit_variant(work_rgb.filter(filt), label, 0.0)
+        except Exception:
+            continue
+    try:
+        _emit_variant(work_rgb.filter(ImageFilter.UnsharpMask(radius=2, percent=180)), "unsharp", 0.05)
+    except Exception:
+        pass
+    for filt, label in ((ImageFilter.MaxFilter(3), "max3"),
+                        (ImageFilter.MinFilter(3), "min3")):
+        try:
+            _emit_variant(work_rgb.filter(filt), label, 0.01)
+        except Exception:
+            continue
+    try:
+        _emit_variant(ImageOps.invert(work_rgb), "invert", 0.0)
+        _emit_variant(ImageOps.posterize(work_rgb, 3), "posterize3", 0.0)
+    except Exception:
+        pass
+    for scale in (1.25, 1.5, 1.75, 2.0):
+        try:
+            w = max(1, int(round(work_rgb.width * scale)))
+            h = max(1, int(round(work_rgb.height * scale)))
+            resized = work_rgb.resize((w, h), resample=Image.BICUBIC)
+        except Exception:
+            continue
+        _emit_variant(resized, f"scale{scale:.2f}", 0.02)
+
+    if np is not None:
+        try:
+            arr = np.asarray(work_gray, dtype=np.uint8)
+        except Exception:
+            arr = None
+        if arr is not None and arr.size:
+            height, width = arr.shape
+            mu = float(arr.mean())
+            sigma = float(arr.std())
+            thresholds: Set[int] = set()
+            if sigma > 1.0:
+                for coeff in (0.8, 0.5, 0.25, -0.25):
+                    thresholds.add(int(np.clip(mu - sigma * coeff, 16, 240)))
+            try:
+                percentiles = [float(np.percentile(arr, p)) for p in (10, 20, 35, 50, 70)]
+            except Exception:
+                percentiles = []
+            for val in percentiles:
+                thresholds.add(int(np.clip(val, 12, 244)))
+            thresholds.add(int(np.clip(mu, 16, 240)))
+            thresholds = {t for t in thresholds if 0 <= t <= 255}
+
+            def _segment_words(mask: "np.ndarray", tag: str) -> None:
+                if mask.ndim != 2:
+                    return
+                ink_cols = mask.sum(axis=0)
+                gap_thr = max(1, int(mask.shape[0] * 0.12))
+                segments: List[Tuple[int, int]] = []
+                start: Optional[int] = None
+                for x, val in enumerate(ink_cols):
+                    if val > gap_thr:
+                        if start is None:
+                            start = max(0, x - 1)
+                    elif start is not None:
+                        segments.append((start, min(mask.shape[1], x + 1)))
+                        start = None
+                if start is not None:
+                    segments.append((start, mask.shape[1]))
+                segments = [seg for seg in segments if seg[1] - seg[0] > 2]
+                if len(segments) <= 1:
+                    return
+                pieces: List[str] = []
+                confs: List[float] = []
+                for x0, x1 in segments[:8]:
+                    try:
+                        seg_crop = work_rgb.crop((x0, 0, x1, work_rgb.height))
+                    except Exception:
+                        continue
+                    txt_seg, conf_seg = toy_ocr_text_from_cell(seg_crop)
+                    if txt_seg:
+                        pieces.append(txt_seg.strip())
+                        confs.append(conf_seg)
+                joined = " ".join([t for t in pieces if t])
+                if not joined:
+                    return
+                conf_est = 0.0
+                if confs:
+                    conf_est = max(confs)
+                    conf_est = max(conf_est, sum(confs) / max(1, len(confs)) + 0.04)
+                _emit_manual(joined, conf_est, f"segment_{tag}")
+
+            for thr in sorted(thresholds):
+                try:
+                    mask = (arr <= thr).astype(np.uint8)
+                except Exception:
+                    continue
+                if not mask.any():
+                    continue
+                try:
+                    bw = Image.fromarray((1 - mask) * 255, mode="L")
+                except Exception:
+                    continue
+                _emit_variant(bw, f"threshold_{thr:03d}", 0.05)
+                try:
+                    inv = ImageOps.invert(bw)
+                except Exception:
+                    inv = None
+                if inv is not None:
+                    _emit_variant(inv, f"threshold_inv_{thr:03d}", 0.03)
+                _segment_words(mask, f"thr{thr:03d}")
+
+            if height > 4:
+                proj = width // 4
+                if proj > 0:
+                    mask_rows = (arr < int(mu)).astype(np.uint8)
+                    row_sum = mask_rows.sum(axis=1)
+                    segments_row: List[Tuple[int, int]] = []
+                    start_row: Optional[int] = None
+                    for idx, val in enumerate(row_sum):
+                        if val > proj:
+                            if start_row is None:
+                                start_row = max(0, idx - 1)
+                        elif start_row is not None:
+                            segments_row.append((start_row, min(height, idx + 1)))
+                            start_row = None
+                    if start_row is not None:
+                        segments_row.append((start_row, height))
+                    if len(segments_row) > 1:
+                        texts: List[str] = []
+                        confidences: List[float] = []
+                        for y0, y1 in segments_row[:4]:
+                            try:
+                                strip = work_rgb.crop((0, y0, work_rgb.width, y1))
+                            except Exception:
+                                continue
+                            txt, conf = toy_ocr_text_from_cell(strip)
+                            if txt:
+                                texts.append(txt.strip())
+                                confidences.append(conf)
+                        if texts:
+                            joined = " ".join(t for t in texts if t)
+                            if joined:
+                                conf_guess = float(max(confidences) if confidences else 0.0)
+                                conf_avg = float(sum(confidences) / max(1, len(confidences)))
+                                conf_val = float(max(conf_guess, conf_avg + 0.05))
+                                _emit_manual(joined, conf_val, "strip_join")
+
+    return variants
+
+
+def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    variants: List[Tuple[str, float, str]] = []
+    tess_variants = _pytesseract_variants(img)
+    variants.extend(tess_variants)
+    if pytesseract is not None and tess_variants:
+        try:
+            inverted = ImageOps.invert(img.convert("RGB"))
+        except Exception:
+            inverted = None
+        if inverted is not None:
+            for txt, conf, transform in _pytesseract_variants(inverted):
+                variants.append((txt, conf, f"{transform}+invert"))
+    if pytesseract is None or not variants:
+        variants.extend(_synthetic_external_variants(img))
+    return variants
 
 def _normalize_total_token(text: str) -> str:
     base = (text or "").lower()
@@ -1426,7 +2034,8 @@ def _match_glyph(cell_bin, atlas):
             symmetry_penalty = 1.0
         variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty
         if variant_best > best_score:
-            best_score = variant_best; best_ch = ch_key
+            best_score = variant_best
+            best_ch = ch_key
     conf = (best_score + 1.0) / 2.0
     return (best_ch if conf >= 0.52 else "?"), float(conf)
 
@@ -1512,7 +2121,7 @@ def _text_from_binary(bw):
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
 
-def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[str, float]:
+def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[str, float]:
     """Very small OCR to work with the demo font. Returns (text, confidence)."""
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
@@ -1520,8 +2129,8 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
     arr = _np.asarray(g, dtype=_np.uint8)
     if arr.size == 0:
         return "", 0.0
+    arr_f = arr.astype(_np.float32)
     try:
-        arr_f = arr.astype(_np.float32)
         gy, gx = _np.gradient(arr_f)
         edge_mag = _np.hypot(gx, gy)
         thr = edge_mag.mean() + edge_mag.std()
@@ -1533,6 +2142,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
         bright_ratio = float(_np.mean(edge_vals > arr.mean())) if edge_vals.size else 0.0
         if bright_ratio > 0.6:
             arr = 255 - arr
+            arr_f = arr.astype(_np.float32)
             g = Image.fromarray(arr, mode="L")
     thr_med = int(_np.clip(_np.median(arr), 48, 208))
     candidates: List[Tuple[np.ndarray, Dict[str, Any]]] = []
@@ -1619,12 +2229,14 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
                 final_text, final_conf = reranked_text, reranked_conf
 
     if final_text:
+        coherence = _ngram_coherence(final_text)
+        surprisal = _ngram_surprisal(final_text)
+        _record_toy_recognition(final_text, float(final_conf), coherence, surprisal)
         _update_ngram_model(final_text)
-    if final_text:
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
 
-def _keywords_from_row(row_cells: list[str]) -> list[str]:
+def _keywords_from_row(row_cells: List[str]) -> List[str]:
     kws = set()
     rx_num = re.compile(r"[+\-]?\d[\d,]*(\.\d+)?")
     rx_date = re.compile(r"\b(20\d{2}|19\d{2})[/-](0?[1-9]|1[0-2])([/-](0?[1-9]|[12][0-9]|3[01]))?\b")
@@ -1635,23 +2247,152 @@ def _keywords_from_row(row_cells: list[str]) -> list[str]:
         if any(sym in t for sym in ["$", "¥", "円"]): kws.add("currency")
     return sorted(kws)[:12]
 
-def _context_line_from_row(headers: list[str], row: list[str]) -> str:
+def _context_line_from_row(headers: List[str], row: List[str]) -> str:
     if headers and len(headers)==len(row):
         pairs = [f"{h.strip()}={row[i].strip()}" for i,h in enumerate(headers)]
         return " | ".join(pairs)
     else:
         return " | ".join([x.strip() for x in row if x.strip()])
 
-def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_path: str,
+def _conceptual_tags(text: str, headers: List[str], row: List[str]) -> List[str]:
+    tags: Set[str] = set()
+    t = (text or "").strip()
+    if not t:
+        return []
+    if any(ch.isalpha() for ch in t):
+        tags.add("alpha")
+    if any(ch.isdigit() for ch in t):
+        tags.add("digit")
+    if re.search(r"\d{4}[-/](0?[1-9]|1[0-2])", t):
+        tags.add("date")
+    if re.search(r"[+\-]?\d+[,.]\d+", t):
+        tags.add("decimal")
+    if re.search(r"[€$¥円]", t):
+        tags.add("currency_symbol")
+    if t.isupper() and len(t) > 1:
+        tags.add("upper")
+    if t.islower() and len(t) > 1:
+        tags.add("lower")
+    if t.replace(" ", "").isdigit():
+        tags.add("integer")
+    normalized = re.sub(r"[^0-9A-Za-z]+", " ", t).strip().lower()
+    if normalized:
+        tags.add(f"lex:{normalized[:20]}")
+    for h in headers:
+        if not h:
+            continue
+        h_norm = h.strip().lower()
+        if not h_norm:
+            continue
+        if any(tok in h_norm for tok in ("total", "amount", "balance")):
+            tags.add("header:total")
+        if "date" in h_norm:
+            tags.add("header:date")
+        if any(tok in h_norm for tok in ("tax", "vat")):
+            tags.add("header:tax")
+    if row:
+        joined = " ".join([c for c in row if c])
+        if len(joined) > 6 and joined == joined.upper():
+            tags.add("row:upper_span")
+        if re.search(r"\bsubtotal\b", joined.lower()):
+            tags.add("row:subtotal")
+    return sorted(tags)
+
+
+def _hypothesize_from_text(text: str, headers: List[str], concepts: List[str]) -> List[Dict[str, Any]]:
+    if not text:
+        text = ""
+    hyps: List[Dict[str, Any]] = []
+    base = text.strip()
+    if base:
+        hyps.append({"text": base, "strategy": "observed", "score": 0.6})
+    compact = re.sub(r"\s+", "", base)
+    if compact and compact != base:
+        hyps.append({"text": compact, "strategy": "compact", "score": 0.45})
+    digits = re.sub(r"[^0-9]", "", base)
+    if digits and digits != compact:
+        hyps.append({"text": digits, "strategy": "digits_only", "score": 0.4})
+    if base and base.upper() != base:
+        hyps.append({"text": base.upper(), "strategy": "upper", "score": 0.35})
+    if base and base.lower() != base:
+        hyps.append({"text": base.lower(), "strategy": "lower", "score": 0.35})
+    if "header:date" in concepts and digits:
+        y, rest = digits[:4], digits[4:]
+        if len(rest) >= 4:
+            hyps.append({"text": f"{y}-{rest[:2]}-{rest[2:4]}", "strategy": "date_template", "score": 0.5})
+    if "decimal" in concepts and digits:
+        if len(digits) > 2:
+            hyps.append({"text": f"{digits[:-2]}.{digits[-2:]}", "strategy": "decimal_guess", "score": 0.55})
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for hyp in hyps:
+        key = hyp.get("text") or ""
+        if key not in dedup or dedup[key].get("score", 0) < hyp.get("score", 0):
+            dedup[key] = hyp
+    return sorted(dedup.values(), key=lambda h: -float(h.get("score", 0.0)))[:6]
+
+
+def export_jsonl_with_ocr(doc_json_path: str,
+                          source_images: Union[str, Sequence[str], Mapping[int, str]],
+                          out_jsonl_path: str,
                           ocr_engine: str = "toy", contextual: bool = True,
                           ocr_min_conf: float = 0.58) -> int:
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
-    im = Image.open(source_image_path).convert("RGB")
+    page_lookup: Dict[int, str] = {}
+    default_image_path: Optional[str]
+    if isinstance(source_images, str):
+        default_image_path = source_images
+    elif isinstance(source_images, Mapping):
+        for key, value in source_images.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, str):
+                page_lookup[idx] = value
+        default_image_path = page_lookup.get(min(page_lookup.keys())) if page_lookup else None
+    else:
+        seq = [p for p in source_images if isinstance(p, str)]
+        page_lookup = {i: path for i, path in enumerate(seq)}
+        default_image_path = seq[0] if seq else None
+    image_cache: Dict[str, Image.Image] = {}
+
+    def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for cand in (path, page_lookup.get(index) if index is not None else None, default_image_path):
+            if isinstance(cand, str) and cand and cand not in seen:
+                seen.add(cand)
+                ordered.append(cand)
+        return ordered
+
+    def _load_page_image(path: Optional[str], index: Optional[int]) -> Optional["Image.Image"]:
+        for target in _candidate_paths(path, index):
+            if target in image_cache:
+                return image_cache[target]
+            try:
+                with Image.open(target) as img:
+                    loaded = img.convert("RGB")
+            except Exception:
+                continue
+            image_cache[target] = loaded
+            return loaded
+        return None
     count = 0
+    learning_signals: List[Dict[str, Any]] = []
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
-        for p in doc["pages"]:
-            pidx = p["index"]
+        for enum_idx, p in enumerate(doc["pages"]):
+            pidx = p.get("index")
+            page_image_path = p.get("image_path")
+            lookup_idx: Optional[int]
+            if isinstance(pidx, int):
+                lookup_idx = pidx
+            else:
+                lookup_idx = enum_idx
+            page_image = _load_page_image(page_image_path, lookup_idx)
+            if page_image is None:
+                continue
+            page_w, page_h = page_image.size
             for ti, t in enumerate(p["tables"]):
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
@@ -1698,11 +2439,11 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                         left_pad = pad_edge_x if c == 0 else pad_inner_x
                         right_pad = pad_edge_x if c == C-1 else pad_inner_x
                         cy1, cy2 = row_bands[r]
-                        crop = im.crop((
+                        crop = page_image.crop((
                             max(0, cx1 - left_pad),
                             max(0, cy1 - pad_y),
-                            min(im.width, cx2 + right_pad),
-                            min(im.height, cy2 + pad_y)
+                            min(page_w, cx2 + right_pad),
+                            min(page_h, cy2 + pad_y)
                         ))
                         if ocr_engine=="toy":
                             txt, conf = toy_ocr_text_from_cell(crop)
@@ -1721,11 +2462,11 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                             cy1, cy2 = row_bands[r]
                             cx1 = x1 + col_bounds[target_col]
                             cx2 = x1 + col_bounds[target_col+1] + pad_edge_x * 2
-                            crop = im.crop((
+                            crop = page_image.crop((
                                 max(0, cx1 - pad_inner_x),
                                 max(0, cy1 - pad_y),
-                                min(im.width, cx2),
-                                min(im.height, cy2 + pad_y)
+                                min(page_w, cx2),
+                                min(page_h, cy2 + pad_y)
                             ))
                             alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
                             m = _NUMERIC_RX.search(alt_txt or "")
@@ -1758,11 +2499,15 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                         note = fallback_notes.get((r, c))
                         if note:
                             filters["linked"] = note
+                        concepts = _conceptual_tags(txt, headers, row_texts)
+                        hypotheses: List[Dict[str, Any]] = []
+                        if low_conf:
+                            hypotheses = _hypothesize_from_text(txt, headers, concepts)
                         rec = {
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
                             "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
-                            "image_path": source_image_path,
+                            "image_path": page_image_path or default_image_path,
                             "text": txt,
                             "search_unit": (txt or ctx_line),
                             "synthesis_window": ctx_line,
@@ -1775,14 +2520,328 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                                 "filters": filters
                             }
                         }
+                        if concepts:
+                            rec["meta"]["concepts"] = concepts
+                        if hypotheses:
+                            rec["meta"]["hypotheses"] = hypotheses
+                            rec["meta"]["needs_review"] = True
+                            learning_signals.append({
+                                "trace_id": trace_id,
+                                "page": pidx,
+                                "table_index": ti,
+                                "row": r,
+                                "col": c,
+                                "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
+                                "table_bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "image_path": page_image_path or default_image_path,
+                                "row_text": row_texts,
+                                "headers": headers,
+                                "observed_text": txt,
+                                "confidence": conf,
+                                "hypotheses": hypotheses,
+                                "concepts": concepts,
+                                "intent": "reanalyze_cell"
+                            })
                         if note:
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         count += 1
+    signals_path = out_jsonl_path + ".signals.json"
+    learn_path = out_jsonl_path + ".learning.jsonl"
+    summary_payload = {
+        "total_records": count,
+        "learning_samples": len(learning_signals),
+        "learning_jsonl": learn_path if learning_signals else None,
+        "low_conf_ratio": (len(learning_signals) / float(max(1, count)))
+    }
+    try:
+        with open(signals_path, "w", encoding="utf-8") as fw_sig:
+            json.dump(summary_payload, fw_sig, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    if learning_signals:
+        try:
+            with open(learn_path, "w", encoding="utf-8") as fw_learn:
+                for sig in learning_signals:
+                    fw_learn.write(json.dumps(sig, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    elif os.path.exists(learn_path):
+        try:
+            os.remove(learn_path)
+        except Exception:
+            pass
     return count
 
+
+def reanalyze_learning_jsonl(learning_jsonl_path: str,
+                             out_dir: Optional[str] = None,
+                             limit: int = 64,
+                             rotate: bool = True) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "input": learning_jsonl_path,
+        "limit": int(limit),
+        "output_jsonl": None,
+        "summary_path": None,
+        "total_seen": 0,
+        "processed": 0,
+        "skipped": 0,
+        "improved": 0,
+        "regressed": 0,
+        "unchanged": 0,
+        "avg_confidence_delta": 0.0,
+        "external_engines": {},
+        "ambiguous_variants": 0,
+        "fallback_variant_count": 0,
+        "fallback_transform_usage": {},
+    }
+    if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
+        summary["error"] = "learning_jsonl_missing"
+        return summary
+
+    dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
+    ensure_dir(dest_dir)
+    base = os.path.basename(learning_jsonl_path)
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    output_jsonl = os.path.join(dest_dir, f"{base}.reanalyzed.jsonl")
+    summary_path = output_jsonl + ".summary.json"
+
+    image_cache: Dict[str, Image.Image] = {}
+
+    def _load_image(path: Optional[str]) -> Optional["Image.Image"]:
+        if not path:
+            return None
+        if path in image_cache:
+            return image_cache[path]
+        try:
+            with Image.open(path) as img:
+                loaded = img.convert("RGB")
+        except Exception:
+            return None
+        image_cache[path] = loaded
+        return loaded
+
+    records: List[Dict[str, Any]] = []
+    delta_sum = 0.0
+    engine_usage: Dict[str, int] = defaultdict(int)
+    ambiguous_total = 0
+    fallback_used = False
+    fallback_transform_usage: Dict[str, int] = defaultdict(int)
+
+    try:
+        with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
+            for raw_line in fr:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if limit and limit > 0 and summary["total_seen"] >= limit:
+                    break
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    summary["skipped"] += 1
+                    continue
+                summary["total_seen"] += 1
+                bbox = sig.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    summary["skipped"] += 1
+                    continue
+                try:
+                    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+                except Exception:
+                    summary["skipped"] += 1
+                    continue
+                page_path = sig.get("image_path")
+                page_img = _load_image(page_path)
+                if page_img is None:
+                    summary["skipped"] += 1
+                    continue
+                pw, ph = page_img.size
+                x1 = max(0, min(pw, x1))
+                y1 = max(0, min(ph, y1))
+                x2 = max(0, min(pw, x2))
+                y2 = max(0, min(ph, y2))
+                if x2 <= x1 or y2 <= y1:
+                    summary["skipped"] += 1
+                    continue
+                crop = page_img.crop((x1, y1, x2, y2))
+
+                observed_text = sig.get("observed_text")
+                try:
+                    observed_conf = float(sig.get("confidence")) if sig.get("confidence") is not None else 0.0
+                except Exception:
+                    observed_conf = 0.0
+
+                variants_map: Dict[str, Dict[str, Any]] = {}
+
+                def _merge_variant(text: str, conf: float, transform: str) -> None:
+                    nonlocal ambiguous_total, fallback_used
+                    key = text or ""
+                    conf_f = float(conf or 0.0)
+                    created = key not in variants_map
+                    if created:
+                        variants_map[key] = {
+                            "text": text,
+                            "confidence": conf_f,
+                            "transforms": [transform],
+                        }
+                    else:
+                        rec = variants_map[key]
+                        if conf_f > rec.get("confidence", 0.0):
+                            rec["confidence"] = conf_f
+                        transforms = rec.setdefault("transforms", [])
+                        if transform not in transforms:
+                            transforms.append(transform)
+                    rec = variants_map[key]
+                    if transform.startswith("engine:"):
+                        engine_name = transform.split(":", 1)[1] if ":" in transform else "unknown"
+                        engine_name = engine_name.split("+", 1)[0]
+                        engine_name = engine_name.split("/", 1)[0]
+                        engine_name = engine_name.split("(", 1)[0]
+                        base_name = engine_name or "unknown"
+                        engine_usage[base_name] += 1
+                        if base_name.startswith("faux_tess"):
+                            fallback_used = True
+                            if transform.startswith("engine:faux_tess/"):
+                                label = transform.split("/", 1)[1] if "/" in transform else ""
+                                label = label.split("+", 1)[0]
+                                label = label or "unknown"
+                                fallback_transform_usage[label] += 1
+                    elif transform.startswith("ambiguous") and created:
+                        ambiguous_total += 1
+
+                base_text, base_conf = toy_ocr_text_from_cell(crop)
+                _merge_variant(base_text, base_conf, "base")
+
+                try:
+                    bright_enhancer = ImageEnhance.Brightness(crop)
+                    txt_b1, conf_b1 = toy_ocr_text_from_cell(bright_enhancer.enhance(1.1))
+                    _merge_variant(txt_b1, conf_b1, "brightness_1.1")
+                    txt_b2, conf_b2 = toy_ocr_text_from_cell(bright_enhancer.enhance(0.9))
+                    _merge_variant(txt_b2, conf_b2, "brightness_0.9")
+                except Exception:
+                    pass
+                try:
+                    contrast_enhancer = ImageEnhance.Contrast(crop)
+                    txt_c, conf_c = toy_ocr_text_from_cell(contrast_enhancer.enhance(1.2))
+                    _merge_variant(txt_c, conf_c, "contrast_1.2")
+                except Exception:
+                    pass
+                for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
+                    _merge_variant(txt_ext, conf_ext, transform_ext)
+                seen_ambiguous: Set[str] = set()
+                for candidate in _ambiguous_variants(observed_text) + _ambiguous_variants(base_text):
+                    if not candidate or candidate in seen_ambiguous:
+                        continue
+                    seen_ambiguous.add(candidate)
+                    conf_guess = max(observed_conf, base_conf, 0.52)
+                    _merge_variant(candidate, conf_guess, "ambiguous_map")
+                if rotate:
+                    for angle in (-2.5, -1.0, 1.0, 2.5):
+                        try:
+                            rotated = crop.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
+                        except Exception:
+                            continue
+                        text_r, conf_r = toy_ocr_text_from_cell(rotated)
+                        _merge_variant(text_r, conf_r, f"rotate_{angle:+.1f}")
+
+                if observed_text:
+                    _merge_variant(observed_text, observed_conf, "observed")
+                hypotheses = sig.get("hypotheses")
+                if isinstance(hypotheses, list):
+                    for hyp in hypotheses:
+                        if isinstance(hyp, dict) and hyp.get("text"):
+                            try:
+                                hyp_score = float(hyp.get("score")) if hyp.get("score") is not None else 0.0
+                            except Exception:
+                                hyp_score = 0.0
+                            _merge_variant(hyp.get("text"), max(observed_conf, hyp_score), "hypothesis")
+
+                variants = sorted(variants_map.values(), key=lambda rec: rec.get("confidence", 0.0), reverse=True)
+                if not variants:
+                    summary["skipped"] += 1
+                    continue
+                best = variants[0]
+                best_conf = float(best.get("confidence", 0.0))
+                best_text = best.get("text")
+                delta = best_conf - observed_conf
+                delta_sum += delta
+
+                same_text = (best_text or "") == (observed_text or "")
+                improved_flag = False
+                regressed_flag = False
+                if same_text:
+                    if best_conf > observed_conf + 0.01:
+                        improved_flag = True
+                else:
+                    if best_conf >= observed_conf + 0.05:
+                        improved_flag = True
+                    elif best_conf + 0.05 < observed_conf:
+                        regressed_flag = True
+
+                if improved_flag:
+                    summary["improved"] += 1
+                elif regressed_flag:
+                    summary["regressed"] += 1
+                else:
+                    summary["unchanged"] += 1
+
+                record = {
+                    "trace_id": sig.get("trace_id"),
+                    "page": sig.get("page"),
+                    "table_index": sig.get("table_index"),
+                    "row": sig.get("row"),
+                    "col": sig.get("col"),
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "image_path": page_path,
+                    "observed_text": observed_text,
+                    "observed_confidence": observed_conf,
+                    "reanalyzed_text": best_text,
+                    "reanalyzed_confidence": best_conf,
+                    "confidence_delta": delta,
+                    "improved": bool(improved_flag),
+                    "regressed": bool(regressed_flag),
+                    "variants": variants[:6],
+                    "headers": sig.get("headers"),
+                    "row_text": sig.get("row_text"),
+                    "table_bbox": sig.get("table_bbox"),
+                    "concepts": sig.get("concepts"),
+                    "hypotheses": hypotheses,
+                }
+                records.append(record)
+                summary["processed"] += 1
+
+    except Exception as exc:
+        summary["error"] = f"reanalyze_failed: {exc}"
+        records = []
+
+    summary["ambiguous_variants"] = int(ambiguous_total)
+    summary["external_engines"] = {k: int(v) for k, v in sorted(engine_usage.items()) if v}
+    summary["used_external_fallback"] = bool(fallback_used)
+    summary["fallback_variant_count"] = int(sum(fallback_transform_usage.values()))
+    if fallback_transform_usage:
+        ordered = sorted(fallback_transform_usage.items(), key=lambda kv: (-kv[1], kv[0]))
+        summary["fallback_transform_usage"] = {k: int(v) for k, v in ordered}
+    else:
+        summary["fallback_transform_usage"] = {}
+
+    if records:
+        summary["output_jsonl"] = output_jsonl
+        summary["summary_path"] = summary_path
+        summary["avg_confidence_delta"] = delta_sum / max(1, summary["processed"])
+        with open(output_jsonl, "w", encoding="utf-8") as fw_out:
+            for rec in records:
+                fw_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with open(summary_path, "w", encoding="utf-8") as fw_sum:
+            json.dump(_json_ready(summary), fw_sum, ensure_ascii=False, indent=2)
+    else:
+        summary["avg_confidence_delta"] = 0.0
+
+    return summary
+
 # ---------- Minimal local hybrid search ----------
-def _tokenize(s: str) -> list[str]:
+def _tokenize(s: str) -> List[str]:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\-\._]+", " ", s)
     return [t for t in s.split() if t]
@@ -1899,7 +2958,12 @@ def cli_export(args):
     if not os.path.exists(jpath):
         print("doc.zocr.json not found in", out_dir); return
     out_jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
-    n = export_jsonl_with_ocr(jpath, src, out_jsonl, ocr_engine="toy", contextual=True)
+    source_images: Union[str, Sequence[str]]
+    if len(args.input) > 1:
+        source_images = [p for p in args.input if isinstance(p, str)]
+    else:
+        source_images = src
+    n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
     print("Exported", n, "records to", out_jsonl)
 
 def cli_index(args):
@@ -3548,13 +4612,14 @@ def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_sc
     amt = float(amount_score) if amount_score is not None else 0.0
     dt = float(date_score) if date_score is not None else None
     if resolved in _INVOICE_GATE_DOMAINS:
-        if amt >= 0.8:
-            note = "amount+date hit" if dt is not None and dt >= 0.5 else "amount hit (date optional)"
-            return True, note, amt
-        if amt >= 0.7 and (dt is None or dt >= 0.3):
-            note = "amount hit (date optional)" if dt is None or dt < 0.5 else "amount+date hit"
-            return True, note, amt
-        return False, "amount below gate", amt
+        if dt is None:
+            return False, "date missing", min(amt, 0.0)
+        if amt < 0.8:
+            return False, "amount below gate", amt
+        if dt < 0.5:
+            return False, "date below gate", dt
+        score = min(amt, dt)
+        return True, "amount+date hit", score
     if amount_score is None or date_score is None:
         return False, "insufficient metrics", 0.0
     mean = (float(amount_score) + float(date_score)) / 2.0
@@ -4003,7 +5068,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 corp_total+=1
                 if filt.get("company_canonical"): corp_hits+=1
     low_conf_rate = low/max(1,total)
-    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else None
+    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else 0.0
 
     S_reproc, S_success = _read_views_sets(views_log)
     reprocess_rate = len(S_reproc & lc_keys)/max(1,len(lc_keys)) if lc_keys else 0.0
@@ -4061,7 +5126,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 tax_cov+=1
                 if abs(int(filt["tax_amount"])-int(filt["tax_amount_expected"]))>1:
                     tax_fail+=1
-    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else None
+    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else 0.0
 
     p95=None
     agg=os.path.join(os.path.dirname(jsonl),"metrics_aggregate.csv")
@@ -4081,7 +5146,9 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
          "domain": domain or "auto",
          "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
          "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
-         "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95,
+         "tax_fail_rate":tax_fail_rate,"tax_coverage":tax_cov,
+         "corporate_match_rate":corporate_match_rate,"corporate_coverage":corp_total,
+         "p95_ms":p95,
          "trust_amount":trust_amount,"trust_date":trust_date,"trust_mean":trust_mean,
          "gate_pass":gate_pass,"gate_reason":gate_reason,"gate_score":gate_score}
     hdr=not os.path.exists(out_csv)
@@ -4125,7 +5192,8 @@ def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile
         numeric_keys = [
             "low_conf_rate", "reprocess_rate", "reprocess_success_rate",
             "hit_amount", "hit_date", "hit_mean", "p95_ms", "tax_fail_rate",
-            "corporate_match_rate", "trust_amount", "trust_date", "trust_mean",
+            "tax_coverage", "corporate_match_rate", "corporate_coverage",
+            "trust_amount", "trust_date", "trust_mean",
         ]
         for key in numeric_keys:
             if key in metrics:
@@ -4244,7 +5312,15 @@ _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
+def _resolve_toy_memory_path(outdir: str) -> str:
+    env_path = os.environ.get("ZOCR_TOY_MEMORY")
+    if env_path:
+        return env_path
+    return os.path.join(outdir, "toy_memory.json")
+
+
 def _collect_dependency_diagnostics() -> Dict[str, Any]:
+    """Summarise optional dependencies so operators can self-check the environment."""
     diag: Dict[str, Any] = {}
 
     poppler_path = shutil.which("pdftoppm")
@@ -4810,6 +5886,21 @@ def _write_pipeline_meta(outdir: str, seed: int):
             meta["files"][mod.__name__] = {"path": p, "sha256": _sha256(p)}
         except Exception:
             pass
+    bundle_dir = getattr(zocr_onefile_consensus, "_BUNDLE_DIR", None)
+    if bundle_dir and os.path.isdir(bundle_dir):
+        bundle_meta: Dict[str, Any] = {}
+        for root, _dirs, files in os.walk(bundle_dir):
+            for fn in sorted(f for f in files if f.endswith(".py")):
+                full = os.path.join(root, fn)
+                try:
+                    bundle_meta[os.path.relpath(full, bundle_dir)] = {
+                        "sha256": _sha256(full),
+                        "size": os.path.getsize(full),
+                    }
+                except Exception:
+                    continue
+        if bundle_meta:
+            meta["bundle_files"] = bundle_meta
     for name in ("numpy", "Pillow"):
         try:
             meta["versions"][name] = importlib.import_module(name).__version__
@@ -4871,6 +5962,148 @@ def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:
         prof["domain"] = domain_hint
     return prof
 
+
+def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
+    signals_path = jsonl_path + ".signals.json"
+    if not os.path.exists(signals_path):
+        return {}
+    try:
+        with open(signals_path, "r", encoding="utf-8") as fr:
+            data = json.load(fr)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        return {}
+    return {}
+
+
+def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]:
+    base = os.path.basename(learning_jsonl)
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    output = os.path.join(outdir, f"{base}.reanalyzed.jsonl")
+    return output, output + ".summary.json"
+
+
+def _profile_snapshot(prof: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(prof))
+
+
+def _profile_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
+    diff: Dict[str, Tuple[Any, Any]] = {}
+    keys = set(before.keys()) | set(after.keys())
+    for key in sorted(keys):
+        if before.get(key) != after.get(key):
+            diff[key] = (before.get(key), after.get(key))
+    return diff
+
+
+def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    intent: Dict[str, Any] = {"action": "steady", "reason": "metrics within guardrails"}
+    hit_mean = None
+    p95 = None
+    if monitor_row:
+        try:
+            hit_mean = float(monitor_row.get("hit_mean") or monitor_row.get("hit_mean_gt"))
+        except Exception:
+            hit_mean = None
+        try:
+            p95 = float(monitor_row.get("p95_ms")) if monitor_row.get("p95_ms") is not None else None
+        except Exception:
+            p95 = None
+    low_conf_ratio = None
+    try:
+        low_conf_ratio = float(export_signals.get("low_conf_ratio")) if export_signals else None
+    except Exception:
+        low_conf_ratio = None
+    if hit_mean is None:
+        intent = {"action": "recover", "reason": "monitor missing", "priority": "high"}
+    elif hit_mean < 0.8:
+        intent = {"action": "focus_headers", "reason": f"hit_mean={hit_mean:.3f} below 0.8", "priority": "high"}
+    elif p95 is not None and p95 > 400.0:
+        intent = {"action": "optimize_speed", "reason": f"p95_ms={p95:.1f} > 400", "priority": "medium"}
+    elif low_conf_ratio is not None and low_conf_ratio > 0.2:
+        intent = {"action": "reanalyze_cells", "reason": f"low_conf_ratio={low_conf_ratio:.2f}", "priority": "medium"}
+    else:
+        intent = {"action": "explore_footer", "reason": "metrics nominal", "priority": "low"}
+    intent["signals"] = {
+        "hit_mean": hit_mean,
+        "p95_ms": p95,
+        "low_conf_ratio": low_conf_ratio,
+        "learning_samples": export_signals.get("learning_samples") if export_signals else None,
+    }
+    intent["profile_domain"] = profile.get("domain")
+    return intent
+
+
+def _apply_intent_to_profile(intent: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
+    updates: Dict[str, Tuple[Any, Any]] = {}
+    action = intent.get("action")
+    if action == "focus_headers":
+        old = profile.get("header_boost", 1.0)
+        profile["header_boost"] = float(old) * 1.15 if isinstance(old, (int, float)) else 1.2
+        updates["header_boost"] = (old, profile["header_boost"])
+        targets = list(profile.get("reanalyze_target") or [])
+        if "headers" not in targets:
+            targets.append("headers")
+        profile["reanalyze_target"] = targets
+    elif action == "optimize_speed":
+        old = profile.get("lambda_shape", 4.5)
+        try:
+            new_val = max(2.5, float(old) * 0.9)
+        except Exception:
+            new_val = 3.8
+        profile["lambda_shape"] = new_val
+        updates["lambda_shape"] = (old, new_val)
+        profile.setdefault("speed_priority", True)
+    elif action == "reanalyze_cells":
+        prev = list(profile.get("reanalyze_target") or [])
+        if "learning_cells" not in prev:
+            prev.append("learning_cells")
+        profile["reanalyze_target"] = prev
+        updates["reanalyze_target"] = (None, prev)
+    elif action == "recover":
+        profile.setdefault("force_monitor_refresh", True)
+        updates["force_monitor_refresh"] = (None, True)
+    return updates
+
+
+def _needs_rerun_for_keys(keys: List[str]) -> Dict[str, bool]:
+    rerun = {"augment": False, "monitor": False}
+    for key in keys:
+        if key in {"lambda_shape", "header_boost", "reanalyze_target"}:
+            rerun["augment"] = True
+            rerun["monitor"] = True
+        elif key in {"w_kw", "w_img", "ocr_min_conf", "force_monitor_refresh"}:
+            rerun["monitor"] = True
+    return rerun
+
+
+def _apply_rag_feedback(manifest_path: Optional[str], profile: Dict[str, Any], profile_path: str) -> Dict[str, Any]:
+    if not manifest_path or not os.path.exists(manifest_path):
+        return {"applied": []}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception:
+        return {"applied": [], "error": "manifest_unreadable"}
+    feedback = payload.get("feedback") if isinstance(payload, dict) else None
+    applied: List[str] = []
+    if isinstance(feedback, dict):
+        profile_overrides = feedback.get("profile_overrides")
+        if isinstance(profile_overrides, dict):
+            for key, value in profile_overrides.items():
+                before = profile.get(key)
+                profile[key] = value
+                applied.append(key)
+    if applied:
+        try:
+            with open(profile_path, "w", encoding="utf-8") as fw:
+                json.dump(_json_ready(profile), fw, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return {"applied": applied, "error": str(e)}
+    return {"applied": applied}
+
 def _patched_run_full_pipeline(
     inputs: List[str],
     outdir: str,
@@ -4899,7 +6132,12 @@ def _patched_run_full_pipeline(
 
     ok = _read_ok_steps(outdir) if resume else set()
 
-    if len(inputs) == 1 and inputs[0].lower() == "demo":
+    toy_memory_path = _resolve_toy_memory_path(outdir)
+    toy_memory_info_load = load_toy_memory(toy_memory_path)
+    toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
+    reset_toy_recognition_stats()
+
+    if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
         pages = _collect_pages(inputs, dpi=dpi)
@@ -4933,9 +6171,16 @@ def _patched_run_full_pipeline(
         "resume_steps": sorted(str(s) for s in ok if s is not None),
         "snapshot": bool(snapshot),
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
+        "toy_memory": {
+            "path": toy_memory_path,
+            "load": _json_ready(toy_memory_info_load),
+        },
     }
 
+    toy_memory_run_baseline = toy_memory_after_load or toy_memory_snapshot()
+
     domain_hints = _prepare_domain_hints(inputs)
+    content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
     domain_auto_summary: Dict[str, Any] = {
         "provided": domain_hint,
         "from_inputs": {
@@ -4946,6 +6191,7 @@ def _patched_run_full_pipeline(
             "scores": domain_hints.get("scores"),
         },
         "initial_profile": prof.get("domain"),
+        "content_threshold": content_conf_threshold,
     }
     selected_source: Optional[str] = None
     selected_confidence: Optional[float] = None
@@ -4984,17 +6230,51 @@ def _patched_run_full_pipeline(
         except Exception:
             pass
 
-    src_img = pages[0]
-
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
         r = _safe_step("Export", zocr_onefile_consensus.export_jsonl_with_ocr,
-                       doc_json_path, src_img, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
+                       doc_json_path, pages, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
+    export_signals = _load_export_signals(jsonl_path)
+    if export_signals:
+        summary["export_signals"] = export_signals
+        if export_signals.get("learning_jsonl"):
+            summary["learning_jsonl"] = export_signals.get("learning_jsonl")
+
+    reanalysis_summary: Optional[Dict[str, Any]] = None
+    learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
+    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
+    if learning_jsonl_path and "learning_cells" in re_targets:
+        re_dir = os.path.join(outdir, "reanalyze")
+        ensure_dir(re_dir)
+        if "ReanalyzeLearning" in ok:
+            print("[SKIP] Reanalyze learning cells (resume)")
+            _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
+            try:
+                with open(summary_path, "r", encoding="utf-8") as fr:
+                    loaded = json.load(fr)
+                    if isinstance(loaded, dict):
+                        reanalysis_summary = loaded
+            except Exception:
+                reanalysis_summary = None
+        else:
+            try:
+                re_limit = int(prof.get("reanalyze_limit") or 64)
+            except Exception:
+                re_limit = 64
+            r = _safe_step("ReanalyzeLearning", reanalyze_learning_jsonl,
+                           learning_jsonl_path, re_dir, re_limit)
+            _append_hist(outdir, r)
+            if r.get("ok"):
+                reanalysis_summary = r.get("out")
+        if reanalysis_summary:
+            summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
+            if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
+                summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None
@@ -5011,23 +6291,36 @@ def _patched_run_full_pipeline(
             domain_auto_summary["from_content"] = autodetect_detail
             resolved = autodetect_detail.get("resolved") or detected_domain
             if resolved:
+                decision: Dict[str, Any] = {"candidate": resolved}
                 take = False
                 conf_val = autodetect_detail.get("confidence")
                 try:
                     conf_float = float(conf_val) if conf_val is not None else None
                 except Exception:
                     conf_float = None
-                if _is_auto_domain(prof.get("domain")):
+                decision["confidence"] = conf_float
+                if conf_float is not None and conf_float >= content_conf_threshold:
                     take = True
-                elif resolved != prof.get("domain") and conf_float is not None and conf_float >= 0.55:
-                    take = True
+                    decision["reason"] = "confidence>=threshold"
+                elif conf_float is None:
+                    decision["reason"] = "confidence-missing"
+                else:
+                    decision["reason"] = "below-threshold"
                 if take:
                     prof["domain"] = resolved
                     selected_source = "content"
                     selected_confidence = conf_float
+                    decision["applied"] = resolved
+                else:
+                    decision["kept"] = prof.get("domain")
+                domain_auto_summary["content_decision"] = decision
         if autodetect_error:
             domain_auto_summary["content_error"] = autodetect_error
 
+    if not prof.get("domain"):
+        prof["domain"] = "invoice_jp_v2"
+        if selected_source is None:
+            selected_source = "default"
     _apply_domain_defaults(prof, prof.get("domain"))
     try:
         with open(prof_path, "w", encoding="utf-8") as pf:
@@ -5061,6 +6354,7 @@ def _patched_run_full_pipeline(
             raise RuntimeError("Index failed")
     _call("post_index", index=idx_path, jsonl=mm_jsonl)
 
+    profile_before_feedback = _profile_snapshot(prof)
     monitor_row = None
     if "Monitor" in ok:
         print("[SKIP] Monitor (resume)")
@@ -5116,6 +6410,71 @@ def _patched_run_full_pipeline(
     summary["learn"] = learn_row
     summary["insights"] = _derive_insights(summary)
 
+    prof_after = _load_profile(outdir, prof.get("domain"))
+    profile_diff = _profile_diff(profile_before_feedback, prof_after)
+    intent = _derive_intent(summary.get("monitor_row"), export_signals, prof_after)
+    summary["intent"] = intent
+    intent_updates = _apply_intent_to_profile(intent, prof_after)
+    combined_updates: Dict[str, Tuple[Any, Any]] = {}
+    if profile_diff:
+        summary["profile_diff"] = {k: _json_ready(v) for k, v in profile_diff.items()}
+        combined_updates.update(profile_diff)
+    if intent_updates:
+        combined_updates.update(intent_updates)
+        summary["intent_applied"] = True
+    if combined_updates:
+        try:
+            with open(prof_path, "w", encoding="utf-8") as pf:
+                json.dump(_json_ready(prof_after), pf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("Profile save skipped:", e)
+        summary["profile_updates"] = {k: _json_ready(v) for k, v in combined_updates.items()}
+    rerun_flags = _needs_rerun_for_keys(list(combined_updates.keys())) if combined_updates else {"augment": False, "monitor": False}
+    summary["feedback_rerun_flags"] = rerun_flags
+    feedback_passes: List[str] = []
+    prof = prof_after
+    if rerun_flags.get("augment"):
+        r = _safe_step("AugmentIntent", zocr_multidomain_core.augment, jsonl_path, mm_jsonl,
+                       prof.get("lambda_shape", 4.5), org_dict_path=org_dict)
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            feedback_passes.append("augment")
+        r = _safe_step("IndexIntent", zocr_multidomain_core.build_index, mm_jsonl, idx_path)
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            feedback_passes.append("index")
+    if rerun_flags.get("monitor"):
+        r = _safe_step("MonitorIntent", zocr_multidomain_core.monitor, mm_jsonl, idx_path, k, mon_csv,
+                       views_log=views_log, gt_jsonl=gt_jsonl, domain=prof.get("domain"))
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            monitor_row = r.get("out") or monitor_row
+            feedback_passes.append("monitor")
+            summary["monitor_row"] = monitor_row
+    if feedback_passes:
+        summary["feedback_passes"] = feedback_passes
+
+    intent_runs: List[str] = []
+    if intent.get("action") == "reanalyze_cells" and learning_jsonl_path and not summary.get("reanalyze_learning"):
+        re_dir = os.path.join(outdir, "reanalyze")
+        ensure_dir(re_dir)
+        try:
+            re_limit = int(prof_after.get("reanalyze_limit") or 64)
+        except Exception:
+            re_limit = 64
+        r = _safe_step("ReanalyzeLearningIntent", reanalyze_learning_jsonl,
+                       learning_jsonl_path, re_dir, re_limit)
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            intent_runs.append("reanalyze_learning")
+            reanalysis_summary = r.get("out")
+            if isinstance(reanalysis_summary, dict):
+                summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
+                if reanalysis_summary.get("output_jsonl"):
+                    summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
+    if intent_runs:
+        summary["intent_runs"] = intent_runs
+
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
                                                      prefix=(prof.get("domain") or "invoice"))
@@ -5153,6 +6512,8 @@ def _patched_run_full_pipeline(
         trace_schema=summary.get("rag_trace_schema"),
         fact_tag_example=summary.get("rag_fact_tag_example"),
     )
+    if summary.get("rag_manifest"):
+        summary["rag_feedback"] = _apply_rag_feedback(summary.get("rag_manifest"), prof, prof_path)
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
@@ -5172,6 +6533,19 @@ def _patched_run_full_pipeline(
     summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
+
+    toy_memory_after_run = toy_memory_snapshot()
+    toy_memory_delta_run = toy_memory_delta(toy_memory_run_baseline, toy_memory_after_run)
+    summary.setdefault("toy_memory", {})
+    summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
+    summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
+    summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
+    summary["toy_memory"]["recognition"] = _json_ready(
+        toy_recognition_stats(reset=True)
+    )
+
+    toy_memory_saved = save_toy_memory(toy_memory_path)
+    summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
