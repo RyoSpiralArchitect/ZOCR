@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+理念 / Vision / Vision
+
+[JA]
+- 単一核で責務を折り畳み、画素→構造→文脈→検索→監視を一枚の可視仕様に落とす。
+- 乱数・環境・バージョン・入出力を指紋化し、再現性を約束する。
+- p95 や Hit@K、失敗率、Views を最初から計測し続け、観測可能性を設計する。
+- registry で各段を開口し、壊さずに他者の知を差し込めるようにする。
+- これは精度の一点突破ではなく、同じ説明が何度でも再現される系を目指す。
+
+[EN]
+- Fold every responsibility into a single core so pixels→structure→context→search→monitoring share one inspectable spec.
+- Fingerprint randomness, environment, versions, and inputs/outputs to guarantee reproducibility.
+- Instrument p95, Hit@K, failure rate, and Views from the start to keep the system observable.
+- Expose each stage via a registry so new knowledge can be inserted without breaking the pipeline.
+- The ambition is not a one-off accuracy spike but a system whose explanations can be replayed endlessly.
+
+[FR]
+- Plier toutes les responsabilités dans un seul noyau afin que pixels→structure→contexte→recherche→surveillance partagent une spécification lisible.
+- Empreinter l’aléatoire, l’environnement, les versions et les entrées/sorties pour garantir la reproductibilité.
+- Instrumenter p95, Hit@K, taux d’échec et Views dès le départ pour garder le système observable.
+- Ouvrir chaque étape via un registre afin d’injecter de nouvelles connaissances sans briser la chaîne.
+- L’objectif n’est pas un pic de précision isolé mais un système dont les explications se rejouent à l’infini.
+"""
+
 # Auto-generated single-file bundle
 # Generated: 2025-11-10T06:47:54.250029Z
 # Purpose : Merge upstream (onefile consensus OCR) -> pipe (orchestrator) -> downstream (core augment/index/query) -> watchdog (monitor)
@@ -19,7 +44,7 @@
 #
 # Notes:
 #  - The embedded sources are verbatim copies of your originals; no simplification or pruning.
-#  - You can still `import zocr_allinone_merged` from Python and access the three submodules via
+#  - You can still `import zocr_allinone_merged_plus` from Python and access the three submodules via
 #      sys.modules['zocr_onefile_consensus'], sys.modules['zocr_multidomain_core'], sys.modules['zocr_pipeline_allinone'].
 
 
@@ -73,8 +98,13 @@ try:
 except Exception:
     np = None
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
 from html.parser import HTMLParser
+
+try:
+    from zocr_multidomain_core import thomas_tridiag as _thomas
+except Exception:
+    _thomas = None
 
 # ----------------- Utils -----------------
 def ensure_dir(p: str) -> None:
@@ -245,16 +275,21 @@ def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H
         if n<=2: return y[:]
         x = np.array(y, dtype=np.float64)
         for _ in range(passes):
-            a = -lam_eff*np.ones(n-1); b = np.ones(n) + 2*lam_eff; c = -lam_eff*np.ones(n-1)
+            a = -lam_eff*np.ones(n-1)
+            b = np.ones(n) + 2*lam_eff
+            c = -lam_eff*np.ones(n-1)
             b[0] = 1 + lam_eff; b[-1] = 1 + lam_eff
-            cp = c.copy(); bp = b.copy(); dp = x.copy()
-            for i in range(1,n):
-                m = a[i-1]/bp[i-1]
-                bp[i] -= m*cp[i-1]
-                dp[i] -= m*dp[i-1]
-            x[-1] = dp[-1]/bp[-1]
-            for i in range(n-2,-1,-1):
-                x[i] = (dp[i]-cp[i]*x[i+1])/bp[i]
+            if _thomas is not None:
+                x = _thomas(a, b, c, x)
+            else:
+                cp = c.copy(); bp = b.copy(); dp = x.copy()
+                for i in range(1,n):
+                    m = a[i-1]/bp[i-1]
+                    bp[i] -= m*cp[i-1]
+                    dp[i] -= m*dp[i-1]
+                x[-1] = dp[-1]/bp[-1]
+                for i in range(n-2,-1,-1):
+                    x[i] = (dp[i]-cp[i]*x[i+1])/bp[i]
         return x.tolist()
     rows_smoothed = []
     for k in range(K):
@@ -346,21 +381,141 @@ def compute_teds(html_pred:str, html_gt:Optional[str]=None)->float:
     return float(0.5*row_sim+0.5*cnt_sim)
 
 # ----------------- Views -----------------
+def _otsu_threshold(gray_u8: "np.ndarray") -> int:
+    hist = np.bincount(gray_u8.reshape(-1), minlength=256)
+    total = gray_u8.size
+    sum_total = float(np.dot(hist, np.arange(256)))
+    sum_b = 0.0
+    weight_b = 0.0
+    best = 127
+    max_var = -1.0
+    for t in range(256):
+        weight_b += hist[t]
+        if weight_b <= 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f <= 0:
+            break
+        sum_b += float(t * hist[t])
+        mean_b = sum_b / weight_b
+        mean_f = (sum_total - sum_b) / weight_f
+        var_between = weight_b * weight_f * (mean_b - mean_f) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            best = t
+    return int(best)
+
+def _gradient_false_color(gray: "np.ndarray") -> Tuple["np.ndarray", "np.ndarray"]:
+    if gray.size == 0:
+        return np.zeros(gray.shape + (3,), dtype=np.uint8), np.zeros_like(gray, dtype=np.float32)
+    norm = gray.astype(np.float32)
+    g_min = float(norm.min())
+    g_max = float(norm.max())
+    if g_max > g_min:
+        norm = (norm - g_min) / (g_max - g_min)
+    else:
+        norm = np.zeros_like(norm, dtype=np.float32)
+    pad = np.pad(norm, 1, mode="edge")
+    kx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
+    ky = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float32)
+    gx = np.zeros_like(norm, dtype=np.float32)
+    gy = np.zeros_like(norm, dtype=np.float32)
+    H, W = norm.shape
+    for i in range(3):
+        for j in range(3):
+            gx += kx[i, j] * pad[i:i+H, j:j+W]
+            gy += ky[i, j] * pad[i:i+H, j:j+W]
+    mag = np.hypot(gx, gy)
+    if float(mag.max()) > 1e-8:
+        mag = mag / float(mag.max())
+    else:
+        mag = np.zeros_like(mag)
+    angle = np.arctan2(gy, gx)
+    red = np.clip(mag * (0.5 * (1.0 + np.cos(angle))), 0.0, 1.0)
+    green = np.clip(mag * (0.5 * (1.0 + np.sin(angle))), 0.0, 1.0)
+    blue = np.clip(np.power(mag, 0.65), 0.0, 1.0)
+    rgb = np.stack([red, green, blue], axis=-1)
+    rgb = np.power(rgb, 0.8)
+    return (rgb * 255.0).astype(np.uint8), mag.astype(np.float32)
+
 def _make_views(im: "Image.Image", out_dir: str, base: str) -> Dict[str,str]:
     ensure_dir(out_dir)
-    paths = {}
-    mic = im.resize((max(1,im.width*3), max(1,im.height*3)), resample=Image.BICUBIC)
-    mic = mic.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
-    p_mic = os.path.join(out_dir, f"{base}.microscope.png"); mic.save(p_mic); paths["microscope"]=p_mic
-    g = ImageOps.grayscale(im)
-    g1 = g.filter(ImageFilter.GaussianBlur(radius=1.2))
-    g2 = g.filter(ImageFilter.GaussianBlur(radius=3.2))
-    dog = ImageChops.subtract(g2, g1)
-    arr = np.array(dog).astype(np.float32)
-    if arr.max() > arr.min():
-        arr = (arr - arr.min()) * (255.0/(arr.max()-arr.min()))
-    xray = Image.fromarray(arr.astype(np.uint8))
-    p_xr = os.path.join(out_dir, f"{base}.xray.png"); xray.save(p_xr); paths["xray"]=p_xr
+    paths: Dict[str, str] = {}
+
+    gray = ImageOps.grayscale(im)
+    gray_u8 = np.asarray(gray, dtype=np.uint8)
+    grad_rgb, mag = _gradient_false_color(gray_u8.astype(np.float32))
+    xray_img = Image.fromarray(grad_rgb, mode="RGB")
+    p_xr = os.path.join(out_dir, f"{base}.xray.png")
+    xray_img.save(p_xr)
+    paths["xray"] = p_xr
+
+    xray_overlay = Image.blend(im.convert("RGB"), xray_img, 0.45)
+    p_xro = os.path.join(out_dir, f"{base}.xray_overlay.png")
+    xray_overlay.save(p_xro)
+    paths["xray_overlay"] = p_xro
+
+    zoom = 3
+    zoom_size = (max(1, im.width * zoom), max(1, im.height * zoom))
+    mic_raw = im.resize(zoom_size, resample=Image.BICUBIC)
+    mic_sharp = ImageEnhance.Sharpness(mic_raw).enhance(2.4)
+    mic_sharp = ImageEnhance.Contrast(mic_sharp).enhance(1.35)
+    mic_sharp = ImageEnhance.Brightness(mic_sharp).enhance(1.05)
+
+    edges = gray.filter(ImageFilter.FIND_EDGES).resize(zoom_size, resample=Image.BICUBIC)
+    edges = ImageOps.autocontrast(edges)
+    edge_rgb = ImageOps.colorize(edges, black="#000000", white="#7fffd4")
+    overlay_zoom = Image.blend(mic_sharp, edge_rgb.convert("RGB"), 0.35)
+
+    otsu = _otsu_threshold(gray_u8)
+    binary = (gray_u8 >= otsu).astype(np.uint8) * 255
+    binary_img = Image.fromarray(binary, mode="L").resize(zoom_size, resample=Image.NEAREST)
+    binary_col = ImageOps.colorize(binary_img, black="#111111", white="#f7f7f7")
+
+    heat = Image.fromarray(np.clip(mag * 255.0, 0.0, 255.0).astype(np.uint8), mode="L")
+    heat = heat.resize(zoom_size, resample=Image.BICUBIC)
+    heat_col = ImageOps.colorize(heat, black="#001f3f", white="#ff6b6b")
+    heat_overlay = Image.blend(heat_col.convert("RGB"), overlay_zoom, 0.4)
+
+    tile = Image.new("RGB", (zoom_size[0] * 2, zoom_size[1] * 2), "#050505")
+    tile.paste(mic_raw.convert("RGB"), (0, 0))
+    tile.paste(overlay_zoom, (zoom_size[0], 0))
+    tile.paste(binary_col.convert("RGB"), (0, zoom_size[1]))
+    tile.paste(heat_overlay, (zoom_size[0], zoom_size[1]))
+
+    draw = ImageDraw.Draw(tile)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    labels = [
+        ((8, 8), "Raw ×3"),
+        ((zoom_size[0] + 8, 8), "Edges + Sharpen"),
+        ((8, zoom_size[1] + 8), f"Otsu bin (τ={otsu})"),
+        ((zoom_size[0] + 8, zoom_size[1] + 8), "Gradient heat")
+    ]
+    for (x, y), text in labels:
+        if font is not None and hasattr(draw, "textbbox"):
+            bbox = draw.textbbox((x, y), text, font=font)
+            draw.rectangle([bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2], fill="#00000080")
+            draw.text((x, y), text, fill="#f8f8f8", font=font)
+        else:
+            draw.text((x, y), text, fill="#f8f8f8")
+
+    base_step = max(1, min(zoom_size[0], zoom_size[1]) // 6)
+    step = max(24, base_step)
+    x0 = zoom_size[0]
+    for xx in range(x0, x0 + zoom_size[0], step):
+        draw.line([(xx, 0), (xx, zoom_size[1])], fill="#1f1f1f", width=1)
+    for yy in range(0, zoom_size[1], step):
+        draw.line([(x0, yy), (x0 + zoom_size[0], yy)], fill="#1f1f1f", width=1)
+    draw.rectangle([0, 0, zoom_size[0] * 2 - 1, zoom_size[1] * 2 - 1], outline="#3a3a3a", width=2)
+
+    p_mic = os.path.join(out_dir, f"{base}.microscope.png")
+    tile.save(p_mic)
+    paths["microscope"] = p_mic
+
     return paths
 
 # ----------------- Robust K_mode by row clusters -----------------
@@ -936,7 +1091,8 @@ def _context_line_from_row(headers: list[str], row: list[str]) -> str:
         return " | ".join([x.strip() for x in row if x.strip()])
 
 def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_path: str,
-                          ocr_engine: str = "toy", contextual: bool = True) -> int:
+                          ocr_engine: str = "toy", contextual: bool = True,
+                          ocr_min_conf: float = 0.58) -> int:
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     im = Image.open(source_image_path).convert("RGB")
@@ -985,6 +1141,7 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                         row_texts = grid_text[r]
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
                         kws = _keywords_from_row(row_texts) if contextual and r>0 else []
+                        low_conf = (conf is not None and conf < ocr_min_conf)
                         rec = {
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
@@ -997,6 +1154,7 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                                 "headers": headers,
                                 "keywords": kws,
                                 "confidence": conf,
+                                "low_conf": bool(low_conf),
                                 "filters": {
                                     "has_currency": ("currency" in kws),
                                     "row_index": r, "col_index": c
@@ -1212,12 +1370,20 @@ import numpy as np
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
 try:
-    from numba import njit
+    from numba import njit, prange
+    from numba import atomic
     _HAS_NUMBA = True
 except Exception:
     def njit(*a, **k):
         def deco(f): return f
         return deco
+    def prange(n):
+        return range(n)
+    class _AtomicStub:
+        @staticmethod
+        def add(arr, idx, val):
+            arr[idx] += val
+    atomic = _AtomicStub()
 
 # -------------------- Optional C build ------------------
 def _build_lib(outdir: Optional[str]=None):
@@ -1572,11 +1738,108 @@ def infer_row_fields(swin: str) -> Dict[str, Any]:
 # Domain keywords for boosts
 DOMAIN_KW = {
     "invoice": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求",0.4),("登録",0.3),("住所",0.3),("単価",0.3),("数量",0.3)],
-    "contract":[("契約",0.8),("署名",0.6),("印",0.5),("住所",0.3),("日付",0.3)],
-    "delivery":[("納品",1.0),("数量",0.8),("単位",0.5),("品名",0.5),("受領",0.4)],
-    "estimate":[("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
-    "receipt":[("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)]
+    "invoice_jp_v2": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求日",0.5),("発行日",0.4)],
+    "invoice_en": [("invoice",1.0),("total",0.9),("amount",0.85),("tax",0.7),("due",0.5),("bill",0.4)],
+    "invoice_fr": [("facture",1.0),("total",0.9),("montant",0.8),("tva",0.7),("échéance",0.5),("paiement",0.4)],
+    "purchase_order": [("purchase",1.0),("order",0.95),("po",0.8),("qty",0.6),("ship",0.5),("vendor",0.4)],
+    "expense": [("expense",1.0),("reimbursement",0.85),("category",0.6),("receipt",0.6),("total",0.5)],
+    "timesheet": [("timesheet",1.0),("hours",0.95),("project",0.6),("rate",0.5),("overtime",0.4)],
+    "shipping_notice": [("shipment",1.0),("tracking",0.9),("carrier",0.7),("delivery",0.6),("ship",0.5)],
+    "medical_receipt": [("診療",1.0),("点数",0.9),("保険",0.8),("負担金",0.6),("薬剤",0.5)],
+    "contract": [("契約",0.8),("署名",0.6),("印",0.5),("住所",0.3),("日付",0.3)],
+    "contract_jp_v2": [("契約",0.9),("条",0.7),("締結",0.6),("甲",0.5),("乙",0.5),("印",0.4)],
+    "contract_en": [("contract",1.0),("signature",0.75),("party",0.6),("term",0.6),("agreement",0.5)],
+    "delivery": [("納品",1.0),("数量",0.8),("単位",0.5),("品名",0.5),("受領",0.4)],
+    "delivery_jp": [("納品書",1.0),("数量",0.85),("品番",0.6),("受領",0.5),("出荷",0.4)],
+    "delivery_en": [("delivery",1.0),("ship",0.85),("carrier",0.7),("qty",0.6),("item",0.5)],
+    "estimate": [("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
+    "estimate_jp": [("見積書",1.0),("見積金額",0.85),("有効期限",0.6),("数量",0.5)],
+    "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
+    "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
+    "receipt_jp": [("領収書",1.0),("税込",0.8),("受領",0.6),("発行日",0.4)],
+    "receipt_en": [("receipt",1.0),("paid",0.9),("total",0.75),("payment",0.6),("tax",0.5)]
 }
+
+DOMAIN_DEFAULTS = {
+    "invoice": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.58},
+    "invoice_jp_v2": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.58},
+    "invoice_en": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.55},
+    "invoice_fr": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.55},
+    "purchase_order": {"lambda_shape": 4.0, "w_kw": 0.5, "w_img": 0.22, "ocr_min_conf": 0.60},
+    "expense": {"lambda_shape": 3.8, "w_kw": 0.5, "w_img": 0.18, "ocr_min_conf": 0.60},
+    "timesheet": {"lambda_shape": 3.6, "w_kw": 0.45, "w_img": 0.18, "ocr_min_conf": 0.62},
+    "shipping_notice": {"lambda_shape": 4.3, "w_kw": 0.5, "w_img": 0.26, "ocr_min_conf": 0.58},
+    "medical_receipt": {"lambda_shape": 5.0, "w_kw": 0.65, "w_img": 0.28, "ocr_min_conf": 0.60},
+    "contract": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "contract_jp_v2": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "contract_en": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "delivery": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "delivery_jp": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "delivery_en": {"lambda_shape": 4.0, "w_kw": 0.48, "w_img": 0.22, "ocr_min_conf": 0.58},
+    "estimate": {"lambda_shape": 4.3, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "estimate_jp": {"lambda_shape": 4.3, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "estimate_en": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "receipt": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "receipt_jp": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "receipt_en": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60}
+}
+
+_DOMAIN_ALIAS = {
+    "invoice": "invoice_jp_v2",
+    "contract": "contract_jp_v2",
+    "delivery": "delivery_jp",
+    "estimate": "estimate_jp",
+    "receipt": "receipt_jp"
+}
+
+def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
+    scores: Dict[str, float] = {k: 0.0 for k in DOMAIN_KW.keys()}
+    hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
+    total_cells = 0
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as fr:
+            for line in fr:
+                try:
+                    ob = json.loads(line)
+                except Exception:
+                    continue
+                text_parts = [ob.get("text") or "", ob.get("synthesis_window") or ""]
+                meta = ob.get("meta") or {}
+                filt = meta.get("filters") or {}
+                for v in filt.values():
+                    if isinstance(v, str):
+                        text_parts.append(v)
+                joined = " ".join(text_parts)
+                joined_lower = joined.lower()
+                total_cells += 1
+                for dom, kws in DOMAIN_KW.items():
+                    score = 0.0
+                    for kw, weight in kws:
+                        if not kw:
+                            continue
+                        if kw in joined or kw.lower() in joined_lower:
+                            score += float(weight)
+                    if score > 0.0:
+                        scores[dom] += score
+                        hits[dom] += 1
+    except FileNotFoundError:
+        pass
+
+    def _score_key(dom: str) -> Tuple[float, int]:
+        return scores.get(dom, 0.0), hits.get(dom, 0)
+
+    best_dom = "invoice_jp_v2"
+    if scores:
+        best_dom = max(scores.keys(), key=lambda d: (_score_key(d)[0], _score_key(d)[1]))
+    resolved = _DOMAIN_ALIAS.get(best_dom, best_dom)
+    detail = {
+        "scores": scores,
+        "hits": hits,
+        "total_cells": total_cells,
+        "resolved": resolved,
+        "raw_best": best_dom
+    }
+    return resolved, detail
 
 # --------------- Augment (pHash + Filters + λ) ---------------
 def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refheight: int=1000, lambda_alpha: float=0.7, org_dict_path: Optional[str]=None):
@@ -1666,24 +1929,49 @@ def build_index(jsonl: str, out_pkl: str):
 
     @njit(cache=True)
     def _compute_df(arr, lengths, V):
-        n=arr.shape[0]; L=arr.shape[1]
-        df=np.zeros(V, dtype=np.int32)
-        seen=np.zeros(V, dtype=np.uint8)
+        n=arr.shape[0]
+        df=np.zeros(V, dtype=np.int64)
+        seen=np.zeros(V, dtype=np.int64)
         for i in range(n):
-            # clear 'seen'
-            for k in range(V):
-                if seen[k]: seen[k]=0
+            mark=i+1
             for j in range(lengths[i]):
                 tid=arr[i,j]
-                if tid>=0 and seen[tid]==0:
-                    seen[tid]=1; df[tid]+=1
+                if tid<0: break
+                if seen[tid]!=mark:
+                    seen[tid]=mark
+                    df[tid]+=1
         return df
 
-    df = _compute_df(arr, lengths, V) if _HAS_NUMBA and V<=20000 else None
+    @njit(parallel=True, cache=True)
+    def _compute_df_parallel(arr, lengths, V):
+        n=arr.shape[0]
+        df=np.zeros(V, dtype=np.int64)
+        seen=np.full(V, -1, dtype=np.int64)
+        for i in prange(n):
+            L=lengths[i]
+            for j in range(L):
+                tid=arr[i,j]
+                if tid<0:
+                    break
+                if seen[tid]!=i:
+                    seen[tid]=i
+                    atomic.add(df, tid, 1)
+        return df
+
+    df=None
+    if _HAS_NUMBA:
+        try:
+            if V <= 200000:
+                df=_compute_df_parallel(arr, lengths, V)
+            else:
+                df=_compute_df(arr, lengths, V)
+        except Exception:
+            df=None
     if df is None:
-        df=np.zeros(V, dtype=np.int32)
-        for i,(ids,_) in enumerate(docs):
-            for tid in set(ids): df[tid]+=1
+        df=np.zeros(V, dtype=np.int64)
+        for ids,_ in docs:
+            for tid in set(ids):
+                df[tid]+=1
     avgdl = float(lengths.sum())/max(1,N)
     ix={"vocab":vocab, "df":df, "avgdl":avgdl, "N":N, "lengths":lengths.tolist(), "docs_tokens":[d[0] for d in docs]}
     with open(out_pkl,"wb") as f: pickle.dump(ix,f)
@@ -2168,11 +2456,27 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
     """Warm-up + fixed number of trials for robust p95."""
     import time, random
     dom_q = {
+        "invoice":        ["合計","金額","消費税","小計","請求","振込"],
         "invoice_jp_v2": ["合計","金額","消費税","小計","請求日","発行日"],
-        "delivery_jp":   ["納品","数量","品名","伝票","受領"],
-        "estimate_jp":   ["見積","有効期限","見積金額","小計"],
-        "receipt_jp":    ["領収","合計","決済","税込","発行日"],
-        "contract_jp_v2":["契約","甲","乙","条","締結日","署名"]
+        "invoice_en":    ["invoice total", "amount due", "tax", "balance", "payment"],
+        "invoice_fr":    ["facture", "montant", "tva", "total", "date"],
+        "purchase_order":["purchase order", "po", "vendor", "ship", "qty"],
+        "expense":       ["expense", "category", "total", "tax", "reimburse"],
+        "timesheet":     ["timesheet", "hours", "project", "rate", "total"],
+        "shipping_notice":["shipment", "tracking", "carrier", "delivery", "ship"],
+        "medical_receipt":["診療", "点数", "保険", "負担金", "薬剤"],
+        "delivery":      ["納品", "数量", "受領", "出荷", "品名"],
+        "delivery_jp":   ["納品", "数量", "品番", "伝票", "受領"],
+        "delivery_en":   ["delivery", "tracking", "carrier", "qty", "item"],
+        "estimate":      ["見積", "単価", "小計", "有効期限"],
+        "estimate_jp":   ["見積金額", "小計", "数量", "有効期限"],
+        "estimate_en":   ["estimate", "quote", "valid", "subtotal", "project"],
+        "receipt":       ["領収", "合計", "発行日", "住所", "税込"],
+        "receipt_jp":    ["領収書", "税込", "受領", "発行日", "現金"],
+        "receipt_en":    ["receipt", "paid", "total", "tax", "cash"],
+        "contract":      ["契約", "締結", "署名", "条", "甲"],
+        "contract_jp_v2":["契約", "甲", "乙", "条", "締結日", "署名"],
+        "contract_en":   ["contract", "signature", "party", "term", "agreement"]
     }.get(domain or "invoice_jp_v2", ["合計","金額","消費税"])
     # deterministic seed for reproducibility
     rnd = random.Random(0x5A17)
@@ -2495,45 +2799,166 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib
 from typing import Any, Dict, List, Optional
 
-# Local modules (written alongside this script)
-from zocr_onefile_consensus import Pipeline, make_demo, export_jsonl_with_ocr, pdf_to_images_via_poppler  # user-provided onefile
-from zocr_multidomain_core import augment, build_index, query, monitor, autotune_unlabeled, learn_from_monitor, auto_all
+import zocr_onefile_consensus
+import zocr_multidomain_core
+
+PLUGINS = {}
+def register(stage):
+    def deco(fn):
+        PLUGINS.setdefault(stage, []).append(fn); return fn
+    return deco
+def _call(stage, **kw):
+    for fn in PLUGINS.get(stage, []):
+        try:
+            fn(**kw)
+        except Exception as e:
+            print(f"[PLUGIN:{stage}] {fn.__name__} -> {e}")
 
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
-# ---------------- Watchdog / transactional steps ----------------
-def safe_step(name: str, fn, *args, **kwargs):
-    t0=time.perf_counter()
+def _read_ok_steps(outdir: str) -> set:
+    path = os.path.join(outdir, "pipeline_history.jsonl")
+    done = set()
+    if not os.path.exists(path): return done
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                ob = json.loads(line)
+                if ob.get("ok"):
+                    done.add(ob.get("name") or ob.get("step"))
+            except Exception:
+                pass
+    return done
+
+def _append_hist(outdir: str, rec: dict):
+    rec = dict(rec)
+    rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with open(os.path.join(outdir, "pipeline_history.jsonl"), "a", encoding="utf-8") as fw:
+        fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+def _load_history(outdir: str) -> List[Dict[str, Any]]:
+    path = os.path.join(outdir, "pipeline_history.jsonl")
+    records: List[Dict[str, Any]] = []
+    if not os.path.exists(path):
+        return records
+    with open(path, "r", encoding="utf-8") as fr:
+        for line in fr:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+    return records
+
+def _print_history(records: List[Dict[str, Any]], limit: Optional[int] = None) -> None:
+    if limit is not None and limit > 0:
+        records = records[-limit:]
+    if not records:
+        print("(no history)")
+        return
+    w_step = max(4, max(len(str(r.get("name") or r.get("step"))) for r in records))
+    w_status = 7
+    header = f"{'timestamp':<20}  {'step':<{w_step}}  {'status':<{w_status}}  elapsed_ms  note"
+    print(header)
+    print("-" * len(header))
+    for rec in records:
+        ts = rec.get("ts", "-")
+        step = rec.get("name") or rec.get("step") or "?"
+        status = "OK" if rec.get("ok") else ("FAIL" if rec.get("ok") is False else "-")
+        elapsed = rec.get("elapsed_ms")
+        note = rec.get("error") or ""
+        if rec.get("out") and status == "OK" and not isinstance(rec["out"], (str, int, float)):
+            if isinstance(rec["out"], dict) and rec["out"].get("path"):
+                note = rec["out"]["path"]
+        print(f"{ts:<20}  {step:<{w_step}}  {status:<{w_status}}  {elapsed!s:<10}  {note}")
+
+def _read_summary(outdir: str) -> Dict[str, Any]:
+    path = os.path.join(outdir, "pipeline_summary.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8") as fr:
+        return json.load(fr)
+
+def _safe_step(name, fn, *a, **kw):
+    t0 = time.perf_counter()
     try:
         print(f"[RUN]  {name}")
-        out = fn(*args, **kwargs)
-        dt = (time.perf_counter()-t0)*1000.0
+        out = fn(*a, **kw)
+        dt = (time.perf_counter() - t0) * 1000.0
         print(f"[OK]   {name} ({dt:.1f} ms)")
         return {"ok": True, "elapsed_ms": dt, "out": out, "name": name}
     except Exception as e:
-        dt = (time.perf_counter()-t0)*1000.0
+        dt = (time.perf_counter() - t0) * 1000.0
         print(f"[FAIL] {name} ({dt:.1f} ms): {type(e).__name__}: {e}")
         traceback.print_exc()
-        return {"ok": False, "elapsed_ms": dt, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(), "name": name}
+        return {"ok": False, "elapsed_ms": dt, "error": f"{type(e).__name__}: {e}", "name": name}
+
+def _sha256(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1<<16), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def _write_pipeline_meta(outdir: str, seed: int):
+    meta = {
+        "seed": int(seed),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "env": {k:v for k,v in os.environ.items() if k in ("PYTHONHASHSEED","OMP_NUM_THREADS","MKL_NUM_THREADS")},
+        "versions": {},
+        "files": {}
+    }
+    mods = [sys.modules.get(__name__), zocr_onefile_consensus, zocr_multidomain_core]
+    for mod in mods:
+        if mod is None: continue
+        try:
+            p = mod.__file__
+            meta["files"][mod.__name__] = {"path": p, "sha256": _sha256(p)}
+        except Exception:
+            pass
+    for name in ("numpy", "Pillow"):
+        try:
+            meta["versions"][name] = importlib.import_module(name).__version__
+        except Exception:
+            meta["versions"][name] = None
+    try:
+        meta["pip_freeze"] = subprocess.run([sys.executable, "-m", "pip", "freeze"], check=False, capture_output=True, text=True).stdout.strip().splitlines()
+    except Exception:
+        meta["pip_freeze"] = []
+    with open(os.path.join(outdir, "pipeline_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 def _collect_pages(inputs: List[str], dpi: int) -> List[str]:
     pages = []
     for it in inputs:
         ext = os.path.splitext(it)[1].lower()
-        if ext==".pdf":
+        if ext == ".pdf":
             try:
-                pages += pdf_to_images_via_poppler(it, dpi=dpi)
+                pages += zocr_onefile_consensus.pdf_to_images_via_poppler(it, dpi=dpi)
             except Exception as e:
                 raise RuntimeError(f"PDF rasterization failed for {it}: {e}")
         else:
             pages.append(it)
     return pages
 
-# ---------------- Top-down pipeline ----------------
-def run_full_pipeline(
+def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:
+    prof_path = os.path.join(outdir, "auto_profile.json")
+    try:
+        with open(prof_path, "r", encoding="utf-8") as f:
+            prof = json.load(f)
+    except Exception:
+        prof = {}
+    if domain_hint and not prof.get("domain"):
+        prof["domain"] = domain_hint
+    return prof
+
+def _patched_run_full_pipeline(
     inputs: List[str],
     outdir: str,
     dpi: int = 200,
@@ -2544,97 +2969,212 @@ def run_full_pipeline(
     views_log: Optional[str] = None,
     gt_jsonl: Optional[str] = None,
     org_dict: Optional[str] = None,
+    resume: bool = False,
+    seed: int = 24601,
+    snapshot: bool = False,
 ) -> Dict[str, Any]:
-    """
-    1) OCR + table reconstruct -> doc.zocr.json
-    2) Export contextual JSONL (toy OCR stub included in onefile)
-    3) Augment -> Index -> Monitor
-    4) (Optional) unlabeled tune + learn on monitor history
-
-    Returns paths & key metrics for quick inspection.
-    """
     ensure_dir(outdir)
-    log_path = os.path.join(outdir, "pipeline_history.jsonl")
-    with open(log_path, "a", encoding="utf-8") as logf:
-        def log_row(**row):
-            row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            logf.write(json.dumps(row, ensure_ascii=False) + "\n"); logf.flush()
+    random.seed(seed)
+    try:
+        import numpy as _np
+        _np.random.seed(seed)
+    except Exception:
+        pass
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    if snapshot:
+        _write_pipeline_meta(outdir, seed)
 
-        # Step 0: inputs
-        if len(inputs)==1 and inputs[0].lower()=="demo":
-            pages, annos = make_demo(outdir)
-        else:
-            pages = _collect_pages(inputs, dpi=dpi)
-            annos = [None]*len(pages)
+    ok = _read_ok_steps(outdir) if resume else set()
 
-        # Step 1: OCR / Table
-        pipe = Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
-        r = safe_step("OCR / Table Reconstruct", pipe.run, "doc", pages, outdir, annos)
-        log_row(step="ocr", **r); 
-        if not r["ok"]: raise RuntimeError("Pipeline halted at OCR step")
-        _, doc_json_path = r["out"]
+    if len(inputs) == 1 and inputs[0].lower() == "demo":
+        pages, annos = zocr_onefile_consensus.make_demo(outdir)
+    else:
+        pages = _collect_pages(inputs, dpi=dpi)
+        annos = [None] * len(pages)
+    if not pages:
+        raise RuntimeError("No input pages provided")
 
-        # Step 2: Export contextual JSONL （toyOCRでstubでも可）
-        jsonl_path = os.path.join(outdir, "doc.contextual.jsonl")
-        src_img = pages[0]
-        r = safe_step("Export JSONL (contextual+OCR)", export_jsonl_with_ocr, doc_json_path, src_img, jsonl_path, "toy", True)
-        log_row(step="export", **r); 
-        if not r["ok"]: raise RuntimeError("Pipeline halted at Export JSONL step")
+    pipe = zocr_onefile_consensus.Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
 
-        # Step 3a: Augment
-        mm_jsonl = os.path.join(outdir, "doc.mm.jsonl")
-        r = safe_step("Augment", augment, jsonl_path, mm_jsonl, org_dict, 4.5)
-        log_row(step="augment", **r); 
-        if not r["ok"]: raise RuntimeError("Pipeline halted at Augment step")
+    doc_json_path = os.path.join(outdir, "doc.zocr.json")
+    jsonl_path = os.path.join(outdir, "doc.contextual.jsonl")
+    mm_jsonl = os.path.join(outdir, "doc.mm.jsonl")
+    idx_path = os.path.join(outdir, "bm25.pkl")
+    mon_csv = os.path.join(outdir, "monitor.csv")
+    prof_path = os.path.join(outdir, "auto_profile.json")
+    prof = _load_profile(outdir, domain_hint)
 
-        # Step 3b: Index
-        idx_path = os.path.join(outdir, "bm25.pkl")
-        r = safe_step("Index", build_index, mm_jsonl, idx_path)
-        log_row(step="index", **r); 
-        if not r["ok"]: raise RuntimeError("Pipeline halted at Index step")
-
-        # Step 3c: Monitor (KPI収集 + p95補完)
-        mon_csv = os.path.join(outdir, "monitor.csv")
-        r = safe_step("Monitor", monitor, mm_jsonl, idx_path, k, mon_csv, views_log, gt_jsonl, domain_hint)
-        log_row(step="monitor", **r); 
-        if not r["ok"]: raise RuntimeError("Pipeline halted at Monitor step")
-        monitor_row = r["out"]
-
-        # Step 4: Optional tuning + learning
-        tune_row = None; learn_row = None
-        if do_tune:
-            tune_dir = os.path.join(outdir, "tune")
-            r = safe_step("Unlabeled Tune", autotune_unlabeled, mm_jsonl, idx_path, tune_dir, "random", tune_budget, domain_hint, 0)
-            log_row(step="tune", **r); 
-            if r["ok"]:
-                # re-monitor to append a fresh KPI after tuning (same CSV)
-                r2 = safe_step("Monitor (post-tune)", monitor, mm_jsonl, idx_path, k, mon_csv, views_log, gt_jsonl, domain_hint)
-                log_row(step="monitor_post_tune", **r2)
-                tune_row = r["out"]
-                # learn small drift
-                prof_json = os.path.join(outdir, "auto_profile.json")
-                r3 = safe_step("Learn-from-Monitor", learn_from_monitor, mon_csv, prof_json, None, domain_hint)
-                log_row(step="learn", **r3)
-                learn_row = r3["out"]
-            else:
-                print("[WARN] Tune failed; skipping learn")
-
-    # Compose summary
-    summary = {
+    summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
         "mm_jsonl": mm_jsonl,
         "index": idx_path,
         "monitor_csv": mon_csv,
-        "monitor_row": monitor_row,
-        "tune": tune_row,
-        "learn": learn_row,
+        "profile_json": prof_path,
+        "history": os.path.join(outdir, "pipeline_history.jsonl"),
     }
+
+    if "OCR" in ok:
+        print("[SKIP] OCR (resume)")
+    else:
+        r = _safe_step("OCR", pipe.run, "doc", pages, outdir, annos)
+        _append_hist(outdir, r)
+        if not r.get("ok"):
+            raise RuntimeError("OCR failed")
+        try:
+            _, doc_json_path = r.get("out", (None, doc_json_path))
+        except Exception:
+            pass
+
+    src_img = pages[0]
+
+    if "Export" in ok:
+        print("[SKIP] Export JSONL (resume)")
+    else:
+        r = _safe_step("Export", zocr_onefile_consensus.export_jsonl_with_ocr,
+                       doc_json_path, src_img, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
+        _append_hist(outdir, r)
+        if not r.get("ok"):
+            raise RuntimeError("Export failed")
+    _call("post_export", jsonl=jsonl_path, outdir=outdir)
+
+    if "Augment" in ok:
+        print("[SKIP] Augment (resume)")
+    else:
+        r = _safe_step("Augment", zocr_multidomain_core.augment, jsonl_path, mm_jsonl,
+                       prof.get("lambda_shape", 4.5), org_dict_path=org_dict)
+        _append_hist(outdir, r)
+        if not r.get("ok"):
+            raise RuntimeError("Augment failed")
+
+    if "Index" in ok:
+        print("[SKIP] Index (resume)")
+    else:
+        r = _safe_step("Index", zocr_multidomain_core.build_index, mm_jsonl, idx_path)
+        _append_hist(outdir, r)
+        if not r.get("ok"):
+            raise RuntimeError("Index failed")
+    _call("post_index", index=idx_path, jsonl=mm_jsonl)
+
+    monitor_row = None
+    if "Monitor" in ok:
+        print("[SKIP] Monitor (resume)")
+    else:
+        r = _safe_step("Monitor", zocr_multidomain_core.monitor, mm_jsonl, idx_path, k, mon_csv,
+                       views_log=views_log, gt_jsonl=gt_jsonl, domain=prof.get("domain"))
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            monitor_row = r.get("out")
+    if monitor_row is None and os.path.exists(mon_csv):
+        try:
+            import csv
+            with open(mon_csv, "r", encoding="utf-8", newline="") as fr:
+                rows = list(csv.DictReader(fr))
+                if rows:
+                    monitor_row = rows[-1]
+        except Exception:
+            monitor_row = None
+    summary["monitor_row"] = monitor_row
+    _call("post_monitor", csv=mon_csv, profile=prof)
+
+    tune_row = None
+    learn_row = None
+    if do_tune:
+        if "Tune" not in ok:
+            r = _safe_step("Tune", zocr_multidomain_core.autotune_unlabeled, mm_jsonl, idx_path, outdir,
+                           method="grid", budget=int(tune_budget), domain_hint=prof.get("domain"),
+                           seed=0, p95_target_ms=300.0, use_smoothing_metric=True)
+            _append_hist(outdir, r)
+            if r.get("ok"):
+                tune_row = r.get("out")
+        if "MonitorPostTune" not in ok:
+            r = _safe_step("MonitorPostTune", zocr_multidomain_core.monitor, mm_jsonl, idx_path, k, mon_csv,
+                           views_log=views_log, gt_jsonl=gt_jsonl, domain=prof.get("domain"))
+            _append_hist(outdir, r)
+            if r.get("ok"):
+                monitor_row = r.get("out") or monitor_row
+        if monitor_row is None and os.path.exists(mon_csv):
+            try:
+                import csv
+                with open(mon_csv, "r", encoding="utf-8", newline="") as fr:
+                    rows = list(csv.DictReader(fr))
+                    if rows:
+                        monitor_row = rows[-1]
+            except Exception:
+                monitor_row = None
+        try:
+            learn_row = zocr_multidomain_core.learn_from_monitor(mon_csv, prof_path, prof_path,
+                                                                  prof.get("domain"), ema=0.5)
+        except Exception as e:
+            print("Learn-from-monitor skipped:", e)
+    summary["tune"] = tune_row
+    summary["learn"] = learn_row
+
+    try:
+        sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
+                                                     prefix=(prof.get("domain") or "invoice"))
+        summary["sql_csv"] = sql_paths.get("csv")
+        summary["sql_schema"] = sql_paths.get("schema")
+    except Exception as e:
+        print("SQL export skipped:", e)
+    _call("post_sql", sql_csv=summary.get("sql_csv"), sql_schema=summary.get("sql_schema"))
+
+    if PLUGINS:
+        summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
+                               for stage, fns in PLUGINS.items()}
+
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     return summary
 
+run_full_pipeline = _patched_run_full_pipeline
+
 # ---------------- CLI ----------------
 def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in {"history", "summary", "plugins"}:
+        cmd = argv[0]
+        rest = argv[1:]
+        if cmd == "history":
+            hp = argparse.ArgumentParser("ZOCR pipeline history")
+            hp.add_argument("--outdir", default="out_allinone")
+            hp.add_argument("--limit", type=int, default=20, help="show only the latest N records; 0 for all")
+            hp.add_argument("--full", action="store_true", help="ignore --limit and show all records")
+            hargs = hp.parse_args(rest)
+            recs = _load_history(hargs.outdir)
+            _print_history(recs, None if hargs.full or hargs.limit <= 0 else hargs.limit)
+            return
+        if cmd == "summary":
+            sp = argparse.ArgumentParser("ZOCR pipeline summary")
+            sp.add_argument("--outdir", default="out_allinone")
+            sp.add_argument("--keys", nargs="*", default=[], help="optional keys to filter the summary output")
+            sargs = sp.parse_args(rest)
+            try:
+                data = _read_summary(sargs.outdir)
+            except FileNotFoundError:
+                print("No summary found at", os.path.join(sargs.outdir, "pipeline_summary.json"))
+                sys.exit(1)
+            if sargs.keys:
+                data = {k: data.get(k) for k in sargs.keys}
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            return
+        if cmd == "plugins":
+            pp = argparse.ArgumentParser("ZOCR plugin registry")
+            pp.add_argument("--stage", default=None, help="filter by stage name")
+            pargs = pp.parse_args(rest)
+            if not PLUGINS:
+                print("(no plugins registered)")
+                return
+            stages = [pargs.stage] if pargs.stage else sorted(PLUGINS.keys())
+            for stage in stages:
+                fns = PLUGINS.get(stage, [])
+                print(f"[{stage}] {len(fns)} plugin(s)")
+                for fn in fns:
+                    print(" -", getattr(fn, "__name__", repr(fn)))
+            return
+
+    if argv and argv[0] == "run":
+        argv = argv[1:]
+
     ap = argparse.ArgumentParser("ZOCR All-in-one Orchestrator")
     ap.add_argument("-i","--input", nargs="+", default=["demo"], help="images or PDFs; use 'demo' for synthetic invoice")
     ap.add_argument("--outdir", default="out_allinone")
@@ -2646,11 +3186,14 @@ def main():
     ap.add_argument("--views-log", default=None)
     ap.add_argument("--gt-jsonl", default=None)
     ap.add_argument("--org-dict", default=None)
-    args = ap.parse_args()
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--seed", type=int, default=24601)
+    ap.add_argument("--snapshot", action="store_true")
+    args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
     try:
-        res = run_full_pipeline(
+        res = _patched_run_full_pipeline(
             inputs=args.input,
             outdir=args.outdir,
             dpi=args.dpi,
@@ -2661,6 +3204,9 @@ def main():
             views_log=args.views_log,
             gt_jsonl=args.gt_jsonl,
             org_dict=args.org_dict,
+            resume=args.resume,
+            seed=args.seed,
+            snapshot=args.snapshot,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
