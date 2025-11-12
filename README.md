@@ -89,14 +89,26 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** toy OCR はエッジ輝度を検知して白地黒字/黒地白字を自動判別し、低信頼セルを削減します。
 - **[EN]** The toy OCR now inspects edge brightness to auto-detect inverted text (white-on-black) and cuts down low-confidence cells.
 - **[FR]** Le toy OCR détecte désormais automatiquement les inversions (texte clair sur fond sombre) via la brillance des arêtes, réduisant les cellules peu fiables.
+- **[JA]** `toy_memory.json`（既定保存先。`ZOCR_TOY_MEMORY` で変更可）にグリフアトラスと N-gram を永続化し、Toy OCR が前回学習した文字や語彙を次回以降も参照します。さらに、実行中は低信頼パッチを短期メモリに保持して新しいグリフを学んだ瞬間に再照合し、`ZOCR_GLYPH_CACHE_LIMIT` / `ZOCR_GLYPH_PENDING_LIMIT` でそのキャッシュサイズを調整できます。N-gram は `ZOCR_NGRAM_EMA_ALPHA` に基づく指数移動平均で忘却と学習のバランスを取り、サマリーの `toy_memory` には読込結果・実行前後の差分・保存状態に加えて、ランタイムキャッシュのヒット率や再試行改善数を含む `recognition` 統計が記録されます。
+- **[EN]** The toy OCR persists its glyph atlas and N-gram priors to `toy_memory.json` (override via `ZOCR_TOY_MEMORY`) so previously seen glyphs and vocabulary stay available. During a run it now keeps low-confidence patches in a short-term store and replays them whenever a new glyph variant is learned; tune the cache and queue sizes via `ZOCR_GLYPH_CACHE_LIMIT` / `ZOCR_GLYPH_PENDING_LIMIT`. The N-gram model applies an exponential moving average controlled by `ZOCR_NGRAM_EMA_ALPHA` to balance retention and forgetting, and the `toy_memory` summary section still lists load/save/delta snapshots while also surfacing runtime cache hits, pending replay counts, and confidence gains inside the `recognition` block.
+- **[FR]** Le toy OCR conserve son atlas de glyphes et ses N-grammes dans `toy_memory.json` (modifiable via `ZOCR_TOY_MEMORY`) afin de réutiliser les caractères déjà vus. Pendant l’exécution il stocke désormais les patches peu fiables dans une mémoire court terme et les réévalue dès qu’un nouveau glyphe est appris ; ajustez la taille des caches avec `ZOCR_GLYPH_CACHE_LIMIT` / `ZOCR_GLYPH_PENDING_LIMIT`. Le modèle de N-grammes applique une moyenne mobile exponentielle (`ZOCR_NGRAM_EMA_ALPHA`) pour doser oubli et apprentissage, et la section `toy_memory` du résumé continue de détailler chargement/sauvegarde/deltas tout en exposant les statistiques de cache runtime, les relectures réussies et les gains de confiance dans le bloc `recognition`.
+- **[JA]** エクスポートは信頼度だけでなく N-gram の驚異度（surprisal）も監視し、閾値 (`ZOCR_SURPRISAL_REVIEW_THRESHOLD`) を超えたセルを高信頼でも学習キューに積み、`*.signals.json` には低信頼件数と高驚異件数の両方を記録します。意図エンジンは `high_surprisal_ratio` も評価し、文脈的に怪しいセルが増えると同一実行内で自動再解析を起動します。
+- **[EN]** The exporter now tracks N-gram surprisal alongside confidence and queues even high-confidence cells for learning when they cross the `ZOCR_SURPRISAL_REVIEW_THRESHOLD`; the `*.signals.json` payload reports both low-confidence and high-surprisal counts. The intent engine inspects `high_surprisal_ratio` so a spike in contextually unlikely cells triggers an immediate reanalysis pass within the same run.
+- **[FR]** L’export surveille désormais la surprise N-gramme en plus de la confiance et place dans la file d’apprentissage les cellules dépassant `ZOCR_SURPRISAL_REVIEW_THRESHOLD`, même si leur confiance reste élevée ; le fichier `*.signals.json` indique les volumes faibles-confiances et hautement surprenants. Le moteur d’intentions lit `high_surprisal_ratio` et relance automatiquement la réanalyse lorsqu’une hausse de cellules contextuellement improbables est détectée.
+- **[JA]** 再解析 (`reanalyze_learning_jsonl`) は Tesseract があれば追加エンジンとして併用し、未導入でも自前の合成フォールバックが閾値スイープ・単語分割・ポスタライズ・高精度シャープ処理まで試し、Tesseract 風の候補を生成します。文字のゆらぎ辞書で `??I` → `771` などの揺れも補正し、サマリーには `external_engines` に加え `fallback_transform_usage` / `fallback_variant_count` でフォールバックの内訳を記録します。
+- **[EN]** The reanalysis stage (`reanalyze_learning_jsonl`) still calls into Tesseract when present, but the synthetic fallback now sweeps adaptive thresholds, performs word segmentation, posterizes, and sharpens aggressively to emulate Tesseract-style outputs when the engine is missing. The ambiguity map continues to remap noisy glyphs such as `??I` → `771`, and the summary exposes both `external_engines` counts and the fallback breakdown via `fallback_transform_usage` / `fallback_variant_count`.
+- **[FR]** La phase de réanalyse (`reanalyze_learning_jsonl`) invoque Tesseract lorsqu’il est disponible, et sinon le repli synthétique effectue des balayages de seuils, segmente les mots, applique une posterization et un affûtage poussé afin d’approcher les sorties de Tesseract. La carte d’ambiguïtés convertit toujours des bruits tels que `??I` en `771`, et le résumé détaille désormais `external_engines` ainsi que la ventilation du repli via `fallback_transform_usage` / `fallback_variant_count`.
+- **[JA]** 再解析結果は自動で `doc.contextual.reanalyzed.jsonl`（または既存ファイルを書き換え）に反映され、`*.signals.json` には `applied_reanalysis` の集計（改善件数・平均Δなど）を追記します。パイプラインサマリーには `reanalysis_applied` として適用結果が積み上がり、後段の `augment/index/monitor` は更新済みテキストをそのまま利用します。
+- **[EN]** Reanalysis outputs now feed straight back into `doc.contextual.reanalyzed.jsonl` (or rewrite the original in place), updating the paired `*.signals.json` with an `applied_reanalysis` block that tracks improved counts and average deltas. The pipeline summary records each pass under `reanalysis_applied`, and downstream augment/index/monitor stages consume the refreshed text automatically.
+- **[FR]** Les résultats de réanalyse sont désormais réinjectés dans `doc.contextual.reanalyzed.jsonl` (ou dans le fichier d’origine réécrit), tandis que `*.signals.json` reçoit un bloc `applied_reanalysis` détaillant les gains et la moyenne des deltas. Chaque passage est archivé dans le résumé via `reanalysis_applied`, et les phases augment/index/monitor exploitent d’emblée ces textes mis à jour.
 - **[JA]** 検索レイヤーは BM25 + キーワード + 画像類似に加え、`filters` に含まれる数値やキーを直接照合するシンボリックスコアを併用し、Trust@K を押し上げます。
 - **[EN]** The retrieval layer now blends BM25 + keyword + image similarity with a symbolic scorer that inspects the structured `filters`, improving Trust@K for downstream RAG agents.
 - **[FR]** La couche de recherche combine BM25 + mots-clés + similarité d'image avec un scoreur symbolique basé sur `filters`, ce qui renforce le Trust@K pour les agents RAG.
 
 ## 自動ドメイン検出 / Automatic Domain Detection / Détection automatique du domaine
-- **[JA]** ファイル名（`samples/invoice/...` など）からトークンを抽出し、`DOMAIN_KW` / `_DOMAIN_ALIAS` の別名と突き合わせて初期候補を生成します。OCR 後は JSONL 内テキストとフィルターを走査し、キーワード一致度とヒット率から信頼度を算出します。`pipeline_summary.json` の `domain_autodetect` に推論経路・信頼度・採用ソースを記録します。
-- **[EN]** The orchestrator mines folder/file tokens, maps them through `DOMAIN_KW` and `_DOMAIN_ALIAS`, then refines the guess by scanning the exported JSONL. Confidence scores determine whether the auto-picked domain should override prior hints; the full trace lives in `pipeline_summary.json` under `domain_autodetect`.
-- **[FR]** L'orchestrateur extrait les jetons des chemins, les compare aux alias/domains connus puis affine la sélection avec le JSONL exporté. La confiance finale décide si l'indice utilisateur est remplacé. Le parcours complet est archivé dans `pipeline_summary.json` (`domain_autodetect`).
+- **[JA]** ファイル名（`samples/invoice/...` など）からトークンを抽出し、`DOMAIN_KW` / `_DOMAIN_ALIAS` の別名と突き合わせて初期候補を生成します。OCR 後は JSONL 内テキストとフィルターを走査し、キーワード一致度とヒット率から信頼度を算出します。信頼度が 0.25 未満なら既存ヒントを保持し、`pipeline_summary.json` の `domain_autodetect` に推論経路・信頼度・採用ソースを記録します。
+- **[EN]** The orchestrator mines folder/file tokens, maps them through `DOMAIN_KW` and `_DOMAIN_ALIAS`, then refines the guess by scanning the exported JSONL. Confidence scores must clear a 0.25 threshold before overriding prior hints; the full trace lives in `pipeline_summary.json` under `domain_autodetect`.
+- **[FR]** L'orchestrateur extrait les jetons des chemins, les compare aux alias/domains connus puis affine la sélection avec le JSONL exporté. Si la confiance reste inférieure à 0,25, l'indice utilisateur est conservé. Le parcours complet est archivé dans `pipeline_summary.json` (`domain_autodetect`).
 
 ## 生成物 / Outputs / Résultats
 - `doc.zocr.json` — OCR & consensus の主 JSON。
@@ -104,6 +116,10 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
 - `sql/` — `sql_export` で生成される CSV とスキーマ（`trace` 列で doc/page/table/row/col を Excel から参照可能）。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
+- `reanalyze/` — 低信頼セルの再解析 JSONL（`*.summary.json` には `external_engines` と `fallback_transform_usage` / `fallback_variant_count` を含む詳細統計） / Reanalysis JSONL for low-confidence cells (the accompanying `*.summary.json` captures `external_engines` plus `fallback_transform_usage` / `fallback_variant_count`) / Ré-analyses JSONL des cellules peu fiables (le `*.summary.json` expose `external_engines` ainsi que `fallback_transform_usage` / `fallback_variant_count`).
+- `toy_memory.json` — Toy OCR の記憶スナップショット（グリフアトラスと N-gram）。`ZOCR_TOY_MEMORY` 環境変数で場所を固定可能。
+- `toy_memory.json` — Snapshot of the toy OCR memory (glyph atlas + N-grams). Set `ZOCR_TOY_MEMORY` to pin the storage path.
+- `toy_memory.json` — Instantané de la mémoire du toy OCR (atlas de glyphes + N-grammes). Utilisez `ZOCR_TOY_MEMORY` pour fixer l’emplacement.
 - `pipeline_summary.json` — すべての成果物と依存診断をまとめた要約（`rag_*`, `sql_*`, `views`, `dependencies`, `report_path` など）。
 - `rag_trace_schema`, `rag_fact_tag_example` — サマリー内で RAG トレーサの仕様と `<fact ...>` タグ例を公開。
 - `monitor.csv` — UTF-8 (BOM 付き) で出力し、Excel/Numbers でも文字化けなく開けます。
@@ -112,10 +128,13 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 
 ## モニタリング洞察 / Monitoring Insights / Analyse de la surveillance
 - `pipeline_summary.json` の `insights` は構造・ゲート・プロファイルの3本立てで、over/under・TEDS・行外れ率や Hit@K を数値付きで提示します。
-- インボイス系ドメインはゲートを緩和し、`hit_amount` が基準を満たせば `hit_date=0` でも「amount hit (date optional)」として PASS します。
-- **[JA]** `monitor.csv` には `trust_amount` / `trust_date` / `trust_mean` を追加し、Top-K に混入した非出典セルの比率を観測できます。
-- **[EN]** `monitor.csv` now records `trust_amount`, `trust_date`, and `trust_mean`, exposing how many Top-K hits carry proper provenance.
-- **[FR]** `monitor.csv` consigne désormais `trust_amount`, `trust_date` et `trust_mean`, ce qui mesure la part des résultats Top-K dotés de provenance.
+- インボイス系ドメインは金額 (`hit_amount>=0.8`) と日付 (`hit_date>=0.5`) の双方が揃わない限り PASS しません。欠損時はゲートが FAIL となり、`gate_reason` で要因を特定できます。
+- **[JA]** `monitor.csv` には `trust_amount` / `trust_date` / `trust_mean` を追加し、Top-K に混入した非出典セルの比率を観測できます。`tax_coverage` / `corporate_coverage` でレートが 0 の理由（候補なしなのか失敗か）も判別できます。
+- **[EN]** `monitor.csv` now records `trust_amount`, `trust_date`, and `trust_mean`, exposing how many Top-K hits carry proper provenance. Coverage counters (`tax_coverage`, `corporate_coverage`) clarify when rates are zero because no candidates were found.
+- **[FR]** `monitor.csv` consigne désormais `trust_amount`, `trust_date` et `trust_mean`, ce qui mesure la part des résultats Top-K dotés de provenance. Les compteurs `tax_coverage` / `corporate_coverage` indiquent si les taux à zéro proviennent d'un manque de candidats.
+- Intent 指向のフィードバックでは `intent.action="reanalyze_cells"` が検知されると同一実行内で再解析フローを即時発火し、結果は `intent_runs` と `learning_reanalyzed_jsonl` に反映されます。
+- When the intent engine requests `reanalyze_cells`, the orchestrator now fires a same-run reanalysis pass and records the action under `intent_runs` together with the refreshed `learning_reanalyzed_jsonl` path.
+- Lorsqu’un intent `reanalyze_cells` est produit, l’orchestrateur déclenche immédiatement la réanalyse et consigne l’action dans `intent_runs` ainsi que le nouveau `learning_reanalyzed_jsonl`.
 - autotune / `learn_from_monitor` が更新した `w_kw` / `w_img` / `ocr_min_conf` / `lambda_shape` を拾い、ヘッダ補完や再走査の微調整ヒントを返します。
 
 ## 対応ドメイン / Supported Domains / Domaines pris en charge
