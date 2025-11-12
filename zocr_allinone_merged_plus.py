@@ -2801,6 +2801,7 @@ Outputs are consolidated under a single outdir.
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib
 from typing import Any, Dict, List, Optional
+from html import escape
 
 import zocr_onefile_consensus
 import zocr_multidomain_core
@@ -2883,6 +2884,249 @@ def _read_summary(outdir: str) -> Dict[str, Any]:
         raise FileNotFoundError(path)
     with open(path, "r", encoding="utf-8") as fr:
         return json.load(fr)
+
+def _read_meta(outdir: str) -> Optional[Dict[str, Any]]:
+    path = os.path.join(outdir, "pipeline_meta.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            return json.load(fr)
+    except Exception:
+        return None
+
+def _render_value(value: Any) -> str:
+    if value is None:
+        return "<span class=\"muted\">–</span>"
+    if isinstance(value, (dict, list)):
+        try:
+            formatted = json.dumps(value, ensure_ascii=False, indent=2)
+        except Exception:
+            formatted = str(value)
+        return f"<pre>{escape(formatted)}</pre>"
+    if isinstance(value, float):
+        return escape(f"{value:,.4g}")
+    return escape(str(value))
+
+def _render_table(data: Dict[str, Any], title: str, keys: Optional[List[str]] = None) -> str:
+    if not data:
+        return ""
+    rows = []
+    items = data.items() if keys is None else ((k, data.get(k)) for k in keys if k in data)
+    for key, value in items:
+        rows.append(
+            f"<tr><th scope=\"row\">{escape(str(key))}</th><td>{_render_value(value)}</td></tr>"
+        )
+    if not rows:
+        return ""
+    return (
+        f"<section>\n<h2>{escape(title)}</h2>\n"
+        "<table class=\"kv\">\n" + "\n".join(rows) + "\n</table>\n</section>"
+    )
+
+def _render_history_table(records: List[Dict[str, Any]]) -> str:
+    if not records:
+        return "<p class=\"muted\">(no history recorded)</p>"
+    header = (
+        "<thead><tr><th>timestamp</th><th>step</th><th>status</th><th>elapsed</th><th>note</th></tr></thead>"
+    )
+    body_rows = []
+    for rec in records:
+        status = "ok" if rec.get("ok") else ("fail" if rec.get("ok") is False else "skip")
+        cls = {
+            "ok": "status-ok",
+            "fail": "status-fail",
+            "skip": "status-skip",
+        }.get(status, "")
+        elapsed = rec.get("elapsed_ms")
+        if isinstance(elapsed, (int, float)):
+            elapsed_s = f"{elapsed:,.1f} ms"
+        else:
+            elapsed_s = escape(str(elapsed)) if elapsed is not None else "–"
+        note = rec.get("error") or ""
+        out = rec.get("out")
+        if not note and isinstance(out, dict):
+            if out.get("path"):
+                note = str(out.get("path"))
+        body_rows.append(
+            "<tr class=\"{cls}\"><td>{ts}</td><td>{step}</td><td><span class=\"badge {cls}\">{status}</span></td><td>{elapsed}</td><td>{note}</td></tr>".format(
+                cls=cls,
+                ts=escape(rec.get("ts", "–")),
+                step=escape(str(rec.get("name") or rec.get("step") or "?")),
+                status=escape(status.upper()),
+                elapsed=elapsed_s,
+                note=escape(str(note)) if note else "",
+            )
+        )
+    return "<table class=\"history\">" + header + "<tbody>" + "".join(body_rows) + "</tbody></table>"
+
+def _generate_report(
+    outdir: str,
+    dest: Optional[str] = None,
+    summary: Optional[Dict[str, Any]] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = 50,
+) -> str:
+    summary = summary or _read_summary(outdir)
+    history = history or _load_history(outdir)
+    meta = meta if meta is not None else _read_meta(outdir)
+    if limit is not None and limit > 0 and len(history) > limit:
+        history = history[-limit:]
+    dest = dest or os.path.join(outdir, "pipeline_report.html")
+    ensure_dir(os.path.dirname(dest) or ".")
+
+    stats = summary.get("history_stats") or {}
+    total_ms = stats.get("total_elapsed_ms")
+    ok_count = stats.get("ok")
+    fail_count = stats.get("fail")
+    total_s = None
+    if isinstance(total_ms, (int, float)):
+        total_s = total_ms / 1000.0
+
+    css = """
+    body { font-family: 'Inter', 'Segoe UI', 'Hiragino Sans', sans-serif; margin: 2rem; background: #0d1117; color: #e6edf3; }
+    a { color: #9cdcfe; }
+    h1, h2, h3 { color: #58a6ff; }
+    section { margin-bottom: 2rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #30363d; padding: 0.45rem 0.6rem; vertical-align: top; }
+    th { background: rgba(88, 166, 255, 0.08); text-align: left; font-weight: 600; }
+    table.kv th { width: 18%; }
+    pre { background: #161b22; border-radius: 8px; padding: 0.75rem; overflow-x: auto; }
+    .muted { opacity: 0.65; }
+    .badge { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
+    .status-ok .badge { background: rgba(63, 185, 80, 0.2); color: #3fb950; }
+    .status-fail .badge { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+    .status-skip .badge { background: rgba(201, 148, 0, 0.2); color: #c99400; }
+    details { margin-top: 1rem; }
+    summary { cursor: pointer; }
+    footer { margin-top: 3rem; font-size: 0.85rem; opacity: 0.7; }
+    """
+
+    meta_table = _render_table(meta or {}, "環境 / Environment / Environnement", [
+        "seed",
+        "python",
+        "platform",
+        "env",
+        "versions",
+    ]) if meta else "<p class=\"muted\">(no snapshot metadata — run with --snapshot)</p>"
+
+    core_table = _render_table(
+        {
+            "Output": summary.get("contextual_jsonl"),
+            "Augmented": summary.get("mm_jsonl"),
+            "Index": summary.get("index"),
+            "Monitor": summary.get("monitor_csv"),
+            "Profile": summary.get("profile_json"),
+            "SQL CSV": summary.get("sql_csv"),
+            "SQL schema": summary.get("sql_schema"),
+            "Report": summary.get("report_html"),
+        },
+        "成果物 / Artifacts / Artefacts",
+    )
+
+    info_table = _render_table(
+        {
+            "inputs": summary.get("inputs"),
+            "pages": summary.get("page_count"),
+            "domain": summary.get("domain"),
+            "seed": summary.get("seed"),
+            "resume_requested": summary.get("resume_requested"),
+            "resume_applied": summary.get("resume_applied"),
+            "resume_steps": summary.get("resume_steps"),
+            "snapshot": summary.get("snapshot"),
+            "tune_budget": summary.get("tune_budget"),
+            "generated_at": summary.get("generated_at"),
+        },
+        "概要 / Overview / Aperçu",
+    )
+
+    plugins = summary.get("plugins") or {}
+    if plugins:
+        plugin_rows = []
+        for stage, fns in sorted(plugins.items()):
+            names = ", ".join(escape(str(fn)) for fn in fns) or "–"
+            plugin_rows.append(f"<tr><th scope=\"row\">{escape(stage)}</th><td>{names}</td></tr>")
+        plugin_html = (
+            "<section><h2>プラグイン / Plugins / Extensions</h2><table class=\"kv\">" +
+            "".join(plugin_rows) + "</table></section>"
+        )
+    else:
+        plugin_html = "<section><h2>プラグイン / Plugins / Extensions</h2><p class=\"muted\">(no plugins registered)</p></section>"
+
+    monitor_html = ""
+    if summary.get("monitor_row"):
+        monitor_html = _render_table(summary.get("monitor_row"), "モニタ / Monitor / Surveillance")
+    tune_html = ""
+    if summary.get("tune"):
+        tune_html = _render_table(summary.get("tune"), "自動調整 / Tuning / Ajustement")
+    learn_html = ""
+    if summary.get("learn"):
+        learn_html = _render_table(summary.get("learn"), "学習 / Learning / Apprentissage")
+
+    history_html = _render_history_table(history)
+
+    stats_text = []
+    if total_ms is not None:
+        stats_text.append(f"総処理時間 / Total / Total : {total_ms:,.1f} ms")
+    if total_s is not None:
+        stats_text.append(f"≈ {total_s:,.2f} s")
+    if ok_count is not None or fail_count is not None:
+        stats_text.append(
+            "成否 / Status : OK={ok} / FAIL={fail}".format(
+                ok=ok_count if ok_count is not None else "–",
+                fail=fail_count if fail_count is not None else "–",
+            )
+        )
+    stats_block = "<p class=\"muted\">" + " ・ ".join(stats_text) + "</p>" if stats_text else ""
+
+    pip_html = ""
+    if meta and meta.get("pip_freeze"):
+        pip_lines = "\n".join(meta["pip_freeze"][:200])
+        extra = ""
+        if len(meta["pip_freeze"]) > 200:
+            extra = f"\n… ({len(meta['pip_freeze']) - 200} more)"
+        pip_html = (
+            "<details><summary>pip freeze</summary><pre>" + escape(pip_lines + extra) + "</pre></details>"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <title>ZOCR Report</title>
+  <style>{css}</style>
+</head>
+<body>
+  <h1>ZOCR Pipeline Report / パイプラインレポート / Rapport</h1>
+  <p>outdir: <code>{escape(os.path.abspath(outdir))}</code></p>
+  {stats_block}
+  {info_table}
+  {core_table}
+  {monitor_html}
+  {tune_html}
+  {learn_html}
+  {plugin_html}
+  <section>
+    <h2>履歴 / History / Historique</h2>
+    {history_html}
+  </section>
+  <section>
+    <h2>環境 / Environment / Environnement</h2>
+    {meta_table}
+    {pip_html}
+  </section>
+  <footer>
+    Generated at {escape(time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()))}
+  </footer>
+</body>
+</html>
+"""
+
+    with open(dest, "w", encoding="utf-8") as fw:
+        fw.write(html)
+    return dest
 
 def _safe_step(name, fn, *a, **kw):
     t0 = time.perf_counter()
@@ -3011,6 +3255,15 @@ def _patched_run_full_pipeline(
         "monitor_csv": mon_csv,
         "profile_json": prof_path,
         "history": os.path.join(outdir, "pipeline_history.jsonl"),
+        "inputs": inputs[:],
+        "page_count": len(pages),
+        "domain": prof.get("domain"),
+        "seed": seed,
+        "resume_requested": bool(resume),
+        "resume_applied": bool(ok),
+        "resume_steps": sorted(str(s) for s in ok if s is not None),
+        "snapshot": bool(snapshot),
+        "tune_budget": int(tune_budget) if tune_budget is not None else None,
     }
 
     if "OCR" in ok:
@@ -3122,8 +3375,27 @@ def _patched_run_full_pipeline(
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
                                for stage, fns in PLUGINS.items()}
 
+    history_records = _load_history(outdir)
+    if history_records:
+        ok_count = sum(1 for r in history_records if r.get("ok"))
+        fail_count = sum(1 for r in history_records if r.get("ok") is False)
+        total_elapsed = sum(float(r.get("elapsed_ms") or 0.0) for r in history_records if isinstance(r.get("elapsed_ms"), (int, float)))
+        summary["history_stats"] = {
+            "ok": ok_count,
+            "fail": fail_count,
+            "total_elapsed_ms": total_elapsed,
+        }
+    summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    report_path = os.path.join(outdir, "pipeline_report.html")
+    summary["report_html"] = report_path
+
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    try:
+        _generate_report(outdir, dest=report_path, summary=summary, history=history_records, meta=_read_meta(outdir))
+    except Exception as e:
+        print("Report generation skipped:", e)
     return summary
 
 run_full_pipeline = _patched_run_full_pipeline
@@ -3131,7 +3403,7 @@ run_full_pipeline = _patched_run_full_pipeline
 # ---------------- CLI ----------------
 def main():
     argv = sys.argv[1:]
-    if argv and argv[0] in {"history", "summary", "plugins"}:
+    if argv and argv[0] in {"history", "summary", "plugins", "report"}:
         cmd = argv[0]
         rest = argv[1:]
         if cmd == "history":
@@ -3170,6 +3442,23 @@ def main():
                 print(f"[{stage}] {len(fns)} plugin(s)")
                 for fn in fns:
                     print(" -", getattr(fn, "__name__", repr(fn)))
+            return
+        if cmd == "report":
+            rp = argparse.ArgumentParser("ZOCR pipeline report")
+            rp.add_argument("--outdir", default="out_allinone")
+            rp.add_argument("--dest", default=None, help="optional destination HTML path")
+            rp.add_argument("--limit", type=int, default=50, help="history rows to include (0 = all)")
+            rp.add_argument("--open", action="store_true", help="open the generated report in a browser")
+            rargs = rp.parse_args(rest)
+            limit = None if rargs.limit <= 0 else rargs.limit
+            path = _generate_report(rargs.outdir, dest=rargs.dest, limit=limit)
+            print("Report written to", path)
+            if rargs.open:
+                try:
+                    import webbrowser
+                    webbrowser.open(f"file://{os.path.abspath(path)}")
+                except Exception as e:
+                    print("Browser open failed:", e)
             return
 
     if argv and argv[0] == "run":
