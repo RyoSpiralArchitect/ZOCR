@@ -1,97 +1,106 @@
-# Z-OCR All-in-One / Z-OCR オールインワン / Z-OCR tout-en-un
+# Z-OCR Suite / Z-OCR スイート / Suite Z-OCR
 
 ## 概要 / Overview / Aperçu
-- **[JA]** 単一ファイル `zocr_allinone_merged_plus.py` が OCR から監視・学習までの処理をまるごと抱え、再現性と観測性を意識した運用を支援します。
-- **[EN]** The single file `zocr_allinone_merged_plus.py` bundles OCR, augmentation, indexing, monitoring, and learning with reproducibility and observability in mind.
-- **[FR]** Le fichier unique `zocr_allinone_merged_plus.py` réunit OCR, augmentation, indexation, surveillance et apprentissage en privilégiant la reproductibilité et l'observabilité.
-
-- **[JA]** 同時に `zocr/` パッケージ（`consensus/`, `core/`, `orchestrator/`）として 3 分割したモジュールも収録し、既存インポート（`zocr_onefile_consensus` など）との互換性を維持したまま再利用できます。
-- **[EN]** Alongside it, the repo now exposes a three-module `zocr/` package (`consensus/`, `core/`, `orchestrator/`) so projects can reuse the pieces while keeping backward-compatible import names such as `zocr_onefile_consensus`.
-- **[FR]** En parallèle, un paquet `zocr/` en trois modules (`consensus/`, `core/`, `orchestrator/`) est fourni pour réutiliser chaque brique tout en conservant la compatibilité des imports historiques comme `zocr_onefile_consensus`。
+- **[JA]** `zocr/` パッケージ（`consensus`, `core`, `orchestrator`）を中心に、OCR→拡張→インデックス→監視→調整→レポートまでをワンコマンドで連結します。`zocr_allinone_merged_plus.py` は互換レガシーとして同梱します。
+- **[EN]** The repo focuses on the modular `zocr/` package (`consensus`, `core`, `orchestrator`) that chains OCR → augmentation → indexing → monitoring → tuning → reporting. The legacy `zocr_allinone_merged_plus.py` remains as a drop-in backup.
+- **[FR]** Le paquet modulaire `zocr/` (`consensus`, `core`, `orchestrator`) relie OCR → augmentation → indexation → surveillance → réglage → rapport via une seule commande. Le fichier unique `zocr_allinone_merged_plus.py` est conservé pour compatibilité.
 
 ## レイアウト / Layout / Structure
 ```
 zocr/
-  consensus/zocr_consensus.py    # OCR + table reconstruction
-  core/zocr_core.py              # augment/index/query/monitor/sql
-  orchestrator/zocr_pipeline.py  # pipeline orchestrator & watchdog
-zocr_allinone_merged_plus.py     # backwards-compatible single-file bundle
+  consensus/zocr_consensus.py    # OCR + table reconstruction helpers
+  core/zocr_core.py              # augmentation, BM25, monitoring, SQL & RAG export
+  orchestrator/zocr_pipeline.py  # CLI pipeline orchestrator + resume/watchdog/reporting
+samples/
+  demo_inputs/                   # place your PDFs/PNGs here for quick demos
+README.md
+zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```
 
-## 使い方 / Usage / Utilisation
+## クイックスタート / Quickstart / Démarrage rapide
 ```bash
-# 初回実行 / First run / Première exécution
-python zocr_allinone_merged_plus.py --profile invoice_jp --snapshot --seed 12345
+# 1. 依存関係 / Dependencies / Dépendances
+python -m pip install numpy pillow tqdm numba
 
-# 途中から再開 / Resume after failure / Reprendre après un échec
-python zocr_allinone_merged_plus.py --resume --seed 12345
+# 2. サンプル入力（任意） / Optional sample input / Entrée d'exemple optionnelle
+#   → Put your PDFs/PNGs under samples/demo_inputs/ (or keep it empty to use the synthetic demo)
 
-# インタラクティブ検索 / Interactive query / Recherche interactive
-python zocr_allinone_merged_plus.py query --jsonl out/doc.mm.jsonl --index out/doc.bm25.pkl --q "total due"
+# 3. パイプライン実行 / Run the pipeline / Lancer le pipeline
+python -m zocr.orchestrator.zocr_pipeline --input demo --domain invoice --snapshot --seed 12345
 
-# 履歴確認 / Inspect history / Consulter l'historique
-python zocr_allinone_merged_plus.py history --outdir out_allinone --limit 10
-
-# サマリー要約 / Summarise outputs / Résumer les sorties
-python zocr_allinone_merged_plus.py summary --outdir out_allinone --keys sql_csv sql_schema monitor_csv
-
-# プラグイン一覧 / List plugins / Lister les plugins
-python zocr_allinone_merged_plus.py plugins
-
-# HTML レポート生成 / Generate HTML report / Générer un rapport HTML
-python zocr_allinone_merged_plus.py report --outdir out_allinone --open
-
-# RAG バンドル確認 / Inspect RAG bundle / Vérifier le bundle RAG
-python zocr_allinone_merged_plus.py summary --outdir out_allinone --keys rag_manifest rag_markdown rag_suggested_queries
+# 4. 途中再開 / Resume after failure / Reprendre après un échec
+python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 12345
 ```
+
+> `python -m zocr.orchestrator.zocr_pipeline run ...` も同義です。All commands below accept either form.
+
+## CLI フラグ / CLI Flags / Options CLI
+| Flag | 説明 / Description / Description |
+|------|----------------------------------|
+| `--input` | **JA:** 入力画像/PDF のパス。`demo` は合成デモ＋`samples/demo_inputs/`。<br>**EN:** Paths to images/PDFs; `demo` mixes the synthetic example with anything in `samples/demo_inputs/`.<br>**FR:** Chemins vers images/PDF ; `demo` combine l'exemple synthétique et les fichiers dans `samples/demo_inputs/`. |
+| `--outdir` | 出力先 / Output directory / Répertoire de sortie。既定: `out_allinone`. |
+| `--dpi` | PDF レンダリング時の DPI / DPI for PDF rendering / DPI pour le rendu PDF. |
+| `--domain` | ドメインヒント（`invoice`, `bank_statement`, `tax`, など）/ Domain hint / Indice de domaine. |
+| `--k` | BM25 ヒット上位件数 / Top-K for BM25 / Top-K BM25. |
+| `--no-tune` | チューニング無効化 / Skip autotune / Désactiver l'auto-réglage. |
+| `--tune-budget` | オートチューニング評価回数 / Trials for autotune / Itérations autotune. |
+| `--views-log` | ビュー生成ログ CSV を追記するパス / CSV log for microscope/X-ray renders / Journal CSV des rendus microscope/X-ray. |
+| `--gt-jsonl` | モニタ評価用のラベル JSONL / Ground-truth JSONL for monitoring / JSONL vérité terrain pour la surveillance. |
+| `--org-dict` | 組織名辞書へのパス / Org-name dictionary path / Chemin dictionnaire d'organisations. |
+| `--resume` | `pipeline_history.jsonl` を参照して段階をスキップ / Resume stages via `pipeline_history.jsonl` / Reprendre les étapes via `pipeline_history.jsonl`. |
+| `--seed` | 乱数シード / RNG seed / Graine aléatoire. |
+| `--snapshot` | `pipeline_meta.json` に環境情報を保存 / Persist environment metadata / Conserver les métadonnées d'environnement. |
+
+## サブコマンド / Subcommands / Sous-commandes
+- `history --outdir out_invoice --limit 10` — 直近の処理履歴を表示 / show recent history / affiche l'historique récent。
+- `summary --outdir out_invoice --keys sql_csv rag_manifest` — 生成物を JSON 出力 / print artifacts / affiche les artefacts。
+- `plugins [--stage post_rag]` — 登録済みプラグインを列挙 / list registered hooks / lister les hooks enregistrés。
+- `report --outdir out_invoice --open` — 三言語 HTML ダッシュボード生成 / build trilingual HTML dashboard / générer un tableau de bord HTML trilingue。
 
 ## 仕組み / Mechanics / Fonctionnement
-- **[JA]** OCR → JSONL 書き出し → 多領域拡張 → BM25 インデックス → モニタリング → （任意で）パラメータ自動調整 → レポート更新、の順に `_safe_step` で保護された段階処理を走らせます。
-- **[EN]** The pipeline executes OCR → JSONL export → multi-domain augmentation → BM25 indexing → monitoring → optional autotune → reporting, with each stage wrapped by `_safe_step` for logging and resumability.
-- **[FR]** Le pipeline enchaîne OCR → export JSONL → augmentation multi-domaines → indexation BM25 → surveillance → autotuning optionnel → rapport, chaque étape étant protégée par `_safe_step` pour journalisation et reprise.
+1. **OCR & Consensus** — `zocr.consensus.zocr_consensus` がレイアウト解析とセル信頼度計算を実行。
+2. **Export JSONL** — RAG に適した JSONL を出力し、`pipeline_history.jsonl` に記録。
+3. **Augment & Index** — `zocr.core.zocr_core` が多領域特徴、BM25、SQL スナップショット、RAG バンドルを構築。
+4. **Monitor & Tune** — ヒット率、p95 レイテンシ、失敗率を監視し、必要に応じて自動調整後に再監視。
+5. **Report & Plugins** — HTML レポート、要約 JSON、RAG マニフェスト、プラグインフック（`post_export`/`post_index`/`post_monitor`/`post_sql`/`post_rag`）を呼び出し。
 
-## 全体アーキテクチャ / Architecture / Architecture globale
-```
-入力 / Input / Entrée
-    ↓
-[OCR & Consensus]
-    ↓
-[Augment & Fusion]
-    ↓
-[BM25 + SQL Export]
-    ↓
-[Monitoring / Watchdog]
-    ↓
-[Tuning & Learning]
-    ↓
-出力 / Output / Sortie
-```
+各段階は `_safe_step` でガードされ、成功・失敗・経過時間を `pipeline_history.jsonl` に追記します。
+
+## 生成物 / Outputs / Résultats
+- `doc.zocr.json` — OCR & consensus の主 JSON。
+- `doc.mm.jsonl` — マルチモーダル JSONL（RAG / BM25 共用）。
+- `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
+- `sql/` — `sql_export` で生成される CSV とスキーマ。
+- `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
+- `pipeline_summary.json` — すべての成果物をまとめた要約（`rag_*`, `sql_*`, `views`, `report_path` など）。
+- `pipeline_meta.json` — `--snapshot` 有効時の環境情報。
+- `pipeline_report.html` — trilingual ダッシュボード（`report` サブコマンドでも再生成可）。
+
+## 対応ドメイン / Supported Domains / Domaines pris en charge
+- インボイス (JP/EN/FR)、見積書、納品書、領収書、契約書、購入注文書。
+- 経費精算、タイムシート、出荷案内、医療領収書、銀行明細、公共料金請求書。
+- 保険金請求、税申告、給与明細など。各プリセットはキーワードと RAG 向け推奨クエリを含みます。
+
+## RAG 連携 / RAG Integration / Intégration RAG
+- `export_rag_bundle` が Markdown ダイジェスト、セル JSONL、テーブル別セクション、推奨クエリを `rag/manifest.json` にまとめます。
+- サマリー (`summary` サブコマンド) から `rag_markdown` や `rag_suggested_queries` を取得し、下流エージェントに渡せます。
+- `post_rag` フックでカスタム転送やストレージ連携を差し込めます。
 
 ## ビジュアライゼーション / Visualisation / Visualisation
-- **[JA]** `views/` には 4 分割のマイクロスコープ画像（原画 ×3, エッジ強調, Otsu 二値, 勾配ヒートマップ）と、原画に疑似カラーの X-Ray オーバーレイを重ねたファイルを自動生成します。
-- **[EN]** The `views/` folder now holds a four-panel microscope mosaic (raw ×3, edge sharpened, Otsu binarisation, gradient heatmap) plus an X-ray false-colour overlay blended with the original crop.
-- **[FR]** Le dossier `views/` contient désormais une mosaïque microscope en quatre panneaux (brut ×3, renforcement des contours, binarisation Otsu, carte thermique de gradient) ainsi qu'une superposition faux-couleur de type rayon X appliquée à l'image d'origine.
+- 4 パネルのマイクロスコープ（原画、シャープ、二値、勾配）と X-Ray オーバーレイを自動生成。
+- `--views-log` で生成履歴を CSV 追記し、監視や QA に利用可能。
 
-## 対応ドメイン / Supported domains / Domaines pris en charge
-- **[JA]** インボイス（日・英・仏）、見積書、納品書、領収書、契約書、購入注文書に加え、経費精算、タイムシート、出荷案内、医療領収書、銀行取引明細、公共料金請求書、保険金請求、確定申告/税申告、給与明細などを検出・最適化するプリセットを収録しました。
-- **[EN]** Domain presets now cover invoices (JP / EN / FR), estimates, delivery slips, receipts, contracts, purchase orders, expenses, timesheets, shipping notices, Japanese medical receipts, bank statements, utility bills, insurance claims, tax returns, and payslips with tuned heuristics.
-- **[FR]** Les préréglages s'étendent aux factures (JP / EN / FR), devis, bons de livraison, reçus, contrats, bons de commande, notes de frais, feuilles de temps, avis d'expédition, reçus médicaux japonais, relevés bancaires, factures de services publics, demandes d'indemnisation, déclarations fiscales et bulletins de paie.
-
-## RAG バンドル / RAG bundle / Paquet RAG
-- **[JA]** `rag/` ディレクトリにセル別 JSONL、ページ/テーブル別セクション、Markdown ダイジェスト、推奨クエリを含むマニフェストを自動生成し、下流の Retrieval-Augmented Generation エージェントに柔軟に受け渡せます。
-- **[EN]** Each run emits a `rag/` bundle with cell-level JSONL, section listings, table snapshots, a Markdown digest, and suggested queries so downstream RAG agents can ingest the corpus without extra wrangling.
-- **[FR]** Chaque exécution produit un dossier `rag/` contenant JSONL par cellule, sections par page/table, résumé Markdown et requêtes suggérées afin de faciliter l'alimentation d'agents RAG en aval.
+## サンプル素材 / Sample Assets / Ressources d'exemple
+- `samples/demo_inputs/` にファイルを配置すると、`--input demo` がそれらを取り込みます。
+- フォルダは空でも構いません。クローン直後は同梱の合成サンプルが利用されます。
+- `samples/README.md` に多言語で手順をまとめています。
 
 ## 依存関係 / Dependencies / Dépendances
 - Python 3.9+
-- NumPy, Pillow, tqdm
-- Numba (オプション / optional / optionnel) — 並列 BM25 DF 計算を高速化
-- `pip install -r requirements.txt` がない環境では、上記パッケージを個別に導入してください。
+- NumPy, Pillow, tqdm（コア機能）
+- Numba（任意、BM25 DF の並列化）
+- Poppler など PDF レンダラ（PDF 入力時に必要な場合あり）
 
-## スナップショットとプラグイン / Snapshots & Plugins / Instantanés & Plugins
-- `--snapshot` を付けると `pipeline_meta.json` にハッシュやバージョン情報を保存します。
-- `--resume` により `pipeline_history.jsonl` を参照して途中段階から再開できます。
-- `zocr_pipeline_allinone.register(stage)` でプラグインを登録し、`post_export` や `post_sql`、`post_rag` などのフックでカスタム処理を差し込めます。
-- `history` / `summary` / `plugins` サブコマンドで、実行履歴や生成物、登録済みフックを CLI から参照できます。
-- `report` サブコマンドまたは自動生成される `pipeline_report.html` により、三言語の HTML ダッシュボードで成果物と履歴を振り返れます / Use the `report` subcommand or the auto-generated `pipeline_report.html` to review artifacts and history via a trilingual HTML dashboard / Le sous-commande `report` ou le fichier `pipeline_report.html` généré automatiquement offrent un tableau de bord HTML trilingue pour revoir artefacts et historique.
-
+## バックアップの単一ファイル版 / Single-file Backup / Fichier unique de secours
+- 既存ワークフローが `zocr_allinone_merged_plus.py` に依存している場合、そのまま利用できます。
+- モジュラー版と同じ CLI/サブコマンド/プラグイン/レポート機能を保持しています。
