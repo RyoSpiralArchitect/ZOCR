@@ -1544,7 +1544,6 @@ if __name__=="__main__":
 
 
 # ===================== Robust p95 + Column Smoothing Hook =====================
-# ===================== Robust p95 + Column Smoothing Hook =====================
 
 def _preload_index_and_raws(index_pkl: str, jsonl: str):
     """Load index + raw JSONL once for repeated timing queries."""
