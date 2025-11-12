@@ -66,6 +66,56 @@ _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
+def _discover_demo_input_targets() -> List[str]:
+    """Locate real demo input directories/files to honour `--input demo`."""
+
+    env_override = os.environ.get("ZOCR_DEMO_INPUTS")
+    env_candidates = []
+    if env_override:
+        for segment in env_override.split(os.pathsep):
+            segment = segment.strip()
+            if segment:
+                env_candidates.append(segment)
+
+    here = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+    search_roots = [os.getcwd(), here]
+    seen_roots = set()
+    uniq_roots: List[str] = []
+    for root in search_roots:
+        norm = os.path.abspath(root)
+        if norm in seen_roots:
+            continue
+        seen_roots.add(norm)
+        uniq_roots.append(norm)
+
+    relative_candidates = [
+        os.path.join("samples", "demo_inputs"),
+        os.path.join("samples", "input_demo"),
+        "demo_inputs",
+        "input_demo",
+    ]
+
+    resolved: List[str] = []
+    seen_paths = set()
+
+    def _add_candidate(path: str) -> None:
+        norm = os.path.abspath(path)
+        if norm in seen_paths:
+            return
+        seen_paths.add(norm)
+        if os.path.exists(norm):
+            resolved.append(norm)
+
+    for candidate in env_candidates:
+        _add_candidate(candidate if os.path.isabs(candidate) else os.path.join(os.getcwd(), candidate))
+
+    for root in uniq_roots:
+        for rel in relative_candidates:
+            _add_candidate(os.path.join(root, rel))
+
+    return resolved
+
+
 def _resolve_toy_memory_path(outdir: str) -> str:
     env_path = os.environ.get("ZOCR_TOY_MEMORY")
     if env_path:
@@ -131,10 +181,13 @@ def _is_auto_domain(value: Optional[str]) -> bool:
     return False
 
 
-def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
+def _prepare_domain_hints(inputs: List[str], extra_paths: Optional[List[str]] = None) -> Dict[str, Any]:
     tokens_raw: List[str] = []
+    token_trace: List[Dict[str, Any]] = []
     per_input: Dict[str, List[str]] = {}
-    for raw in inputs:
+    extra_tokens: Dict[str, List[str]] = {}
+
+    def _ingest(raw: str, bucket: Dict[str, List[str]], source: str) -> None:
         norm = os.path.normpath(raw)
         seg_tokens: List[str] = []
         parts = norm.replace("\\", "/").split("/")
@@ -147,9 +200,16 @@ def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
                 if not tok or tok in _STOP_TOKENS or tok.isdigit() or len(tok) < 2:
                     continue
                 tokens_raw.append(tok)
+                token_trace.append({"token": tok, "source": source, "path": raw})
                 seg_tokens.append(tok)
         if seg_tokens:
-            per_input[raw] = seg_tokens
+            bucket[raw] = seg_tokens
+
+    for raw in inputs:
+        _ingest(raw, per_input, "input")
+    if extra_paths:
+        for raw in extra_paths:
+            _ingest(raw, extra_tokens, "page")
     unique_tokens = sorted(set(tokens_raw))
     domain_kw = getattr(zocr_multidomain_core, "DOMAIN_KW", {})
     alias_map = getattr(zocr_multidomain_core, "_DOMAIN_ALIAS", {})
@@ -173,8 +233,10 @@ def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
             best_score = score
     return {
         "tokens_raw": tokens_raw,
+        "token_trace": token_trace,
         "tokens": unique_tokens,
         "per_input": per_input,
+        "extra_paths": extra_tokens,
         "guess": best_dom,
         "best_score": best_score,
         "scores": {k: float(v) for k, v in candidate_scores.items() if v > 0.0},
@@ -502,6 +564,7 @@ def _generate_report(
     info_table = _render_table(
         {
             "inputs": summary.get("inputs"),
+            "page_images": summary.get("page_images"),
             "pages": summary.get("page_count"),
             "domain": summary.get("domain"),
             "seed": summary.get("seed"),
@@ -729,6 +792,72 @@ def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
     except Exception:
         return {}
     return {}
+
+
+def _should_toy_self_correct(
+    export_signals: Optional[Dict[str, Any]],
+    recognition_stats: Optional[Dict[str, Any]],
+) -> Tuple[bool, Dict[str, Any]]:
+    details: Dict[str, Any] = {"reasons": [], "metrics": {}}
+    signals = export_signals or {}
+
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            f = float(value)
+        except Exception:
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+
+    low_conf_ratio = _as_float(signals.get("low_conf_ratio"))
+    high_surprisal_ratio = _as_float(signals.get("high_surprisal_ratio"))
+    review_ratio = _as_float(signals.get("review_ratio"))
+    learning_samples = _as_float(signals.get("learning_samples"))
+
+    metrics = details["metrics"]
+    if low_conf_ratio is not None:
+        metrics["low_conf_ratio"] = low_conf_ratio
+        if low_conf_ratio >= 0.2:
+            details["reasons"].append("low_conf_ratio")
+    if high_surprisal_ratio is not None:
+        metrics["high_surprisal_ratio"] = high_surprisal_ratio
+        if high_surprisal_ratio >= 0.14:
+            details["reasons"].append("high_surprisal_ratio")
+    if review_ratio is not None:
+        metrics["review_ratio"] = review_ratio
+        if review_ratio >= 0.25:
+            details["reasons"].append("review_ratio")
+    if learning_samples is not None:
+        metrics["learning_samples"] = learning_samples
+        if learning_samples >= 8:
+            details["reasons"].append("learning_samples")
+
+    stats = recognition_stats or {}
+    cells = _as_float(stats.get("cells")) or 0.0
+    if cells > 0:
+        low_conf_cells = _as_float(stats.get("low_conf_cells"))
+        if low_conf_cells is not None:
+            recog_low_conf_ratio = low_conf_cells / cells
+            metrics["recognition_low_conf_ratio"] = recog_low_conf_ratio
+            if recog_low_conf_ratio >= 0.24:
+                details["reasons"].append("recognition_low_conf")
+        high_surprisal_cells = _as_float(stats.get("high_surprisal_cells"))
+        if high_surprisal_cells is not None:
+            recog_high_surprisal_ratio = high_surprisal_cells / cells
+            metrics["recognition_high_surprisal_ratio"] = recog_high_surprisal_ratio
+            if recog_high_surprisal_ratio >= 0.18:
+                details["reasons"].append("recognition_high_surprisal")
+
+    runtime_replay = _as_float(stats.get("runtime_replay_improved"))
+    if runtime_replay is not None:
+        metrics["runtime_replay_improved"] = runtime_replay
+        if runtime_replay >= 3.0:
+            details["reasons"].append("runtime_replay")
+
+    return (len(details["reasons"]) > 0), details
 
 
 def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]:
@@ -1132,6 +1261,7 @@ def _patched_run_full_pipeline(
     resume: bool = False,
     seed: int = 24601,
     snapshot: bool = False,
+    ocr_engine: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     random.seed(seed)
@@ -1152,13 +1282,38 @@ def _patched_run_full_pipeline(
     if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
         zocr_onefile_consensus.reset_toy_recognition_stats()
 
-    if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
-        pages, annos = zocr_onefile_consensus.make_demo(outdir)
+    if len(inputs) == 1 and inputs[0].lower() == "demo":
+        real_demo_targets = []
+        if os.path.exists(inputs[0]):
+            real_demo_targets = [inputs[0]]
+        else:
+            real_demo_targets = _discover_demo_input_targets()
+
+        pages = _collect_pages(real_demo_targets, dpi=dpi) if real_demo_targets else []
+
+        filtered_pages: List[str] = []
+        seen_page_paths = set()
+        for page in pages:
+            norm = os.path.abspath(page)
+            if norm in seen_page_paths:
+                continue
+            if not os.path.exists(page):
+                continue
+            seen_page_paths.add(norm)
+            filtered_pages.append(page)
+        pages = filtered_pages
+
+        if pages:
+            annos = [None] * len(pages)
+        else:
+            pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
         pages = _collect_pages(inputs, dpi=dpi)
         annos = [None] * len(pages)
     if not pages:
         raise RuntimeError("No input pages provided")
+
+    page_images = {idx: page for idx, page in enumerate(pages)}
 
     pipe = zocr_onefile_consensus.Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
 
@@ -1170,6 +1325,9 @@ def _patched_run_full_pipeline(
     prof_path = os.path.join(outdir, "auto_profile.json")
     prof = _load_profile(outdir, domain_hint)
 
+    env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
+    effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
         "mm_jsonl": mm_jsonl,
@@ -1179,6 +1337,7 @@ def _patched_run_full_pipeline(
         "history": os.path.join(outdir, "pipeline_history.jsonl"),
         "inputs": inputs[:],
         "page_count": len(pages),
+        "page_images": page_images,
         "domain": prof.get("domain"),
         "seed": seed,
         "resume_requested": bool(resume),
@@ -1186,18 +1345,21 @@ def _patched_run_full_pipeline(
         "resume_steps": sorted(str(s) for s in ok if s is not None),
         "snapshot": bool(snapshot),
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
+        "ocr_engine": effective_ocr_engine,
         "toy_memory": {
             "path": toy_memory_path,
             "load": _json_ready(toy_memory_info_load),
         },
     }
 
+    prof.setdefault("ocr_engine", effective_ocr_engine)
+
     toy_memory_run_baseline = toy_memory_after_load or zocr_onefile_consensus.toy_memory_snapshot()
     toy_memory_after_run: Optional[Dict[str, Any]] = None
     toy_memory_delta_run: Optional[Dict[str, Any]] = None
     toy_recognition_stats: Optional[Dict[str, Any]] = None
 
-    domain_hints = _prepare_domain_hints(inputs)
+    domain_hints = _prepare_domain_hints(inputs, list(page_images.values()))
     content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
     domain_auto_summary: Dict[str, Any] = {
         "provided": domain_hint,
@@ -1206,6 +1368,8 @@ def _patched_run_full_pipeline(
             "best_score": float(domain_hints.get("best_score") or 0.0) if domain_hints.get("best_score") else None,
             "tokens": domain_hints.get("tokens"),
             "per_input": domain_hints.get("per_input"),
+            "extra_paths": domain_hints.get("extra_paths"),
+            "token_trace": domain_hints.get("token_trace"),
             "scores": domain_hints.get("scores"),
         },
         "initial_profile": prof.get("domain"),
@@ -1251,8 +1415,17 @@ def _patched_run_full_pipeline(
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
-        r = _safe_step("Export", zocr_onefile_consensus.export_jsonl_with_ocr,
-                       doc_json_path, pages, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
+        ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
+        r = _safe_step(
+            "Export",
+            zocr_onefile_consensus.export_jsonl_with_ocr,
+            doc_json_path,
+            page_images,
+            jsonl_path,
+            effective_ocr_engine,
+            True,
+            ocr_min_conf,
+        )
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
@@ -1264,51 +1437,102 @@ def _patched_run_full_pipeline(
             summary["learning_jsonl"] = export_signals.get("learning_jsonl")
 
     reanalysis_summary: Optional[Dict[str, Any]] = None
+    reanalysis_reasons_done: Set[str] = set()
     learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
-    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
-    if learning_jsonl_path and "learning_cells" in re_targets:
+    toy_snapshot: Optional[Dict[str, Any]] = None
+    if isinstance(effective_ocr_engine, str) and effective_ocr_engine.lower().startswith("toy"):
+        if hasattr(zocr_onefile_consensus, "toy_recognition_stats"):
+            try:
+                toy_snapshot = zocr_onefile_consensus.toy_recognition_stats(reset=False)
+            except Exception:
+                toy_snapshot = None
+
+    def _run_learning_reanalysis(step_label: str, reason: str, resume_key: Optional[str] = None) -> bool:
+        nonlocal reanalysis_summary, jsonl_path, export_signals
+        if not learning_jsonl_path:
+            return False
+        if reason in reanalysis_reasons_done:
+            return False
         re_dir = os.path.join(outdir, "reanalyze")
         ensure_dir(re_dir)
-        if "ReanalyzeLearning" in ok:
-            print("[SKIP] Reanalyze learning cells (resume)")
+        cache_summary: Optional[Dict[str, Any]] = None
+        hist_key = resume_key or step_label
+        if hist_key in ok:
+            print(f"[SKIP] {step_label} (resume)")
             _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
             try:
                 with open(summary_path, "r", encoding="utf-8") as fr:
                     loaded = json.load(fr)
                     if isinstance(loaded, dict):
-                        reanalysis_summary = loaded
+                        cache_summary = loaded
             except Exception:
-                reanalysis_summary = None
-        else:
+                cache_summary = None
+        if cache_summary is None:
             try:
                 re_limit = int(prof.get("reanalyze_limit") or 64)
             except Exception:
                 re_limit = 64
-            r = _safe_step("ReanalyzeLearning", zocr_onefile_consensus.reanalyze_learning_jsonl,
-                           learning_jsonl_path, re_dir, re_limit)
-            _append_hist(outdir, r)
-            if r.get("ok"):
-                reanalysis_summary = r.get("out")
-        if reanalysis_summary:
-            summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
-            if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
-                summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
-                jsonl_path = _apply_reanalysis_to_contextual_jsonl(
-                    jsonl_path,
-                    reanalysis_summary.get("output_jsonl"),
-                    outdir,
-                    summary,
-                    prof.get("ocr_min_conf", 0.58),
-                    export_signals.get("surprisal_threshold") if export_signals else None,
-                )
-                export_signals = summary.get("export_signals", export_signals)
+            result = _safe_step(
+                step_label,
+                zocr_onefile_consensus.reanalyze_learning_jsonl,
+                learning_jsonl_path,
+                re_dir,
+                re_limit,
+                ocr_engine=effective_ocr_engine,
+            )
+            _append_hist(outdir, result)
+            if not result.get("ok"):
+                return False
+            out = result.get("out")
+            cache_summary = out if isinstance(out, dict) else None
+        if not isinstance(cache_summary, dict):
+            return False
+        reanalysis_summary = cache_summary
+        reanalysis_reasons_done.add(reason)
+        summary.setdefault("reanalysis_runs", []).append(_json_ready({"step": step_label, "reason": reason}))
+        summary["reanalyze_learning"] = _json_ready(cache_summary)
+        output_jsonl = cache_summary.get("output_jsonl")
+        if output_jsonl:
+            summary["learning_reanalyzed_jsonl"] = output_jsonl
+            jsonl_path = _apply_reanalysis_to_contextual_jsonl(
+                jsonl_path,
+                output_jsonl,
+                outdir,
+                summary,
+                prof.get("ocr_min_conf", 0.58),
+                export_signals.get("surprisal_threshold") if export_signals else None,
+            )
+            export_signals = summary.get("export_signals", export_signals)
+        return True
+
+    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
+    if learning_jsonl_path and "learning_cells" in re_targets:
+        _run_learning_reanalysis("ReanalyzeLearning", "profile_reanalyze_target", "ReanalyzeLearning")
+    toy_self_correction_details: Optional[Dict[str, Any]] = None
+    toy_triggered = False
+    toy_executed = False
+    if learning_jsonl_path and toy_snapshot is not None:
+        toy_triggered, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
+        if toy_triggered:
+            toy_executed = _run_learning_reanalysis("ReanalyzeLearningAuto", "toy_self_correction")
+    if toy_self_correction_details is None and toy_snapshot is not None:
+        _, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
+    if toy_self_correction_details is not None:
+        summary["toy_self_correction"] = {
+            "triggered": bool(toy_triggered),
+            "executed": bool(toy_executed),
+            "details": _json_ready(toy_self_correction_details),
+        }
+
+    pre_augment_reanalysis_reasons = set(reanalysis_reasons_done)
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None
     if os.path.exists(jsonl_path):
         try:
             detected_domain, autodetect_detail = zocr_multidomain_core.detect_domain_on_jsonl(
-                jsonl_path, domain_hints.get("tokens_raw")
+                jsonl_path,
+                domain_hints.get("token_trace") or domain_hints.get("tokens_raw"),
             )
         except Exception as e:
             autodetect_error = str(e)
@@ -1477,7 +1701,18 @@ def _patched_run_full_pipeline(
         except Exception as e:
             print("Profile save skipped:", e)
         summary["profile_updates"] = {k: _json_ready(v) for k, v in combined_updates.items()}
+    intent_runs: List[str] = []
+    if intent.get("action") == "reanalyze_cells" and learning_jsonl_path:
+        if _run_learning_reanalysis("ReanalyzeLearningIntent", "intent_reanalyze"):
+            intent_runs.append("reanalyze_learning")
+    if intent_runs:
+        summary["intent_runs"] = intent_runs
     rerun_flags = _needs_rerun_for_keys(list(combined_updates.keys())) if combined_updates else {"augment": False, "monitor": False}
+    new_reanalysis_reasons = reanalysis_reasons_done - pre_augment_reanalysis_reasons
+    if new_reanalysis_reasons:
+        rerun_flags["augment"] = True
+        rerun_flags["monitor"] = True
+        summary["reanalysis_post_augment"] = sorted(new_reanalysis_reasons)
     summary["feedback_rerun_flags"] = rerun_flags
     feedback_passes: List[str] = []
     prof = prof_after
@@ -1501,36 +1736,6 @@ def _patched_run_full_pipeline(
             summary["monitor_row"] = monitor_row
     if feedback_passes:
         summary["feedback_passes"] = feedback_passes
-
-    intent_runs: List[str] = []
-    if intent.get("action") == "reanalyze_cells" and learning_jsonl_path and not summary.get("reanalyze_learning"):
-        re_dir = os.path.join(outdir, "reanalyze")
-        ensure_dir(re_dir)
-        try:
-            re_limit = int(prof_after.get("reanalyze_limit") or 64)
-        except Exception:
-            re_limit = 64
-        r = _safe_step("ReanalyzeLearningIntent", zocr_onefile_consensus.reanalyze_learning_jsonl,
-                       learning_jsonl_path, re_dir, re_limit)
-        _append_hist(outdir, r)
-        if r.get("ok"):
-            intent_runs.append("reanalyze_learning")
-            reanalysis_summary = r.get("out")
-            if isinstance(reanalysis_summary, dict):
-                summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
-                if reanalysis_summary.get("output_jsonl"):
-                    summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
-                    jsonl_path = _apply_reanalysis_to_contextual_jsonl(
-                        jsonl_path,
-                        reanalysis_summary.get("output_jsonl"),
-                        outdir,
-                        summary,
-                        prof.get("ocr_min_conf", 0.58),
-                        export_signals.get("surprisal_threshold") if export_signals else None,
-                    )
-                    export_signals = summary.get("export_signals", export_signals)
-    if intent_runs:
-        summary["intent_runs"] = intent_runs
 
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
@@ -1716,6 +1921,11 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=24601)
     ap.add_argument("--snapshot", action="store_true")
+    ap.add_argument(
+        "--ocr-engine",
+        default=None,
+        help="OCR backend to use (e.g. toy, tesseract, easyocr). Overrides ZOCR_OCR_ENGINE.",
+    )
     args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
@@ -1734,6 +1944,7 @@ def main():
             resume=args.resume,
             seed=args.seed,
             snapshot=args.snapshot,
+            ocr_engine=args.ocr_engine,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
