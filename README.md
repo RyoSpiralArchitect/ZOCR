@@ -26,13 +26,29 @@ python -m pip install numpy pillow tqdm numba
 #   → Put your PDFs/PNGs under samples/demo_inputs/ (or keep it empty to use the synthetic demo)
 
 # 3. パイプライン実行 / Run the pipeline / Lancer le pipeline
-python -m zocr.orchestrator.zocr_pipeline --input demo --snapshot --seed 12345
+python -m zocr run --input demo --snapshot --seed 12345
 
 # 4. 途中再開 / Resume after failure / Reprendre après un échec
-python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 12345
+python -m zocr run --outdir out_invoice --resume --seed 12345
 ```
 
-> `python -m zocr.orchestrator.zocr_pipeline run ...` も同義です。`--domain` を省略すると、ファイル名と OCR 結果から自動判別されます。All commands below accept either form; omitting `--domain` lets the pipeline auto-detect from filenames + OCR output.
+
+> `python -m zocr pipeline ...` や `python -m zocr.orchestrator.zocr_pipeline ...` も利用できます。`--domain` を省略するとファイル名と OCR 結果から自動判別されます。
+> `python -m zocr pipeline ...` and the legacy `python -m zocr.orchestrator.zocr_pipeline ...` remain available; omitting `--domain` keeps automatic detection.
+> `python -m zocr pipeline ...` et l'ancienne forme `python -m zocr.orchestrator.zocr_pipeline ...` restent possibles ; sans `--domain` la détection est automatique.
+
+
+## 統一 CLI / Unified CLI / Interface unifiée
+- **[JA]** `python -m zocr run ...` でオーケストレータを実行し、`consensus` や `core` サブコマンドで個別モジュールも呼び出せます。
+- **[EN]** `python -m zocr run ...` triggers the orchestrator, while `consensus` and `core` expose the specialised CLIs.
+- **[FR]** `python -m zocr run ...` lance l'orchestrateur ; `consensus` et `core` donnent accès aux CLI spécialisées。
+
+| Command | 説明 / Description / Description |
+|---------|----------------------------------|
+| `python -m zocr run …` | **JA:** パイプライン実行（デフォルト）。<br>**EN:** Run the end-to-end pipeline (default).<br>**FR:** Lance la chaîne complète (par défaut). |
+| `python -m zocr pipeline …` | **JA:** `run` と同義、旧来オプション保持。<br>**EN:** Alias of `run`, keeps legacy flags.<br>**FR:** Alias de `run`, conserve les options historiques. |
+| `python -m zocr consensus …` | **JA:** OCR/テーブル復元 CLI（デモ・エクスポート）。<br>**EN:** Consensus/table reconstruction CLI.<br>**FR:** CLI pour la reconstruction de tableaux. |
+| `python -m zocr core …` | **JA:** マルチモーダルコア（augment/index/query/sql/monitor）。<br>**EN:** Multi-domain core (augment/index/query/sql/monitor).<br>**FR:** Noyau multi-domaine (augment/index/query/sql/monitor). |
 
 ## CLI フラグ / CLI Flags / Options CLI
 | Flag | 説明 / Description / Description |
