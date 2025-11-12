@@ -2849,7 +2849,13 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
 
     runner: Callable[["Image.Image"], Tuple[str, float]]
 
-    if engine_key in ("toy", "mock", "demo"):
+    if engine_key == "fast":
+
+        def _fast_runner(img: "Image.Image") -> Tuple[str, float]:
+            return "", 0.0
+
+        runner = _fast_runner
+    elif engine_key in ("toy", "mock", "demo"):
         runner = toy_ocr_text_from_cell
     elif engine_key.startswith("tess"):
         if pytesseract is None or _PYTESS_OUTPUT is None:
@@ -3108,6 +3114,29 @@ def export_jsonl_with_ocr(doc_json_path: str,
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
 
+    progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
+    log_progress = progress_flag not in {"", "0", "false", "no"}
+
+    def _parse_env_int(name: str, default: int, minimum: int = 0) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value)
+
+    log_every = max(1, _parse_env_int("ZOCR_EXPORT_LOG_EVERY", 200, 1))
+    max_cells = _parse_env_int("ZOCR_EXPORT_MAX_CELLS", 0, 0)
+    cells_done = 0
+    t0 = time.time()
+    stop_due_to_limit = False
+
+    pages = doc.get("pages") if isinstance(doc, dict) else None
+    if not isinstance(pages, list):
+        pages = []
+
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
         seen: Set[str] = set()
@@ -3139,8 +3168,27 @@ def export_jsonl_with_ocr(doc_json_path: str,
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
         else 0.0
     )
+    if log_progress:
+        est_cells = 0
+        for p_est in pages:
+            if not isinstance(p_est, dict):
+                continue
+            for t_est in p_est.get("tables", []) or []:
+                dbg_est = t_est.get("dbg", {}) if isinstance(t_est, dict) else {}
+                col_bounds = dbg_est.get("col_bounds", []) if isinstance(dbg_est, dict) else []
+                cols = max(1, len(col_bounds) - 1)
+                baselines = dbg_est.get("baselines_segs", []) if isinstance(dbg_est, dict) else []
+                rows = max(2, len(baselines)) if baselines else 2
+                row_bands_rel = dbg_est.get("row_bands_rel") if isinstance(dbg_est, dict) else None
+                if isinstance(row_bands_rel, list) and row_bands_rel:
+                    rows = max(rows, len(row_bands_rel))
+                est_cells += max(1, rows) * max(1, cols)
+        print(f"[Export] engine={ocr_engine} pages={len(pages)} ~cells={est_cells}", flush=True)
+
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
-        for enum_idx, p in enumerate(doc["pages"]):
+        for enum_idx, p in enumerate(pages):
+            if stop_due_to_limit:
+                break
             pidx = p.get("index")
             page_image_path = p.get("image_path")
             lookup_idx: Optional[int]
@@ -3152,7 +3200,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
             if page_image is None:
                 continue
             page_w, page_h = page_image.size
-            for ti, t in enumerate(p["tables"]):
+            tables = p.get("tables", []) if isinstance(p, dict) else []
+            for ti, t in enumerate(tables):
+                if stop_due_to_limit:
+                    break
+                if not isinstance(t, dict):
+                    continue
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -3209,6 +3262,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
                         grid_conf[r][c] = _normalize_confidence(conf)
+                        cells_done += 1
+                        if log_progress and (cells_done % log_every == 0):
+                            dt = time.time() - t0
+                            print(f"[Export] {cells_done} cells ({dt:.1f}s)", flush=True)
+                        if max_cells and cells_done >= max_cells:
+                            stop_due_to_limit = True
+                            break
+                    if stop_due_to_limit:
+                        break
+                if stop_due_to_limit:
+                    break
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -3335,6 +3399,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         count += 1
+                if log_progress:
+                    fw.flush()
+            if stop_due_to_limit:
+                break
+        if log_progress:
+            print(f"[Export] done: {count} records", flush=True)
     signals_path = out_jsonl_path + ".signals.json"
     learn_path = out_jsonl_path + ".learning.jsonl"
     summary_payload: Dict[str, Any] = {
@@ -7917,6 +7987,8 @@ def _patched_run_full_pipeline(
 
     env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
     effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+    export_ocr_override = os.environ.get("ZOCR_EXPORT_OCR")
+    export_ocr_engine = export_ocr_override or effective_ocr_engine
 
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
@@ -7936,6 +8008,7 @@ def _patched_run_full_pipeline(
         "snapshot": bool(snapshot),
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
         "ocr_engine": effective_ocr_engine,
+        "export_ocr_engine": export_ocr_engine,
         "toy_memory": {
             "path": toy_memory_path,
             "load": _json_ready(toy_memory_info_load),
@@ -8007,12 +8080,12 @@ def _patched_run_full_pipeline(
     else:
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
-            "Export",
+            f"Export (engine={export_ocr_engine})",
             zocr_onefile_consensus.export_jsonl_with_ocr,
             doc_json_path,
             page_images,
             jsonl_path,
-            effective_ocr_engine,
+            export_ocr_engine,
             True,
             ocr_min_conf,
         )
@@ -8031,7 +8104,7 @@ def _patched_run_full_pipeline(
     reanalysis_last_execs: List[Dict[str, Any]] = []
     learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
     toy_snapshot: Optional[Dict[str, Any]] = None
-    if isinstance(effective_ocr_engine, str) and effective_ocr_engine.lower().startswith("toy"):
+    if isinstance(export_ocr_engine, str) and export_ocr_engine.lower().startswith("toy"):
         if hasattr(zocr_onefile_consensus, "toy_recognition_stats"):
             try:
                 toy_snapshot = zocr_onefile_consensus.toy_recognition_stats(reset=False)
@@ -8097,7 +8170,7 @@ def _patched_run_full_pipeline(
                             learning_jsonl_path,
                             re_dir,
                             re_limit,
-                            ocr_engine=effective_ocr_engine,
+                            ocr_engine=export_ocr_engine,
                         )
                 else:
                     result = _safe_step(
@@ -8106,7 +8179,7 @@ def _patched_run_full_pipeline(
                         learning_jsonl_path,
                         re_dir,
                         re_limit,
-                        ocr_engine=effective_ocr_engine,
+                        ocr_engine=export_ocr_engine,
                     )
                 _append_hist(outdir, result)
                 if not result.get("ok"):

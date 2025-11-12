@@ -1373,6 +1373,8 @@ def _patched_run_full_pipeline(
 
     env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
     effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+    export_ocr_override = os.environ.get("ZOCR_EXPORT_OCR")
+    export_ocr_engine = export_ocr_override or effective_ocr_engine
 
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
@@ -1392,6 +1394,7 @@ def _patched_run_full_pipeline(
         "snapshot": bool(snapshot),
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
         "ocr_engine": effective_ocr_engine,
+        "export_ocr_engine": export_ocr_engine,
         "toy_memory": {
             "path": toy_memory_path,
             "load": _json_ready(toy_memory_info_load),
@@ -1463,12 +1466,12 @@ def _patched_run_full_pipeline(
     else:
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
-            "Export",
+            f"Export (engine={export_ocr_engine})",
             zocr_onefile_consensus.export_jsonl_with_ocr,
             doc_json_path,
             page_images,
             jsonl_path,
-            effective_ocr_engine,
+            export_ocr_engine,
             True,
             ocr_min_conf,
         )
@@ -1487,7 +1490,7 @@ def _patched_run_full_pipeline(
     reanalysis_last_execs: List[Dict[str, Any]] = []
     learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
     toy_snapshot: Optional[Dict[str, Any]] = None
-    if isinstance(effective_ocr_engine, str) and effective_ocr_engine.lower().startswith("toy"):
+    if isinstance(export_ocr_engine, str) and export_ocr_engine.lower().startswith("toy"):
         if hasattr(zocr_onefile_consensus, "toy_recognition_stats"):
             try:
                 toy_snapshot = zocr_onefile_consensus.toy_recognition_stats(reset=False)
@@ -1553,7 +1556,7 @@ def _patched_run_full_pipeline(
                             learning_jsonl_path,
                             re_dir,
                             re_limit,
-                            ocr_engine=effective_ocr_engine,
+                            ocr_engine=export_ocr_engine,
                         )
                 else:
                     result = _safe_step(
@@ -1562,7 +1565,7 @@ def _patched_run_full_pipeline(
                         learning_jsonl_path,
                         re_dir,
                         re_limit,
-                        ocr_engine=effective_ocr_engine,
+                        ocr_engine=export_ocr_engine,
                     )
                 _append_hist(outdir, result)
                 if not result.get("ok"):
