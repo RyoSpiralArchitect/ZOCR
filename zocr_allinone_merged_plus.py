@@ -584,6 +584,22 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 row_bands.append((y_top,y_bot)); cur=[cy]
         y_top=int(max(0,min(cur)-med_h*0.6)); y_bot=int(min(H,max(cur)+med_h*0.6))
         row_bands.append((y_top,y_bot))
+    if not row_bands:
+        proj = (bin_img>0).sum(axis=1).astype(np.float64)
+        if proj.size:
+            thr = max(proj.mean()*0.5, proj.max()*0.1)
+            in_band = False
+            start = 0
+            for y,val in enumerate(proj):
+                if val >= thr and not in_band:
+                    in_band = True; start = y
+                elif val < thr and in_band:
+                    row_bands.append((max(0, int(start-1)), min(H, y+1)))
+                    in_band = False
+            if in_band:
+                row_bands.append((max(0, int(start-1)), H))
+    if not row_bands:
+        row_bands.append((0, H))
     # per-row chunks & counts
     chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
     row_counts=[len(row) for row in chunks_by_row]
@@ -1093,7 +1109,7 @@ def _match_glyph(cell_bin, atlas):
     conf = (best_score+1)/2  # [-1,1] -> [0,1]
     return (best_ch if conf>=0.52 else "?"), float(conf)
 
-def _otsu_threshold(arr):
+def _otsu_threshold_toy(arr):
     import numpy as _np
     hist = _np.bincount(arr.reshape(-1), minlength=256).astype(_np.float64)
     total = hist.sum()
@@ -1148,7 +1164,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
     text, conf = _text_from_binary(bw)
     if text:
         return text, conf
-    thr_otsu = _otsu_threshold(arr)
+    thr_otsu = _otsu_threshold_toy(arr)
     bw2 = (arr < thr_otsu).astype(_np.uint8) * 255
     text, conf = _text_from_binary(bw2)
     if text:
@@ -1521,11 +1537,12 @@ ZOCR Multi‑Domain Core (single file)
 ※ 依存：標準 Python + Pillow + numpy（Numba があれば自動使用。無ければフォールバック）。
 """
 
-import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, html
+import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys, html, platform
 from collections import defaultdict, Counter
 from typing import List, Optional, Dict, Any, Tuple, Set
 from PIL import Image, ImageOps
 import numpy as np
+from functools import lru_cache
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
@@ -1599,15 +1616,18 @@ def _build_lib(outdir: Optional[str]=None):
 
     // --- RLE-CC (4-neigh BFS) ---
     typedef struct { int x; int y; } P;
+    #define MAX_STACK_CAP 1000000
     EXP int rle_cc(const uint8_t* img, int H, int W, int max_boxes, int* out_xyxy){
         // BFS stack (iterative) to avoid recursion
-        int max_stack = H*W;
+        long long need = (long long)H * (long long)W;
+        int max_stack = (need > MAX_STACK_CAP) ? MAX_STACK_CAP : (int)need;
         P* st = (P*)malloc(sizeof(P)*max_stack);
         if(!st) return -3;
         uint8_t* vis = (uint8_t*)calloc(H*W,1);
         if(!vis){ free(st); return -4; }
 
         int nb=0;
+        int overflow = 0;
         for(int y=0;y<H;y++){
             for(int x=0;x<W;x++){
                 int idx=y*W+x;
@@ -1631,11 +1651,17 @@ def _build_lib(outdir: Optional[str]=None):
                         if(nx>=0 && nx<W && ny>=0 && ny<H){
                             int nidx=ny*W+nx;
                             if(!vis[nidx] && img[nidx]!=0){
-                                vis[nidx]=1; st[top++]=(P){nx,ny};
-                                if(top>=max_stack-1) top=max_stack-1; // clamp
+                                vis[nidx]=1;
+                                if(top < max_stack){
+                                    st[top++] = (P){nx,ny};
+                                } else {
+                                    overflow = 1;
+                                    break;
+                                }
                             }
                         }
                     }
+                    if(overflow){ break; }
                 }
                 if(nb<max_boxes){
                     // x2,y2 を+1（半開区間）にする場合はここで調整
@@ -1657,9 +1683,17 @@ def _build_lib(outdir: Optional[str]=None):
         with open(cpath, "w") as f: f.write(csrc)
         outdir = outdir or tmp
         os.makedirs(outdir, exist_ok=True)
-        so = os.path.join(outdir, "libzocr.so")
+        sysname = platform.system()
+        if sysname == "Windows":
+            return None, None
         cc = os.environ.get("CC", "cc")
-        r = subprocess.run([cc, "-O3", "-shared", "-fPIC", cpath, "-o", so], capture_output=True)
+        ext = ".so"
+        args = ["-O3", "-shared", "-fPIC"]
+        if sysname == "Darwin":
+            ext = ".dylib"
+            args = ["-O3", "-dynamiclib", "-fPIC", "-undefined", "dynamic_lookup"]
+        so = os.path.join(outdir, "libzocr" + ext)
+        r = subprocess.run([cc, *args, cpath, "-o", so], capture_output=True)
         if r.returncode != 0:
             return None, None
         lib = ctypes.CDLL(so)
@@ -1802,14 +1836,20 @@ def lambda_schedule(page_height: int, base_lambda: float, ref_height: int=1000, 
     return float(base_lambda) * ((float(page_height)/float(ref_height))**float(alpha))
 
 # --------------- pHash / Tiny vec ----------------------
+@lru_cache(maxsize=1)
+def _dct_basis_32() -> np.ndarray:
+    N = 32
+    x = np.arange(N, dtype=np.float64)
+    k = np.arange(N, dtype=np.float64).reshape(-1, 1)
+    basis = np.cos((math.pi/N)*(x+0.5)*k).astype(np.float64, copy=False)
+    return np.nan_to_num(basis, copy=False)
+
+
 def phash64(img: Image.Image) -> int:
     g = ImageOps.grayscale(img).resize((32,32), Image.BICUBIC)
     a = np.asarray(g, dtype=np.float64)
     a = np.nan_to_num(a, copy=False)
-    N=32
-    x=np.arange(N,dtype=np.float64); k=np.arange(N,dtype=np.float64).reshape(-1,1)
-    basis=np.cos((math.pi/N)*(x+0.5)*k).astype(np.float64, copy=False)
-    basis = np.nan_to_num(basis, copy=False)
+    basis = _dct_basis_32()
     d=basis@a@basis.T
     d=np.nan_to_num(d, copy=False, posinf=0.0, neginf=0.0)
     d += 1e-9

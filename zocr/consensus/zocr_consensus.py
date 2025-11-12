@@ -509,6 +509,22 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 row_bands.append((y_top,y_bot)); cur=[cy]
         y_top=int(max(0,min(cur)-med_h*0.6)); y_bot=int(min(H,max(cur)+med_h*0.6))
         row_bands.append((y_top,y_bot))
+    if not row_bands:
+        proj = (bin_img>0).sum(axis=1).astype(np.float64)
+        if proj.size:
+            thr = max(proj.mean()*0.5, proj.max()*0.1)
+            in_band = False
+            start = 0
+            for y,val in enumerate(proj):
+                if val >= thr and not in_band:
+                    in_band = True; start = y
+                elif val < thr and in_band:
+                    row_bands.append((max(0, int(start-1)), min(H, y+1)))
+                    in_band = False
+            if in_band:
+                row_bands.append((max(0, int(start-1)), H))
+    if not row_bands:
+        row_bands.append((0, H))
     # per-row chunks & counts
     chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
     row_counts=[len(row) for row in chunks_by_row]
@@ -1018,7 +1034,7 @@ def _match_glyph(cell_bin, atlas):
     conf = (best_score+1)/2  # [-1,1] -> [0,1]
     return (best_ch if conf>=0.52 else "?"), float(conf)
 
-def _otsu_threshold(arr):
+def _otsu_threshold_toy(arr):
     import numpy as _np
     hist = _np.bincount(arr.reshape(-1), minlength=256).astype(_np.float64)
     total = hist.sum()
@@ -1073,7 +1089,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
     text, conf = _text_from_binary(bw)
     if text:
         return text, conf
-    thr_otsu = _otsu_threshold(arr)
+    thr_otsu = _otsu_threshold_toy(arr)
     bw2 = (arr < thr_otsu).astype(_np.uint8) * 255
     text, conf = _text_from_binary(bw2)
     if text:
