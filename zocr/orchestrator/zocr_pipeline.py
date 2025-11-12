@@ -794,6 +794,72 @@ def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
     return {}
 
 
+def _should_toy_self_correct(
+    export_signals: Optional[Dict[str, Any]],
+    recognition_stats: Optional[Dict[str, Any]],
+) -> Tuple[bool, Dict[str, Any]]:
+    details: Dict[str, Any] = {"reasons": [], "metrics": {}}
+    signals = export_signals or {}
+
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            f = float(value)
+        except Exception:
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+
+    low_conf_ratio = _as_float(signals.get("low_conf_ratio"))
+    high_surprisal_ratio = _as_float(signals.get("high_surprisal_ratio"))
+    review_ratio = _as_float(signals.get("review_ratio"))
+    learning_samples = _as_float(signals.get("learning_samples"))
+
+    metrics = details["metrics"]
+    if low_conf_ratio is not None:
+        metrics["low_conf_ratio"] = low_conf_ratio
+        if low_conf_ratio >= 0.2:
+            details["reasons"].append("low_conf_ratio")
+    if high_surprisal_ratio is not None:
+        metrics["high_surprisal_ratio"] = high_surprisal_ratio
+        if high_surprisal_ratio >= 0.14:
+            details["reasons"].append("high_surprisal_ratio")
+    if review_ratio is not None:
+        metrics["review_ratio"] = review_ratio
+        if review_ratio >= 0.25:
+            details["reasons"].append("review_ratio")
+    if learning_samples is not None:
+        metrics["learning_samples"] = learning_samples
+        if learning_samples >= 8:
+            details["reasons"].append("learning_samples")
+
+    stats = recognition_stats or {}
+    cells = _as_float(stats.get("cells")) or 0.0
+    if cells > 0:
+        low_conf_cells = _as_float(stats.get("low_conf_cells"))
+        if low_conf_cells is not None:
+            recog_low_conf_ratio = low_conf_cells / cells
+            metrics["recognition_low_conf_ratio"] = recog_low_conf_ratio
+            if recog_low_conf_ratio >= 0.24:
+                details["reasons"].append("recognition_low_conf")
+        high_surprisal_cells = _as_float(stats.get("high_surprisal_cells"))
+        if high_surprisal_cells is not None:
+            recog_high_surprisal_ratio = high_surprisal_cells / cells
+            metrics["recognition_high_surprisal_ratio"] = recog_high_surprisal_ratio
+            if recog_high_surprisal_ratio >= 0.18:
+                details["reasons"].append("recognition_high_surprisal")
+
+    runtime_replay = _as_float(stats.get("runtime_replay_improved"))
+    if runtime_replay is not None:
+        metrics["runtime_replay_improved"] = runtime_replay
+        if runtime_replay >= 3.0:
+            details["reasons"].append("runtime_replay")
+
+    return (len(details["reasons"]) > 0), details
+
+
 def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]:
     base = os.path.basename(learning_jsonl)
     if base.endswith(".jsonl"):
@@ -1371,45 +1437,94 @@ def _patched_run_full_pipeline(
             summary["learning_jsonl"] = export_signals.get("learning_jsonl")
 
     reanalysis_summary: Optional[Dict[str, Any]] = None
+    reanalysis_reasons_done: Set[str] = set()
     learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
-    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
-    if learning_jsonl_path and "learning_cells" in re_targets:
+    toy_snapshot: Optional[Dict[str, Any]] = None
+    if isinstance(effective_ocr_engine, str) and effective_ocr_engine.lower().startswith("toy"):
+        if hasattr(zocr_onefile_consensus, "toy_recognition_stats"):
+            try:
+                toy_snapshot = zocr_onefile_consensus.toy_recognition_stats(reset=False)
+            except Exception:
+                toy_snapshot = None
+
+    def _run_learning_reanalysis(step_label: str, reason: str, resume_key: Optional[str] = None) -> bool:
+        nonlocal reanalysis_summary, jsonl_path, export_signals
+        if not learning_jsonl_path:
+            return False
+        if reason in reanalysis_reasons_done:
+            return False
         re_dir = os.path.join(outdir, "reanalyze")
         ensure_dir(re_dir)
-        if "ReanalyzeLearning" in ok:
-            print("[SKIP] Reanalyze learning cells (resume)")
+        cache_summary: Optional[Dict[str, Any]] = None
+        hist_key = resume_key or step_label
+        if hist_key in ok:
+            print(f"[SKIP] {step_label} (resume)")
             _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
             try:
                 with open(summary_path, "r", encoding="utf-8") as fr:
                     loaded = json.load(fr)
                     if isinstance(loaded, dict):
-                        reanalysis_summary = loaded
+                        cache_summary = loaded
             except Exception:
-                reanalysis_summary = None
-        else:
+                cache_summary = None
+        if cache_summary is None:
             try:
                 re_limit = int(prof.get("reanalyze_limit") or 64)
             except Exception:
                 re_limit = 64
-            r = _safe_step("ReanalyzeLearning", zocr_onefile_consensus.reanalyze_learning_jsonl,
-                           learning_jsonl_path, re_dir, re_limit,
-                           ocr_engine=effective_ocr_engine)
-            _append_hist(outdir, r)
-            if r.get("ok"):
-                reanalysis_summary = r.get("out")
-        if reanalysis_summary:
-            summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
-            if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
-                summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
-                jsonl_path = _apply_reanalysis_to_contextual_jsonl(
-                    jsonl_path,
-                    reanalysis_summary.get("output_jsonl"),
-                    outdir,
-                    summary,
-                    prof.get("ocr_min_conf", 0.58),
-                    export_signals.get("surprisal_threshold") if export_signals else None,
-                )
-                export_signals = summary.get("export_signals", export_signals)
+            result = _safe_step(
+                step_label,
+                zocr_onefile_consensus.reanalyze_learning_jsonl,
+                learning_jsonl_path,
+                re_dir,
+                re_limit,
+                ocr_engine=effective_ocr_engine,
+            )
+            _append_hist(outdir, result)
+            if not result.get("ok"):
+                return False
+            out = result.get("out")
+            cache_summary = out if isinstance(out, dict) else None
+        if not isinstance(cache_summary, dict):
+            return False
+        reanalysis_summary = cache_summary
+        reanalysis_reasons_done.add(reason)
+        summary.setdefault("reanalysis_runs", []).append(_json_ready({"step": step_label, "reason": reason}))
+        summary["reanalyze_learning"] = _json_ready(cache_summary)
+        output_jsonl = cache_summary.get("output_jsonl")
+        if output_jsonl:
+            summary["learning_reanalyzed_jsonl"] = output_jsonl
+            jsonl_path = _apply_reanalysis_to_contextual_jsonl(
+                jsonl_path,
+                output_jsonl,
+                outdir,
+                summary,
+                prof.get("ocr_min_conf", 0.58),
+                export_signals.get("surprisal_threshold") if export_signals else None,
+            )
+            export_signals = summary.get("export_signals", export_signals)
+        return True
+
+    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
+    if learning_jsonl_path and "learning_cells" in re_targets:
+        _run_learning_reanalysis("ReanalyzeLearning", "profile_reanalyze_target", "ReanalyzeLearning")
+    toy_self_correction_details: Optional[Dict[str, Any]] = None
+    toy_triggered = False
+    toy_executed = False
+    if learning_jsonl_path and toy_snapshot is not None:
+        toy_triggered, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
+        if toy_triggered:
+            toy_executed = _run_learning_reanalysis("ReanalyzeLearningAuto", "toy_self_correction")
+    if toy_self_correction_details is None and toy_snapshot is not None:
+        _, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
+    if toy_self_correction_details is not None:
+        summary["toy_self_correction"] = {
+            "triggered": bool(toy_triggered),
+            "executed": bool(toy_executed),
+            "details": _json_ready(toy_self_correction_details),
+        }
+
+    pre_augment_reanalysis_reasons = set(reanalysis_reasons_done)
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None
@@ -1586,7 +1701,18 @@ def _patched_run_full_pipeline(
         except Exception as e:
             print("Profile save skipped:", e)
         summary["profile_updates"] = {k: _json_ready(v) for k, v in combined_updates.items()}
+    intent_runs: List[str] = []
+    if intent.get("action") == "reanalyze_cells" and learning_jsonl_path:
+        if _run_learning_reanalysis("ReanalyzeLearningIntent", "intent_reanalyze"):
+            intent_runs.append("reanalyze_learning")
+    if intent_runs:
+        summary["intent_runs"] = intent_runs
     rerun_flags = _needs_rerun_for_keys(list(combined_updates.keys())) if combined_updates else {"augment": False, "monitor": False}
+    new_reanalysis_reasons = reanalysis_reasons_done - pre_augment_reanalysis_reasons
+    if new_reanalysis_reasons:
+        rerun_flags["augment"] = True
+        rerun_flags["monitor"] = True
+        summary["reanalysis_post_augment"] = sorted(new_reanalysis_reasons)
     summary["feedback_rerun_flags"] = rerun_flags
     feedback_passes: List[str] = []
     prof = prof_after
@@ -1610,37 +1736,6 @@ def _patched_run_full_pipeline(
             summary["monitor_row"] = monitor_row
     if feedback_passes:
         summary["feedback_passes"] = feedback_passes
-
-    intent_runs: List[str] = []
-    if intent.get("action") == "reanalyze_cells" and learning_jsonl_path and not summary.get("reanalyze_learning"):
-        re_dir = os.path.join(outdir, "reanalyze")
-        ensure_dir(re_dir)
-        try:
-            re_limit = int(prof_after.get("reanalyze_limit") or 64)
-        except Exception:
-            re_limit = 64
-        r = _safe_step("ReanalyzeLearningIntent", zocr_onefile_consensus.reanalyze_learning_jsonl,
-                       learning_jsonl_path, re_dir, re_limit,
-                       ocr_engine=effective_ocr_engine)
-        _append_hist(outdir, r)
-        if r.get("ok"):
-            intent_runs.append("reanalyze_learning")
-            reanalysis_summary = r.get("out")
-            if isinstance(reanalysis_summary, dict):
-                summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
-                if reanalysis_summary.get("output_jsonl"):
-                    summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
-                    jsonl_path = _apply_reanalysis_to_contextual_jsonl(
-                        jsonl_path,
-                        reanalysis_summary.get("output_jsonl"),
-                        outdir,
-                        summary,
-                        prof.get("ocr_min_conf", 0.58),
-                        export_signals.get("surprisal_threshold") if export_signals else None,
-                    )
-                    export_signals = summary.get("export_signals", export_signals)
-    if intent_runs:
-        summary["intent_runs"] = intent_runs
 
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
