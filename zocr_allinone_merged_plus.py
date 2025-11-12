@@ -1023,12 +1023,10 @@ def _render_glyphs(font=None, size=16):
     return atlas
 
 def _resize_keep_ar(im, w, h):
-    im = ImageOps.invert(im) if im.mode!="L" else ImageOps.invert(im.convert("L"))
-    im = ImageOps.invert(im)
     im = im.convert("L")
     iw, ih = im.size
     scale = min(max(1, w-2)/max(1, iw), max(1, h-2)/max(1, ih))
-    tw, th = max(1,int(iw*scale)), max(1,int(ih*scale))
+    tw, th = max(1, int(round(iw*scale))), max(1, int(round(ih*scale)))
     imr = im.resize((tw, th), resample=Image.BILINEAR)
     out = Image.new("L", (w,h), 0)
     out.paste(imr, ((w-tw)//2,(h-th)//2))
@@ -1600,6 +1598,20 @@ def thomas_tridiag(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -
     for i in range(n-2,-1,-1):
         x[i] = dp[i] - cp[i]*x[i+1]
     return x
+
+def _second_diff_tridiag(n: int, lam: float):
+    """Return tri-diagonal coefficients matching the consensus D² smoothing."""
+    n = int(n)
+    lam = float(max(0.0, lam))
+    if n <= 0:
+        return np.array([]), np.array([]), np.array([])
+    a = -lam * np.ones(max(0, n-1), dtype=np.float64)
+    c = -lam * np.ones(max(0, n-1), dtype=np.float64)
+    b = np.ones(n, dtype=np.float64) + 2.0 * lam
+    if n >= 1:
+        b[0] = 1.0 + lam
+        b[-1] = 1.0 + lam
+    return a, b, c
 
 def cc_label_python(bw: np.ndarray) -> List[Tuple[int,int,int,int]]:
     """Python 版 CC（フォールバック）。bwはuint8 0/1。"""
@@ -3392,6 +3404,14 @@ if not hasattr(zocr_multidomain_core, 'learn_from_monitor'):
             return zocr_multidomain_core.auto_all(*args, **kwargs)
         raise NotImplementedError('learn_from_monitor is not available in this build')
     zocr_multidomain_core.learn_from_monitor = _zocr__learn_from_monitor_shim
+
+# --- Wire the C-backed solver into consensus once both modules are ready ---
+try:
+    if getattr(zocr_onefile_consensus, "_thomas", None) is None \
+       and hasattr(zocr_multidomain_core, "thomas_tridiag"):
+        zocr_onefile_consensus._thomas = zocr_multidomain_core.thomas_tridiag
+except Exception:
+    pass
 
 # ---------------- [Pipe] all-in-one orchestrator -------------------
 _SRC_ZOCR_PIPELINE_ALLINONE = r'''

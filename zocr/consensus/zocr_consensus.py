@@ -960,12 +960,10 @@ def _render_glyphs(font=None, size=16):
     return atlas
 
 def _resize_keep_ar(im, w, h):
-    im = ImageOps.invert(im) if im.mode!="L" else ImageOps.invert(im.convert("L"))
-    im = ImageOps.invert(im)
     im = im.convert("L")
     iw, ih = im.size
     scale = min(max(1, w-2)/max(1, iw), max(1, h-2)/max(1, ih))
-    tw, th = max(1,int(iw*scale)), max(1,int(ih*scale))
+    tw, th = max(1, int(round(iw*scale))), max(1, int(round(ih*scale)))
     imr = im.resize((tw, th), resample=Image.BILINEAR)
     out = Image.new("L", (w,h), 0)
     out.paste(imr, ((w-tw)//2,(h-th)//2))

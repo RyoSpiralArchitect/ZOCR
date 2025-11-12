@@ -249,6 +249,20 @@ def thomas_tridiag(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -
         x[i] = dp[i] - cp[i]*x[i+1]
     return x
 
+def _second_diff_tridiag(n: int, lam: float):
+    """Return tri-diagonal coefficients matching the consensus D² smoothing."""
+    n = int(n)
+    lam = float(max(0.0, lam))
+    if n <= 0:
+        return np.array([]), np.array([]), np.array([])
+    a = -lam * np.ones(max(0, n-1), dtype=np.float64)
+    c = -lam * np.ones(max(0, n-1), dtype=np.float64)
+    b = np.ones(n, dtype=np.float64) + 2.0 * lam
+    if n >= 1:
+        b[0] = 1.0 + lam
+        b[-1] = 1.0 + lam
+    return a, b, c
+
 def cc_label_python(bw: np.ndarray) -> List[Tuple[int,int,int,int]]:
     """Python 版 CC（フォールバック）。bwはuint8 0/1。"""
     H,W = bw.shape
@@ -1541,7 +1555,6 @@ def main():
 
 if __name__=="__main__":
     main()
-
 
 # ===================== Robust p95 + Column Smoothing Hook =====================
 
