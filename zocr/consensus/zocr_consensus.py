@@ -14,7 +14,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 
 from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict
 
@@ -1653,42 +1653,66 @@ def _hypothesize_from_text(text: str, headers: List[str], concepts: List[str]) -
     return sorted(dedup.values(), key=lambda h: -float(h.get("score", 0.0)))[:6]
 
 
-def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_path: str,
+def export_jsonl_with_ocr(doc_json_path: str,
+                          source_images: Union[str, Sequence[str], Mapping[int, str]],
+                          out_jsonl_path: str,
                           ocr_engine: str = "toy", contextual: bool = True,
                           ocr_min_conf: float = 0.58) -> int:
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
-    default_image_path = source_image_path
+    page_lookup: Dict[int, str] = {}
+    default_image_path: Optional[str]
+    if isinstance(source_images, str):
+        default_image_path = source_images
+    elif isinstance(source_images, Mapping):
+        for key, value in source_images.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, str):
+                page_lookup[idx] = value
+        default_image_path = page_lookup.get(min(page_lookup.keys())) if page_lookup else None
+    else:
+        seq = [p for p in source_images if isinstance(p, str)]
+        page_lookup = {i: path for i, path in enumerate(seq)}
+        default_image_path = seq[0] if seq else None
     image_cache: Dict[str, Image.Image] = {}
 
-    def _load_page_image(path: Optional[str]) -> Optional["Image.Image"]:
-        target = path or default_image_path
-        if not target:
-            return None
-        if target in image_cache:
-            return image_cache[target]
-        try:
-            with Image.open(target) as img:
-                loaded = img.convert("RGB")
-        except Exception:
-            if default_image_path and target != default_image_path:
-                try:
-                    with Image.open(default_image_path) as img:
-                        loaded = img.convert("RGB")
-                except Exception:
-                    return None
-            else:
-                return None
-        image_cache[target] = loaded
-        return loaded
+    def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for cand in (path, page_lookup.get(index) if index is not None else None, default_image_path):
+            if isinstance(cand, str) and cand and cand not in seen:
+                seen.add(cand)
+                ordered.append(cand)
+        return ordered
+
+    def _load_page_image(path: Optional[str], index: Optional[int]) -> Optional["Image.Image"]:
+        for target in _candidate_paths(path, index):
+            if target in image_cache:
+                return image_cache[target]
+            try:
+                with Image.open(target) as img:
+                    loaded = img.convert("RGB")
+            except Exception:
+                continue
+            image_cache[target] = loaded
+            return loaded
+        return None
 
     count = 0
     learning_signals: List[Dict[str, Any]] = []
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
-        for p in doc["pages"]:
+        for enum_idx, p in enumerate(doc["pages"]):
             pidx = p.get("index")
             page_image_path = p.get("image_path")
-            page_image = _load_page_image(page_image_path)
+            lookup_idx: Optional[int]
+            if isinstance(pidx, int):
+                lookup_idx = pidx
+            else:
+                lookup_idx = enum_idx
+            page_image = _load_page_image(page_image_path, lookup_idx)
             if page_image is None:
                 continue
             page_w, page_h = page_image.size
@@ -2211,7 +2235,12 @@ def cli_export(args):
     if not os.path.exists(jpath):
         print("doc.zocr.json not found in", out_dir); return
     out_jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
-    n = export_jsonl_with_ocr(jpath, src, out_jsonl, ocr_engine="toy", contextual=True)
+    source_images: Union[str, Sequence[str]]
+    if len(args.input) > 1:
+        source_images = [p for p in args.input if isinstance(p, str)]
+    else:
+        source_images = src
+    n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
     print("Exported", n, "records to", out_jsonl)
 
 def cli_index(args):

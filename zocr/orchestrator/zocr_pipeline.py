@@ -864,7 +864,7 @@ def _patched_run_full_pipeline(
 
     ok = _read_ok_steps(outdir) if resume else set()
 
-    if len(inputs) == 1 and inputs[0].lower() == "demo":
+    if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
         pages = _collect_pages(inputs, dpi=dpi)
@@ -949,13 +949,11 @@ def _patched_run_full_pipeline(
         except Exception:
             pass
 
-    src_img = pages[0]
-
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
         r = _safe_step("Export", zocr_onefile_consensus.export_jsonl_with_ocr,
-                       doc_json_path, src_img, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
+                       doc_json_path, pages, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
