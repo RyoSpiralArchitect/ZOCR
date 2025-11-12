@@ -88,10 +88,10 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
 from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
-from collections import Counter
+from collections import Counter, defaultdict, OrderedDict
 
 try:
     import numpy as np
@@ -1035,6 +1035,68 @@ _ASCII_SET = (
     " +#=_[]{}"
 )
 
+_GLYPH_VARIANT_LIMIT = 6
+_THRESHOLD_MEMORY_LIMIT = 2048
+_THRESHOLD_MEMORY: "OrderedDict[Tuple[int, int, int], int]" = OrderedDict()
+
+
+def _threshold_memory_lookup(key: Tuple[int, int, int]) -> Optional[int]:
+    if key in _THRESHOLD_MEMORY:
+        try:
+            _THRESHOLD_MEMORY.move_to_end(key)
+        except Exception:
+            pass
+        return int(_THRESHOLD_MEMORY[key])
+    return None
+
+
+def _threshold_memory_store(key: Tuple[int, int, int], value: int) -> None:
+    try:
+        _THRESHOLD_MEMORY[key] = int(value)
+        _THRESHOLD_MEMORY.move_to_end(key)
+    except Exception:
+        _THRESHOLD_MEMORY[key] = int(value)
+    if len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
+        try:
+            while len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
+                _THRESHOLD_MEMORY.popitem(last=False)
+        except Exception:
+            while len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
+                _THRESHOLD_MEMORY.popitem()
+
+_NGRAM_COUNTS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+_NGRAM_TOTALS: Dict[str, int] = defaultdict(int)
+_AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
+    "0": ("O", "D"),
+    "O": ("0",),
+    "1": ("I", "l"),
+    "I": ("1", "l"),
+    "l": ("1", "I"),
+    "5": ("S",),
+    "S": ("5",),
+    "2": ("Z",),
+    "Z": ("2",),
+    "8": ("B",),
+    "B": ("8",),
+    "6": ("G",),
+    "G": ("6",),
+    "7": ("T",),
+    "T": ("7",),
+}
+
+def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
+    arr_f = np.asarray(arr, dtype=np.float32)
+    if arr_f.size == 0:
+        return {"aspect": 1.0, "density": 0.0, "symmetry": 0.0, "count": 0}
+    if arr_f.max() > 1.5:
+        arr_f = arr_f / 255.0
+    h, w = arr_f.shape
+    aspect = float(w) / float(h or 1)
+    density = float(arr_f.mean())
+    flipped = np.flip(arr_f, axis=1) if arr_f.ndim == 2 else arr_f
+    symmetry = 1.0 - float(np.mean(np.abs(arr_f - flipped))) if arr_f.size else 0.0
+    return {"aspect": aspect, "density": density, "symmetry": symmetry, "count": 1}
+
 def _render_glyphs(font=None, size=16):
     # PIL's default bitmap font via ImageFont.load_default() matches our demo
     f = ImageFont.load_default() if font is None else font
@@ -1048,22 +1110,189 @@ def _render_glyphs(font=None, size=16):
         # crop to bbox
         bbox = img.getbbox() or (0,0,1,1)
         crop = img.crop(bbox)
-        atlas[ch] = crop
-        arr = np.asarray(crop, dtype=np.float32) / 255.0
-        if arr.size == 0:
-            aspect = 1.0
-            density = 0.0
-            symmetry = 0.0
-        else:
-            h, w = arr.shape
-            aspect = float(w) / float(h or 1)
-            density = float(arr.mean())
-            flipped = np.flip(arr, axis=1)
-            symmetry = 1.0 - float(np.mean(np.abs(arr - flipped)))
-        feats[ch] = {"aspect": aspect, "density": density, "symmetry": symmetry}
+        atlas[ch] = [crop]
+        feats[ch] = _compute_glyph_features_from_array(np.asarray(crop, dtype=np.float32))
     return atlas, feats
 
 _GLYPH_ATLAS, _GLYPH_FEATS = _render_glyphs()
+
+def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
+    if not feats:
+        return
+    cur = _GLYPH_FEATS.setdefault(ch, {"aspect": feats.get("aspect", 1.0),
+                                        "density": feats.get("density", 0.0),
+                                        "symmetry": feats.get("symmetry", 0.0),
+                                        "count": feats.get("count", 1) or 1})
+    count = max(1, int(cur.get("count", 1)))
+    new_count = min(_GLYPH_VARIANT_LIMIT, count + 1)
+    alpha = 1.0 / float(min(count + 1, _GLYPH_VARIANT_LIMIT))
+    for key in ("aspect", "density", "symmetry"):
+        current_val = cur.get(key, feats.get(key, 0.0))
+        target_val = feats.get(key, current_val)
+        cur[key] = current_val + (target_val - current_val) * alpha
+    cur["count"] = new_count
+
+def _adapt_glyph(ch: str, img: "Image.Image") -> None:
+    if not ch or img is None:
+        return
+    try:
+        arr = np.asarray(img.convert("L"), dtype=np.uint8)
+    except Exception:
+        return
+    if arr.size == 0:
+        return
+    atlas_list = _GLYPH_ATLAS.setdefault(ch, [])
+    for tpl in atlas_list:
+        try:
+            if np.array_equal(np.asarray(tpl, dtype=np.uint8), arr):
+                return
+        except Exception:
+            continue
+    atlas_list.append(Image.fromarray(arr, mode="L"))
+    if len(atlas_list) > _GLYPH_VARIANT_LIMIT:
+        atlas_list.pop(0)
+    feats = _compute_glyph_features_from_array(arr)
+    _blend_glyph_features(ch, feats)
+
+def _generate_contextual_variants(text: str) -> Set[str]:
+    variants: Set[str] = set()
+    if not text:
+        return variants
+    chars = list(text)
+    L = len(chars)
+    for i in range(L):
+        alts = _AMBIGUOUS_CHAR_MAP.get(chars[i])
+        if not alts:
+            continue
+        for alt in alts:
+            variant = chars[:]
+            variant[i] = alt
+            variants.add("".join(variant))
+    limited_positions = [i for i, ch in enumerate(chars) if _AMBIGUOUS_CHAR_MAP.get(ch)]
+    if len(limited_positions) >= 2:
+        for i in limited_positions[:3]:
+            for j in limited_positions[:3]:
+                if j <= i:
+                    continue
+                for alt_i in _AMBIGUOUS_CHAR_MAP.get(chars[i], ()):  # type: ignore[arg-type]
+                    for alt_j in _AMBIGUOUS_CHAR_MAP.get(chars[j], ()):  # type: ignore[arg-type]
+                        variant = chars[:]
+                        variant[i] = alt_i
+                        variant[j] = alt_j
+                        variants.add("".join(variant))
+    return variants
+
+def _normalize_digit_like(text: str) -> str:
+    repl = text.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
+    repl = repl.replace("S", "5").replace("s", "5").replace("B", "8").replace("b", "6")
+    repl = repl.replace("G", "6").replace("Z", "2")
+    return repl
+
+def _looks_like_numeric_token(text: str) -> bool:
+    return bool(re.fullmatch(r"[0-9OIlSsbB]{2,}", text or ""))
+
+def _looks_like_upper_token(text: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
+
+def _ngram_coherence(text: str) -> float:
+    if len(text) < 2 or not _NGRAM_TOTALS:
+        return 0.0
+    prev = "\0"
+    total_pairs = 0
+    log_sum = 0.0
+    vocab = len(_ASCII_SET) + 4
+    for ch in text:
+        totals = _NGRAM_TOTALS.get(prev, 0)
+        counts = _NGRAM_COUNTS.get(prev)
+        prob = None
+        if counts and totals:
+            prob = (counts.get(ch, 0) + 1.0) / (totals + vocab)
+        elif counts:
+            prob = (counts.get(ch, 0) + 1.0) / (len(counts) + vocab)
+        if prob is not None:
+            log_sum += math.log(prob)
+            total_pairs += 1
+        prev = ch
+    if total_pairs == 0:
+        return 0.0
+    return float(math.exp(log_sum / total_pairs))
+
+def _score_candidate_with_context(text: str, base_conf: float) -> float:
+    score = max(0.0, min(1.0, base_conf))
+    if not text:
+        return score
+    numeric_like = _looks_like_numeric_token(text)
+    upper_like = _looks_like_upper_token(text)
+    if numeric_like:
+        normalized = _normalize_digit_like(text)
+        if normalized.isdigit():
+            score = max(score, min(1.0, base_conf + 0.08))
+    if upper_like and text.replace("0", "O").isalpha():
+        score = max(score, min(1.0, base_conf + 0.05))
+    coherence = _ngram_coherence(text)
+    if coherence > 0:
+        score = max(score, min(1.0, base_conf * (0.85 + 0.15 * coherence) + 0.05 * coherence))
+    return min(1.0, score)
+
+def _contextual_rerank_candidates(candidates: Dict[str, float]) -> Tuple[str, float]:
+    if not candidates:
+        return "", 0.0
+    base_text, base_conf = max(candidates.items(), key=lambda kv: kv[1])
+    enriched: Dict[str, float] = dict(candidates)
+    for text, conf in list(enriched.items()):
+        variants = _generate_contextual_variants(text)
+        if _looks_like_numeric_token(text):
+            variants.add(_normalize_digit_like(text))
+        for v in variants:
+            if not v or v == text:
+                continue
+            if v not in enriched:
+                enriched[v] = max(0.0, min(1.0, conf * 0.92))
+    best_text, best_score = base_text, _score_candidate_with_context(base_text, enriched[base_text])
+    for text, conf in enriched.items():
+        score = _score_candidate_with_context(text, conf)
+        if score > best_score or (abs(score - best_score) <= 1e-6 and conf > enriched.get(best_text, 0.0)):
+            best_text, best_score = text, score
+    return best_text, float(best_score)
+
+def _update_ngram_model(text: str) -> None:
+    if not text:
+        return
+    prev = "\0"
+    for ch in text:
+        _NGRAM_COUNTS[prev][ch] += 1
+        _NGRAM_TOTALS[prev] += 1
+        prev = ch
+
+def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> List[Tuple["np.ndarray", Dict[str, Any]]]:
+    variants: List[Tuple["np.ndarray", Dict[str, Any]]] = []
+    try:
+        gray_img = Image.fromarray(arr.astype(np.uint8)) if arr is not None else None
+    except Exception:
+        gray_img = None
+    if best_bw is not None:
+        try:
+            bw_img = Image.fromarray(best_bw.astype(np.uint8))
+            for size in (3, 5):
+                try:
+                    variants.append((np.asarray(bw_img.filter(ImageFilter.MaxFilter(size)), dtype=np.uint8), {"type": "augment_max", "size": size}))
+                    variants.append((np.asarray(bw_img.filter(ImageFilter.MinFilter(size)), dtype=np.uint8), {"type": "augment_min", "size": size}))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    if gray_img is not None:
+        fill = int(float(np.median(arr))) if arr.size else 0
+        for angle in (-3, -1, 1, 3):
+            try:
+                rotated = gray_img.rotate(angle, resample=Image.BILINEAR, fillcolor=fill)
+                rot_arr = np.asarray(rotated, dtype=np.uint8)
+                thr = _otsu_threshold_toy(rot_arr)
+                bw = (rot_arr < thr).astype(np.uint8) * 255
+                variants.append((bw, {"type": "augment_rotate", "angle": angle, "thr": thr}))
+            except Exception:
+                continue
+    return variants
 
 _TOTAL_LABEL_HINTS = [
     "total", "grandtotal", "amountdue", "balancedue", "totaldue", "subtotal",
@@ -1128,18 +1357,25 @@ def _match_glyph(cell_bin, atlas):
     cell_aspect = float(cw) / float(ch or 1)
     best_ch, best_score = "", -1.0
     for ch_key, tpl in atlas.items():
-        t = _resize_keep_ar(tpl, cw, ch)
-        b = _np.asarray(t, dtype=_np.float32)
-        if b.size == 0:
+        tpl_list = tpl if isinstance(tpl, (list, tuple)) else [tpl]
+        variant_best = -1.0
+        for glyph_img in tpl_list:
+            t = _resize_keep_ar(glyph_img, cw, ch)
+            b = _np.asarray(t, dtype=_np.float32)
+            if b.size == 0:
+                continue
+            b_norm = (b - b.mean()) / (b.std() + 1e-6)
+            score = -1.0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    shifted = _shift_normed(b_norm, dx, dy)
+                    cand = float((cell_norm * shifted).mean())
+                    if cand > score:
+                        score = cand
+            if score > variant_best:
+                variant_best = score
+        if variant_best < -0.5:
             continue
-        b_norm = (b - b.mean()) / (b.std() + 1e-6)
-        score = -1.0
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                shifted = _shift_normed(b_norm, dx, dy)
-                cand = float((cell_norm * shifted).mean())
-                if cand > score:
-                    score = cand
         feats = _GLYPH_FEATS.get(ch_key, {})
         glyph_aspect = feats.get("aspect", 1.0) or 1.0
         glyph_density = feats.get("density", 0.5)
@@ -1151,9 +1387,9 @@ def _match_glyph(cell_bin, atlas):
             symmetry_penalty = 0.8 + 0.2 * max(0.0, sym_cell)
         else:
             symmetry_penalty = 1.0
-        score *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty
-        if score > best_score:
-            best_score = score; best_ch = ch_key
+        variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty
+        if variant_best > best_score:
+            best_score = variant_best; best_ch = ch_key
     conf = (best_score + 1.0) / 2.0
     return (best_ch if conf >= 0.52 else "?"), float(conf)
 
@@ -1225,6 +1461,8 @@ def _text_from_binary(bw):
     for (x1, y1, x2, y2, _) in refined:
         patch = Image.fromarray(bw[y1:y2, x1:x2])
         ch, sc = _match_glyph(patch, atlas)
+        if ch and ch != "?" and sc > 0.6:
+            _adapt_glyph(ch, patch)
         text.append(ch)
         scores.append(sc)
     if not text:
@@ -1243,55 +1481,110 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
     g = ImageOps.autocontrast(crop_img.convert("L"))
     g = g.filter(ImageFilter.MedianFilter(3))
     arr = _np.asarray(g, dtype=_np.uint8)
-    if arr.size:
+    if arr.size == 0:
+        return "", 0.0
+    try:
         arr_f = arr.astype(_np.float32)
-        try:
-            gy, gx = _np.gradient(arr_f)
-            edge_mag = _np.hypot(gx, gy)
-            thr = edge_mag.mean() + edge_mag.std()
-            mask = edge_mag > thr
-        except Exception:
-            mask = None
-        if mask is not None and mask.any():
-            edge_vals = arr[mask]
-            bright_ratio = float(_np.mean(edge_vals > arr.mean())) if edge_vals.size else 0.0
-            if bright_ratio > 0.6:
-                arr = 255 - arr
-                g = Image.fromarray(arr, mode="L")
+        gy, gx = _np.gradient(arr_f)
+        edge_mag = _np.hypot(gx, gy)
+        thr = edge_mag.mean() + edge_mag.std()
+        mask = edge_mag > thr
+    except Exception:
+        mask = None
+    if mask is not None and mask.any():
+        edge_vals = arr[mask]
+        bright_ratio = float(_np.mean(edge_vals > arr.mean())) if edge_vals.size else 0.0
+        if bright_ratio > 0.6:
+            arr = 255 - arr
+            g = Image.fromarray(arr, mode="L")
     thr_med = int(_np.clip(_np.median(arr), 48, 208))
-    candidates: List[np.ndarray] = []
+    candidates: List[Tuple[np.ndarray, Dict[str, Any]]] = []
+    seen_hashes: Set[Tuple[int, int, str]] = set()
+
+    def _add_candidate(bw_arr: Any, meta: Dict[str, Any]) -> bool:
+        try:
+            arr_u8 = _np.asarray(bw_arr, dtype=_np.uint8)
+        except Exception:
+            return False
+        if arr_u8.size == 0:
+            return False
+        digest = hashlib.sha1(arr_u8.tobytes()).hexdigest()
+        sig = (int(arr_u8.shape[0]), int(arr_u8.shape[1]), digest)
+        if sig in seen_hashes:
+            return False
+        seen_hashes.add(sig)
+        candidates.append((arr_u8.copy(), meta))
+        return True
+
+    key = (int(arr.shape[0]), int(arr.shape[1]), int(float(arr.mean()) // 16))
     bw_med = (arr < thr_med).astype(_np.uint8) * 255
-    candidates.append(bw_med)
+    _add_candidate(bw_med, {"type": "median", "thr": thr_med})
+    thr_mem = _threshold_memory_lookup(key)
+    if thr_mem is not None:
+        _add_candidate((arr < thr_mem).astype(_np.uint8) * 255, {"type": "memory", "thr": thr_mem})
     try:
         blur = _np.asarray(Image.fromarray(arr).filter(ImageFilter.BoxBlur(max(1, bin_k//2))), dtype=_np.float32)
         adapt_dark = (arr + 8 < blur).astype(_np.uint8) * 255
         adapt_light = (arr - 8 > blur).astype(_np.uint8) * 255
-        candidates.append(adapt_dark)
-        candidates.append(adapt_light)
+        _add_candidate(adapt_dark, {"type": "adaptive_dark"})
+        _add_candidate(adapt_light, {"type": "adaptive_light"})
     except Exception:
         pass
     thr_otsu = _otsu_threshold_toy(arr)
-    bw_otsu = (arr < thr_otsu).astype(_np.uint8) * 255
-    bw_inv = (arr > thr_otsu).astype(_np.uint8) * 255
-    candidates.append(bw_otsu)
-    candidates.append(bw_inv)
+    _add_candidate((arr < thr_otsu).astype(_np.uint8) * 255, {"type": "otsu", "thr": thr_otsu})
+    _add_candidate((arr > thr_otsu).astype(_np.uint8) * 255, {"type": "otsu_inv", "thr": thr_otsu})
+    thr_min = max(16, thr_med - 60)
+    thr_max = min(240, thr_med + 70)
+    for thr_candidate in range(thr_min, thr_max + 1, 10):
+        _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep", "thr": thr_candidate})
+    spread = int(max(6, arr.std()))
+    for delta in (-spread, spread):
+        thr_val = int(_np.clip(thr_med + delta, 16, 240))
+        _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
+
+    candidate_scores: Dict[str, float] = {}
     best_text, best_conf = "", 0.0
-    for bw in candidates:
-        if bw is None or bw.size == 0:
-            continue
-        text, conf = _text_from_binary(bw)
-        if text and conf > best_conf:
-            best_text, best_conf = text, conf
-    if best_text:
-        return best_text, best_conf
-    try:
-        expanded = Image.fromarray(bw_med).filter(ImageFilter.MaxFilter(3))
-        bw4 = _np.asarray(expanded, dtype=_np.uint8)
-        text, conf = _text_from_binary(bw4)
-        if text:
-            return text, conf
-    except Exception:
-        pass
+    best_meta: Optional[Dict[str, Any]] = None
+    best_bw: Optional[np.ndarray] = None
+
+    def _evaluate_from(idx: int) -> int:
+        nonlocal best_text, best_conf, best_meta, best_bw
+        total = len(candidates)
+        for i in range(idx, total):
+            bw, meta = candidates[i]
+            text, conf = _text_from_binary(bw)
+            if text:
+                prev = candidate_scores.get(text)
+                if prev is None or conf > prev:
+                    candidate_scores[text] = conf
+            if text and conf > best_conf:
+                best_text, best_conf, best_meta, best_bw = text, conf, meta, bw
+        return total
+
+    _evaluate_from(0)
+    if best_conf < 0.5:
+        start_len = len(candidates)
+        for bw_aug, meta_aug in _self_augment_views(arr, best_bw):
+            _add_candidate(bw_aug, meta_aug)
+        _evaluate_from(start_len)
+
+    if best_meta and best_meta.get("thr") is not None:
+        _threshold_memory_store(key, int(best_meta["thr"]))
+
+    final_text, final_conf = best_text, best_conf
+    if candidate_scores:
+        reranked_text, reranked_conf = _contextual_rerank_candidates(candidate_scores)
+        if reranked_text:
+            if reranked_conf >= final_conf - 1e-6:
+                final_text = reranked_text
+                final_conf = max(final_conf, reranked_conf)
+            elif not final_text:
+                final_text, final_conf = reranked_text, reranked_conf
+
+    if final_text:
+        _update_ngram_model(final_text)
+    if final_text:
+        return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
 
 def _keywords_from_row(row_cells: list[str]) -> list[str]:
