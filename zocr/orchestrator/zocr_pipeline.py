@@ -694,6 +694,148 @@ def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:
         prof["domain"] = domain_hint
     return prof
 
+
+def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
+    signals_path = jsonl_path + ".signals.json"
+    if not os.path.exists(signals_path):
+        return {}
+    try:
+        with open(signals_path, "r", encoding="utf-8") as fr:
+            data = json.load(fr)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        return {}
+    return {}
+
+
+def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]:
+    base = os.path.basename(learning_jsonl)
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    output = os.path.join(outdir, f"{base}.reanalyzed.jsonl")
+    return output, output + ".summary.json"
+
+
+def _profile_snapshot(prof: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(prof))
+
+
+def _profile_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
+    diff: Dict[str, Tuple[Any, Any]] = {}
+    keys = set(before.keys()) | set(after.keys())
+    for key in sorted(keys):
+        if before.get(key) != after.get(key):
+            diff[key] = (before.get(key), after.get(key))
+    return diff
+
+
+def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    intent: Dict[str, Any] = {"action": "steady", "reason": "metrics within guardrails"}
+    hit_mean = None
+    p95 = None
+    if monitor_row:
+        try:
+            hit_mean = float(monitor_row.get("hit_mean") or monitor_row.get("hit_mean_gt"))
+        except Exception:
+            hit_mean = None
+        try:
+            p95 = float(monitor_row.get("p95_ms")) if monitor_row.get("p95_ms") is not None else None
+        except Exception:
+            p95 = None
+    low_conf_ratio = None
+    try:
+        low_conf_ratio = float(export_signals.get("low_conf_ratio")) if export_signals else None
+    except Exception:
+        low_conf_ratio = None
+    if hit_mean is None:
+        intent = {"action": "recover", "reason": "monitor missing", "priority": "high"}
+    elif hit_mean < 0.8:
+        intent = {"action": "focus_headers", "reason": f"hit_mean={hit_mean:.3f} below 0.8", "priority": "high"}
+    elif p95 is not None and p95 > 400.0:
+        intent = {"action": "optimize_speed", "reason": f"p95_ms={p95:.1f} > 400", "priority": "medium"}
+    elif low_conf_ratio is not None and low_conf_ratio > 0.2:
+        intent = {"action": "reanalyze_cells", "reason": f"low_conf_ratio={low_conf_ratio:.2f}", "priority": "medium"}
+    else:
+        intent = {"action": "explore_footer", "reason": "metrics nominal", "priority": "low"}
+    intent["signals"] = {
+        "hit_mean": hit_mean,
+        "p95_ms": p95,
+        "low_conf_ratio": low_conf_ratio,
+        "learning_samples": export_signals.get("learning_samples") if export_signals else None,
+    }
+    intent["profile_domain"] = profile.get("domain")
+    return intent
+
+
+def _apply_intent_to_profile(intent: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
+    updates: Dict[str, Tuple[Any, Any]] = {}
+    action = intent.get("action")
+    if action == "focus_headers":
+        old = profile.get("header_boost", 1.0)
+        profile["header_boost"] = float(old) * 1.15 if isinstance(old, (int, float)) else 1.2
+        updates["header_boost"] = (old, profile["header_boost"])
+        targets = list(profile.get("reanalyze_target") or [])
+        if "headers" not in targets:
+            targets.append("headers")
+        profile["reanalyze_target"] = targets
+    elif action == "optimize_speed":
+        old = profile.get("lambda_shape", 4.5)
+        try:
+            new_val = max(2.5, float(old) * 0.9)
+        except Exception:
+            new_val = 3.8
+        profile["lambda_shape"] = new_val
+        updates["lambda_shape"] = (old, new_val)
+        profile.setdefault("speed_priority", True)
+    elif action == "reanalyze_cells":
+        prev = list(profile.get("reanalyze_target") or [])
+        if "learning_cells" not in prev:
+            prev.append("learning_cells")
+        profile["reanalyze_target"] = prev
+        updates["reanalyze_target"] = (None, prev)
+    elif action == "recover":
+        profile.setdefault("force_monitor_refresh", True)
+        updates["force_monitor_refresh"] = (None, True)
+    return updates
+
+
+def _needs_rerun_for_keys(keys: List[str]) -> Dict[str, bool]:
+    rerun = {"augment": False, "monitor": False}
+    for key in keys:
+        if key in {"lambda_shape", "header_boost", "reanalyze_target"}:
+            rerun["augment"] = True
+            rerun["monitor"] = True
+        elif key in {"w_kw", "w_img", "ocr_min_conf", "force_monitor_refresh"}:
+            rerun["monitor"] = True
+    return rerun
+
+
+def _apply_rag_feedback(manifest_path: Optional[str], profile: Dict[str, Any], profile_path: str) -> Dict[str, Any]:
+    if not manifest_path or not os.path.exists(manifest_path):
+        return {"applied": []}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception:
+        return {"applied": [], "error": "manifest_unreadable"}
+    feedback = payload.get("feedback") if isinstance(payload, dict) else None
+    applied: List[str] = []
+    if isinstance(feedback, dict):
+        profile_overrides = feedback.get("profile_overrides")
+        if isinstance(profile_overrides, dict):
+            for key, value in profile_overrides.items():
+                before = profile.get(key)
+                profile[key] = value
+                applied.append(key)
+    if applied:
+        try:
+            with open(profile_path, "w", encoding="utf-8") as fw:
+                json.dump(_json_ready(profile), fw, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return {"applied": applied, "error": str(e)}
+    return {"applied": applied}
+
 def _patched_run_full_pipeline(
     inputs: List[str],
     outdir: str,
@@ -722,7 +864,7 @@ def _patched_run_full_pipeline(
 
     ok = _read_ok_steps(outdir) if resume else set()
 
-    if len(inputs) == 1 and inputs[0].lower() == "demo":
+    if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
         pages = _collect_pages(inputs, dpi=dpi)
@@ -759,6 +901,7 @@ def _patched_run_full_pipeline(
     }
 
     domain_hints = _prepare_domain_hints(inputs)
+    content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
     domain_auto_summary: Dict[str, Any] = {
         "provided": domain_hint,
         "from_inputs": {
@@ -769,6 +912,7 @@ def _patched_run_full_pipeline(
             "scores": domain_hints.get("scores"),
         },
         "initial_profile": prof.get("domain"),
+        "content_threshold": content_conf_threshold,
     }
     selected_source: Optional[str] = None
     selected_confidence: Optional[float] = None
@@ -807,17 +951,51 @@ def _patched_run_full_pipeline(
         except Exception:
             pass
 
-    src_img = pages[0]
-
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
         r = _safe_step("Export", zocr_onefile_consensus.export_jsonl_with_ocr,
-                       doc_json_path, src_img, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
+                       doc_json_path, pages, jsonl_path, "toy", True, prof.get("ocr_min_conf", 0.58))
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
+    export_signals = _load_export_signals(jsonl_path)
+    if export_signals:
+        summary["export_signals"] = export_signals
+        if export_signals.get("learning_jsonl"):
+            summary["learning_jsonl"] = export_signals.get("learning_jsonl")
+
+    reanalysis_summary: Optional[Dict[str, Any]] = None
+    learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
+    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
+    if learning_jsonl_path and "learning_cells" in re_targets:
+        re_dir = os.path.join(outdir, "reanalyze")
+        ensure_dir(re_dir)
+        if "ReanalyzeLearning" in ok:
+            print("[SKIP] Reanalyze learning cells (resume)")
+            _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
+            try:
+                with open(summary_path, "r", encoding="utf-8") as fr:
+                    loaded = json.load(fr)
+                    if isinstance(loaded, dict):
+                        reanalysis_summary = loaded
+            except Exception:
+                reanalysis_summary = None
+        else:
+            try:
+                re_limit = int(prof.get("reanalyze_limit") or 64)
+            except Exception:
+                re_limit = 64
+            r = _safe_step("ReanalyzeLearning", zocr_onefile_consensus.reanalyze_learning_jsonl,
+                           learning_jsonl_path, re_dir, re_limit)
+            _append_hist(outdir, r)
+            if r.get("ok"):
+                reanalysis_summary = r.get("out")
+        if reanalysis_summary:
+            summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
+            if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
+                summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None
@@ -834,23 +1012,36 @@ def _patched_run_full_pipeline(
             domain_auto_summary["from_content"] = autodetect_detail
             resolved = autodetect_detail.get("resolved") or detected_domain
             if resolved:
+                decision: Dict[str, Any] = {"candidate": resolved}
                 take = False
                 conf_val = autodetect_detail.get("confidence")
                 try:
                     conf_float = float(conf_val) if conf_val is not None else None
                 except Exception:
                     conf_float = None
-                if _is_auto_domain(prof.get("domain")):
+                decision["confidence"] = conf_float
+                if conf_float is not None and conf_float >= content_conf_threshold:
                     take = True
-                elif resolved != prof.get("domain") and conf_float is not None and conf_float >= 0.55:
-                    take = True
+                    decision["reason"] = "confidence>=threshold"
+                elif conf_float is None:
+                    decision["reason"] = "confidence-missing"
+                else:
+                    decision["reason"] = "below-threshold"
                 if take:
                     prof["domain"] = resolved
                     selected_source = "content"
                     selected_confidence = conf_float
+                    decision["applied"] = resolved
+                else:
+                    decision["kept"] = prof.get("domain")
+                domain_auto_summary["content_decision"] = decision
         if autodetect_error:
             domain_auto_summary["content_error"] = autodetect_error
 
+    if not prof.get("domain"):
+        prof["domain"] = "invoice_jp_v2"
+        if selected_source is None:
+            selected_source = "default"
     _apply_domain_defaults(prof, prof.get("domain"))
     try:
         with open(prof_path, "w", encoding="utf-8") as pf:
@@ -884,6 +1075,7 @@ def _patched_run_full_pipeline(
             raise RuntimeError("Index failed")
     _call("post_index", index=idx_path, jsonl=mm_jsonl)
 
+    profile_before_feedback = _profile_snapshot(prof)
     monitor_row = None
     if "Monitor" in ok:
         print("[SKIP] Monitor (resume)")
@@ -939,6 +1131,50 @@ def _patched_run_full_pipeline(
     summary["learn"] = learn_row
     summary["insights"] = _derive_insights(summary)
 
+    prof_after = _load_profile(outdir, prof.get("domain"))
+    profile_diff = _profile_diff(profile_before_feedback, prof_after)
+    intent = _derive_intent(summary.get("monitor_row"), export_signals, prof_after)
+    summary["intent"] = intent
+    intent_updates = _apply_intent_to_profile(intent, prof_after)
+    combined_updates: Dict[str, Tuple[Any, Any]] = {}
+    if profile_diff:
+        summary["profile_diff"] = {k: _json_ready(v) for k, v in profile_diff.items()}
+        combined_updates.update(profile_diff)
+    if intent_updates:
+        combined_updates.update(intent_updates)
+        summary["intent_applied"] = True
+    if combined_updates:
+        try:
+            with open(prof_path, "w", encoding="utf-8") as pf:
+                json.dump(_json_ready(prof_after), pf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("Profile save skipped:", e)
+        summary["profile_updates"] = {k: _json_ready(v) for k, v in combined_updates.items()}
+    rerun_flags = _needs_rerun_for_keys(list(combined_updates.keys())) if combined_updates else {"augment": False, "monitor": False}
+    summary["feedback_rerun_flags"] = rerun_flags
+    feedback_passes: List[str] = []
+    prof = prof_after
+    if rerun_flags.get("augment"):
+        r = _safe_step("AugmentIntent", zocr_multidomain_core.augment, jsonl_path, mm_jsonl,
+                       prof.get("lambda_shape", 4.5), org_dict_path=org_dict)
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            feedback_passes.append("augment")
+        r = _safe_step("IndexIntent", zocr_multidomain_core.build_index, mm_jsonl, idx_path)
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            feedback_passes.append("index")
+    if rerun_flags.get("monitor"):
+        r = _safe_step("MonitorIntent", zocr_multidomain_core.monitor, mm_jsonl, idx_path, k, mon_csv,
+                       views_log=views_log, gt_jsonl=gt_jsonl, domain=prof.get("domain"))
+        _append_hist(outdir, r)
+        if r.get("ok"):
+            monitor_row = r.get("out") or monitor_row
+            feedback_passes.append("monitor")
+            summary["monitor_row"] = monitor_row
+    if feedback_passes:
+        summary["feedback_passes"] = feedback_passes
+
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
                                                      prefix=(prof.get("domain") or "invoice"))
@@ -976,6 +1212,8 @@ def _patched_run_full_pipeline(
         trace_schema=summary.get("rag_trace_schema"),
         fact_tag_example=summary.get("rag_fact_tag_example"),
     )
+    if summary.get("rag_manifest"):
+        summary["rag_feedback"] = _apply_rag_feedback(summary.get("rag_manifest"), prof, prof_path)
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
