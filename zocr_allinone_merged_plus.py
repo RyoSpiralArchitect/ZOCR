@@ -1430,10 +1430,218 @@ def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
     return variants
 
 
+def _synthetic_external_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    variants: List[Tuple[str, float, str]] = []
+    try:
+        base = ImageOps.autocontrast(img.convert("L"))
+    except Exception:
+        try:
+            base = img.convert("L")
+        except Exception:
+            return variants
+
+    work_gray = ImageOps.expand(base, border=1, fill=255)
+    try:
+        work_rgb = work_gray.convert("RGB")
+    except Exception:
+        work_rgb = work_gray
+    seen: Set[Tuple[str, str]] = set()
+
+    def _emit_variant(im: "Image.Image", label: str, boost: float = 0.0) -> None:
+        if im is None:
+            return
+        try:
+            rgb = im.convert("RGB")
+        except Exception:
+            rgb = im
+        try:
+            text, conf = toy_ocr_text_from_cell(rgb)
+        except Exception:
+            return
+        if not text:
+            return
+        key = (text, label)
+        if key in seen:
+            return
+        seen.add(key)
+        conf_adj = float(max(0.0, min(1.0, conf + boost)))
+        variants.append((text, conf_adj, f"engine:faux_tess/{label}"))
+
+    def _emit_manual(text: str, conf: float, label: str, boost: float = 0.0) -> None:
+        if not text:
+            return
+        key = (text, label)
+        if key in seen:
+            return
+        seen.add(key)
+        conf_adj = float(max(0.0, min(1.0, (conf or 0.0) + boost)))
+        variants.append((text, conf_adj, f"engine:faux_tess/{label}"))
+
+    _emit_variant(work_rgb, "autocontrast", 0.03)
+    _emit_variant(ImageOps.equalize(work_rgb), "equalize")
+    _emit_variant(ImageOps.expand(work_rgb, border=2, fill=255), "pad2", 0.03)
+    try:
+        _emit_variant(ImageEnhance.Sharpness(work_rgb).enhance(1.6), "sharp_1.6", 0.03)
+        _emit_variant(ImageEnhance.Sharpness(work_rgb).enhance(2.2), "sharp_2.2", 0.04)
+    except Exception:
+        pass
+    for filt, label in ((ImageFilter.MedianFilter(5), "median5"),
+                        (ImageFilter.ModeFilter(size=3), "mode3"),
+                        (ImageFilter.DETAIL, "detail"),
+                        (ImageFilter.SMOOTH_MORE, "smooth")):
+        try:
+            _emit_variant(work_rgb.filter(filt), label, 0.0)
+        except Exception:
+            continue
+    try:
+        _emit_variant(work_rgb.filter(ImageFilter.UnsharpMask(radius=2, percent=180)), "unsharp", 0.05)
+    except Exception:
+        pass
+    for filt, label in ((ImageFilter.MaxFilter(3), "max3"),
+                        (ImageFilter.MinFilter(3), "min3")):
+        try:
+            _emit_variant(work_rgb.filter(filt), label, 0.01)
+        except Exception:
+            continue
+    try:
+        _emit_variant(ImageOps.invert(work_rgb), "invert", 0.0)
+        _emit_variant(ImageOps.posterize(work_rgb, 3), "posterize3", 0.0)
+    except Exception:
+        pass
+    for scale in (1.25, 1.5, 1.75, 2.0):
+        try:
+            w = max(1, int(round(work_rgb.width * scale)))
+            h = max(1, int(round(work_rgb.height * scale)))
+            resized = work_rgb.resize((w, h), resample=Image.BICUBIC)
+        except Exception:
+            continue
+        _emit_variant(resized, f"scale{scale:.2f}", 0.02)
+
+    if np is not None:
+        try:
+            arr = np.asarray(work_gray, dtype=np.uint8)
+        except Exception:
+            arr = None
+        if arr is not None and arr.size:
+            height, width = arr.shape
+            mu = float(arr.mean())
+            sigma = float(arr.std())
+            thresholds: Set[int] = set()
+            if sigma > 1.0:
+                for coeff in (0.8, 0.5, 0.25, -0.25):
+                    thresholds.add(int(np.clip(mu - sigma * coeff, 16, 240)))
+            try:
+                percentiles = [float(np.percentile(arr, p)) for p in (10, 20, 35, 50, 70)]
+            except Exception:
+                percentiles = []
+            for val in percentiles:
+                thresholds.add(int(np.clip(val, 12, 244)))
+            thresholds.add(int(np.clip(mu, 16, 240)))
+            thresholds = {t for t in thresholds if 0 <= t <= 255}
+
+            def _segment_words(mask: "np.ndarray", tag: str) -> None:
+                if mask.ndim != 2:
+                    return
+                ink_cols = mask.sum(axis=0)
+                gap_thr = max(1, int(mask.shape[0] * 0.12))
+                segments: List[Tuple[int, int]] = []
+                start: Optional[int] = None
+                for x, val in enumerate(ink_cols):
+                    if val > gap_thr:
+                        if start is None:
+                            start = max(0, x - 1)
+                    elif start is not None:
+                        segments.append((start, min(mask.shape[1], x + 1)))
+                        start = None
+                if start is not None:
+                    segments.append((start, mask.shape[1]))
+                segments = [seg for seg in segments if seg[1] - seg[0] > 2]
+                if len(segments) <= 1:
+                    return
+                pieces: List[str] = []
+                confs: List[float] = []
+                for x0, x1 in segments[:8]:
+                    try:
+                        seg_crop = work_rgb.crop((x0, 0, x1, work_rgb.height))
+                    except Exception:
+                        continue
+                    txt_seg, conf_seg = toy_ocr_text_from_cell(seg_crop)
+                    if txt_seg:
+                        pieces.append(txt_seg.strip())
+                        confs.append(conf_seg)
+                joined = " ".join([t for t in pieces if t])
+                if not joined:
+                    return
+                conf_est = 0.0
+                if confs:
+                    conf_est = max(confs)
+                    conf_est = max(conf_est, sum(confs) / max(1, len(confs)) + 0.04)
+                _emit_manual(joined, conf_est, f"segment_{tag}")
+
+            for thr in sorted(thresholds):
+                try:
+                    mask = (arr <= thr).astype(np.uint8)
+                except Exception:
+                    continue
+                if not mask.any():
+                    continue
+                try:
+                    bw = Image.fromarray((1 - mask) * 255, mode="L")
+                except Exception:
+                    continue
+                _emit_variant(bw, f"threshold_{thr:03d}", 0.05)
+                try:
+                    inv = ImageOps.invert(bw)
+                except Exception:
+                    inv = None
+                if inv is not None:
+                    _emit_variant(inv, f"threshold_inv_{thr:03d}", 0.03)
+                _segment_words(mask, f"thr{thr:03d}")
+
+            if height > 4:
+                proj = width // 4
+                if proj > 0:
+                    mask_rows = (arr < int(mu)).astype(np.uint8)
+                    row_sum = mask_rows.sum(axis=1)
+                    segments_row: List[Tuple[int, int]] = []
+                    start_row: Optional[int] = None
+                    for idx, val in enumerate(row_sum):
+                        if val > proj:
+                            if start_row is None:
+                                start_row = max(0, idx - 1)
+                        elif start_row is not None:
+                            segments_row.append((start_row, min(height, idx + 1)))
+                            start_row = None
+                    if start_row is not None:
+                        segments_row.append((start_row, height))
+                    if len(segments_row) > 1:
+                        texts: List[str] = []
+                        confidences: List[float] = []
+                        for y0, y1 in segments_row[:4]:
+                            try:
+                                strip = work_rgb.crop((0, y0, work_rgb.width, y1))
+                            except Exception:
+                                continue
+                            txt, conf = toy_ocr_text_from_cell(strip)
+                            if txt:
+                                texts.append(txt.strip())
+                                confidences.append(conf)
+                        if texts:
+                            joined = " ".join(t for t in texts if t)
+                            if joined:
+                                conf_guess = float(max(confidences) if confidences else 0.0)
+                                conf_avg = float(sum(confidences) / max(1, len(confidences)))
+                                conf_val = float(max(conf_guess, conf_avg + 0.05))
+                                _emit_manual(joined, conf_val, "strip_join")
+
+    return variants
+
+
 def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
     variants: List[Tuple[str, float, str]] = []
-    variants.extend(_pytesseract_variants(img))
-    if pytesseract is not None and variants:
+    tess_variants = _pytesseract_variants(img)
+    variants.extend(tess_variants)
+    if pytesseract is not None and tess_variants:
         try:
             inverted = ImageOps.invert(img.convert("RGB"))
         except Exception:
@@ -1441,6 +1649,8 @@ def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float,
         if inverted is not None:
             for txt, conf, transform in _pytesseract_variants(inverted):
                 variants.append((txt, conf, f"{transform}+invert"))
+    if pytesseract is None or not variants:
+        variants.extend(_synthetic_external_variants(img))
     return variants
 
 def _normalize_total_token(text: str) -> str:
@@ -2086,6 +2296,8 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "avg_confidence_delta": 0.0,
         "external_engines": {},
         "ambiguous_variants": 0,
+        "fallback_variant_count": 0,
+        "fallback_transform_usage": {},
     }
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
@@ -2118,6 +2330,8 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
     delta_sum = 0.0
     engine_usage: Dict[str, int] = defaultdict(int)
     ambiguous_total = 0
+    fallback_used = False
+    fallback_transform_usage: Dict[str, int] = defaultdict(int)
 
     try:
         with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
@@ -2166,7 +2380,7 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 variants_map: Dict[str, Dict[str, Any]] = {}
 
                 def _merge_variant(text: str, conf: float, transform: str) -> None:
-                    nonlocal ambiguous_total
+                    nonlocal ambiguous_total, fallback_used
                     key = text or ""
                     conf_f = float(conf or 0.0)
                     created = key not in variants_map
@@ -2186,7 +2400,18 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     rec = variants_map[key]
                     if transform.startswith("engine:"):
                         engine_name = transform.split(":", 1)[1] if ":" in transform else "unknown"
-                        engine_usage[engine_name or "unknown"] += 1
+                        engine_name = engine_name.split("+", 1)[0]
+                        engine_name = engine_name.split("/", 1)[0]
+                        engine_name = engine_name.split("(", 1)[0]
+                        base_name = engine_name or "unknown"
+                        engine_usage[base_name] += 1
+                        if base_name.startswith("faux_tess"):
+                            fallback_used = True
+                            if transform.startswith("engine:faux_tess/"):
+                                label = transform.split("/", 1)[1] if "/" in transform else ""
+                                label = label.split("+", 1)[0]
+                                label = label or "unknown"
+                                fallback_transform_usage[label] += 1
                     elif transform.startswith("ambiguous") and created:
                         ambiguous_total += 1
 
@@ -2297,6 +2522,13 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
 
     summary["ambiguous_variants"] = int(ambiguous_total)
     summary["external_engines"] = {k: int(v) for k, v in sorted(engine_usage.items()) if v}
+    summary["used_external_fallback"] = bool(fallback_used)
+    summary["fallback_variant_count"] = int(sum(fallback_transform_usage.values()))
+    if fallback_transform_usage:
+        ordered = sorted(fallback_transform_usage.items(), key=lambda kv: (-kv[1], kv[0]))
+        summary["fallback_transform_usage"] = {k: int(v) for k, v in ordered}
+    else:
+        summary["fallback_transform_usage"] = {}
 
     if records:
         summary["output_jsonl"] = output_jsonl
