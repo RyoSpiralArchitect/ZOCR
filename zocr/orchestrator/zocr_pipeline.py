@@ -887,7 +887,8 @@ def _patched_run_full_pipeline(
     ok = _read_ok_steps(outdir) if resume else set()
 
     toy_memory_path = _resolve_toy_memory_path(outdir)
-    toy_memory_loaded = zocr_onefile_consensus.load_toy_memory(toy_memory_path)
+    toy_memory_info_load = zocr_onefile_consensus.load_toy_memory(toy_memory_path)
+    toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
 
     if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
@@ -925,9 +926,11 @@ def _patched_run_full_pipeline(
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
         "toy_memory": {
             "path": toy_memory_path,
-            "loaded": bool(toy_memory_loaded),
+            "load": _json_ready(toy_memory_info_load),
         },
     }
+
+    toy_memory_run_baseline = toy_memory_after_load or zocr_onefile_consensus.toy_memory_snapshot()
 
     domain_hints = _prepare_domain_hints(inputs)
     content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
@@ -1284,9 +1287,15 @@ def _patched_run_full_pipeline(
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
 
-    toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
+    toy_memory_after_run = zocr_onefile_consensus.toy_memory_snapshot()
+    toy_memory_delta_run = zocr_onefile_consensus.toy_memory_delta(toy_memory_run_baseline, toy_memory_after_run)
     summary.setdefault("toy_memory", {})
-    summary["toy_memory"]["saved"] = bool(toy_memory_saved)
+    summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
+    summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
+    summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
+
+    toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
+    summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)

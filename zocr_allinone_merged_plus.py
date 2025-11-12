@@ -1164,6 +1164,55 @@ def _render_glyphs(font=None, size=16):
 _GLYPH_ATLAS, _GLYPH_FEATS = _render_glyphs()
 
 
+def _toy_memory_snapshot_internal() -> Dict[str, Any]:
+    glyph_chars = 0
+    glyph_variants = 0
+    for variants in _GLYPH_ATLAS.values():
+        if variants:
+            glyph_chars += 1
+            glyph_variants += len(variants)
+    ngram_contexts = 0
+    ngram_transitions = 0
+    for mapping in _NGRAM_COUNTS.values():
+        if mapping:
+            ngram_contexts += 1
+            ngram_transitions += len(mapping)
+    ngram_observations = int(sum(_NGRAM_TOTALS.values()))
+    snapshot: Dict[str, Any] = {
+        "glyph_chars": int(glyph_chars),
+        "glyph_variants": int(glyph_variants),
+        "avg_variants_per_char": float(glyph_variants / glyph_chars) if glyph_chars else 0.0,
+        "ngram_contexts": int(ngram_contexts),
+        "ngram_transitions": int(ngram_transitions),
+        "ngram_observations": ngram_observations,
+        "avg_ngram_branching": float(ngram_transitions / ngram_contexts) if ngram_contexts else 0.0,
+    }
+    return snapshot
+
+
+def toy_memory_snapshot() -> Dict[str, Any]:
+    return dict(_toy_memory_snapshot_internal())
+
+
+def toy_memory_delta(before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    if before is None:
+        before = {}
+    if after is None:
+        after = {}
+    delta: Dict[str, float] = {}
+    keys = set(k for k, v in after.items() if isinstance(v, (int, float))) | set(
+        k for k, v in before.items() if isinstance(v, (int, float))
+    )
+    for key in sorted(keys):
+        a = after.get(key)
+        b = before.get(key)
+        if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+            aval = float(a) if isinstance(a, (int, float)) else 0.0
+            bval = float(b) if isinstance(b, (int, float)) else 0.0
+            delta[key] = aval - bval
+    return delta
+
+
 def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "version": 1,
@@ -1202,27 +1251,45 @@ def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
     return payload
 
 
-def save_toy_memory(path: str) -> bool:
+def save_toy_memory(path: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "path": path,
+        "saved": False,
+        "snapshot": toy_memory_snapshot(),
+    }
     if not path:
-        return False
+        return info
     try:
         payload = _toy_memory_payload()
         ensure_dir(os.path.dirname(path) or ".")
         with open(path, "w", encoding="utf-8") as fw:
             json.dump(payload, fw, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
+        info["saved"] = True
+        try:
+            info["bytes"] = os.path.getsize(path)
+        except Exception:
+            pass
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    info["snapshot"] = toy_memory_snapshot()
+    return info
 
 
-def load_toy_memory(path: str) -> bool:
+def load_toy_memory(path: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "path": path,
+        "loaded": False,
+        "changed": False,
+        "snapshot_before": toy_memory_snapshot(),
+    }
     if not path or not os.path.exists(path):
-        return False
+        return info
     try:
         with open(path, "r", encoding="utf-8") as fr:
             payload = json.load(fr)
-    except Exception:
-        return False
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return info
     changed = False
     try:
         glyph_payload = payload.get("glyph_atlas", {})
@@ -1263,18 +1330,34 @@ def load_toy_memory(path: str) -> bool:
                 for ch, val in mapping.items():
                     try:
                         target[ch] += int(val)
+                        changed = True
                     except Exception:
                         continue
         totals_payload = payload.get("ngram_totals", {})
         if isinstance(totals_payload, dict):
             for prev, total in totals_payload.items():
                 try:
-                    _NGRAM_TOTALS[prev] = max(_NGRAM_TOTALS.get(prev, 0), int(total))
+                    current = _NGRAM_TOTALS.get(prev, 0)
+                    new_total = int(total)
+                    if new_total > current:
+                        _NGRAM_TOTALS[prev] = new_total
+                        changed = True
                 except Exception:
                     continue
-        return changed
-    except Exception:
-        return False
+        info["loaded"] = True
+        info["changed"] = bool(changed)
+        info["snapshot_after"] = toy_memory_snapshot()
+        info["delta"] = toy_memory_delta(info.get("snapshot_before"), info.get("snapshot_after"))
+        try:
+            info["bytes"] = os.path.getsize(path)
+        except Exception:
+            pass
+        return info
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        info["snapshot_after"] = toy_memory_snapshot()
+        info["delta"] = toy_memory_delta(info.get("snapshot_before"), info.get("snapshot_after"))
+        return info
 
 def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
     if not feats:
@@ -5950,7 +6033,8 @@ def _patched_run_full_pipeline(
     ok = _read_ok_steps(outdir) if resume else set()
 
     toy_memory_path = _resolve_toy_memory_path(outdir)
-    toy_memory_loaded = load_toy_memory(toy_memory_path)
+    toy_memory_info_load = load_toy_memory(toy_memory_path)
+    toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
 
     if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
         pages, annos = zocr_onefile_consensus.make_demo(outdir)
@@ -5988,9 +6072,11 @@ def _patched_run_full_pipeline(
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
         "toy_memory": {
             "path": toy_memory_path,
-            "loaded": bool(toy_memory_loaded),
+            "load": _json_ready(toy_memory_info_load),
         },
     }
+
+    toy_memory_run_baseline = toy_memory_after_load or toy_memory_snapshot()
 
     domain_hints = _prepare_domain_hints(inputs)
     content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
@@ -6347,9 +6433,15 @@ def _patched_run_full_pipeline(
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
 
-    toy_memory_saved = save_toy_memory(toy_memory_path)
+    toy_memory_after_run = toy_memory_snapshot()
+    toy_memory_delta_run = toy_memory_delta(toy_memory_run_baseline, toy_memory_after_run)
     summary.setdefault("toy_memory", {})
-    summary["toy_memory"]["saved"] = bool(toy_memory_saved)
+    summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
+    summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
+    summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
+
+    toy_memory_saved = save_toy_memory(toy_memory_path)
+    summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
