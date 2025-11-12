@@ -139,6 +139,88 @@ def _toy_memory_series_paths(path: str) -> Tuple[str, str]:
     return base_dir, os.path.join(base_dir, "summary.json")
 
 
+def _series_tail(history: Sequence[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    tail: List[Dict[str, Any]] = []
+    if limit <= 0:
+        return tail
+    for entry in list(history)[-limit:]:
+        if not isinstance(entry, dict):
+            continue
+        trimmed: Dict[str, Any] = {
+            "epoch": entry.get("epoch"),
+            "written_at": entry.get("written_at"),
+            "delta_prev": entry.get("delta_prev"),
+            "recognition": entry.get("recognition"),
+        }
+        snapshot = entry.get("snapshot")
+        if isinstance(snapshot, dict):
+            trimmed["snapshot"] = {
+                "glyph_variants": snapshot.get("glyph_variants"),
+                "avg_variants_per_char": snapshot.get("avg_variants_per_char"),
+                "ngram_observations": snapshot.get("ngram_observations"),
+                "avg_ngram_branching": snapshot.get("avg_ngram_branching"),
+            }
+        tail.append(trimmed)
+    return tail
+
+
+def _toy_memory_series_stats(history: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    stats: Dict[str, Any] = {"epochs": len(history)}
+    if not history:
+        return stats
+    latest = history[-1]
+    try:
+        stats["latest_epoch"] = int(latest.get("epoch")) if latest.get("epoch") is not None else None
+    except Exception:
+        stats["latest_epoch"] = latest.get("epoch")
+    snapshot = latest.get("snapshot") if isinstance(latest, dict) else None
+    if isinstance(snapshot, dict):
+        stats["latest_variants"] = float(snapshot.get("glyph_variants") or 0.0)
+        stats["latest_ngram_observations"] = float(snapshot.get("ngram_observations") or 0.0)
+        stats["latest_avg_variants_per_char"] = float(snapshot.get("avg_variants_per_char") or 0.0)
+        stats["latest_avg_ngram_branching"] = float(snapshot.get("avg_ngram_branching") or 0.0)
+    variant_deltas: List[float] = []
+    surprisal_ratios: List[float] = []
+    runtime_improvements: List[float] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        delta_prev = entry.get("delta_prev")
+        if isinstance(delta_prev, dict):
+            try:
+                variant_deltas.append(float(delta_prev.get("glyph_variants") or 0.0))
+            except Exception:
+                variant_deltas.append(0.0)
+        recognition = entry.get("recognition")
+        if isinstance(recognition, dict):
+            try:
+                surprisal_ratios.append(float(recognition.get("high_surprisal_cells") or 0.0) / float(recognition.get("cells") or 1.0))
+            except Exception:
+                pass
+            try:
+                runtime_improvements.append(float(recognition.get("runtime_replay_improved") or 0.0))
+            except Exception:
+                runtime_improvements.append(0.0)
+    if variant_deltas:
+        stats["variant_delta_total"] = float(sum(variant_deltas))
+        stats["variant_delta_avg"] = float(sum(variant_deltas) / len(variant_deltas))
+        recent_window = max(1, min(6, len(variant_deltas)))
+        stats["variant_delta_recent_avg"] = float(sum(variant_deltas[-recent_window:]) / recent_window)
+        stagnant = 0
+        for delta in reversed(variant_deltas):
+            if delta <= 0:
+                stagnant += 1
+            else:
+                break
+        stats["stagnant_epochs"] = int(stagnant)
+    if surprisal_ratios:
+        stats["recent_high_surprisal_ratio"] = float(sum(surprisal_ratios[-3:]) / min(3, len(surprisal_ratios)))
+    if runtime_improvements:
+        stats["recent_runtime_replay_improved"] = float(sum(runtime_improvements[-3:]))
+        stats["runtime_replay_total"] = float(sum(runtime_improvements))
+    return stats
+
+
 def _load_toy_memory_series_payload(path: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     version_dir, summary_path = _toy_memory_series_paths(path)
     info: Dict[str, Any] = {
@@ -161,8 +243,13 @@ def _load_toy_memory_series_payload(path: str) -> Tuple[Optional[Dict[str, Any]]
     info["epoch_path"] = epoch_path
     info["latest_epoch"] = summary_payload.get("latest_epoch")
     info["summary"] = summary_payload
+    history = summary_payload.get("history") if isinstance(summary_payload, dict) else None
+    if isinstance(history, list):
+        info["stats"] = _toy_memory_series_stats(history)
+        info["history_tail"] = _series_tail(history)
     if not os.path.exists(epoch_path):
         info["error"] = "epoch_missing"
+        info["summary"] = summary_payload
         return None, info
     try:
         with open(epoch_path, "r", encoding="utf-8") as fr:
@@ -170,6 +257,7 @@ def _load_toy_memory_series_payload(path: str) -> Tuple[Optional[Dict[str, Any]]
     except Exception as exc:
         info["error"] = f"epoch_load_failed: {type(exc).__name__}: {exc}"
         return None, info
+    info["summary"] = summary_payload
     return payload, info
 
 
@@ -1566,12 +1654,15 @@ def _write_toy_memory_series(path: str, payload: Dict[str, Any], snapshot: Dict[
     history_limit = 48
     if len(history) > history_limit:
         history = history[-history_limit:]
+    stats = _toy_memory_series_stats(history)
     summary_payload = {
         "latest_epoch": epoch,
         "latest_path": epoch_name,
         "updated_at": timestamp,
         "latest_snapshot": snapshot,
         "history": history,
+        "stats": stats,
+        "tail": _series_tail(history),
     }
     try:
         with open(summary_path, "w", encoding="utf-8") as fw:
@@ -1590,6 +1681,8 @@ def _write_toy_memory_series(path: str, payload: Dict[str, Any], snapshot: Dict[
         "delta_prev": delta_prev,
         "recognition": recognition,
         "summary": summary_path,
+        "stats": stats,
+        "tail": _series_tail(history),
     }
 
 
