@@ -1159,6 +1159,21 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
     arr = _np.asarray(g, dtype=_np.uint8)
+    if arr.size:
+        arr_f = arr.astype(_np.float32)
+        try:
+            gy, gx = _np.gradient(arr_f)
+            edge_mag = _np.hypot(gx, gy)
+            thr = edge_mag.mean() + edge_mag.std()
+            mask = edge_mag > thr
+        except Exception:
+            mask = None
+        if mask is not None and mask.any():
+            edge_vals = arr[mask]
+            bright_ratio = float(_np.mean(edge_vals > arr.mean())) if edge_vals.size else 0.0
+            if bright_ratio > 0.65:
+                arr = 255 - arr
+                g = Image.fromarray(arr, mode="L")
     thr_med = int(_np.clip(_np.median(arr), 48, 208))
     bw = (arr < thr_med).astype(_np.uint8) * 255
     text, conf = _text_from_binary(bw)
@@ -2000,10 +2015,10 @@ DOMAIN_KW = {
 }
 
 DOMAIN_DEFAULTS = {
-    "invoice": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.58},
-    "invoice_jp_v2": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.58},
-    "invoice_en": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.55},
-    "invoice_fr": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.55},
+    "invoice": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.55},
+    "invoice_jp_v2": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.55},
+    "invoice_en": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.53},
+    "invoice_fr": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.53},
     "purchase_order": {"lambda_shape": 4.0, "w_kw": 0.5, "w_img": 0.22, "ocr_min_conf": 0.60},
     "expense": {"lambda_shape": 3.8, "w_kw": 0.5, "w_img": 0.18, "ocr_min_conf": 0.60},
     "timesheet": {"lambda_shape": 3.6, "w_kw": 0.45, "w_img": 0.18, "ocr_min_conf": 0.62},

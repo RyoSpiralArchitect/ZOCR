@@ -69,6 +69,9 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - **[JA]** Export 段階では合議フェーズで得た `row_bands` を再利用し、行分割の精度を維持したままセル OCR を行います。
 - **[EN]** During export we reuse the consensus `row_bands` so OCR crops stay aligned with the reconstructed rows.
 - **[FR]** Pendant l'export, les `row_bands` issus du consensus sont réutilisés afin d'aligner l'OCR sur les lignes reconstruites.
+- **[JA]** toy OCR はエッジ輝度を検知して白地黒字/黒地白字を自動判別し、低信頼セルを削減します。
+- **[EN]** The toy OCR now inspects edge brightness to auto-detect inverted text (white-on-black) and cuts down low-confidence cells.
+- **[FR]** Le toy OCR détecte désormais automatiquement les inversions (texte clair sur fond sombre) via la brillance des arêtes, réduisant les cellules peu fiables.
 - **[JA]** 検索レイヤーは BM25 + キーワード + 画像類似に加え、`filters` に含まれる数値やキーを直接照合するシンボリックスコアを併用し、Trust@K を押し上げます。
 - **[EN]** The retrieval layer now blends BM25 + keyword + image similarity with a symbolic scorer that inspects the structured `filters`, improving Trust@K for downstream RAG agents.
 - **[FR]** La couche de recherche combine BM25 + mots-clés + similarité d'image avec un scoreur symbolique basé sur `filters`, ce qui renforce le Trust@K pour les agents RAG.
@@ -102,6 +105,9 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - インボイス (JP/EN/FR)、見積書、納品書、領収書、契約書、購入注文書、経費精算、タイムシート、出荷案内、銀行明細、公共料金請求書。
 - 医療領収書に加え **医療請求 (medical_bill)**、**通関申告 (customs_declaration)**、**助成金申請 (grant_application)**、**搭乗券 (boarding_pass)**、**銀行明細 (bank_statement)**、**公共料金 (utility_bill)**、**保険金請求 (insurance_claim)**、**税務申告 (tax_form)**、**給与明細 (payslip)**、**出荷案内 (shipping_notice)**、**経費精算 (expense_report)** を新たに追加。既存の **賃貸借契約**、**ローン明細**、**旅行行程** も強化済みです。
 - 各ドメインは `DOMAIN_KW`/`DOMAIN_DEFAULTS`/`DOMAIN_SUGGESTED_QUERIES` を共有し、RAG 推奨クエリやウォームアップ検索を自動設定します。
+- **[JA]** インボイス系の既定 `ocr_min_conf` を 0.55 前後に調整し、薄い印字や淡色背景でもセルを保持しやすくしています。
+- **[EN]** Invoice defaults now use an `ocr_min_conf` around 0.55 so faint print and pastel backgrounds stay captured.
+- **[FR]** Les profils facture adoptent désormais un `ocr_min_conf` proche de 0,55 afin de conserver les textes pâles ou sur fonds pastels.
 
 ## RAG 連携 / RAG Integration / Intégration RAG
 - `export_rag_bundle` が Markdown ダイジェスト、セル JSONL、テーブル別セクション、推奨クエリを `rag/manifest.json` にまとめます。
