@@ -13,8 +13,8 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict, deque
 
@@ -31,6 +31,65 @@ except Exception:  # pragma: no cover - optional dependency
     pytesseract = None  # type: ignore
     _PYTESS_OUTPUT = None  # type: ignore
 from html.parser import HTMLParser
+
+_OCR_BACKEND_CACHE: Dict[str, Callable[["Image.Image"], Tuple[str, float]]] = {}
+_OCR_BACKEND_WARNED: Set[str] = set()
+_EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
+
+_TOY_SELF_CORRECTION_STACK: List[Dict[str, Any]] = []
+
+
+def _normalize_self_correction_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    if not isinstance(config, dict):
+        return normalized
+    for key, value in config.items():
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            normalized[key] = value
+        elif isinstance(value, (list, tuple)):
+            normalized[key] = [v for v in value]
+        elif isinstance(value, dict):
+            normalized[key] = {k: v for k, v in value.items()}
+    return normalized
+
+
+def push_toy_self_correction(config: Optional[Dict[str, Any]]) -> None:
+    """Push a new toy OCR self-correction configuration onto the active stack."""
+
+    _TOY_SELF_CORRECTION_STACK.append(_normalize_self_correction_config(config))
+
+
+def pop_toy_self_correction() -> None:
+    """Pop the most recent toy OCR self-correction configuration."""
+
+    if _TOY_SELF_CORRECTION_STACK:
+        _TOY_SELF_CORRECTION_STACK.pop()
+
+
+def current_toy_self_correction() -> Dict[str, Any]:
+    """Return the merged toy OCR self-correction configuration."""
+
+    merged: Dict[str, Any] = {}
+    for cfg in _TOY_SELF_CORRECTION_STACK:
+        for key, value in cfg.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                combined = dict(merged[key])  # type: ignore[index]
+                combined.update(value)
+                merged[key] = combined
+            else:
+                merged[key] = value
+    return merged
+
+
+@contextlib.contextmanager
+def toy_self_correction_scope(config: Optional[Dict[str, Any]]):
+    """Context manager helper to apply a temporary toy self-correction config."""
+
+    push_toy_self_correction(config)
+    try:
+        yield
+    finally:
+        pop_toy_self_correction()
 
 _thomas = None
 try:
@@ -1967,6 +2026,7 @@ def _update_ngram_model(text: str) -> None:
 
 def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> List[Tuple["np.ndarray", Dict[str, Any]]]:
     variants: List[Tuple["np.ndarray", Dict[str, Any]]] = []
+    cfg = current_toy_self_correction()
     try:
         gray_img = Image.fromarray(arr.astype(np.uint8)) if arr is not None else None
     except Exception:
@@ -1974,17 +2034,51 @@ def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> L
     if best_bw is not None:
         try:
             bw_img = Image.fromarray(best_bw.astype(np.uint8))
-            for size in (3, 5):
+            filter_sizes: List[int] = [3, 5]
+            if cfg and isinstance(cfg.get("augment_filter_sizes"), (list, tuple)):
+                for candidate in cfg.get("augment_filter_sizes", []):  # type: ignore[assignment]
+                    try:
+                        filt_size = int(round(float(candidate)))
+                    except Exception:
+                        continue
+                    if filt_size % 2 == 0 or filt_size <= 0:
+                        continue
+                    filter_sizes.append(filt_size)
+            max_filter = int(cfg.get("max_filter_size", 9)) if isinstance(cfg, dict) else 9
+            norm_sizes = sorted({s for s in filter_sizes if 1 <= s <= max_filter})
+            if not norm_sizes:
+                norm_sizes = [3, 5]
+            for size in norm_sizes:
                 try:
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MaxFilter(size)), dtype=np.uint8), {"type": "augment_max", "size": size}))
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MinFilter(size)), dtype=np.uint8), {"type": "augment_min", "size": size}))
                 except Exception:
                     continue
+            if cfg and cfg.get("augment_invert"):
+                try:
+                    inverted = 255 - np.asarray(bw_img, dtype=np.uint8)
+                    variants.append((inverted, {"type": "augment_invert"}))
+                except Exception:
+                    pass
         except Exception:
             pass
     if gray_img is not None:
         fill = int(float(np.median(arr))) if arr.size else 0
-        for angle in (-3, -1, 1, 3):
+        rotations = [-3, -1, 1, 3]
+        if cfg and isinstance(cfg.get("extra_rotations"), (list, tuple)):
+            limit = int(cfg.get("rotation_limit", 12))
+            for candidate in cfg.get("extra_rotations", []):  # type: ignore[assignment]
+                try:
+                    rot = int(round(float(candidate)))
+                except Exception:
+                    continue
+                if -limit <= rot <= limit:
+                    rotations.append(rot)
+        rotations = sorted({int(r) for r in rotations if -30 <= int(r) <= 30}) or [-3, -1, 1, 3]
+        if cfg and cfg.get("include_zero_rotation"):
+            rotations.append(0)
+            rotations = sorted({int(r) for r in rotations if -30 <= int(r) <= 30}) or [-3, -1, 1, 3]
+        for angle in rotations:
             try:
                 rotated = gray_img.rotate(angle, resample=Image.BILINEAR, fillcolor=fill)
                 rot_arr = np.asarray(rotated, dtype=np.uint8)
@@ -2516,6 +2610,18 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     g = ImageOps.autocontrast(crop_img.convert("L"))
     g = g.filter(ImageFilter.MedianFilter(3))
     arr = _np.asarray(g, dtype=_np.uint8)
+    cfg = current_toy_self_correction()
+    if isinstance(cfg.get("bin_k_override"), (int, float)):
+        try:
+            bin_k = max(3, int(round(float(cfg["bin_k_override"]))))
+        except Exception:
+            pass
+    elif isinstance(cfg.get("bin_k_scale"), (int, float)):
+        try:
+            scale = float(cfg.get("bin_k_scale"))
+            bin_k = max(3, int(round(bin_k * scale)))
+        except Exception:
+            pass
     if arr.size == 0:
         return "", 0.0
     arr_f = arr.astype(_np.float32)
@@ -2569,12 +2675,31 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     thr_otsu = _otsu_threshold_toy(arr)
     _add_candidate((arr < thr_otsu).astype(_np.uint8) * 255, {"type": "otsu", "thr": thr_otsu})
     _add_candidate((arr > thr_otsu).astype(_np.uint8) * 255, {"type": "otsu_inv", "thr": thr_otsu})
-    thr_min = max(16, thr_med - 60)
-    thr_max = min(240, thr_med + 70)
-    for thr_candidate in range(thr_min, thr_max + 1, 10):
+    threshold_expand = int(cfg.get("threshold_expand", 0)) if isinstance(cfg, dict) else 0
+    threshold_step = int(cfg.get("threshold_step", 10)) if isinstance(cfg, dict) else 10
+    fine_step = int(cfg.get("fine_threshold_step", 0)) if isinstance(cfg, dict) else 0
+    threshold_step = max(2, min(24, threshold_step or 10))
+    fine_step = max(0, min(threshold_step, fine_step))
+    thr_min = max(16, thr_med - 60 - threshold_expand)
+    thr_max = min(240, thr_med + 70 + threshold_expand)
+    for thr_candidate in range(thr_min, thr_max + 1, threshold_step):
         _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep", "thr": thr_candidate})
-    spread = int(max(6, arr.std()))
-    for delta in (-spread, spread):
+    if fine_step and fine_step < threshold_step:
+        for thr_candidate in range(thr_min, thr_max + 1, fine_step):
+            _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep_fine", "thr": thr_candidate})
+    spread_base = int(max(6, arr.std()))
+    extra_spread = int(cfg.get("extra_local_spread", 0)) if isinstance(cfg, dict) else 0
+    spread = max(6, spread_base + max(0, extra_spread))
+    local_offsets: List[int] = [-spread, spread]
+    if isinstance(cfg, dict) and isinstance(cfg.get("local_sweep_offsets"), (list, tuple)):
+        for candidate in cfg.get("local_sweep_offsets", []):  # type: ignore[assignment]
+            try:
+                offset = int(round(float(candidate)))
+            except Exception:
+                continue
+            if offset not in local_offsets:
+                local_offsets.append(offset)
+    for delta in local_offsets:
         thr_val = int(_np.clip(thr_med + delta, 16, 240))
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
 
@@ -2598,11 +2723,19 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         return total
 
     _evaluate_from(0)
-    if best_conf < 0.5:
+    target_conf = float(cfg.get("target_confidence", 0.5)) if isinstance(cfg, dict) else 0.5
+    force_augment = bool(cfg.get("force_augment")) if isinstance(cfg, dict) else False
+    extra_augment_passes = int(cfg.get("extra_augment_passes", 0)) if isinstance(cfg, dict) else 0
+    extra_augment_passes = max(0, extra_augment_passes)
+    need_augment = force_augment or (best_conf < target_conf)
+    augment_cycles = max(1, 1 + extra_augment_passes) if need_augment else extra_augment_passes
+    for _ in range(augment_cycles):
         start_len = len(candidates)
         for bw_aug, meta_aug in _self_augment_views(arr, best_bw):
             _add_candidate(bw_aug, meta_aug)
         _evaluate_from(start_len)
+        if not force_augment and best_conf >= target_conf:
+            break
 
     if best_meta and best_meta.get("thr") is not None:
         _threshold_memory_store(key, int(best_meta["thr"]))
@@ -2624,6 +2757,167 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         _update_ngram_model(final_text)
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
+
+
+def _normalize_confidence(value: Any) -> float:
+    try:
+        conf = float(value)
+    except Exception:
+        conf = 0.0
+    if not math.isfinite(conf):
+        conf = 0.0
+    return float(max(0.0, min(1.0, conf)))
+
+
+def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple[str, float]]:
+    normalized = (name or "toy").strip()
+    cache_key = normalized.lower() or "toy"
+    cached = _OCR_BACKEND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    engine_name, _, engine_extra = normalized.partition(":")
+    engine_key = (engine_name or "toy").strip().lower() or "toy"
+    extra = engine_extra.strip()
+
+    runner: Callable[["Image.Image"], Tuple[str, float]]
+
+    if engine_key in ("toy", "mock", "demo"):
+        runner = toy_ocr_text_from_cell
+    elif engine_key.startswith("tess"):
+        if pytesseract is None or _PYTESS_OUTPUT is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract not available; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            lang = extra or os.environ.get("ZOCR_TESS_LANG", os.environ.get("TESS_LANG", "jpn+eng"))
+            psm = os.environ.get("ZOCR_TESS_PSM", "6")
+            oem = os.environ.get("ZOCR_TESS_OEM")
+            config_parts = []
+            if psm:
+                config_parts.append(f"--psm {psm}")
+            if oem:
+                config_parts.append(f"--oem {oem}")
+            tess_config = " ".join(config_parts)
+
+            def _tesseract_runner(img: "Image.Image") -> Tuple[str, float]:
+                try:
+                    target = img if getattr(img, "mode", "") in ("L", "RGB") else img.convert("RGB")
+                except Exception:
+                    target = img
+                try:
+                    data = pytesseract.image_to_data(  # type: ignore[arg-type]
+                        target,
+                        lang=lang or None,
+                        config=tess_config or "",
+                        output_type=_PYTESS_OUTPUT.DICT,
+                    )
+                except Exception:
+                    data = None
+                words: List[str] = []
+                confs: List[float] = []
+                if isinstance(data, dict):
+                    texts = data.get("text") or []
+                    conf_vals = data.get("conf") or []
+                    for raw_txt, raw_conf in zip(texts, conf_vals):
+                        txt = str(raw_txt or "").strip()
+                        if not txt:
+                            continue
+                        try:
+                            conf_val = float(raw_conf)
+                        except Exception:
+                            conf_val = -1.0
+                        if conf_val < 0:
+                            continue
+                        words.append(txt)
+                        confs.append(max(0.0, min(100.0, conf_val)))
+                if not words:
+                    try:
+                        raw = pytesseract.image_to_string(  # type: ignore[arg-type]
+                            target,
+                            lang=lang or None,
+                            config=tess_config or "",
+                        )
+                    except Exception:
+                        raw = None
+                    text_raw = (raw or "").strip()
+                    if text_raw:
+                        words.append(text_raw)
+                        confs.append(62.0)
+                if not words:
+                    return "", 0.0
+                conf_avg = (sum(confs) / len(confs)) / 100.0 if confs else 0.0
+                return " ".join(words), _normalize_confidence(conf_avg)
+
+            runner = _tesseract_runner
+    elif engine_key.startswith("easy"):
+        if np is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] easyocr requested but numpy is unavailable; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            try:
+                import easyocr  # type: ignore
+            except Exception:
+                if cache_key not in _OCR_BACKEND_WARNED:
+                    print("[WARN] easyocr not available; falling back to toy OCR")
+                    _OCR_BACKEND_WARNED.add(cache_key)
+                runner = toy_ocr_text_from_cell
+            else:
+                langs_raw = extra or os.environ.get("ZOCR_EASYOCR_LANGS", "ja,en")
+                langs = [tok.strip() for tok in langs_raw.split(",") if tok.strip()]
+                if not langs:
+                    langs = ["ja", "en"]
+                gpu_flag = (os.environ.get("ZOCR_EASYOCR_GPU", "").strip().lower())
+                gpu = gpu_flag not in ("0", "false", "no", "off")
+                reader_key = (tuple(langs), gpu)
+                reader = _EASYOCR_READER_CACHE.get(reader_key)
+                if reader is None:
+                    reader = easyocr.Reader(langs, gpu=gpu)
+                    _EASYOCR_READER_CACHE[reader_key] = reader
+
+                def _easyocr_runner(img: "Image.Image") -> Tuple[str, float]:
+                    try:
+                        target = img if getattr(img, "mode", "") == "RGB" else img.convert("RGB")
+                        arr = np.asarray(target)
+                    except Exception:
+                        return "", 0.0
+                    try:
+                        results = reader.readtext(arr, detail=1)
+                    except Exception:
+                        return "", 0.0
+                    texts: List[str] = []
+                    confs: List[float] = []
+                    for item in results:
+                        if not isinstance(item, (list, tuple)):
+                            continue
+                        text_val = item[1] if len(item) > 1 else ""
+                        conf_val = item[2] if len(item) > 2 else 0.0
+                        txt = str(text_val or "").strip()
+                        if not txt:
+                            continue
+                        texts.append(txt)
+                        try:
+                            conf_float = float(conf_val)
+                        except Exception:
+                            conf_float = 0.0
+                        confs.append(max(0.0, min(1.0, conf_float)))
+                    if not texts:
+                        return "", 0.0
+                    conf_avg = sum(confs) / len(confs) if confs else 0.0
+                    return " ".join(texts), _normalize_confidence(conf_avg)
+
+                runner = _easyocr_runner
+    else:
+        if cache_key not in _OCR_BACKEND_WARNED:
+            print(f"[WARN] Unknown OCR engine '{name}', falling back to toy OCR")
+            _OCR_BACKEND_WARNED.add(cache_key)
+        runner = toy_ocr_text_from_cell
+
+    _OCR_BACKEND_CACHE[cache_key] = runner
+    return runner
 
 def _keywords_from_row(row_cells: List[str]) -> List[str]:
     kws = set()
@@ -2745,6 +3039,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         page_lookup = {i: path for i, path in enumerate(seq)}
         default_image_path = seq[0] if seq else None
     image_cache: Dict[str, Image.Image] = {}
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
@@ -2842,12 +3137,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_w, cx2 + right_pad),
                             min(page_h, cy2 + pad_y)
                         ))
-                        if ocr_engine=="toy":
-                            txt, conf = toy_ocr_text_from_cell(crop)
-                        else:
-                            txt, conf = ("", 0.0)
+                        txt, conf = ocr_runner(crop)
+                        if not isinstance(txt, str):
+                            txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
-                        grid_conf[r][c] = conf
+                        grid_conf[r][c] = _normalize_confidence(conf)
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -2865,11 +3159,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 min(page_w, cx2),
                                 min(page_h, cy2 + pad_y)
                             ))
-                            alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
+                            alt_txt, alt_conf = ocr_runner(crop)
                             m = _NUMERIC_RX.search(alt_txt or "")
                             if m:
                                 grid_text[r][target_col] = m.group(0)
-                                grid_conf[r][target_col] = max(grid_conf[r][target_col], alt_conf)
+                                grid_conf[r][target_col] = max(
+                                    grid_conf[r][target_col], _normalize_confidence(alt_conf)
+                                )
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
                 headers = grid_text[0] if contextual else []
@@ -3009,8 +3305,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
 def reanalyze_learning_jsonl(learning_jsonl_path: str,
                              out_dir: Optional[str] = None,
                              limit: int = 64,
-                             rotate: bool = True) -> Dict[str, Any]:
-    """Re-run toy OCR over low-confidence cells to propose improved readings."""
+                             rotate: bool = True,
+                             ocr_engine: str = "toy") -> Dict[str, Any]:
+    """Re-run the selected OCR backend over low-confidence cells to propose improved readings."""
     summary: Dict[str, Any] = {
         "input": learning_jsonl_path,
         "limit": int(limit),
@@ -3027,10 +3324,16 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "ambiguous_variants": 0,
         "fallback_variant_count": 0,
         "fallback_transform_usage": {},
+        "ocr_engine": ocr_engine,
     }
+    active_cfg = current_toy_self_correction()
+    if active_cfg:
+        summary["toy_self_correction"] = _normalize_self_correction_config(active_cfg)
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
         return summary
+
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
     ensure_dir(dest_dir)
@@ -3122,21 +3425,24 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 crop = page_img.crop((x1, y1, x2, y2))
 
                 observed_text = sig.get("observed_text")
-                try:
-                    observed_conf = float(sig.get("confidence")) if sig.get("confidence") is not None else 0.0
-                except Exception:
-                    observed_conf = 0.0
+                observed_conf = _normalize_confidence(sig.get("confidence"))
 
                 variants_map: Dict[str, Dict[str, Any]] = {}
 
-                def _merge_variant(text: str, conf: float, transform: str) -> None:
+                def _merge_variant(text: Any, conf: Any, transform: str) -> None:
                     nonlocal ambiguous_total, fallback_used
-                    key = text or ""
-                    conf_f = float(conf or 0.0)
+                    if isinstance(text, str):
+                        normalized_text = text
+                    elif text is None:
+                        normalized_text = ""
+                    else:
+                        normalized_text = str(text)
+                    key = normalized_text
+                    conf_f = _normalize_confidence(conf)
                     created = key not in variants_map
                     if created:
                         variants_map[key] = {
-                            "text": text,
+                            "text": normalized_text,
                             "confidence": conf_f,
                             "transforms": [transform],
                         }
@@ -3165,20 +3471,27 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     elif transform.startswith("ambiguous") and created:
                         ambiguous_total += 1
 
-                base_text, base_conf = toy_ocr_text_from_cell(crop)
-                _merge_variant(base_text, base_conf, "base")
+                base_text_raw, base_conf_raw = ocr_runner(crop)
+                base_conf = _normalize_confidence(base_conf_raw)
+                _merge_variant(base_text_raw, base_conf, "base")
+                if isinstance(base_text_raw, str):
+                    base_text = base_text_raw
+                elif base_text_raw is None:
+                    base_text = ""
+                else:
+                    base_text = str(base_text_raw)
 
                 try:
                     bright_enhancer = ImageEnhance.Brightness(crop)
-                    txt_b1, conf_b1 = toy_ocr_text_from_cell(bright_enhancer.enhance(1.1))
+                    txt_b1, conf_b1 = ocr_runner(bright_enhancer.enhance(1.1))
                     _merge_variant(txt_b1, conf_b1, "brightness_1.1")
-                    txt_b2, conf_b2 = toy_ocr_text_from_cell(bright_enhancer.enhance(0.9))
+                    txt_b2, conf_b2 = ocr_runner(bright_enhancer.enhance(0.9))
                     _merge_variant(txt_b2, conf_b2, "brightness_0.9")
                 except Exception:
                     pass
                 try:
                     contrast_enhancer = ImageEnhance.Contrast(crop)
-                    txt_c, conf_c = toy_ocr_text_from_cell(contrast_enhancer.enhance(1.2))
+                    txt_c, conf_c = ocr_runner(contrast_enhancer.enhance(1.2))
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
@@ -3197,7 +3510,7 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                             rotated = crop.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
                         except Exception:
                             continue
-                        text_r, conf_r = toy_ocr_text_from_cell(rotated)
+                        text_r, conf_r = ocr_runner(rotated)
                         _merge_variant(text_r, conf_r, f"rotate_{angle:+.1f}")
 
                 if observed_text:
