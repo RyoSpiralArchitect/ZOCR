@@ -16,7 +16,7 @@ from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
 from typing import Any, Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 
 try:
     import numpy as np
@@ -961,7 +961,35 @@ _ASCII_SET = (
 )
 
 _GLYPH_VARIANT_LIMIT = 6
-_THRESHOLD_MEMORY: Dict[Tuple[int, int, int], int] = {}
+_THRESHOLD_MEMORY_LIMIT = 2048
+_THRESHOLD_MEMORY: "OrderedDict[Tuple[int, int, int], int]" = OrderedDict()
+
+
+def _threshold_memory_lookup(key: Tuple[int, int, int]) -> Optional[int]:
+    if key in _THRESHOLD_MEMORY:
+        try:
+            _THRESHOLD_MEMORY.move_to_end(key)
+        except Exception:
+            pass
+        return int(_THRESHOLD_MEMORY[key])
+    return None
+
+
+def _threshold_memory_store(key: Tuple[int, int, int], value: int) -> None:
+    try:
+        _THRESHOLD_MEMORY[key] = int(value)
+        _THRESHOLD_MEMORY.move_to_end(key)
+    except Exception:
+        _THRESHOLD_MEMORY[key] = int(value)
+    if len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
+        try:
+            while len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
+                _THRESHOLD_MEMORY.popitem(last=False)
+        except Exception:
+            # fallback: clear if OrderedDict semantics unavailable
+            while len(_THRESHOLD_MEMORY) > _THRESHOLD_MEMORY_LIMIT:
+                _THRESHOLD_MEMORY.popitem()
+
 _NGRAM_COUNTS: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 _NGRAM_TOTALS: Dict[str, int] = defaultdict(int)
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
@@ -1422,8 +1450,8 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
     key = (int(arr.shape[0]), int(arr.shape[1]), int(float(arr.mean()) // 16))
     bw_med = (arr < thr_med).astype(_np.uint8) * 255
     _add_candidate(bw_med, {"type": "median", "thr": thr_med})
-    if key in _THRESHOLD_MEMORY:
-        thr_mem = int(_THRESHOLD_MEMORY[key])
+    thr_mem = _threshold_memory_lookup(key)
+    if thr_mem is not None:
         _add_candidate((arr < thr_mem).astype(_np.uint8) * 255, {"type": "memory", "thr": thr_mem})
     try:
         blur = _np.asarray(Image.fromarray(arr).filter(ImageFilter.BoxBlur(max(1, bin_k//2))), dtype=_np.float32)
@@ -1472,7 +1500,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
         _evaluate_from(start_len)
 
     if best_meta and best_meta.get("thr") is not None:
-        _THRESHOLD_MEMORY[key] = int(best_meta["thr"])
+        _threshold_memory_store(key, int(best_meta["thr"]))
 
     final_text, final_conf = best_text, best_conf
     if candidate_scores:
