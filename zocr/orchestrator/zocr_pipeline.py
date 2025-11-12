@@ -66,6 +66,56 @@ _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
+def _discover_demo_input_targets() -> List[str]:
+    """Locate real demo input directories/files to honour `--input demo`."""
+
+    env_override = os.environ.get("ZOCR_DEMO_INPUTS")
+    env_candidates = []
+    if env_override:
+        for segment in env_override.split(os.pathsep):
+            segment = segment.strip()
+            if segment:
+                env_candidates.append(segment)
+
+    here = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+    search_roots = [os.getcwd(), here]
+    seen_roots = set()
+    uniq_roots: List[str] = []
+    for root in search_roots:
+        norm = os.path.abspath(root)
+        if norm in seen_roots:
+            continue
+        seen_roots.add(norm)
+        uniq_roots.append(norm)
+
+    relative_candidates = [
+        os.path.join("samples", "demo_inputs"),
+        os.path.join("samples", "input_demo"),
+        "demo_inputs",
+        "input_demo",
+    ]
+
+    resolved: List[str] = []
+    seen_paths = set()
+
+    def _add_candidate(path: str) -> None:
+        norm = os.path.abspath(path)
+        if norm in seen_paths:
+            return
+        seen_paths.add(norm)
+        if os.path.exists(norm):
+            resolved.append(norm)
+
+    for candidate in env_candidates:
+        _add_candidate(candidate if os.path.isabs(candidate) else os.path.join(os.getcwd(), candidate))
+
+    for root in uniq_roots:
+        for rel in relative_candidates:
+            _add_candidate(os.path.join(root, rel))
+
+    return resolved
+
+
 def _resolve_toy_memory_path(outdir: str) -> str:
     env_path = os.environ.get("ZOCR_TOY_MEMORY")
     if env_path:
@@ -1153,8 +1203,31 @@ def _patched_run_full_pipeline(
     if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
         zocr_onefile_consensus.reset_toy_recognition_stats()
 
-    if len(inputs) == 1 and inputs[0].lower() == "demo" and not os.path.exists(inputs[0]):
-        pages, annos = zocr_onefile_consensus.make_demo(outdir)
+    if len(inputs) == 1 and inputs[0].lower() == "demo":
+        real_demo_targets = []
+        if os.path.exists(inputs[0]):
+            real_demo_targets = [inputs[0]]
+        else:
+            real_demo_targets = _discover_demo_input_targets()
+
+        pages = _collect_pages(real_demo_targets, dpi=dpi) if real_demo_targets else []
+
+        filtered_pages: List[str] = []
+        seen_page_paths = set()
+        for page in pages:
+            norm = os.path.abspath(page)
+            if norm in seen_page_paths:
+                continue
+            if not os.path.exists(page):
+                continue
+            seen_page_paths.add(norm)
+            filtered_pages.append(page)
+        pages = filtered_pages
+
+        if pages:
+            annos = [None] * len(pages)
+        else:
+            pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
         pages = _collect_pages(inputs, dpi=dpi)
         annos = [None] * len(pages)
