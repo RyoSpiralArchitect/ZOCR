@@ -1906,9 +1906,10 @@ def _normalize_text(val: Optional[Any]) -> str:
         return ""
     return re.sub(r"\s+", " ", val)
 
-def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
+def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
     scores: Dict[str, float] = {k: 0.0 for k in DOMAIN_KW.keys()}
     hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
+    token_hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
     total_cells = 0
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fr:
@@ -1939,6 +1940,49 @@ def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
     except FileNotFoundError:
         pass
 
+    if filename_tokens:
+        lookup: Dict[str, List[str]] = {}
+
+        def _register(key: str, target: str):
+            key = key.strip().lower()
+            if not key:
+                return
+            lookup.setdefault(key, []).append(target)
+
+        for dom in DOMAIN_KW.keys():
+            key = dom.lower()
+            _register(key, dom)
+            for part in re.split(r"[^a-z0-9]+", key):
+                if part:
+                    _register(part, dom)
+
+        for alias, target in _DOMAIN_ALIAS.items():
+            key = alias.lower()
+            _register(key, target)
+            for part in re.split(r"[^a-z0-9]+", key):
+                if part:
+                    _register(part, target)
+
+        for token in filename_tokens:
+            token_l = (token or "").strip().lower()
+            if not token_l:
+                continue
+            matched = False
+            for dom in lookup.get(token_l, []):
+                scores[dom] += 0.6
+                hits[dom] += 1
+                token_hits[dom] += 1
+                matched = True
+            if matched:
+                continue
+            for key, dom_list in lookup.items():
+                if token_l in key and key not in lookup.get(token_l, []):
+                    for dom in dom_list:
+                        scores[dom] += 0.3
+                        hits[dom] += 1
+                        token_hits[dom] += 1
+                    break
+
     def _score_key(dom: str) -> Tuple[float, int]:
         return scores.get(dom, 0.0), hits.get(dom, 0)
 
@@ -1946,12 +1990,17 @@ def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
     if scores:
         best_dom = max(scores.keys(), key=lambda d: (_score_key(d)[0], _score_key(d)[1]))
     resolved = _DOMAIN_ALIAS.get(best_dom, best_dom)
+    score_total = sum(max(0.0, s) for s in scores.values())
+    confidence = scores.get(best_dom, 0.0) / score_total if score_total > 0 else 0.0
     detail = {
         "scores": scores,
         "hits": hits,
+        "token_hits": token_hits,
         "total_cells": total_cells,
         "resolved": resolved,
-        "raw_best": best_dom
+        "raw_best": best_dom,
+        "confidence": confidence,
+        "filename_tokens": filename_tokens or [],
     }
     return resolved, detail
 
@@ -3553,7 +3602,7 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re
 from typing import Any, Dict, List, Optional
 from html import escape
 
@@ -3592,6 +3641,85 @@ def _json_ready(obj: Any):
     return obj
 
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
+
+_STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
+
+
+def _is_auto_domain(value: Optional[str]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        return norm in {"", "auto", "autodetect", "detect", "default"}
+    return False
+
+
+def _prepare_domain_hints(inputs: List[str]) -> Dict[str, Any]:
+    tokens_raw: List[str] = []
+    per_input: Dict[str, List[str]] = {}
+    for raw in inputs:
+        norm = os.path.normpath(raw)
+        seg_tokens: List[str] = []
+        parts = norm.replace("\\", "/").split("/")
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            base = os.path.splitext(part)[0]
+            for tok in re.split(r"[^a-z0-9]+", base.lower()):
+                if not tok or tok in _STOP_TOKENS or tok.isdigit() or len(tok) < 2:
+                    continue
+                tokens_raw.append(tok)
+                seg_tokens.append(tok)
+        if seg_tokens:
+            per_input[raw] = seg_tokens
+    unique_tokens = sorted(set(tokens_raw))
+    domain_kw = getattr(zocr_multidomain_core, "DOMAIN_KW", {})
+    alias_map = getattr(zocr_multidomain_core, "_DOMAIN_ALIAS", {})
+    candidate_scores: Dict[str, float] = {dom: 0.0 for dom in domain_kw.keys()}
+    for tok in tokens_raw:
+        target = alias_map.get(tok)
+        if target:
+            candidate_scores.setdefault(target, 0.0)
+            candidate_scores[target] += 1.2
+        for dom in list(candidate_scores.keys()):
+            dom_l = dom.lower()
+            if tok == dom_l:
+                candidate_scores[dom] += 1.0
+            elif tok in dom_l.split("_"):
+                candidate_scores[dom] += 0.5
+    best_dom = None
+    best_score = 0.0
+    for dom, score in candidate_scores.items():
+        if score > best_score:
+            best_dom = dom
+            best_score = score
+    return {
+        "tokens_raw": tokens_raw,
+        "tokens": unique_tokens,
+        "per_input": per_input,
+        "guess": best_dom,
+        "best_score": best_score,
+        "scores": {k: float(v) for k, v in candidate_scores.items() if v > 0.0},
+    }
+
+
+def _apply_domain_defaults(prof: Dict[str, Any], domain: Optional[str]) -> None:
+    if not domain:
+        return
+    defaults = getattr(zocr_multidomain_core, "DOMAIN_DEFAULTS", {})
+    alias_map = getattr(zocr_multidomain_core, "_DOMAIN_ALIAS", {})
+    base = defaults.get(domain)
+    if base is None:
+        base = defaults.get(alias_map.get(domain, "")) if alias_map else None
+    if base is None and "invoice_jp_v2" in defaults:
+        base = defaults["invoice_jp_v2"]
+    if base:
+        for key, value in base.items():
+            prof.setdefault(key, value)
+    prof.setdefault("domain", domain)
+    if prof.get("w_bm25") is None:
+        prof["w_bm25"] = 1.0
 
 def _read_ok_steps(outdir: str) -> set:
     path = os.path.join(outdir, "pipeline_history.jsonl")
@@ -4123,6 +4251,34 @@ def _patched_run_full_pipeline(
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
     }
 
+    domain_hints = _prepare_domain_hints(inputs)
+    domain_auto_summary: Dict[str, Any] = {
+        "provided": domain_hint,
+        "from_inputs": {
+            "guess": domain_hints.get("guess"),
+            "best_score": float(domain_hints.get("best_score") or 0.0) if domain_hints.get("best_score") else None,
+            "tokens": domain_hints.get("tokens"),
+            "per_input": domain_hints.get("per_input"),
+            "scores": domain_hints.get("scores"),
+        },
+        "initial_profile": prof.get("domain"),
+    }
+    selected_source: Optional[str] = None
+    selected_confidence: Optional[float] = None
+    if prof.get("domain") and not _is_auto_domain(prof.get("domain")):
+        selected_source = "profile"
+    elif domain_hint and not _is_auto_domain(domain_hint):
+        prof["domain"] = domain_hint
+        selected_source = "cli"
+    elif _is_auto_domain(prof.get("domain")) and domain_hints.get("guess"):
+        prof["domain"] = domain_hints.get("guess")
+        selected_source = "inputs"
+        try:
+            selected_confidence = float(domain_hints.get("best_score") or 0.0)
+        except Exception:
+            selected_confidence = None
+    summary["domain_autodetect"] = domain_auto_summary
+
     if "OCR" in ok:
         print("[SKIP] OCR (resume)")
         try:
@@ -4155,6 +4311,53 @@ def _patched_run_full_pipeline(
         if not r.get("ok"):
             raise RuntimeError("Export failed")
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
+
+    autodetect_detail: Optional[Dict[str, Any]] = None
+    autodetect_error: Optional[str] = None
+    if os.path.exists(jsonl_path):
+        try:
+            detected_domain, autodetect_detail = zocr_multidomain_core.detect_domain_on_jsonl(
+                jsonl_path, domain_hints.get("tokens_raw")
+            )
+        except Exception as e:
+            autodetect_error = str(e)
+            detected_domain = None  # type: ignore
+            autodetect_detail = None
+        if autodetect_detail:
+            domain_auto_summary["from_content"] = autodetect_detail
+            resolved = autodetect_detail.get("resolved") or detected_domain
+            if resolved:
+                take = False
+                conf_val = autodetect_detail.get("confidence")
+                try:
+                    conf_float = float(conf_val) if conf_val is not None else None
+                except Exception:
+                    conf_float = None
+                if _is_auto_domain(prof.get("domain")):
+                    take = True
+                elif resolved != prof.get("domain") and conf_float is not None and conf_float >= 0.55:
+                    take = True
+                if take:
+                    prof["domain"] = resolved
+                    selected_source = "content"
+                    selected_confidence = conf_float
+        if autodetect_error:
+            domain_auto_summary["content_error"] = autodetect_error
+
+    _apply_domain_defaults(prof, prof.get("domain"))
+    try:
+        with open(prof_path, "w", encoding="utf-8") as pf:
+            json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Profile save skipped:", e)
+
+    domain_auto_summary["selected"] = {
+        "source": selected_source,
+        "domain": prof.get("domain"),
+        "confidence": selected_confidence,
+    }
+    summary["domain_autodetect"] = domain_auto_summary
+    summary["domain"] = prof.get("domain")
 
     if "Augment" in ok:
         print("[SKIP] Augment (resume)")

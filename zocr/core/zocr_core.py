@@ -576,9 +576,10 @@ def _normalize_text(val: Optional[Any]) -> str:
         return ""
     return re.sub(r"\s+", " ", val)
 
-def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
+def detect_domain_on_jsonl(jsonl_path: str, filename_tokens: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
     scores: Dict[str, float] = {k: 0.0 for k in DOMAIN_KW.keys()}
     hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
+    token_hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
     total_cells = 0
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fr:
@@ -609,6 +610,50 @@ def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
     except FileNotFoundError:
         pass
 
+    if filename_tokens:
+        lookup: Dict[str, List[str]] = {}
+
+        def _register(key: str, target: str):
+            key = key.strip().lower()
+            if not key:
+                return
+            lookup.setdefault(key, []).append(target)
+
+        for dom in DOMAIN_KW.keys():
+            key = dom.lower()
+            _register(key, dom)
+            for part in re.split(r"[^a-z0-9]+", key):
+                if part:
+                    _register(part, dom)
+
+        for alias, target in _DOMAIN_ALIAS.items():
+            key = alias.lower()
+            _register(key, target)
+            for part in re.split(r"[^a-z0-9]+", key):
+                if part:
+                    _register(part, target)
+
+        for token in filename_tokens:
+            token_l = (token or "").strip().lower()
+            if not token_l:
+                continue
+            matched = False
+            for dom in lookup.get(token_l, []):
+                scores[dom] += 0.6
+                hits[dom] += 1
+                token_hits[dom] += 1
+                matched = True
+            if matched:
+                continue
+            # try fuzzy match when no direct key
+            for key, dom_list in lookup.items():
+                if token_l in key and key not in lookup.get(token_l, []):
+                    for dom in dom_list:
+                        scores[dom] += 0.3
+                        hits[dom] += 1
+                        token_hits[dom] += 1
+                    break
+
     def _score_key(dom: str) -> Tuple[float, int]:
         return scores.get(dom, 0.0), hits.get(dom, 0)
 
@@ -616,12 +661,17 @@ def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
     if scores:
         best_dom = max(scores.keys(), key=lambda d: (_score_key(d)[0], _score_key(d)[1]))
     resolved = _DOMAIN_ALIAS.get(best_dom, best_dom)
+    score_total = sum(max(0.0, s) for s in scores.values())
+    confidence = scores.get(best_dom, 0.0) / score_total if score_total > 0 else 0.0
     detail = {
         "scores": scores,
         "hits": hits,
+        "token_hits": token_hits,
         "total_cells": total_cells,
         "resolved": resolved,
-        "raw_best": best_dom
+        "raw_best": best_dom,
+        "confidence": confidence,
+        "filename_tokens": filename_tokens or [],
     }
     return resolved, detail
 

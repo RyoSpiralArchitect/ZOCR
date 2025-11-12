@@ -26,13 +26,13 @@ python -m pip install numpy pillow tqdm numba
 #   → Put your PDFs/PNGs under samples/demo_inputs/ (or keep it empty to use the synthetic demo)
 
 # 3. パイプライン実行 / Run the pipeline / Lancer le pipeline
-python -m zocr.orchestrator.zocr_pipeline --input demo --domain invoice --snapshot --seed 12345
+python -m zocr.orchestrator.zocr_pipeline --input demo --snapshot --seed 12345
 
 # 4. 途中再開 / Resume after failure / Reprendre après un échec
 python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 12345
 ```
 
-> `python -m zocr.orchestrator.zocr_pipeline run ...` も同義です。All commands below accept either form.
+> `python -m zocr.orchestrator.zocr_pipeline run ...` も同義です。`--domain` を省略すると、ファイル名と OCR 結果から自動判別されます。All commands below accept either form; omitting `--domain` lets the pipeline auto-detect from filenames + OCR output.
 
 ## CLI フラグ / CLI Flags / Options CLI
 | Flag | 説明 / Description / Description |
@@ -40,7 +40,7 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 | `--input` | **JA:** 入力画像/PDF のパス。`demo` は合成デモ＋`samples/demo_inputs/`。<br>**EN:** Paths to images/PDFs; `demo` mixes the synthetic example with anything in `samples/demo_inputs/`.<br>**FR:** Chemins vers images/PDF ; `demo` combine l'exemple synthétique et les fichiers dans `samples/demo_inputs/`. |
 | `--outdir` | 出力先 / Output directory / Répertoire de sortie。既定: `out_allinone`. |
 | `--dpi` | PDF レンダリング時の DPI / DPI for PDF rendering / DPI pour le rendu PDF. |
-| `--domain` | ドメインヒント（`invoice`, `bank_statement`, `tax`, など）/ Domain hint / Indice de domaine. |
+| `--domain` | ドメインヒント。未指定または `auto`/`detect` の場合はファイル名・OCR テキストから自動推定（`invoice`, `bank_statement`, `tax` なども指定可）/ Domain hint; leave empty or set to `auto` to infer from filenames + OCR / Indice de domaine ; vide ou `auto` pour une détection à partir des fichiers + OCR. |
 | `--k` | BM25 ヒット上位件数 / Top-K for BM25 / Top-K BM25. |
 | `--no-tune` | チューニング無効化 / Skip autotune / Désactiver l'auto-réglage. |
 | `--tune-budget` | オートチューニング評価回数 / Trials for autotune / Itérations autotune. |
@@ -65,6 +65,11 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 5. **Report & Plugins** — HTML レポート、要約 JSON、RAG マニフェスト、プラグインフック（`post_export`/`post_index`/`post_monitor`/`post_sql`/`post_rag`）を呼び出し。
 
 各段階は `_safe_step` でガードされ、成功・失敗・経過時間を `pipeline_history.jsonl` に追記します。
+
+## 自動ドメイン検出 / Automatic Domain Detection / Détection automatique du domaine
+- **[JA]** ファイル名（`samples/invoice/...` など）からトークンを抽出し、`DOMAIN_KW` / `_DOMAIN_ALIAS` の別名と突き合わせて初期候補を生成します。OCR 後は JSONL 内テキストとフィルターを走査し、キーワード一致度とヒット率から信頼度を算出します。`pipeline_summary.json` の `domain_autodetect` に推論経路・信頼度・採用ソースを記録します。
+- **[EN]** The orchestrator mines folder/file tokens, maps them through `DOMAIN_KW` and `_DOMAIN_ALIAS`, then refines the guess by scanning the exported JSONL. Confidence scores determine whether the auto-picked domain should override prior hints; the full trace lives in `pipeline_summary.json` under `domain_autodetect`.
+- **[FR]** L'orchestrateur extrait les jetons des chemins, les compare aux alias/domains connus puis affine la sélection avec le JSONL exporté. La confiance finale décide si l'indice utilisateur est remplacé. Le parcours complet est archivé dans `pipeline_summary.json` (`domain_autodetect`).
 
 ## 生成物 / Outputs / Résultats
 - `doc.zocr.json` — OCR & consensus の主 JSON。
