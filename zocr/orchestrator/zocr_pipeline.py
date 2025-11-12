@@ -901,6 +901,7 @@ def _patched_run_full_pipeline(
     }
 
     domain_hints = _prepare_domain_hints(inputs)
+    content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
     domain_auto_summary: Dict[str, Any] = {
         "provided": domain_hint,
         "from_inputs": {
@@ -911,6 +912,7 @@ def _patched_run_full_pipeline(
             "scores": domain_hints.get("scores"),
         },
         "initial_profile": prof.get("domain"),
+        "content_threshold": content_conf_threshold,
     }
     selected_source: Optional[str] = None
     selected_confidence: Optional[float] = None
@@ -1010,23 +1012,36 @@ def _patched_run_full_pipeline(
             domain_auto_summary["from_content"] = autodetect_detail
             resolved = autodetect_detail.get("resolved") or detected_domain
             if resolved:
+                decision: Dict[str, Any] = {"candidate": resolved}
                 take = False
                 conf_val = autodetect_detail.get("confidence")
                 try:
                     conf_float = float(conf_val) if conf_val is not None else None
                 except Exception:
                     conf_float = None
-                if _is_auto_domain(prof.get("domain")):
+                decision["confidence"] = conf_float
+                if conf_float is not None and conf_float >= content_conf_threshold:
                     take = True
-                elif resolved != prof.get("domain") and conf_float is not None and conf_float >= 0.55:
-                    take = True
+                    decision["reason"] = "confidence>=threshold"
+                elif conf_float is None:
+                    decision["reason"] = "confidence-missing"
+                else:
+                    decision["reason"] = "below-threshold"
                 if take:
                     prof["domain"] = resolved
                     selected_source = "content"
                     selected_confidence = conf_float
+                    decision["applied"] = resolved
+                else:
+                    decision["kept"] = prof.get("domain")
+                domain_auto_summary["content_decision"] = decision
         if autodetect_error:
             domain_auto_summary["content_error"] = autodetect_error
 
+    if not prof.get("domain"):
+        prof["domain"] = "invoice_jp_v2"
+        if selected_source is None:
+            selected_source = "default"
     _apply_domain_defaults(prof, prof.get("domain"))
     try:
         with open(prof_path, "w", encoding="utf-8") as pf:

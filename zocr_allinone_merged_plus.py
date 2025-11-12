@@ -3962,13 +3962,14 @@ def _evaluate_gate(domain: Optional[str], amount_score: Optional[float], date_sc
     amt = float(amount_score) if amount_score is not None else 0.0
     dt = float(date_score) if date_score is not None else None
     if resolved in _INVOICE_GATE_DOMAINS:
-        if amt >= 0.8:
-            note = "amount+date hit" if dt is not None and dt >= 0.5 else "amount hit (date optional)"
-            return True, note, amt
-        if amt >= 0.7 and (dt is None or dt >= 0.3):
-            note = "amount hit (date optional)" if dt is None or dt < 0.5 else "amount+date hit"
-            return True, note, amt
-        return False, "amount below gate", amt
+        if dt is None:
+            return False, "date missing", min(amt, 0.0)
+        if amt < 0.8:
+            return False, "amount below gate", amt
+        if dt < 0.5:
+            return False, "date below gate", dt
+        score = min(amt, dt)
+        return True, "amount+date hit", score
     if amount_score is None or date_score is None:
         return False, "insufficient metrics", 0.0
     mean = (float(amount_score) + float(date_score)) / 2.0
@@ -4417,7 +4418,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 corp_total+=1
                 if filt.get("company_canonical"): corp_hits+=1
     low_conf_rate = low/max(1,total)
-    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else None
+    corporate_match_rate = (corp_hits/max(1,corp_total)) if corp_total>0 else 0.0
 
     S_reproc, S_success = _read_views_sets(views_log)
     reprocess_rate = len(S_reproc & lc_keys)/max(1,len(lc_keys)) if lc_keys else 0.0
@@ -4475,7 +4476,7 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                 tax_cov+=1
                 if abs(int(filt["tax_amount"])-int(filt["tax_amount_expected"]))>1:
                     tax_fail+=1
-    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else None
+    tax_fail_rate = (tax_fail/max(1,tax_cov)) if tax_cov>0 else 0.0
 
     p95=None
     agg=os.path.join(os.path.dirname(jsonl),"metrics_aggregate.csv")
@@ -4495,7 +4496,9 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
          "domain": domain or "auto",
          "low_conf_rate":low_conf_rate,"reprocess_rate":reprocess_rate,"reprocess_success_rate":reprocess_success_rate,
          "hit_amount":hit_amount,"hit_date":hit_date,"hit_mean":hit_mean,
-         "tax_fail_rate":tax_fail_rate,"corporate_match_rate":corporate_match_rate,"p95_ms":p95,
+         "tax_fail_rate":tax_fail_rate,"tax_coverage":tax_cov,
+         "corporate_match_rate":corporate_match_rate,"corporate_coverage":corp_total,
+         "p95_ms":p95,
          "trust_amount":trust_amount,"trust_date":trust_date,"trust_mean":trust_mean,
          "gate_pass":gate_pass,"gate_reason":gate_reason,"gate_score":gate_score}
     hdr=not os.path.exists(out_csv)
@@ -4539,7 +4542,8 @@ def learn_from_monitor(monitor_csv: str, profile_json_in: Optional[str], profile
         numeric_keys = [
             "low_conf_rate", "reprocess_rate", "reprocess_success_rate",
             "hit_amount", "hit_date", "hit_mean", "p95_ms", "tax_fail_rate",
-            "corporate_match_rate", "trust_amount", "trust_date", "trust_mean",
+            "tax_coverage", "corporate_match_rate", "corporate_coverage",
+            "trust_amount", "trust_date", "trust_mean",
         ]
         for key in numeric_keys:
             if key in metrics:
@@ -5493,6 +5497,7 @@ def _patched_run_full_pipeline(
     }
 
     domain_hints = _prepare_domain_hints(inputs)
+    content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
     domain_auto_summary: Dict[str, Any] = {
         "provided": domain_hint,
         "from_inputs": {
@@ -5503,6 +5508,7 @@ def _patched_run_full_pipeline(
             "scores": domain_hints.get("scores"),
         },
         "initial_profile": prof.get("domain"),
+        "content_threshold": content_conf_threshold,
     }
     selected_source: Optional[str] = None
     selected_confidence: Optional[float] = None
@@ -5602,23 +5608,36 @@ def _patched_run_full_pipeline(
             domain_auto_summary["from_content"] = autodetect_detail
             resolved = autodetect_detail.get("resolved") or detected_domain
             if resolved:
+                decision: Dict[str, Any] = {"candidate": resolved}
                 take = False
                 conf_val = autodetect_detail.get("confidence")
                 try:
                     conf_float = float(conf_val) if conf_val is not None else None
                 except Exception:
                     conf_float = None
-                if _is_auto_domain(prof.get("domain")):
+                decision["confidence"] = conf_float
+                if conf_float is not None and conf_float >= content_conf_threshold:
                     take = True
-                elif resolved != prof.get("domain") and conf_float is not None and conf_float >= 0.55:
-                    take = True
+                    decision["reason"] = "confidence>=threshold"
+                elif conf_float is None:
+                    decision["reason"] = "confidence-missing"
+                else:
+                    decision["reason"] = "below-threshold"
                 if take:
                     prof["domain"] = resolved
                     selected_source = "content"
                     selected_confidence = conf_float
+                    decision["applied"] = resolved
+                else:
+                    decision["kept"] = prof.get("domain")
+                domain_auto_summary["content_decision"] = decision
         if autodetect_error:
             domain_auto_summary["content_error"] = autodetect_error
 
+    if not prof.get("domain"):
+        prof["domain"] = "invoice_jp_v2"
+        if selected_source is None:
+            selected_source = "default"
     _apply_domain_defaults(prof, prof.get("domain"))
     try:
         with open(prof_path, "w", encoding="utf-8") as pf:
