@@ -5,6 +5,19 @@
 - **[EN]** The single file `zocr_allinone_merged_plus.py` bundles OCR, augmentation, indexing, monitoring, and learning with reproducibility and observability in mind.
 - **[FR]** Le fichier unique `zocr_allinone_merged_plus.py` réunit OCR, augmentation, indexation, surveillance et apprentissage en privilégiant la reproductibilité et l'observabilité.
 
+- **[JA]** 同時に `zocr/` パッケージ（`consensus/`, `core/`, `orchestrator/`）として 3 分割したモジュールも収録し、既存インポート（`zocr_onefile_consensus` など）との互換性を維持したまま再利用できます。
+- **[EN]** Alongside it, the repo now exposes a three-module `zocr/` package (`consensus/`, `core/`, `orchestrator/`) so projects can reuse the pieces while keeping backward-compatible import names such as `zocr_onefile_consensus`.
+- **[FR]** En parallèle, un paquet `zocr/` en trois modules (`consensus/`, `core/`, `orchestrator/`) est fourni pour réutiliser chaque brique tout en conservant la compatibilité des imports historiques comme `zocr_onefile_consensus`。
+
+## レイアウト / Layout / Structure
+```
+zocr/
+  consensus/zocr_consensus.py    # OCR + table reconstruction
+  core/zocr_core.py              # augment/index/query/monitor/sql
+  orchestrator/zocr_pipeline.py  # pipeline orchestrator & watchdog
+zocr_allinone_merged_plus.py     # backwards-compatible single-file bundle
+```
+
 ## 使い方 / Usage / Utilisation
 ```bash
 # 初回実行 / First run / Première exécution
@@ -47,6 +60,16 @@ python zocr_allinone_merged_plus.py plugins
     ↓
 出力 / Output / Sortie
 ```
+
+## ビジュアライゼーション / Visualisation / Visualisation
+- **[JA]** `views/` には 4 分割のマイクロスコープ画像（原画 ×3, エッジ強調, Otsu 二値, 勾配ヒートマップ）と、原画に疑似カラーの X-Ray オーバーレイを重ねたファイルを自動生成します。
+- **[EN]** The `views/` folder now holds a four-panel microscope mosaic (raw ×3, edge sharpened, Otsu binarisation, gradient heatmap) plus an X-ray false-colour overlay blended with the original crop.
+- **[FR]** Le dossier `views/` contient désormais une mosaïque microscope en quatre panneaux (brut ×3, renforcement des contours, binarisation Otsu, carte thermique de gradient) ainsi qu'une superposition faux-couleur de type rayon X appliquée à l'image d'origine.
+
+## 対応ドメイン / Supported domains / Domaines pris en charge
+- **[JA]** インボイス（日・英・仏）、見積書、納品書、領収書、契約書、購入注文書、経費精算、タイムシート、出荷案内、医療領収書などを検出・最適化用プリセットとして収録しています。
+- **[EN]** Domain presets span invoices (JP / EN / FR), estimates, delivery slips, receipts, contracts, purchase orders, expenses, timesheets, shipping notices, and Japanese medical receipts for automatic detection and tuning.
+- **[FR]** Les préréglages de domaine couvrent factures (JP / EN / FR), devis, bons de livraison, reçus, contrats, bons de commande, notes de frais, feuilles de temps, avis d'expédition et reçus médicaux japonais pour la détection et l'optimisation automatiques.
 
 ## 依存関係 / Dependencies / Dépendances
 - Python 3.9+

@@ -98,7 +98,7 @@ try:
 except Exception:
     np = None
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
 from html.parser import HTMLParser
 
 try:
@@ -381,21 +381,141 @@ def compute_teds(html_pred:str, html_gt:Optional[str]=None)->float:
     return float(0.5*row_sim+0.5*cnt_sim)
 
 # ----------------- Views -----------------
+def _otsu_threshold(gray_u8: "np.ndarray") -> int:
+    hist = np.bincount(gray_u8.reshape(-1), minlength=256)
+    total = gray_u8.size
+    sum_total = float(np.dot(hist, np.arange(256)))
+    sum_b = 0.0
+    weight_b = 0.0
+    best = 127
+    max_var = -1.0
+    for t in range(256):
+        weight_b += hist[t]
+        if weight_b <= 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f <= 0:
+            break
+        sum_b += float(t * hist[t])
+        mean_b = sum_b / weight_b
+        mean_f = (sum_total - sum_b) / weight_f
+        var_between = weight_b * weight_f * (mean_b - mean_f) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            best = t
+    return int(best)
+
+def _gradient_false_color(gray: "np.ndarray") -> Tuple["np.ndarray", "np.ndarray"]:
+    if gray.size == 0:
+        return np.zeros(gray.shape + (3,), dtype=np.uint8), np.zeros_like(gray, dtype=np.float32)
+    norm = gray.astype(np.float32)
+    g_min = float(norm.min())
+    g_max = float(norm.max())
+    if g_max > g_min:
+        norm = (norm - g_min) / (g_max - g_min)
+    else:
+        norm = np.zeros_like(norm, dtype=np.float32)
+    pad = np.pad(norm, 1, mode="edge")
+    kx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
+    ky = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float32)
+    gx = np.zeros_like(norm, dtype=np.float32)
+    gy = np.zeros_like(norm, dtype=np.float32)
+    H, W = norm.shape
+    for i in range(3):
+        for j in range(3):
+            gx += kx[i, j] * pad[i:i+H, j:j+W]
+            gy += ky[i, j] * pad[i:i+H, j:j+W]
+    mag = np.hypot(gx, gy)
+    if float(mag.max()) > 1e-8:
+        mag = mag / float(mag.max())
+    else:
+        mag = np.zeros_like(mag)
+    angle = np.arctan2(gy, gx)
+    red = np.clip(mag * (0.5 * (1.0 + np.cos(angle))), 0.0, 1.0)
+    green = np.clip(mag * (0.5 * (1.0 + np.sin(angle))), 0.0, 1.0)
+    blue = np.clip(np.power(mag, 0.65), 0.0, 1.0)
+    rgb = np.stack([red, green, blue], axis=-1)
+    rgb = np.power(rgb, 0.8)
+    return (rgb * 255.0).astype(np.uint8), mag.astype(np.float32)
+
 def _make_views(im: "Image.Image", out_dir: str, base: str) -> Dict[str,str]:
     ensure_dir(out_dir)
-    paths = {}
-    mic = im.resize((max(1,im.width*3), max(1,im.height*3)), resample=Image.BICUBIC)
-    mic = mic.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
-    p_mic = os.path.join(out_dir, f"{base}.microscope.png"); mic.save(p_mic); paths["microscope"]=p_mic
-    g = ImageOps.grayscale(im)
-    g1 = g.filter(ImageFilter.GaussianBlur(radius=1.2))
-    g2 = g.filter(ImageFilter.GaussianBlur(radius=3.2))
-    dog = ImageChops.subtract(g2, g1)
-    arr = np.array(dog).astype(np.float32)
-    if arr.max() > arr.min():
-        arr = (arr - arr.min()) * (255.0/(arr.max()-arr.min()))
-    xray = Image.fromarray(arr.astype(np.uint8))
-    p_xr = os.path.join(out_dir, f"{base}.xray.png"); xray.save(p_xr); paths["xray"]=p_xr
+    paths: Dict[str, str] = {}
+
+    gray = ImageOps.grayscale(im)
+    gray_u8 = np.asarray(gray, dtype=np.uint8)
+    grad_rgb, mag = _gradient_false_color(gray_u8.astype(np.float32))
+    xray_img = Image.fromarray(grad_rgb, mode="RGB")
+    p_xr = os.path.join(out_dir, f"{base}.xray.png")
+    xray_img.save(p_xr)
+    paths["xray"] = p_xr
+
+    xray_overlay = Image.blend(im.convert("RGB"), xray_img, 0.45)
+    p_xro = os.path.join(out_dir, f"{base}.xray_overlay.png")
+    xray_overlay.save(p_xro)
+    paths["xray_overlay"] = p_xro
+
+    zoom = 3
+    zoom_size = (max(1, im.width * zoom), max(1, im.height * zoom))
+    mic_raw = im.resize(zoom_size, resample=Image.BICUBIC)
+    mic_sharp = ImageEnhance.Sharpness(mic_raw).enhance(2.4)
+    mic_sharp = ImageEnhance.Contrast(mic_sharp).enhance(1.35)
+    mic_sharp = ImageEnhance.Brightness(mic_sharp).enhance(1.05)
+
+    edges = gray.filter(ImageFilter.FIND_EDGES).resize(zoom_size, resample=Image.BICUBIC)
+    edges = ImageOps.autocontrast(edges)
+    edge_rgb = ImageOps.colorize(edges, black="#000000", white="#7fffd4")
+    overlay_zoom = Image.blend(mic_sharp, edge_rgb.convert("RGB"), 0.35)
+
+    otsu = _otsu_threshold(gray_u8)
+    binary = (gray_u8 >= otsu).astype(np.uint8) * 255
+    binary_img = Image.fromarray(binary, mode="L").resize(zoom_size, resample=Image.NEAREST)
+    binary_col = ImageOps.colorize(binary_img, black="#111111", white="#f7f7f7")
+
+    heat = Image.fromarray(np.clip(mag * 255.0, 0.0, 255.0).astype(np.uint8), mode="L")
+    heat = heat.resize(zoom_size, resample=Image.BICUBIC)
+    heat_col = ImageOps.colorize(heat, black="#001f3f", white="#ff6b6b")
+    heat_overlay = Image.blend(heat_col.convert("RGB"), overlay_zoom, 0.4)
+
+    tile = Image.new("RGB", (zoom_size[0] * 2, zoom_size[1] * 2), "#050505")
+    tile.paste(mic_raw.convert("RGB"), (0, 0))
+    tile.paste(overlay_zoom, (zoom_size[0], 0))
+    tile.paste(binary_col.convert("RGB"), (0, zoom_size[1]))
+    tile.paste(heat_overlay, (zoom_size[0], zoom_size[1]))
+
+    draw = ImageDraw.Draw(tile)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    labels = [
+        ((8, 8), "Raw ×3"),
+        ((zoom_size[0] + 8, 8), "Edges + Sharpen"),
+        ((8, zoom_size[1] + 8), f"Otsu bin (τ={otsu})"),
+        ((zoom_size[0] + 8, zoom_size[1] + 8), "Gradient heat")
+    ]
+    for (x, y), text in labels:
+        if font is not None and hasattr(draw, "textbbox"):
+            bbox = draw.textbbox((x, y), text, font=font)
+            draw.rectangle([bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2], fill="#00000080")
+            draw.text((x, y), text, fill="#f8f8f8", font=font)
+        else:
+            draw.text((x, y), text, fill="#f8f8f8")
+
+    base_step = max(1, min(zoom_size[0], zoom_size[1]) // 6)
+    step = max(24, base_step)
+    x0 = zoom_size[0]
+    for xx in range(x0, x0 + zoom_size[0], step):
+        draw.line([(xx, 0), (xx, zoom_size[1])], fill="#1f1f1f", width=1)
+    for yy in range(0, zoom_size[1], step):
+        draw.line([(x0, yy), (x0 + zoom_size[0], yy)], fill="#1f1f1f", width=1)
+    draw.rectangle([0, 0, zoom_size[0] * 2 - 1, zoom_size[1] * 2 - 1], outline="#3a3a3a", width=2)
+
+    p_mic = os.path.join(out_dir, f"{base}.microscope.png")
+    tile.save(p_mic)
+    paths["microscope"] = p_mic
+
     return paths
 
 # ----------------- Robust K_mode by row clusters -----------------
@@ -1618,11 +1738,108 @@ def infer_row_fields(swin: str) -> Dict[str, Any]:
 # Domain keywords for boosts
 DOMAIN_KW = {
     "invoice": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求",0.4),("登録",0.3),("住所",0.3),("単価",0.3),("数量",0.3)],
-    "contract":[("契約",0.8),("署名",0.6),("印",0.5),("住所",0.3),("日付",0.3)],
-    "delivery":[("納品",1.0),("数量",0.8),("単位",0.5),("品名",0.5),("受領",0.4)],
-    "estimate":[("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
-    "receipt":[("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)]
+    "invoice_jp_v2": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求日",0.5),("発行日",0.4)],
+    "invoice_en": [("invoice",1.0),("total",0.9),("amount",0.85),("tax",0.7),("due",0.5),("bill",0.4)],
+    "invoice_fr": [("facture",1.0),("total",0.9),("montant",0.8),("tva",0.7),("échéance",0.5),("paiement",0.4)],
+    "purchase_order": [("purchase",1.0),("order",0.95),("po",0.8),("qty",0.6),("ship",0.5),("vendor",0.4)],
+    "expense": [("expense",1.0),("reimbursement",0.85),("category",0.6),("receipt",0.6),("total",0.5)],
+    "timesheet": [("timesheet",1.0),("hours",0.95),("project",0.6),("rate",0.5),("overtime",0.4)],
+    "shipping_notice": [("shipment",1.0),("tracking",0.9),("carrier",0.7),("delivery",0.6),("ship",0.5)],
+    "medical_receipt": [("診療",1.0),("点数",0.9),("保険",0.8),("負担金",0.6),("薬剤",0.5)],
+    "contract": [("契約",0.8),("署名",0.6),("印",0.5),("住所",0.3),("日付",0.3)],
+    "contract_jp_v2": [("契約",0.9),("条",0.7),("締結",0.6),("甲",0.5),("乙",0.5),("印",0.4)],
+    "contract_en": [("contract",1.0),("signature",0.75),("party",0.6),("term",0.6),("agreement",0.5)],
+    "delivery": [("納品",1.0),("数量",0.8),("単位",0.5),("品名",0.5),("受領",0.4)],
+    "delivery_jp": [("納品書",1.0),("数量",0.85),("品番",0.6),("受領",0.5),("出荷",0.4)],
+    "delivery_en": [("delivery",1.0),("ship",0.85),("carrier",0.7),("qty",0.6),("item",0.5)],
+    "estimate": [("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
+    "estimate_jp": [("見積書",1.0),("見積金額",0.85),("有効期限",0.6),("数量",0.5)],
+    "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
+    "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
+    "receipt_jp": [("領収書",1.0),("税込",0.8),("受領",0.6),("発行日",0.4)],
+    "receipt_en": [("receipt",1.0),("paid",0.9),("total",0.75),("payment",0.6),("tax",0.5)]
 }
+
+DOMAIN_DEFAULTS = {
+    "invoice": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.58},
+    "invoice_jp_v2": {"lambda_shape": 4.5, "w_kw": 0.6, "w_img": 0.3, "ocr_min_conf": 0.58},
+    "invoice_en": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.55},
+    "invoice_fr": {"lambda_shape": 4.2, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.55},
+    "purchase_order": {"lambda_shape": 4.0, "w_kw": 0.5, "w_img": 0.22, "ocr_min_conf": 0.60},
+    "expense": {"lambda_shape": 3.8, "w_kw": 0.5, "w_img": 0.18, "ocr_min_conf": 0.60},
+    "timesheet": {"lambda_shape": 3.6, "w_kw": 0.45, "w_img": 0.18, "ocr_min_conf": 0.62},
+    "shipping_notice": {"lambda_shape": 4.3, "w_kw": 0.5, "w_img": 0.26, "ocr_min_conf": 0.58},
+    "medical_receipt": {"lambda_shape": 5.0, "w_kw": 0.65, "w_img": 0.28, "ocr_min_conf": 0.60},
+    "contract": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "contract_jp_v2": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "contract_en": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "delivery": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "delivery_jp": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "delivery_en": {"lambda_shape": 4.0, "w_kw": 0.48, "w_img": 0.22, "ocr_min_conf": 0.58},
+    "estimate": {"lambda_shape": 4.3, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "estimate_jp": {"lambda_shape": 4.3, "w_kw": 0.55, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "estimate_en": {"lambda_shape": 4.2, "w_kw": 0.5, "w_img": 0.25, "ocr_min_conf": 0.58},
+    "receipt": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "receipt_jp": {"lambda_shape": 4.1, "w_kw": 0.6, "w_img": 0.2, "ocr_min_conf": 0.60},
+    "receipt_en": {"lambda_shape": 4.0, "w_kw": 0.55, "w_img": 0.2, "ocr_min_conf": 0.60}
+}
+
+_DOMAIN_ALIAS = {
+    "invoice": "invoice_jp_v2",
+    "contract": "contract_jp_v2",
+    "delivery": "delivery_jp",
+    "estimate": "estimate_jp",
+    "receipt": "receipt_jp"
+}
+
+def detect_domain_on_jsonl(jsonl_path: str) -> Tuple[str, Dict[str, Any]]:
+    scores: Dict[str, float] = {k: 0.0 for k in DOMAIN_KW.keys()}
+    hits: Dict[str, int] = {k: 0 for k in DOMAIN_KW.keys()}
+    total_cells = 0
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as fr:
+            for line in fr:
+                try:
+                    ob = json.loads(line)
+                except Exception:
+                    continue
+                text_parts = [ob.get("text") or "", ob.get("synthesis_window") or ""]
+                meta = ob.get("meta") or {}
+                filt = meta.get("filters") or {}
+                for v in filt.values():
+                    if isinstance(v, str):
+                        text_parts.append(v)
+                joined = " ".join(text_parts)
+                joined_lower = joined.lower()
+                total_cells += 1
+                for dom, kws in DOMAIN_KW.items():
+                    score = 0.0
+                    for kw, weight in kws:
+                        if not kw:
+                            continue
+                        if kw in joined or kw.lower() in joined_lower:
+                            score += float(weight)
+                    if score > 0.0:
+                        scores[dom] += score
+                        hits[dom] += 1
+    except FileNotFoundError:
+        pass
+
+    def _score_key(dom: str) -> Tuple[float, int]:
+        return scores.get(dom, 0.0), hits.get(dom, 0)
+
+    best_dom = "invoice_jp_v2"
+    if scores:
+        best_dom = max(scores.keys(), key=lambda d: (_score_key(d)[0], _score_key(d)[1]))
+    resolved = _DOMAIN_ALIAS.get(best_dom, best_dom)
+    detail = {
+        "scores": scores,
+        "hits": hits,
+        "total_cells": total_cells,
+        "resolved": resolved,
+        "raw_best": best_dom
+    }
+    return resolved, detail
 
 # --------------- Augment (pHash + Filters + λ) ---------------
 def augment(jsonl_in: str, jsonl_out: str, lambda_shape: float=4.5, lambda_refheight: int=1000, lambda_alpha: float=0.7, org_dict_path: Optional[str]=None):
@@ -2239,11 +2456,27 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
     """Warm-up + fixed number of trials for robust p95."""
     import time, random
     dom_q = {
+        "invoice":        ["合計","金額","消費税","小計","請求","振込"],
         "invoice_jp_v2": ["合計","金額","消費税","小計","請求日","発行日"],
-        "delivery_jp":   ["納品","数量","品名","伝票","受領"],
-        "estimate_jp":   ["見積","有効期限","見積金額","小計"],
-        "receipt_jp":    ["領収","合計","決済","税込","発行日"],
-        "contract_jp_v2":["契約","甲","乙","条","締結日","署名"]
+        "invoice_en":    ["invoice total", "amount due", "tax", "balance", "payment"],
+        "invoice_fr":    ["facture", "montant", "tva", "total", "date"],
+        "purchase_order":["purchase order", "po", "vendor", "ship", "qty"],
+        "expense":       ["expense", "category", "total", "tax", "reimburse"],
+        "timesheet":     ["timesheet", "hours", "project", "rate", "total"],
+        "shipping_notice":["shipment", "tracking", "carrier", "delivery", "ship"],
+        "medical_receipt":["診療", "点数", "保険", "負担金", "薬剤"],
+        "delivery":      ["納品", "数量", "受領", "出荷", "品名"],
+        "delivery_jp":   ["納品", "数量", "品番", "伝票", "受領"],
+        "delivery_en":   ["delivery", "tracking", "carrier", "qty", "item"],
+        "estimate":      ["見積", "単価", "小計", "有効期限"],
+        "estimate_jp":   ["見積金額", "小計", "数量", "有効期限"],
+        "estimate_en":   ["estimate", "quote", "valid", "subtotal", "project"],
+        "receipt":       ["領収", "合計", "発行日", "住所", "税込"],
+        "receipt_jp":    ["領収書", "税込", "受領", "発行日", "現金"],
+        "receipt_en":    ["receipt", "paid", "total", "tax", "cash"],
+        "contract":      ["契約", "締結", "署名", "条", "甲"],
+        "contract_jp_v2":["契約", "甲", "乙", "条", "締結日", "署名"],
+        "contract_en":   ["contract", "signature", "party", "term", "agreement"]
     }.get(domain or "invoice_jp_v2", ["合計","金額","消費税"])
     # deterministic seed for reproducibility
     rnd = random.Random(0x5A17)
