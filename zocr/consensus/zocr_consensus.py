@@ -1572,6 +1572,83 @@ def _context_line_from_row(headers: list[str], row: list[str]) -> str:
     else:
         return " | ".join([x.strip() for x in row if x.strip()])
 
+def _conceptual_tags(text: str, headers: list[str], row: list[str]) -> List[str]:
+    tags: Set[str] = set()
+    t = (text or "").strip()
+    if not t:
+        return []
+    if any(ch.isalpha() for ch in t):
+        tags.add("alpha")
+    if any(ch.isdigit() for ch in t):
+        tags.add("digit")
+    if re.search(r"\d{4}[-/](0?[1-9]|1[0-2])", t):
+        tags.add("date")
+    if re.search(r"[+\-]?\d+[,.]\d+", t):
+        tags.add("decimal")
+    if re.search(r"[€$¥円]", t):
+        tags.add("currency_symbol")
+    if t.isupper() and len(t) > 1:
+        tags.add("upper")
+    if t.islower() and len(t) > 1:
+        tags.add("lower")
+    if t.replace(" ", "").isdigit():
+        tags.add("integer")
+    normalized = re.sub(r"[^0-9A-Za-z]+", " ", t).strip().lower()
+    if normalized:
+        tags.add(f"lex:{normalized[:20]}")
+    for h in headers:
+        if not h:
+            continue
+        h_norm = h.strip().lower()
+        if not h_norm:
+            continue
+        if any(tok in h_norm for tok in ("total", "amount", "balance")):
+            tags.add("header:total")
+        if "date" in h_norm:
+            tags.add("header:date")
+        if any(tok in h_norm for tok in ("tax", "vat")):
+            tags.add("header:tax")
+    if row:
+        joined = " ".join([c for c in row if c])
+        if len(joined) > 6 and joined == joined.upper():
+            tags.add("row:upper_span")
+        if re.search(r"\bsubtotal\b", joined.lower()):
+            tags.add("row:subtotal")
+    return sorted(tags)
+
+
+def _hypothesize_from_text(text: str, headers: list[str], concepts: List[str]) -> List[Dict[str, Any]]:
+    if not text:
+        text = ""
+    hyps: List[Dict[str, Any]] = []
+    base = text.strip()
+    if base:
+        hyps.append({"text": base, "strategy": "observed", "score": 0.6})
+    compact = re.sub(r"\s+", "", base)
+    if compact and compact != base:
+        hyps.append({"text": compact, "strategy": "compact", "score": 0.45})
+    digits = re.sub(r"[^0-9]", "", base)
+    if digits and digits != compact:
+        hyps.append({"text": digits, "strategy": "digits_only", "score": 0.4})
+    if base and base.upper() != base:
+        hyps.append({"text": base.upper(), "strategy": "upper", "score": 0.35})
+    if base and base.lower() != base:
+        hyps.append({"text": base.lower(), "strategy": "lower", "score": 0.35})
+    if "header:date" in concepts and digits:
+        y, rest = digits[:4], digits[4:]
+        if len(rest) >= 4:
+            hyps.append({"text": f"{y}-{rest[:2]}-{rest[2:4]}", "strategy": "date_template", "score": 0.5})
+    if "decimal" in concepts and digits:
+        if len(digits) > 2:
+            hyps.append({"text": f"{digits[:-2]}.{digits[-2:]}", "strategy": "decimal_guess", "score": 0.55})
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for hyp in hyps:
+        key = hyp.get("text") or ""
+        if key not in dedup or dedup[key].get("score", 0) < hyp.get("score", 0):
+            dedup[key] = hyp
+    return sorted(dedup.values(), key=lambda h: -float(h.get("score", 0.0)))[:6]
+
+
 def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_path: str,
                           ocr_engine: str = "toy", contextual: bool = True,
                           ocr_min_conf: float = 0.58) -> int:
@@ -1579,6 +1656,7 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
         doc = json.load(f)
     im = Image.open(source_image_path).convert("RGB")
     count = 0
+    learning_signals: List[Dict[str, Any]] = []
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
         for p in doc["pages"]:
             pidx = p["index"]
@@ -1688,6 +1766,10 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                         note = fallback_notes.get((r, c))
                         if note:
                             filters["linked"] = note
+                        concepts = _conceptual_tags(txt, headers, row_texts)
+                        hypotheses: List[Dict[str, Any]] = []
+                        if low_conf:
+                            hypotheses = _hypothesize_from_text(txt, headers, concepts)
                         rec = {
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
@@ -1705,10 +1787,52 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                                 "filters": filters
                             }
                         }
+                        if concepts:
+                            rec["meta"]["concepts"] = concepts
+                        if hypotheses:
+                            rec["meta"]["hypotheses"] = hypotheses
+                            rec["meta"]["needs_review"] = True
+                            learning_signals.append({
+                                "trace_id": trace_id,
+                                "page": pidx,
+                                "table_index": ti,
+                                "row": r,
+                                "col": c,
+                                "observed_text": txt,
+                                "confidence": conf,
+                                "hypotheses": hypotheses,
+                                "concepts": concepts,
+                                "intent": "reanalyze_cell"
+                            })
                         if note:
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         count += 1
+    signals_path = out_jsonl_path + ".signals.json"
+    learn_path = out_jsonl_path + ".learning.jsonl"
+    summary_payload = {
+        "total_records": count,
+        "learning_samples": len(learning_signals),
+        "learning_jsonl": learn_path if learning_signals else None,
+        "low_conf_ratio": (len(learning_signals) / float(max(1, count)))
+    }
+    try:
+        with open(signals_path, "w", encoding="utf-8") as fw_sig:
+            json.dump(summary_payload, fw_sig, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    if learning_signals:
+        try:
+            with open(learn_path, "w", encoding="utf-8") as fw_learn:
+                for sig in learning_signals:
+                    fw_learn.write(json.dumps(sig, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    elif os.path.exists(learn_path):
+        try:
+            os.remove(learn_path)
+        except Exception:
+            pass
     return count
 
 # ---------- Minimal local hybrid search ----------
