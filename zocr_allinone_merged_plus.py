@@ -1025,7 +1025,7 @@ def main():
     print("Wrote:", os.path.join(args.out,"metrics_aggregate.csv"))
 
 # ==================== (NEW) Toy OCR & Export / Local Search ====================
-import re, pickle, hashlib
+import re, pickle, hashlib, math
 
 _ASCII_SET = (
     "0123456789"
@@ -1039,6 +1039,7 @@ def _render_glyphs(font=None, size=16):
     # PIL's default bitmap font via ImageFont.load_default() matches our demo
     f = ImageFont.load_default() if font is None else font
     atlas = {}
+    feats = {}
     for ch in _ASCII_SET:
         # Render on tight canvas
         img = Image.new("L", (size*2, size*2), 0)
@@ -1048,9 +1049,21 @@ def _render_glyphs(font=None, size=16):
         bbox = img.getbbox() or (0,0,1,1)
         crop = img.crop(bbox)
         atlas[ch] = crop
-    return atlas
+        arr = np.asarray(crop, dtype=np.float32) / 255.0
+        if arr.size == 0:
+            aspect = 1.0
+            density = 0.0
+            symmetry = 0.0
+        else:
+            h, w = arr.shape
+            aspect = float(w) / float(h or 1)
+            density = float(arr.mean())
+            flipped = np.flip(arr, axis=1)
+            symmetry = 1.0 - float(np.mean(np.abs(arr - flipped)))
+        feats[ch] = {"aspect": aspect, "density": density, "symmetry": symmetry}
+    return atlas, feats
 
-_GLYPH_ATLAS = _render_glyphs()
+_GLYPH_ATLAS, _GLYPH_FEATS = _render_glyphs()
 
 _TOTAL_LABEL_HINTS = [
     "total", "grandtotal", "amountdue", "balancedue", "totaldue", "subtotal",
@@ -1089,25 +1102,60 @@ def _resize_keep_ar(im, w, h):
     out.paste(imr, ((w-tw)//2,(h-th)//2))
     return out
 
+def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
+    if dx == 0 and dy == 0:
+        return arr
+    out = np.roll(arr, shift=(dy, dx), axis=(0, 1))
+    if dy > 0:
+        out[:dy, :] = 0
+    elif dy < 0:
+        out[dy:, :] = 0
+    if dx > 0:
+        out[:, :dx] = 0
+    elif dx < 0:
+        out[:, dx:] = 0
+    return out
+
 def _match_glyph(cell_bin, atlas):
-    # try best correlation over atlas
+    # try best correlation over atlas with light shift tolerance and feature penalties
     cw, ch = cell_bin.size
+    import numpy as _np
+    cell_arr = _np.asarray(cell_bin, dtype=_np.float32)
+    if cell_arr.size == 0:
+        return "", 0.0
+    cell_norm = (cell_arr - cell_arr.mean()) / (cell_arr.std() + 1e-6)
+    cell_density = float((cell_arr > 0).mean())
+    cell_aspect = float(cw) / float(ch or 1)
     best_ch, best_score = "", -1.0
     for ch_key, tpl in atlas.items():
-        tw, th = tpl.size
         t = _resize_keep_ar(tpl, cw, ch)
-        # normalized correlation
-        import numpy as _np
-        a = _np.asarray(cell_bin, dtype=_np.float32)
         b = _np.asarray(t, dtype=_np.float32)
-        a = (a - a.mean())/ (a.std()+1e-6)
-        b = (b - b.mean())/ (b.std()+1e-6)
-        score = float((a*b).mean())
+        if b.size == 0:
+            continue
+        b_norm = (b - b.mean()) / (b.std() + 1e-6)
+        score = -1.0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                shifted = _shift_normed(b_norm, dx, dy)
+                cand = float((cell_norm * shifted).mean())
+                if cand > score:
+                    score = cand
+        feats = _GLYPH_FEATS.get(ch_key, {})
+        glyph_aspect = feats.get("aspect", 1.0) or 1.0
+        glyph_density = feats.get("density", 0.5)
+        glyph_sym = feats.get("symmetry", 0.0)
+        aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
+        density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
+        if glyph_sym > 0.5:
+            sym_cell = float(1.0 - _np.mean(_np.abs(cell_arr - _np.flip(cell_arr, axis=1))) / 255.0)
+            symmetry_penalty = 0.8 + 0.2 * max(0.0, sym_cell)
+        else:
+            symmetry_penalty = 1.0
+        score *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty
         if score > best_score:
             best_score = score; best_ch = ch_key
-    # map low score to '?'
-    conf = (best_score+1)/2  # [-1,1] -> [0,1]
-    return (best_ch if conf>=0.52 else "?"), float(conf)
+    conf = (best_score + 1.0) / 2.0
+    return (best_ch if conf >= 0.52 else "?"), float(conf)
 
 def _otsu_threshold_toy(arr):
     import numpy as _np
@@ -1141,23 +1189,59 @@ def _text_from_binary(bw):
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
         return "", 0.0
-    cc.sort(key=lambda b: b[0])
+    refined: List[Tuple[int,int,int,int,float]] = []
+    for (x1, y1, x2, y2, area) in cc:
+        sub = bw[y1:y2, x1:x2]
+        if sub.size == 0:
+            continue
+        if (x2 - x1) > max(2, int(1.8 * (y2 - y1))):
+            col_density = (sub > 0).sum(axis=0)
+            gap_thr = max(1, int(0.12 * sub.shape[0]))
+            mask = col_density <= gap_thr
+            segments = []
+            idx = 0
+            L = mask.shape[0]
+            while idx < L:
+                while idx < L and mask[idx]:
+                    idx += 1
+                if idx >= L:
+                    break
+                j = idx
+                while j < L and not mask[j]:
+                    j += 1
+                if j - idx >= max(2, int(0.4 * (y2 - y1))):
+                    segments.append((x1 + idx, y1, x1 + j, y2))
+                idx = j
+            if segments:
+                refined.extend([(sx1, sy1, sx2, sy2, (sx2 - sx1) * (sy2 - sy1)) for (sx1, sy1, sx2, sy2) in segments])
+                continue
+        refined.append((x1, y1, x2, y2, area))
+    if not refined:
+        refined = cc
+    refined.sort(key=lambda b: b[0])
     atlas = _GLYPH_ATLAS
     text = []
     scores = []
-    for (x1, y1, x2, y2, _) in cc:
+    for (x1, y1, x2, y2, _) in refined:
         patch = Image.fromarray(bw[y1:y2, x1:x2])
         ch, sc = _match_glyph(patch, atlas)
         text.append(ch)
         scores.append(sc)
     if not text:
         return "", 0.0
-    return "".join(text), float(sum(scores)/len(scores))
+    raw = np.asarray(scores, dtype=np.float64)
+    base = (raw + 1.0) * 0.5
+    mean = base.mean() if base.size else 0.0
+    spread = base.std() if base.size else 0.0
+    adj = (mean - 0.55) / (0.12 + spread * 0.5)
+    conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
+    return "".join(text), float(conf)
 
 def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[str, float]:
     """Very small OCR to work with the demo font. Returns (text, confidence)."""
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
+    g = g.filter(ImageFilter.MedianFilter(3))
     arr = _np.asarray(g, dtype=_np.uint8)
     if arr.size:
         arr_f = arr.astype(_np.float32)
@@ -1171,25 +1255,37 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> tuple[st
         if mask is not None and mask.any():
             edge_vals = arr[mask]
             bright_ratio = float(_np.mean(edge_vals > arr.mean())) if edge_vals.size else 0.0
-            if bright_ratio > 0.65:
+            if bright_ratio > 0.6:
                 arr = 255 - arr
                 g = Image.fromarray(arr, mode="L")
     thr_med = int(_np.clip(_np.median(arr), 48, 208))
-    bw = (arr < thr_med).astype(_np.uint8) * 255
-    text, conf = _text_from_binary(bw)
-    if text:
-        return text, conf
-    thr_otsu = _otsu_threshold_toy(arr)
-    bw2 = (arr < thr_otsu).astype(_np.uint8) * 255
-    text, conf = _text_from_binary(bw2)
-    if text:
-        return text, conf
-    bw3 = (arr > thr_otsu).astype(_np.uint8) * 255
-    text, conf = _text_from_binary(bw3)
-    if text:
-        return text, conf
+    candidates: List[np.ndarray] = []
+    bw_med = (arr < thr_med).astype(_np.uint8) * 255
+    candidates.append(bw_med)
     try:
-        expanded = Image.fromarray(bw).filter(ImageFilter.MaxFilter(3))
+        blur = _np.asarray(Image.fromarray(arr).filter(ImageFilter.BoxBlur(max(1, bin_k//2))), dtype=_np.float32)
+        adapt_dark = (arr + 8 < blur).astype(_np.uint8) * 255
+        adapt_light = (arr - 8 > blur).astype(_np.uint8) * 255
+        candidates.append(adapt_dark)
+        candidates.append(adapt_light)
+    except Exception:
+        pass
+    thr_otsu = _otsu_threshold_toy(arr)
+    bw_otsu = (arr < thr_otsu).astype(_np.uint8) * 255
+    bw_inv = (arr > thr_otsu).astype(_np.uint8) * 255
+    candidates.append(bw_otsu)
+    candidates.append(bw_inv)
+    best_text, best_conf = "", 0.0
+    for bw in candidates:
+        if bw is None or bw.size == 0:
+            continue
+        text, conf = _text_from_binary(bw)
+        if text and conf > best_conf:
+            best_text, best_conf = text, conf
+    if best_text:
+        return best_text, best_conf
+    try:
+        expanded = Image.fromarray(bw_med).filter(ImageFilter.MaxFilter(3))
         bw4 = _np.asarray(expanded, dtype=_np.uint8)
         text, conf = _text_from_binary(bw4)
         if text:
@@ -3764,7 +3860,7 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil
 from typing import Any, Dict, List, Optional, Tuple
 from html import escape
 
@@ -3816,6 +3912,54 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+def _collect_dependency_diagnostics() -> Dict[str, Any]:
+    diag: Dict[str, Any] = {}
+
+    poppler_path = shutil.which("pdftoppm")
+    diag["poppler_pdftoppm"] = {
+        "status": "available" if poppler_path else "missing",
+        "path": poppler_path,
+        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+    }
+
+    numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    diag["numba"] = {
+        "status": "enabled" if numba_enabled else "python-fallback",
+        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+    }
+
+    libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
+    diag["c_extensions"] = {
+        "status": "loaded" if libc_path else "python-fallback",
+        "path": libc_path,
+        "detail": "Custom SIMD/Thomas/rle helpers" if libc_path else "Using pure Python/NumPy helpers",
+    }
+
+    numpy_version = None
+    if _np is not None:
+        try:
+            numpy_version = getattr(_np, "__version__", None)
+        except Exception:
+            numpy_version = None
+    diag["numpy"] = {
+        "status": "available" if _np is not None else "missing",
+        "version": numpy_version,
+    }
+
+    try:
+        import PIL  # type: ignore
+
+        pillow_version = getattr(PIL, "__version__", None)
+    except Exception:
+        pillow_version = None
+    diag["pillow"] = {
+        "status": "available" if pillow_version else "unknown",
+        "version": pillow_version,
+    }
+
+    return diag
 
 
 def _is_auto_domain(value: Optional[str]) -> bool:
@@ -4173,6 +4317,14 @@ def _generate_report(
         "versions",
     ]) if meta else "<p class=\"muted\">(no snapshot metadata — run with --snapshot)</p>"
 
+    dep_table = ""
+    deps = summary.get("dependencies") if isinstance(summary, dict) else None
+    if isinstance(deps, dict) and deps:
+        dep_table = _render_table(
+            deps,
+            "依存診断 / Dependency Check / Diagnostic",
+        )
+
     core_table = _render_table(
         {
             "Output": summary.get("contextual_jsonl"),
@@ -4276,6 +4428,7 @@ def _generate_report(
   <section>
     <h2>環境 / Environment / Environnement</h2>
     {meta_table}
+    {dep_table}
     {pip_html}
   </section>
   <footer>
@@ -4685,6 +4838,7 @@ def _patched_run_full_pipeline(
             "fail": fail_count,
             "total_elapsed_ms": total_elapsed,
         }
+    summary["dependencies"] = _collect_dependency_diagnostics()
     summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
@@ -4702,7 +4856,7 @@ run_full_pipeline = _patched_run_full_pipeline
 # ---------------- CLI ----------------
 def main():
     argv = sys.argv[1:]
-    if argv and argv[0] in {"history", "summary", "plugins", "report"}:
+    if argv and argv[0] in {"history", "summary", "plugins", "report", "diagnose"}:
         cmd = argv[0]
         rest = argv[1:]
         if cmd == "history":
@@ -4758,6 +4912,24 @@ def main():
                     webbrowser.open(f"file://{os.path.abspath(path)}")
                 except Exception as e:
                     print("Browser open failed:", e)
+            return
+        if cmd == "diagnose":
+            dp = argparse.ArgumentParser("ZOCR dependency diagnostics")
+            dp.add_argument("--json", action="store_true", help="emit structured JSON instead of a table")
+            dargs = dp.parse_args(rest)
+            diag = _collect_dependency_diagnostics()
+            if dargs.json:
+                print(json.dumps(_json_ready(diag), ensure_ascii=False, indent=2))
+            else:
+                print("Dependency check:")
+                for key in sorted(diag.keys()):
+                    info = diag[key]
+                    status = info.get("status") if isinstance(info, dict) else None
+                    print(f" - {key}: {status or info}")
+                    if isinstance(info, dict):
+                        for sub_key in ("path", "version", "detail", "hint"):
+                            if info.get(sub_key):
+                                print(f"     {sub_key}: {info[sub_key]}")
             return
 
     if argv and argv[0] == "run":

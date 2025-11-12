@@ -12,7 +12,7 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil
 from typing import Any, Dict, List, Optional, Tuple
 from html import escape
 
@@ -64,6 +64,55 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+def _collect_dependency_diagnostics() -> Dict[str, Any]:
+    """Summarise optional dependencies so operators can self-check the environment."""
+    diag: Dict[str, Any] = {}
+
+    poppler_path = shutil.which("pdftoppm")
+    diag["poppler_pdftoppm"] = {
+        "status": "available" if poppler_path else "missing",
+        "path": poppler_path,
+        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+    }
+
+    numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    diag["numba"] = {
+        "status": "enabled" if numba_enabled else "python-fallback",
+        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+    }
+
+    libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
+    diag["c_extensions"] = {
+        "status": "loaded" if libc_path else "python-fallback",
+        "path": libc_path,
+        "detail": "Custom SIMD/Thomas/rle helpers" if libc_path else "Using pure Python/NumPy helpers",
+    }
+
+    numpy_version = None
+    if _np is not None:
+        try:
+            numpy_version = getattr(_np, "__version__", None)
+        except Exception:
+            numpy_version = None
+    diag["numpy"] = {
+        "status": "available" if _np is not None else "missing",
+        "version": numpy_version,
+    }
+
+    try:
+        import PIL  # type: ignore
+
+        pillow_version = getattr(PIL, "__version__", None)
+    except Exception:
+        pillow_version = None
+    diag["pillow"] = {
+        "status": "available" if pillow_version else "unknown",
+        "version": pillow_version,
+    }
+
+    return diag
 
 
 def _is_auto_domain(value: Optional[str]) -> bool:
@@ -421,6 +470,14 @@ def _generate_report(
         "versions",
     ]) if meta else "<p class=\"muted\">(no snapshot metadata — run with --snapshot)</p>"
 
+    dep_table = ""
+    deps = summary.get("dependencies") if isinstance(summary, dict) else None
+    if isinstance(deps, dict) and deps:
+        dep_table = _render_table(
+            deps,
+            "依存診断 / Dependency Check / Diagnostic",
+        )
+
     core_table = _render_table(
         {
             "Output": summary.get("contextual_jsonl"),
@@ -524,6 +581,7 @@ def _generate_report(
   <section>
     <h2>環境 / Environment / Environnement</h2>
     {meta_table}
+    {dep_table}
     {pip_html}
   </section>
   <footer>
@@ -933,6 +991,7 @@ def _patched_run_full_pipeline(
             "fail": fail_count,
             "total_elapsed_ms": total_elapsed,
         }
+    summary["dependencies"] = _collect_dependency_diagnostics()
     summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
@@ -950,7 +1009,7 @@ run_full_pipeline = _patched_run_full_pipeline
 # ---------------- CLI ----------------
 def main():
     argv = sys.argv[1:]
-    if argv and argv[0] in {"history", "summary", "plugins", "report"}:
+    if argv and argv[0] in {"history", "summary", "plugins", "report", "diagnose"}:
         cmd = argv[0]
         rest = argv[1:]
         if cmd == "history":
@@ -1006,6 +1065,24 @@ def main():
                     webbrowser.open(f"file://{os.path.abspath(path)}")
                 except Exception as e:
                     print("Browser open failed:", e)
+            return
+        if cmd == "diagnose":
+            dp = argparse.ArgumentParser("ZOCR dependency diagnostics")
+            dp.add_argument("--json", action="store_true", help="emit structured JSON instead of a table")
+            dargs = dp.parse_args(rest)
+            diag = _collect_dependency_diagnostics()
+            if dargs.json:
+                print(json.dumps(_json_ready(diag), ensure_ascii=False, indent=2))
+            else:
+                print("Dependency check:")
+                for key in sorted(diag.keys()):
+                    info = diag[key]
+                    status = info.get("status") if isinstance(info, dict) else None
+                    print(f" - {key}: {status or info}")
+                    if isinstance(info, dict):
+                        for sub_key in ("path", "version", "detail", "hint"):
+                            if info.get(sub_key):
+                                print(f"     {sub_key}: {info[sub_key]}")
             return
 
     if argv and argv[0] == "run":

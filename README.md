@@ -56,6 +56,7 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `summary --outdir out_invoice --keys sql_csv rag_manifest` — 生成物を JSON 出力 / print artifacts / affiche les artefacts。
 - `plugins [--stage post_rag]` — 登録済みプラグインを列挙 / list registered hooks / lister les hooks enregistrés。
 - `report --outdir out_invoice --open` — 三言語 HTML ダッシュボード生成 / build trilingual HTML dashboard / générer un tableau de bord HTML trilingue。
+- `diagnose [--json]` — 依存関係の自己診断（Poppler/Numba/C拡張など）/ dependency self-check for Poppler/Numba/C helpers / autodiagnostic des dépendances (Poppler/Numba/extensions C).
 
 ## 仕組み / Mechanics / Fonctionnement
 1. **OCR & Consensus** — `zocr.consensus.zocr_consensus` がレイアウト解析とセル信頼度計算を実行。
@@ -87,7 +88,7 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
 - `sql/` — `sql_export` で生成される CSV とスキーマ（`trace` 列で doc/page/table/row/col を Excel から参照可能）。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
-- `pipeline_summary.json` — すべての成果物をまとめた要約（`rag_*`, `sql_*`, `views`, `report_path` など）。
+- `pipeline_summary.json` — すべての成果物と依存診断をまとめた要約（`rag_*`, `sql_*`, `views`, `dependencies`, `report_path` など）。
 - `rag_trace_schema`, `rag_fact_tag_example` — サマリー内で RAG トレーサの仕様と `<fact ...>` タグ例を公開。
 - `monitor.csv` — UTF-8 (BOM 付き) で出力し、Excel/Numbers でも文字化けなく開けます。
 - `pipeline_meta.json` — `--snapshot` 有効時の環境情報。
