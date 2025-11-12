@@ -13,5 +13,12 @@ Déposez vos PDF/PNG dans `samples/demo_inputs/` pour remplacer la démo synthé
 - 賃貸借契約 / Rental agreements → `samples/rental_agreement/`
 - ローン明細 / Loan statements → `samples/loan_statement/`
 - 旅行行程 / Travel itineraries → `samples/travel_itinerary/`
+- 銀行明細 / Bank statements → `samples/bank_statement/`
+- 公共料金 / Utility bills → `samples/utility_bill/`
+- 保険金請求 / Insurance claims → `samples/insurance_claim/`
+- 税務申告 / Tax forms → `samples/tax_form/`
+- 給与明細 / Payslips → `samples/payslip/`
+- 出荷案内 / Shipping notices → `samples/shipping_notice/`
+- 経費精算 / Expense reports → `samples/expense_report/`
 
 各フォルダの README に、推奨されるフィールドやドメイン指定（`--domain rental_agreement` など）を記載しています。

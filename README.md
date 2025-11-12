@@ -66,6 +66,10 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 
 各段階は `_safe_step` でガードされ、成功・失敗・経過時間を `pipeline_history.jsonl` に追記します。
 
+- **[JA]** Export 段階では合議フェーズで得た `row_bands` を再利用し、行分割の精度を維持したままセル OCR を行います。
+- **[EN]** During export we reuse the consensus `row_bands` so OCR crops stay aligned with the reconstructed rows.
+- **[FR]** Pendant l'export, les `row_bands` issus du consensus sont réutilisés afin d'aligner l'OCR sur les lignes reconstruites.
+
 ## 自動ドメイン検出 / Automatic Domain Detection / Détection automatique du domaine
 - **[JA]** ファイル名（`samples/invoice/...` など）からトークンを抽出し、`DOMAIN_KW` / `_DOMAIN_ALIAS` の別名と突き合わせて初期候補を生成します。OCR 後は JSONL 内テキストとフィルターを走査し、キーワード一致度とヒット率から信頼度を算出します。`pipeline_summary.json` の `domain_autodetect` に推論経路・信頼度・採用ソースを記録します。
 - **[EN]** The orchestrator mines folder/file tokens, maps them through `DOMAIN_KW` and `_DOMAIN_ALIAS`, then refines the guess by scanning the exported JSONL. Confidence scores determine whether the auto-picked domain should override prior hints; the full trace lives in `pipeline_summary.json` under `domain_autodetect`.
@@ -89,7 +93,7 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 
 ## 対応ドメイン / Supported Domains / Domaines pris en charge
 - インボイス (JP/EN/FR)、見積書、納品書、領収書、契約書、購入注文書、経費精算、タイムシート、出荷案内、銀行明細、公共料金請求書。
-- 医療領収書に加え **医療請求 (medical_bill)**、**通関申告 (customs_declaration)**、**助成金申請 (grant_application)**、**搭乗券 (boarding_pass)** を新たに追加。既存の **賃貸借契約**、**ローン明細**、**旅行行程** も強化済みです。
+- 医療領収書に加え **医療請求 (medical_bill)**、**通関申告 (customs_declaration)**、**助成金申請 (grant_application)**、**搭乗券 (boarding_pass)**、**銀行明細 (bank_statement)**、**公共料金 (utility_bill)**、**保険金請求 (insurance_claim)**、**税務申告 (tax_form)**、**給与明細 (payslip)**、**出荷案内 (shipping_notice)**、**経費精算 (expense_report)** を新たに追加。既存の **賃貸借契約**、**ローン明細**、**旅行行程** も強化済みです。
 - 各ドメインは `DOMAIN_KW`/`DOMAIN_DEFAULTS`/`DOMAIN_SUGGESTED_QUERIES` を共有し、RAG 推奨クエリやウォームアップ検索を自動設定します。
 
 ## RAG 連携 / RAG Integration / Intégration RAG
@@ -105,7 +109,7 @@ python -m zocr.orchestrator.zocr_pipeline --outdir out_invoice --resume --seed 1
 - `samples/demo_inputs/` にファイルを配置すると、`--input demo` がそれらを取り込みます。
 - フォルダは空でも構いません。クローン直後は同梱の合成サンプルが利用されます。
 - `samples/README.md` に多言語で手順をまとめています。
-- `samples/invoice/`, `samples/purchase_order/`, `samples/medical_bill/`, `samples/customs_declaration/`, `samples/grant_application/`, `samples/boarding_pass/` を新設。既存の `rental_agreement/`, `loan_statement/`, `travel_itinerary/` とあわせて README がドメイン指定や期待フィールドを案内します。
+- `samples/invoice/`, `samples/purchase_order/`, `samples/medical_bill/`, `samples/customs_declaration/`, `samples/grant_application/`, `samples/boarding_pass/`, `samples/bank_statement/`, `samples/utility_bill/`, `samples/insurance_claim/`, `samples/tax_form/`, `samples/payslip/`, `samples/shipping_notice/`, `samples/expense_report/` など、それぞれの README が推奨ドメインや注目フィールドを案内します。
 
 ## 依存関係 / Dependencies / Dépendances
 - Python 3.9+

@@ -712,11 +712,16 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
             crop = imc.crop((xl,yt,xr,yb))
             name = f"cell_r{r0}_c{c0}_s{st}"
             views_cells[name] = _make_views(crop, vdir, name)
+    row_bands_rel = [
+        (int(max(0, min(H, yt))), int(max(0, min(H, yb))))
+        for (yt, yb) in row_bands
+    ]
     dbg = {
         "rows":R,"cols":C,"row_counts": row_counts,
         "col_bounds":col_bounds,"smear_wx": wx, "smear_wy": wy,
         "med_h": med_h, "col_jitter": col_jitter,
         "baselines_segs": baselines,
+        "row_bands_rel": row_bands_rel,
         "lambda": {"lambda_base": lam_base, "lambda_eff": lam_eff,
                    "k_pred0": K_pred0, "k_mode": K_mode, "k_pred": len(centers)},
         "iou_prob_events": iou_events[:200],
@@ -1105,15 +1110,32 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
                 C = max(1, len(col_bounds)-1)
-                # rows: approximate by equal split if we can't recover
-                baselines = dbg.get("baselines_segs", [])
-                R = max(2, len(baselines))  # assume header+rows
-                # split bbox evenly
+                baselines = list(dbg.get("baselines_segs", []) or [])
+                # rows: prefer reconstruction bands if available
                 row_bands = []
-                for r in range(R):
-                    yt = int(y1 + (y2-y1)*r/R)
-                    yb = int(y1 + (y2-y1)*(r+1)/R)
-                    row_bands.append((yt, yb))
+                rel_bands = dbg.get("row_bands_rel") or []
+                if isinstance(rel_bands, list) and rel_bands:
+                    H = max(1, y2 - y1)
+                    for rt, rb in rel_bands:
+                        try:
+                            fr = float(rt)
+                            to = float(rb)
+                        except (TypeError, ValueError):
+                            continue
+                        fr = max(0.0, min(float(H), fr))
+                        to = max(fr, min(float(H), to))
+                        row_bands.append((int(y1 + fr), int(y1 + to)))
+                if not row_bands:
+                    R = max(2, len(baselines)) or 2
+                    for r in range(R):
+                        yt = int(y1 + (y2-y1)*r/R)
+                        yb = int(y1 + (y2-y1)*(r+1)/R)
+                        row_bands.append((yt, yb))
+                R = len(row_bands)
+                if len(baselines) < R:
+                    baselines.extend([[] for _ in range(R - len(baselines))])
+                elif len(baselines) > R:
+                    baselines = baselines[:R]
                 # OCR pass across grid
                 grid_text = [["" for _ in range(C)] for __ in range(R)]
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
@@ -2862,7 +2884,6 @@ def main():
 
 if __name__=="__main__":
     main()
-
 
 # ===================== Robust p95 + Column Smoothing Hook =====================
 
