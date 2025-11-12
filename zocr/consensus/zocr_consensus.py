@@ -53,6 +53,50 @@ if __name__.startswith("zocr."):
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
+
+def _toy_memory_series_paths(path: str) -> Tuple[str, str]:
+    base_dir = os.environ.get("ZOCR_TOY_MEMORY_SERIES")
+    if base_dir:
+        base_dir = os.path.abspath(base_dir)
+    else:
+        root = os.path.dirname(path) if path else ""
+        base_dir = os.path.join(root or ".", "toy_memory_versioned")
+    return base_dir, os.path.join(base_dir, "summary.json")
+
+
+def _load_toy_memory_series_payload(path: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    version_dir, summary_path = _toy_memory_series_paths(path)
+    info: Dict[str, Any] = {
+        "version_dir": version_dir,
+        "summary_path": summary_path,
+    }
+    if not os.path.exists(summary_path):
+        return None, info
+    try:
+        with open(summary_path, "r", encoding="utf-8") as fr:
+            summary_payload = json.load(fr)
+    except Exception as exc:
+        info["error"] = f"summary_load_failed: {type(exc).__name__}: {exc}"
+        return None, info
+    latest_rel = summary_payload.get("latest_path")
+    if not latest_rel:
+        info["summary"] = summary_payload
+        return None, info
+    epoch_path = latest_rel if os.path.isabs(latest_rel) else os.path.join(version_dir, latest_rel)
+    info["epoch_path"] = epoch_path
+    info["latest_epoch"] = summary_payload.get("latest_epoch")
+    info["summary"] = summary_payload
+    if not os.path.exists(epoch_path):
+        info["error"] = "epoch_missing"
+        return None, info
+    try:
+        with open(epoch_path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception as exc:
+        info["error"] = f"epoch_load_failed: {type(exc).__name__}: {exc}"
+        return None, info
+    return payload, info
+
 def clamp(x, lo, hi): return lo if x<lo else (hi if x>hi else x)
 
 # ----------------- Binarization -----------------
@@ -1405,6 +1449,80 @@ def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
     return payload
 
 
+def _write_toy_memory_series(path: str, payload: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    version_dir, summary_path = _toy_memory_series_paths(path)
+    try:
+        ensure_dir(version_dir)
+    except Exception as exc:
+        return {"error": f"series_dir_failed: {type(exc).__name__}: {exc}"}
+    summary_payload: Dict[str, Any] = {}
+    try:
+        if os.path.exists(summary_path):
+            with open(summary_path, "r", encoding="utf-8") as fr:
+                loaded = json.load(fr)
+                if isinstance(loaded, dict):
+                    summary_payload = loaded
+    except Exception as exc:
+        summary_payload = {"error": f"summary_parse_failed: {type(exc).__name__}: {exc}"}
+    latest_epoch = int(summary_payload.get("latest_epoch") or 0)
+    epoch = latest_epoch + 1
+    epoch_name = f"epoch_{epoch:06d}.json"
+    epoch_path = os.path.join(version_dir, epoch_name)
+    try:
+        with open(epoch_path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception as exc:
+        return {"error": f"epoch_write_failed: {type(exc).__name__}: {exc}"}
+    prev_snapshot = summary_payload.get("latest_snapshot") if isinstance(summary_payload, dict) else None
+    delta_prev = toy_memory_delta(prev_snapshot, snapshot)
+    recognition = toy_recognition_stats(reset=False)
+    timestamp = time.time()
+    entry = {
+        "epoch": epoch,
+        "path": epoch_name,
+        "written_at": timestamp,
+        "snapshot": snapshot,
+        "delta_prev": delta_prev,
+        "recognition": recognition,
+    }
+    history: List[Dict[str, Any]] = []
+    if isinstance(summary_payload, dict):
+        hist = summary_payload.get("history")
+        if isinstance(hist, list):
+            history.extend(hist)
+    history.append(entry)
+    history_limit = 48
+    if len(history) > history_limit:
+        history = history[-history_limit:]
+    summary_payload = {
+        "latest_epoch": epoch,
+        "latest_path": epoch_name,
+        "updated_at": timestamp,
+        "latest_snapshot": snapshot,
+        "history": history,
+    }
+    try:
+        with open(summary_path, "w", encoding="utf-8") as fw:
+            json.dump(summary_payload, fw, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return {
+            "epoch": epoch,
+            "path": epoch_path,
+            "delta_prev": delta_prev,
+            "recognition": recognition,
+            "error": f"summary_write_failed: {type(exc).__name__}: {exc}",
+        }
+    return {
+        "epoch": epoch,
+        "path": epoch_path,
+        "delta_prev": delta_prev,
+        "recognition": recognition,
+        "summary": summary_path,
+    }
+
+
 def save_toy_memory(path: str) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "path": path,
@@ -1423,6 +1541,9 @@ def save_toy_memory(path: str) -> Dict[str, Any]:
             info["bytes"] = os.path.getsize(path)
         except Exception:
             pass
+        series_meta = _write_toy_memory_series(path, payload, info["snapshot"])
+        if series_meta:
+            info["series"] = series_meta
     except Exception as exc:
         info["error"] = f"{type(exc).__name__}: {exc}"
     info["snapshot"] = toy_memory_snapshot()
@@ -1436,13 +1557,24 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
         "changed": False,
         "snapshot_before": toy_memory_snapshot(),
     }
-    if not path or not os.path.exists(path):
-        return info
-    try:
-        with open(path, "r", encoding="utf-8") as fr:
-            payload = json.load(fr)
-    except Exception as exc:
-        info["error"] = f"{type(exc).__name__}: {exc}"
+    payload: Optional[Dict[str, Any]] = None
+    source_path: Optional[str] = None
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fr:
+                payload = json.load(fr)
+            source_path = path
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}: {exc}"
+            payload = None
+    if payload is None and path:
+        series_payload, series_meta = _load_toy_memory_series_payload(path)
+        if series_meta:
+            info.setdefault("series", series_meta)
+        if series_payload is not None:
+            payload = series_payload
+            source_path = series_meta.get("epoch_path") if isinstance(series_meta, dict) else None
+    if payload is None:
         return info
     changed = False
     try:
@@ -1506,10 +1638,22 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
         info["changed"] = bool(changed)
         info["snapshot_after"] = toy_memory_snapshot()
         info["delta"] = toy_memory_delta(info.get("snapshot_before"), info.get("snapshot_after"))
+        if source_path:
+            info["source_path"] = source_path
+            if source_path != path:
+                try:
+                    series_info = info.setdefault("series", {})
+                    series_info["epoch_bytes"] = os.path.getsize(source_path)
+                except Exception:
+                    pass
         try:
             info["bytes"] = os.path.getsize(path)
         except Exception:
-            pass
+            if source_path and os.path.exists(source_path):
+                try:
+                    info["bytes"] = os.path.getsize(source_path)
+                except Exception:
+                    pass
         return info
     except Exception as exc:
         info["error"] = f"{type(exc).__name__}: {exc}"

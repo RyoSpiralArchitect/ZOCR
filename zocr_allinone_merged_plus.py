@@ -128,6 +128,51 @@ if __name__.startswith("zocr."):
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
+
+def _toy_memory_series_paths(path: str) -> Tuple[str, str]:
+    base_dir = os.environ.get("ZOCR_TOY_MEMORY_SERIES")
+    if base_dir:
+        base_dir = os.path.abspath(base_dir)
+    else:
+        root = os.path.dirname(path) if path else ""
+        base_dir = os.path.join(root or ".", "toy_memory_versioned")
+    return base_dir, os.path.join(base_dir, "summary.json")
+
+
+def _load_toy_memory_series_payload(path: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    version_dir, summary_path = _toy_memory_series_paths(path)
+    info: Dict[str, Any] = {
+        "version_dir": version_dir,
+        "summary_path": summary_path,
+    }
+    if not os.path.exists(summary_path):
+        return None, info
+    try:
+        with open(summary_path, "r", encoding="utf-8") as fr:
+            summary_payload = json.load(fr)
+    except Exception as exc:
+        info["error"] = f"summary_load_failed: {type(exc).__name__}: {exc}"
+        return None, info
+    latest_rel = summary_payload.get("latest_path")
+    if not latest_rel:
+        info["summary"] = summary_payload
+        return None, info
+    epoch_path = latest_rel if os.path.isabs(latest_rel) else os.path.join(version_dir, latest_rel)
+    info["epoch_path"] = epoch_path
+    info["latest_epoch"] = summary_payload.get("latest_epoch")
+    info["summary"] = summary_payload
+    if not os.path.exists(epoch_path):
+        info["error"] = "epoch_missing"
+        return None, info
+    try:
+        with open(epoch_path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except Exception as exc:
+        info["error"] = f"epoch_load_failed: {type(exc).__name__}: {exc}"
+        return None, info
+    return payload, info
+
+
 def clamp(x, lo, hi): return lo if x<lo else (hi if x>hi else x)
 
 # ----------------- Binarization -----------------
@@ -1474,6 +1519,80 @@ def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
     return payload
 
 
+def _write_toy_memory_series(path: str, payload: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    version_dir, summary_path = _toy_memory_series_paths(path)
+    try:
+        ensure_dir(version_dir)
+    except Exception as exc:
+        return {"error": f"series_dir_failed: {type(exc).__name__}: {exc}"}
+    summary_payload: Dict[str, Any] = {}
+    try:
+        if os.path.exists(summary_path):
+            with open(summary_path, "r", encoding="utf-8") as fr:
+                loaded = json.load(fr)
+                if isinstance(loaded, dict):
+                    summary_payload = loaded
+    except Exception as exc:
+        summary_payload = {"error": f"summary_parse_failed: {type(exc).__name__}: {exc}"}
+    latest_epoch = int(summary_payload.get("latest_epoch") or 0)
+    epoch = latest_epoch + 1
+    epoch_name = f"epoch_{epoch:06d}.json"
+    epoch_path = os.path.join(version_dir, epoch_name)
+    try:
+        with open(epoch_path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception as exc:
+        return {"error": f"epoch_write_failed: {type(exc).__name__}: {exc}"}
+    prev_snapshot = summary_payload.get("latest_snapshot") if isinstance(summary_payload, dict) else None
+    delta_prev = toy_memory_delta(prev_snapshot, snapshot)
+    recognition = toy_recognition_stats(reset=False)
+    timestamp = time.time()
+    entry = {
+        "epoch": epoch,
+        "path": epoch_name,
+        "written_at": timestamp,
+        "snapshot": snapshot,
+        "delta_prev": delta_prev,
+        "recognition": recognition,
+    }
+    history: List[Dict[str, Any]] = []
+    if isinstance(summary_payload, dict):
+        hist = summary_payload.get("history")
+        if isinstance(hist, list):
+            history.extend(hist)
+    history.append(entry)
+    history_limit = 48
+    if len(history) > history_limit:
+        history = history[-history_limit:]
+    summary_payload = {
+        "latest_epoch": epoch,
+        "latest_path": epoch_name,
+        "updated_at": timestamp,
+        "latest_snapshot": snapshot,
+        "history": history,
+    }
+    try:
+        with open(summary_path, "w", encoding="utf-8") as fw:
+            json.dump(summary_payload, fw, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return {
+            "epoch": epoch,
+            "path": epoch_path,
+            "delta_prev": delta_prev,
+            "recognition": recognition,
+            "error": f"summary_write_failed: {type(exc).__name__}: {exc}",
+        }
+    return {
+        "epoch": epoch,
+        "path": epoch_path,
+        "delta_prev": delta_prev,
+        "recognition": recognition,
+        "summary": summary_path,
+    }
+
+
 def save_toy_memory(path: str) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "path": path,
@@ -1492,6 +1611,9 @@ def save_toy_memory(path: str) -> Dict[str, Any]:
             info["bytes"] = os.path.getsize(path)
         except Exception:
             pass
+        series_meta = _write_toy_memory_series(path, payload, info["snapshot"])
+        if series_meta:
+            info["series"] = series_meta
     except Exception as exc:
         info["error"] = f"{type(exc).__name__}: {exc}"
     info["snapshot"] = toy_memory_snapshot()
@@ -1505,13 +1627,24 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
         "changed": False,
         "snapshot_before": toy_memory_snapshot(),
     }
-    if not path or not os.path.exists(path):
-        return info
-    try:
-        with open(path, "r", encoding="utf-8") as fr:
-            payload = json.load(fr)
-    except Exception as exc:
-        info["error"] = f"{type(exc).__name__}: {exc}"
+    payload: Optional[Dict[str, Any]] = None
+    source_path: Optional[str] = None
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fr:
+                payload = json.load(fr)
+            source_path = path
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}: {exc}"
+            payload = None
+    if payload is None and path:
+        series_payload, series_meta = _load_toy_memory_series_payload(path)
+        if series_meta:
+            info.setdefault("series", series_meta)
+        if series_payload is not None:
+            payload = series_payload
+            source_path = series_meta.get("epoch_path") if isinstance(series_meta, dict) else None
+    if payload is None:
         return info
     changed = False
     try:
@@ -1575,10 +1708,22 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
         info["changed"] = bool(changed)
         info["snapshot_after"] = toy_memory_snapshot()
         info["delta"] = toy_memory_delta(info.get("snapshot_before"), info.get("snapshot_after"))
+        if source_path:
+            info["source_path"] = source_path
+            if source_path != path:
+                try:
+                    series_info = info.setdefault("series", {})
+                    series_info["epoch_bytes"] = os.path.getsize(source_path)
+                except Exception:
+                    pass
         try:
             info["bytes"] = os.path.getsize(path)
         except Exception:
-            pass
+            if source_path and os.path.exists(source_path):
+                try:
+                    info["bytes"] = os.path.getsize(source_path)
+                except Exception:
+                    pass
         return info
     except Exception as exc:
         info["error"] = f"{type(exc).__name__}: {exc}"
@@ -5814,7 +5959,7 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
 from typing import Any, Dict, List, Optional, Tuple
 from html import escape
 
@@ -6596,7 +6741,13 @@ def _profile_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Tu
     return diff
 
 
-def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+def _derive_intent(
+    monitor_row: Optional[Dict[str, Any]],
+    export_signals: Dict[str, Any],
+    profile: Dict[str, Any],
+    toy_memory_delta: Optional[Dict[str, Any]] = None,
+    recognition_stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     intent: Dict[str, Any] = {"action": "steady", "reason": "metrics within guardrails"}
     hit_mean = None
     p95 = None
@@ -6621,12 +6772,51 @@ def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[s
         )
     except Exception:
         high_surprisal_ratio = None
+    recog_low_conf_ratio = None
+    recog_high_surprisal_ratio = None
+    learned_variants = 0.0
+    runtime_replay = 0.0
+    if recognition_stats:
+        try:
+            cells = float(recognition_stats.get("cells") or 0.0)
+        except Exception:
+            cells = 0.0
+        if cells > 0:
+            try:
+                recog_low_conf_ratio = float(recognition_stats.get("low_conf_cells", 0.0)) / cells
+            except Exception:
+                recog_low_conf_ratio = None
+            try:
+                recog_high_surprisal_ratio = float(recognition_stats.get("high_surprisal_cells", 0.0)) / cells
+            except Exception:
+                recog_high_surprisal_ratio = None
+        try:
+            runtime_replay = float(recognition_stats.get("runtime_replay_improved", 0.0))
+        except Exception:
+            runtime_replay = 0.0
+    if toy_memory_delta:
+        try:
+            learned_variants = float(toy_memory_delta.get("glyph_variants", 0.0))
+        except Exception:
+            learned_variants = 0.0
     if hit_mean is None:
         intent = {"action": "recover", "reason": "monitor missing", "priority": "high"}
     elif hit_mean < 0.8:
         intent = {"action": "focus_headers", "reason": f"hit_mean={hit_mean:.3f} below 0.8", "priority": "high"}
     elif p95 is not None and p95 > 400.0:
         intent = {"action": "optimize_speed", "reason": f"p95_ms={p95:.1f} > 400", "priority": "medium"}
+    elif recog_high_surprisal_ratio is not None and recog_high_surprisal_ratio > 0.18:
+        intent = {
+            "action": "reanalyze_cells",
+            "reason": f"recognition_high_surprisal={recog_high_surprisal_ratio:.2f}",
+            "priority": "high",
+        }
+    elif recog_low_conf_ratio is not None and recog_low_conf_ratio > 0.28:
+        intent = {
+            "action": "reanalyze_cells",
+            "reason": f"recognition_low_conf={recog_low_conf_ratio:.2f}",
+            "priority": "medium",
+        }
     elif low_conf_ratio is not None and low_conf_ratio > 0.2:
         intent = {
             "action": "reanalyze_cells",
@@ -6639,6 +6829,15 @@ def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[s
             "reason": f"high_surprisal_ratio={high_surprisal_ratio:.2f}",
             "priority": "medium",
         }
+    elif learned_variants > 4.0 and (
+        (low_conf_ratio is not None and low_conf_ratio > 0.14)
+        or (recog_low_conf_ratio is not None and recog_low_conf_ratio > 0.18)
+    ):
+        intent = {
+            "action": "reanalyze_cells",
+            "reason": f"memory_growth={learned_variants:.0f} variants without confidence relief",
+            "priority": "medium",
+        }
     else:
         intent = {"action": "explore_footer", "reason": "metrics nominal", "priority": "low"}
     intent["signals"] = {
@@ -6646,6 +6845,10 @@ def _derive_intent(monitor_row: Optional[Dict[str, Any]], export_signals: Dict[s
         "p95_ms": p95,
         "low_conf_ratio": low_conf_ratio,
         "high_surprisal_ratio": high_surprisal_ratio,
+        "recognition_low_conf_ratio": recog_low_conf_ratio,
+        "recognition_high_surprisal_ratio": recog_high_surprisal_ratio,
+        "learned_variants": learned_variants,
+        "runtime_replay_improved": runtime_replay,
         "surprisal_threshold": export_signals.get("surprisal_threshold") if export_signals else None,
         "learning_samples": export_signals.get("learning_samples") if export_signals else None,
     }
@@ -6721,6 +6924,147 @@ def _apply_rag_feedback(manifest_path: Optional[str], profile: Dict[str, Any], p
             return {"applied": applied, "error": str(e)}
     return {"applied": applied}
 
+
+def _simulate_param_shift(
+    monitor_row: Optional[Dict[str, Any]],
+    export_signals: Dict[str, Any],
+    recognition_stats: Optional[Dict[str, Any]],
+    toy_memory_delta: Optional[Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    simulations: List[Dict[str, Any]] = []
+    low_conf_ratio = None
+    high_surprisal_ratio = None
+    if export_signals:
+        try:
+            low_conf_ratio = float(export_signals.get("low_conf_ratio"))
+        except Exception:
+            low_conf_ratio = None
+        try:
+            high_surprisal_ratio = float(export_signals.get("high_surprisal_ratio"))
+        except Exception:
+            high_surprisal_ratio = None
+    recog_low_conf = None
+    recog_high_surprisal = None
+    cells = None
+    if recognition_stats:
+        try:
+            cells = float(recognition_stats.get("cells") or 0.0)
+        except Exception:
+            cells = 0.0
+        if cells and cells > 0:
+            try:
+                recog_low_conf = float(recognition_stats.get("low_conf_cells", 0.0)) / cells
+            except Exception:
+                recog_low_conf = None
+            try:
+                recog_high_surprisal = float(recognition_stats.get("high_surprisal_cells", 0.0)) / cells
+            except Exception:
+                recog_high_surprisal = None
+    memory_growth = 0.0
+    runtime_improved = 0.0
+    if toy_memory_delta:
+        try:
+            memory_growth = float(toy_memory_delta.get("glyph_variants", 0.0))
+        except Exception:
+            memory_growth = 0.0
+        try:
+            runtime_improved = float(toy_memory_delta.get("runtime_replay_improved", 0.0))
+        except Exception:
+            runtime_improved = 0.0
+    averaged_low_conf = None
+    ratios = [r for r in (low_conf_ratio, recog_low_conf) if r is not None]
+    if ratios:
+        averaged_low_conf = sum(ratios) / float(len(ratios))
+    averaged_high_surprisal = None
+    ratios = [r for r in (high_surprisal_ratio, recog_high_surprisal) if r is not None]
+    if ratios:
+        averaged_high_surprisal = sum(ratios) / float(len(ratios))
+    base_conf = None
+    try:
+        base_conf = float(profile.get("ocr_min_conf", 0.58))
+    except Exception:
+        base_conf = 0.58
+    if base_conf is None or math.isnan(base_conf):
+        base_conf = 0.58
+    for offset in (-0.05, 0.05):
+        candidate = float(min(0.95, max(0.3, base_conf + offset)))
+        delta = candidate - base_conf
+        predicted_low_conf = None
+        if averaged_low_conf is not None:
+            learning_boost = min(0.2, max(0.0, memory_growth) * 0.01 + max(0.0, runtime_improved) * 0.005)
+            predicted_low_conf = averaged_low_conf + delta * 0.9
+            if delta < 0:
+                predicted_low_conf = max(0.0, predicted_low_conf - learning_boost)
+            else:
+                predicted_low_conf = min(1.0, predicted_low_conf + learning_boost * 0.5)
+        predicted_high_surprisal = None
+        if averaged_high_surprisal is not None:
+            predicted_high_surprisal = averaged_high_surprisal + delta * 0.6
+            if delta < 0:
+                predicted_high_surprisal = max(0.0, predicted_high_surprisal - 0.03)
+        confidence = 0.4 + min(0.5, max(0.0, memory_growth) * 0.02 + (runtime_improved * 0.01))
+        simulations.append(
+            {
+                "type": "profile_param",
+                "param": "ocr_min_conf",
+                "delta": round(delta, 4),
+                "candidate": round(candidate, 4),
+                "confidence": round(confidence, 3),
+                "predictions": {
+                    "low_conf_ratio": predicted_low_conf,
+                    "high_surprisal_ratio": predicted_high_surprisal,
+                },
+            }
+        )
+    base_lambda = None
+    try:
+        base_lambda = float(profile.get("lambda_shape", 4.5))
+    except Exception:
+        base_lambda = 4.5
+    if base_lambda is None or math.isnan(base_lambda):
+        base_lambda = 4.5
+    base_p95 = None
+    if monitor_row:
+        try:
+            base_p95 = float(monitor_row.get("p95_ms")) if monitor_row.get("p95_ms") is not None else None
+        except Exception:
+            base_p95 = None
+    for offset in (-0.4, 0.4):
+        candidate = float(min(8.0, max(2.0, base_lambda + offset)))
+        delta = candidate - base_lambda
+        predicted_p95 = None
+        if base_p95 is not None:
+            speed_factor = -delta * 18.0
+            predicted_p95 = max(120.0, base_p95 + speed_factor)
+        simulations.append(
+            {
+                "type": "profile_param",
+                "param": "lambda_shape",
+                "delta": round(delta, 4),
+                "candidate": round(candidate, 4),
+                "confidence": 0.5,
+                "predictions": {
+                    "p95_ms": predicted_p95,
+                },
+            }
+        )
+    averaged_low_conf = averaged_low_conf if averaged_low_conf is not None else low_conf_ratio
+    if averaged_low_conf is not None:
+        expected = max(0.0, averaged_low_conf - min(0.12, max(0.0, memory_growth) * 0.015))
+        simulations.append(
+            {
+                "type": "action",
+                "action": "reanalyze_cells",
+                "confidence": round(0.55 + min(0.4, max(0.0, memory_growth) * 0.03), 3),
+                "predictions": {
+                    "low_conf_ratio": expected,
+                    "runtime_replay_gain": runtime_improved + max(0.0, memory_growth) * 0.1,
+                },
+            }
+        )
+    return simulations
+
 def _patched_run_full_pipeline(
     inputs: List[str],
     outdir: str,
@@ -6795,6 +7139,9 @@ def _patched_run_full_pipeline(
     }
 
     toy_memory_run_baseline = toy_memory_after_load or toy_memory_snapshot()
+    toy_memory_after_run: Optional[Dict[str, Any]] = None
+    toy_memory_delta_run: Optional[Dict[str, Any]] = None
+    toy_recognition_stats_payload: Optional[Dict[str, Any]] = None
 
     domain_hints = _prepare_domain_hints(inputs)
     content_conf_threshold = float(os.environ.get("ZOCR_DOMAIN_CONF_THRESHOLD", "0.25"))
@@ -7036,10 +7383,32 @@ def _patched_run_full_pipeline(
     summary["learn"] = learn_row
     summary["insights"] = _derive_insights(summary)
 
+    toy_memory_after_run = toy_memory_snapshot()
+    toy_memory_delta_run = toy_memory_delta(toy_memory_run_baseline, toy_memory_after_run)
+    try:
+        toy_recognition_stats_payload = toy_recognition_stats(reset=False)
+    except Exception:
+        toy_recognition_stats_payload = None
+
     prof_after = _load_profile(outdir, prof.get("domain"))
     profile_diff = _profile_diff(profile_before_feedback, prof_after)
-    intent = _derive_intent(summary.get("monitor_row"), export_signals, prof_after)
+    intent = _derive_intent(
+        summary.get("monitor_row"),
+        export_signals,
+        prof_after,
+        toy_memory_delta_run,
+        toy_recognition_stats_payload,
+    )
     summary["intent"] = intent
+    simulations = _simulate_param_shift(
+        summary.get("monitor_row"),
+        export_signals,
+        toy_recognition_stats_payload,
+        toy_memory_delta_run,
+        prof_after,
+    )
+    if simulations:
+        summary["intent_simulations"] = _json_ready(simulations)
     intent_updates = _apply_intent_to_profile(intent, prof_after)
     combined_updates: Dict[str, Tuple[Any, Any]] = {}
     if profile_diff:
@@ -7169,15 +7538,20 @@ def _patched_run_full_pipeline(
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
 
-    toy_memory_after_run = toy_memory_snapshot()
-    toy_memory_delta_run = toy_memory_delta(toy_memory_run_baseline, toy_memory_after_run)
     summary.setdefault("toy_memory", {})
     summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
     summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
     summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
-    summary["toy_memory"]["recognition"] = _json_ready(
-        toy_recognition_stats(reset=True)
-    )
+    if toy_recognition_stats_payload is not None:
+        summary["toy_memory"]["recognition"] = _json_ready(toy_recognition_stats_payload)
+        try:
+            reset_toy_recognition_stats()
+        except Exception:
+            pass
+    else:
+        summary["toy_memory"]["recognition"] = _json_ready(
+            toy_recognition_stats(reset=True)
+        )
 
     toy_memory_saved = save_toy_memory(toy_memory_path)
     summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
