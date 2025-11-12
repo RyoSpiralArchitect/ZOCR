@@ -709,6 +709,14 @@ def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
     return {}
 
 
+def _reanalyze_output_paths(learning_jsonl: str, outdir: str) -> Tuple[str, str]:
+    base = os.path.basename(learning_jsonl)
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    output = os.path.join(outdir, f"{base}.reanalyzed.jsonl")
+    return output, output + ".summary.json"
+
+
 def _profile_snapshot(prof: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(prof))
 
@@ -957,6 +965,37 @@ def _patched_run_full_pipeline(
         summary["export_signals"] = export_signals
         if export_signals.get("learning_jsonl"):
             summary["learning_jsonl"] = export_signals.get("learning_jsonl")
+
+    reanalysis_summary: Optional[Dict[str, Any]] = None
+    learning_jsonl_path = export_signals.get("learning_jsonl") if export_signals else None
+    re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
+    if learning_jsonl_path and "learning_cells" in re_targets:
+        re_dir = os.path.join(outdir, "reanalyze")
+        ensure_dir(re_dir)
+        if "ReanalyzeLearning" in ok:
+            print("[SKIP] Reanalyze learning cells (resume)")
+            _, summary_path = _reanalyze_output_paths(learning_jsonl_path, re_dir)
+            try:
+                with open(summary_path, "r", encoding="utf-8") as fr:
+                    loaded = json.load(fr)
+                    if isinstance(loaded, dict):
+                        reanalysis_summary = loaded
+            except Exception:
+                reanalysis_summary = None
+        else:
+            try:
+                re_limit = int(prof.get("reanalyze_limit") or 64)
+            except Exception:
+                re_limit = 64
+            r = _safe_step("ReanalyzeLearning", zocr_onefile_consensus.reanalyze_learning_jsonl,
+                           learning_jsonl_path, re_dir, re_limit)
+            _append_hist(outdir, r)
+            if r.get("ok"):
+                reanalysis_summary = r.get("out")
+        if reanalysis_summary:
+            summary["reanalyze_learning"] = _json_ready(reanalysis_summary)
+            if isinstance(reanalysis_summary, dict) and reanalysis_summary.get("output_jsonl"):
+                summary["learning_reanalyzed_jsonl"] = reanalysis_summary.get("output_jsonl")
 
     autodetect_detail: Optional[Dict[str, Any]] = None
     autodetect_error: Optional[str] = None

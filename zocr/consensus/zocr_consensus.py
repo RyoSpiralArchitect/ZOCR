@@ -752,7 +752,11 @@ class Pipeline:
                 rows_gt, cols_gt = _rows_cols_from_html(html_gt)
             else:
                 html_gt=None; teds=compute_teds(html_pred,None); rows_gt=cols_gt=None
-            results["pages"].append({"index":i+1,"tables":[{"bbox":tbl_bbox,"html":html_pred,"dbg":dbg,"teds":teds}]})
+            results["pages"].append({
+                "index": i + 1,
+                "image_path": os.path.abspath(page_path),
+                "tables": [{"bbox": tbl_bbox, "html": html_pred, "dbg": dbg, "teds": teds}],
+            })
             latencies_sorted=sorted(latencies)
             p50 = latencies_sorted[len(latencies_sorted)//2]
             p95 = latencies_sorted[max(0,int(len(latencies_sorted)*0.95)-1)]
@@ -1654,12 +1658,40 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                           ocr_min_conf: float = 0.58) -> int:
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
-    im = Image.open(source_image_path).convert("RGB")
+    default_image_path = source_image_path
+    image_cache: Dict[str, Image.Image] = {}
+
+    def _load_page_image(path: Optional[str]) -> Optional["Image.Image"]:
+        target = path or default_image_path
+        if not target:
+            return None
+        if target in image_cache:
+            return image_cache[target]
+        try:
+            with Image.open(target) as img:
+                loaded = img.convert("RGB")
+        except Exception:
+            if default_image_path and target != default_image_path:
+                try:
+                    with Image.open(default_image_path) as img:
+                        loaded = img.convert("RGB")
+                except Exception:
+                    return None
+            else:
+                return None
+        image_cache[target] = loaded
+        return loaded
+
     count = 0
     learning_signals: List[Dict[str, Any]] = []
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
         for p in doc["pages"]:
-            pidx = p["index"]
+            pidx = p.get("index")
+            page_image_path = p.get("image_path")
+            page_image = _load_page_image(page_image_path)
+            if page_image is None:
+                continue
+            page_w, page_h = page_image.size
             for ti, t in enumerate(p["tables"]):
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
@@ -1706,11 +1738,11 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                         left_pad = pad_edge_x if c == 0 else pad_inner_x
                         right_pad = pad_edge_x if c == C-1 else pad_inner_x
                         cy1, cy2 = row_bands[r]
-                        crop = im.crop((
+                        crop = page_image.crop((
                             max(0, cx1 - left_pad),
                             max(0, cy1 - pad_y),
-                            min(im.width, cx2 + right_pad),
-                            min(im.height, cy2 + pad_y)
+                            min(page_w, cx2 + right_pad),
+                            min(page_h, cy2 + pad_y)
                         ))
                         if ocr_engine=="toy":
                             txt, conf = toy_ocr_text_from_cell(crop)
@@ -1729,11 +1761,11 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                             cy1, cy2 = row_bands[r]
                             cx1 = x1 + col_bounds[target_col]
                             cx2 = x1 + col_bounds[target_col+1] + pad_edge_x * 2
-                            crop = im.crop((
+                            crop = page_image.crop((
                                 max(0, cx1 - pad_inner_x),
                                 max(0, cy1 - pad_y),
-                                min(im.width, cx2),
-                                min(im.height, cy2 + pad_y)
+                                min(page_w, cx2),
+                                min(page_h, cy2 + pad_y)
                             ))
                             alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
                             m = _NUMERIC_RX.search(alt_txt or "")
@@ -1774,7 +1806,7 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
                             "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
-                            "image_path": source_image_path,
+                            "image_path": page_image_path or default_image_path,
                             "text": txt,
                             "search_unit": (txt or ctx_line),
                             "synthesis_window": ctx_line,
@@ -1798,6 +1830,11 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
                                 "table_index": ti,
                                 "row": r,
                                 "col": c,
+                                "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
+                                "table_bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "image_path": page_image_path or default_image_path,
+                                "row_text": row_texts,
+                                "headers": headers,
                                 "observed_text": txt,
                                 "confidence": conf,
                                 "hypotheses": hypotheses,
@@ -1834,6 +1871,227 @@ def export_jsonl_with_ocr(doc_json_path: str, source_image_path: str, out_jsonl_
         except Exception:
             pass
     return count
+
+
+def reanalyze_learning_jsonl(learning_jsonl_path: str,
+                             out_dir: Optional[str] = None,
+                             limit: int = 64,
+                             rotate: bool = True) -> Dict[str, Any]:
+    """Re-run toy OCR over low-confidence cells to propose improved readings."""
+    summary: Dict[str, Any] = {
+        "input": learning_jsonl_path,
+        "limit": int(limit),
+        "output_jsonl": None,
+        "summary_path": None,
+        "total_seen": 0,
+        "processed": 0,
+        "skipped": 0,
+        "improved": 0,
+        "regressed": 0,
+        "unchanged": 0,
+        "avg_confidence_delta": 0.0,
+    }
+    if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
+        summary["error"] = "learning_jsonl_missing"
+        return summary
+
+    dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
+    ensure_dir(dest_dir)
+    base = os.path.basename(learning_jsonl_path)
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    output_jsonl = os.path.join(dest_dir, f"{base}.reanalyzed.jsonl")
+    summary_path = output_jsonl + ".summary.json"
+
+    image_cache: Dict[str, Image.Image] = {}
+
+    def _load_image(path: Optional[str]) -> Optional["Image.Image"]:
+        if not path:
+            return None
+        if path in image_cache:
+            return image_cache[path]
+        try:
+            with Image.open(path) as img:
+                loaded = img.convert("RGB")
+        except Exception:
+            return None
+        image_cache[path] = loaded
+        return loaded
+
+    records: List[Dict[str, Any]] = []
+    delta_sum = 0.0
+
+    try:
+        with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
+            for raw_line in fr:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if limit and limit > 0 and summary["total_seen"] >= limit:
+                    break
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    summary["skipped"] += 1
+                    continue
+                summary["total_seen"] += 1
+                bbox = sig.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    summary["skipped"] += 1
+                    continue
+                try:
+                    x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+                except Exception:
+                    summary["skipped"] += 1
+                    continue
+                page_path = sig.get("image_path")
+                page_img = _load_image(page_path)
+                if page_img is None:
+                    summary["skipped"] += 1
+                    continue
+                pw, ph = page_img.size
+                x1 = max(0, min(pw, x1))
+                y1 = max(0, min(ph, y1))
+                x2 = max(0, min(pw, x2))
+                y2 = max(0, min(ph, y2))
+                if x2 <= x1 or y2 <= y1:
+                    summary["skipped"] += 1
+                    continue
+                crop = page_img.crop((x1, y1, x2, y2))
+
+                observed_text = sig.get("observed_text")
+                try:
+                    observed_conf = float(sig.get("confidence")) if sig.get("confidence") is not None else 0.0
+                except Exception:
+                    observed_conf = 0.0
+
+                variants_map: Dict[str, Dict[str, Any]] = {}
+
+                def _merge_variant(text: str, conf: float, transform: str) -> None:
+                    key = text or ""
+                    conf_f = float(conf or 0.0)
+                    if key not in variants_map:
+                        variants_map[key] = {
+                            "text": text,
+                            "confidence": conf_f,
+                            "transforms": [transform],
+                        }
+                    else:
+                        rec = variants_map[key]
+                        if conf_f > rec.get("confidence", 0.0):
+                            rec["confidence"] = conf_f
+                        if transform not in rec.get("transforms", []):
+                            rec.setdefault("transforms", []).append(transform)
+
+                base_text, base_conf = toy_ocr_text_from_cell(crop)
+                _merge_variant(base_text, base_conf, "base")
+
+                try:
+                    bright_enhancer = ImageEnhance.Brightness(crop)
+                    txt_b1, conf_b1 = toy_ocr_text_from_cell(bright_enhancer.enhance(1.1))
+                    _merge_variant(txt_b1, conf_b1, "brightness_1.1")
+                    txt_b2, conf_b2 = toy_ocr_text_from_cell(bright_enhancer.enhance(0.9))
+                    _merge_variant(txt_b2, conf_b2, "brightness_0.9")
+                except Exception:
+                    pass
+                try:
+                    contrast_enhancer = ImageEnhance.Contrast(crop)
+                    txt_c, conf_c = toy_ocr_text_from_cell(contrast_enhancer.enhance(1.2))
+                    _merge_variant(txt_c, conf_c, "contrast_1.2")
+                except Exception:
+                    pass
+                if rotate:
+                    for angle in (-2.5, -1.0, 1.0, 2.5):
+                        try:
+                            rotated = crop.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
+                        except Exception:
+                            continue
+                        text_r, conf_r = toy_ocr_text_from_cell(rotated)
+                        _merge_variant(text_r, conf_r, f"rotate_{angle:+.1f}")
+
+                if observed_text:
+                    _merge_variant(observed_text, observed_conf, "observed")
+                hypotheses = sig.get("hypotheses")
+                if isinstance(hypotheses, list):
+                    for hyp in hypotheses:
+                        if isinstance(hyp, dict) and hyp.get("text"):
+                            try:
+                                hyp_score = float(hyp.get("score")) if hyp.get("score") is not None else 0.0
+                            except Exception:
+                                hyp_score = 0.0
+                            _merge_variant(hyp.get("text"), max(observed_conf, hyp_score), "hypothesis")
+
+                variants = sorted(variants_map.values(), key=lambda rec: rec.get("confidence", 0.0), reverse=True)
+                if not variants:
+                    summary["skipped"] += 1
+                    continue
+                best = variants[0]
+                best_conf = float(best.get("confidence", 0.0))
+                best_text = best.get("text")
+                delta = best_conf - observed_conf
+                delta_sum += delta
+
+                same_text = (best_text or "") == (observed_text or "")
+                improved_flag = False
+                regressed_flag = False
+                if same_text:
+                    if best_conf > observed_conf + 0.01:
+                        improved_flag = True
+                else:
+                    if best_conf >= observed_conf + 0.05:
+                        improved_flag = True
+                    elif best_conf + 0.05 < observed_conf:
+                        regressed_flag = True
+
+                if improved_flag:
+                    summary["improved"] += 1
+                elif regressed_flag:
+                    summary["regressed"] += 1
+                else:
+                    summary["unchanged"] += 1
+
+                record = {
+                    "trace_id": sig.get("trace_id"),
+                    "page": sig.get("page"),
+                    "table_index": sig.get("table_index"),
+                    "row": sig.get("row"),
+                    "col": sig.get("col"),
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "image_path": page_path,
+                    "observed_text": observed_text,
+                    "observed_confidence": observed_conf,
+                    "reanalyzed_text": best_text,
+                    "reanalyzed_confidence": best_conf,
+                    "confidence_delta": delta,
+                    "improved": bool(improved_flag),
+                    "regressed": bool(regressed_flag),
+                    "variants": variants[:6],
+                    "headers": sig.get("headers"),
+                    "row_text": sig.get("row_text"),
+                    "table_bbox": sig.get("table_bbox"),
+                    "concepts": sig.get("concepts"),
+                    "hypotheses": hypotheses,
+                }
+                records.append(record)
+                summary["processed"] += 1
+
+    except Exception as exc:
+        summary["error"] = f"reanalyze_failed: {exc}"
+        records = []
+
+    if records:
+        summary["output_jsonl"] = output_jsonl
+        summary["summary_path"] = summary_path
+        summary["avg_confidence_delta"] = delta_sum / max(1, summary["processed"])
+        with open(output_jsonl, "w", encoding="utf-8") as fw_out:
+            for rec in records:
+                fw_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with open(summary_path, "w", encoding="utf-8") as fw_sum:
+            json.dump(_json_ready(summary), fw_sum, ensure_ascii=False, indent=2)
+    else:
+        summary["avg_confidence_delta"] = 0.0
+
+    return summary
 
 # ---------- Minimal local hybrid search ----------
 def _tokenize(s: str) -> List[str]:
