@@ -481,7 +481,16 @@ DOMAIN_KW = {
     "delivery_jp": [("納品書",1.0),("数量",0.85),("品番",0.6),("受領",0.5),("出荷",0.4)],
     "delivery_en": [("delivery",1.0),("ship",0.85),("carrier",0.7),("qty",0.6),("item",0.5)],
     "estimate": [("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
-    "estimate_jp": [("見積書",1.0),("見積金額",0.85),("有効期限",0.6),("数量",0.5)],
+    "estimate_jp": [
+        ("見積書", 4.0),
+        ("見積日", 2.5),
+        ("有効期限", 2.5),
+        ("見積金額", 3.0),
+        ("合計", 2.0),
+        ("小計", 1.5),
+        ("消費税", 1.5),
+        ("税込", 1.2),
+    ],
     "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
     "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
     "receipt_jp": [("領収書",1.0),("税込",0.8),("受領",0.6),("発行日",0.4)],
@@ -672,6 +681,24 @@ DOMAIN_SUGGESTED_QUERIES = {
     "grant_application_en": ["project title", "requested amount", "milestone", "deliverable"],
     "boarding_pass_en": ["flight number", "seat", "gate", "boarding time"],
     "default": ["total amount", "date", "company", "reference number"]
+}
+
+DOMAIN_MONITOR_QUERIES = {
+    "default": {
+        "q_amount": "合計 金額 消費税 円 2023 2024 2025",
+        "q_date": "請求日 発行日 2023 2024 2025",
+        "q_due": "支払期日 支払期限 期日 支払日",
+    },
+    "contract_jp_v2": {
+        "q_amount": "契約金額 代金 支払",
+        "q_date": "契約日 締結日 開始日 終了日",
+        "q_due": "契約期間 支払期日 締結日",
+    },
+    "estimate_jp": {
+        "q_amount": "見積金額 合計 金額 税込 税抜 円",
+        "q_date": "見積日 発行日 作成日 2023 2024 2025",
+        "q_due": "有効期限 納期 2023 2024 2025",
+    },
 }
 
 
@@ -2372,13 +2399,17 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                     good += 1
         trust = good / len(res) if res else None
         return hit, trust
-    q_amount="合計 金額 消費税 円 2023 2024 2025"
-    q_date="請求日 発行日 2023 2024 2025"
-    q_due="支払期日 支払期限 期日 支払日"
-    if domain=="contract_jp_v2":
-        q_amount="契約金額 代金 支払"
-        q_date="契約日 締結日 開始日 終了日"
-        q_due="契約期間 支払期日 締結日"
+    domain_key = domain or "default"
+    resolved_monitor_key = _DOMAIN_ALIAS.get(domain_key, domain_key)
+    monitor_cfg = (
+        DOMAIN_MONITOR_QUERIES.get(resolved_monitor_key)
+        or DOMAIN_MONITOR_QUERIES.get(domain_key)
+        or DOMAIN_MONITOR_QUERIES["default"]
+    )
+    defaults_monitor = DOMAIN_MONITOR_QUERIES["default"]
+    q_amount = monitor_cfg.get("q_amount") or defaults_monitor["q_amount"]
+    q_date = monitor_cfg.get("q_date") or defaults_monitor["q_date"]
+    q_due = monitor_cfg.get("q_due") or defaults_monitor["q_due"]
     hit_amount, trust_amount = _score("amount", q_amount)
     hit_date, trust_date = _score("date", q_date)
     hit_due, trust_due = _score("due", q_due)

@@ -4542,6 +4542,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             hypotheses = _hypothesize_from_text(txt, headers, concepts)
                         needs_review = bool(review_reasons)
                         rec = {
+                            "type": "cell",
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
                             "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
