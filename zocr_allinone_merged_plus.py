@@ -2248,6 +2248,7 @@ def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
 # --- Toy OCR knobs ----------------------------------------------------------
 _TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
 _FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
+_LAST_EXPORT_STATS: Dict[str, Any] = {}
 
 
 def toy_runtime_config() -> Dict[str, Any]:
@@ -2257,6 +2258,12 @@ def toy_runtime_config() -> Dict[str, Any]:
         "threshold_sweeps": int(_TOY_SWEEPS),
         "force_numeric": bool(_FORCE_NUMERIC),
     }
+
+
+def last_export_stats() -> Dict[str, Any]:
+    """Return metrics captured during the most recent contextual export."""
+
+    return dict(_LAST_EXPORT_STATS)
 
 
 def configure_toy_runtime(
@@ -3373,6 +3380,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
     learning_signals: List[Dict[str, Any]] = []
     low_conf_samples = 0
     surprisal_samples = 0
+    stats_start = time.time()
+    pages_processed = 0
+    tables_processed = 0
+    total_cells = 0
+    forced_cells = 0
+    numeric_tables = 0
+    numeric_columns_total = 0
+    numeric_columns_by_kind: Counter = Counter()
+    forced_fields: Counter = Counter()
     surprisal_threshold = (
         float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
@@ -3399,6 +3415,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         for enum_idx, p in enumerate(pages):
             if stop_due_to_limit:
                 break
+            pages_processed += 1
             pidx = p.get("index")
             page_image_path = p.get("image_path")
             lookup_idx: Optional[int]
@@ -3416,6 +3433,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     break
                 if not isinstance(t, dict):
                     continue
+                tables_processed += 1
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -3458,6 +3476,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
                     for c in range(C):
+                        total_cells += 1
                         cx1 = x1 + col_bounds[c]
                         cx2 = x1 + col_bounds[c+1]
                         left_pad = pad_edge_x if c == 0 else pad_inner_x
@@ -3521,6 +3540,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
+                header_fields = _numeric_header_kinds(headers)
+                if header_fields:
+                    table_numeric_cols = sum(1 for kind in header_fields if kind)
+                    if table_numeric_cols:
+                        numeric_tables += 1
+                        numeric_columns_total += table_numeric_cols
+                        for kind in header_fields:
+                            if kind:
+                                numeric_columns_by_kind[kind] += 1
                 if contextual:
                     _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
@@ -3659,6 +3687,27 @@ def export_jsonl_with_ocr(doc_json_path: str,
             os.remove(learn_path)
         except Exception:
             pass
+    duration = time.time() - stats_start if stats_start else 0.0
+    numeric_stats = {
+        "tables": int(numeric_tables),
+        "columns": int(numeric_columns_total),
+        "columns_by_kind": dict(numeric_columns_by_kind),
+        "forced_cells": int(forced_cells),
+        "forced_fields": dict(forced_fields),
+    }
+    export_stats = {
+        "ocr_engine": ocr_engine,
+        "records": int(count),
+        "pages": int(pages_processed),
+        "tables": int(tables_processed),
+        "cells_total": int(total_cells),
+        "duration_sec": round(duration, 3),
+        "numeric": numeric_stats,
+        "toy_runtime": toy_runtime_config(),
+        "force_numeric": bool(_FORCE_NUMERIC),
+    }
+    global _LAST_EXPORT_STATS
+    _LAST_EXPORT_STATS = export_stats
     return count
 
 
@@ -8246,6 +8295,7 @@ def _patched_run_full_pipeline(
     export_ocr_engine = export_ocr_override or effective_ocr_engine
 
     toy_runtime_overrides: Dict[str, Any] = {}
+    toy_runtime_snapshot: Optional[Dict[str, Any]] = None
     configure_runtime = getattr(zocr_onefile_consensus, "configure_toy_runtime", None)
     if callable(configure_runtime) and (toy_sweep_limit is not None or force_numeric_flag is not None):
         try:
@@ -8255,6 +8305,12 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] Toy runtime configure failed: {exc}")
             toy_runtime_overrides = {}
+    runtime_config_fn = getattr(zocr_onefile_consensus, "toy_runtime_config", None)
+    if callable(runtime_config_fn):
+        try:
+            toy_runtime_snapshot = runtime_config_fn()
+        except Exception:
+            toy_runtime_snapshot = None
 
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
@@ -8285,6 +8341,10 @@ def _patched_run_full_pipeline(
 
     if force_numeric_flag is not None:
         summary["force_numeric_by_header"] = bool(force_numeric_flag)
+    if toy_runtime_overrides:
+        summary["toy_runtime_overrides"] = _json_ready(toy_runtime_overrides)
+    if toy_runtime_snapshot:
+        summary["toy_runtime_config"] = _json_ready(toy_runtime_snapshot)
     if toy_sweep_limit is not None:
         summary["toy_sweeps"] = int(toy_sweep_limit)
     if toy_runtime_overrides:
@@ -8367,6 +8427,14 @@ def _patched_run_full_pipeline(
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
+        export_stats_fn = getattr(zocr_onefile_consensus, "last_export_stats", None)
+        if callable(export_stats_fn):
+            try:
+                export_stats = export_stats_fn()
+            except Exception:
+                export_stats = None
+            if export_stats:
+                summary["export_stats"] = _json_ready(export_stats)
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
     export_signals = _load_export_signals(jsonl_path)
     if export_signals:

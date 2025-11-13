@@ -1409,6 +1409,7 @@ def _patched_run_full_pipeline(
     export_ocr_engine = export_ocr_override or effective_ocr_engine
 
     toy_runtime_overrides: Dict[str, Any] = {}
+    toy_runtime_snapshot: Optional[Dict[str, Any]] = None
     configure_runtime = getattr(zocr_onefile_consensus, "configure_toy_runtime", None)
     if callable(configure_runtime) and (toy_sweep_limit is not None or force_numeric_flag is not None):
         try:
@@ -1418,6 +1419,12 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] Toy runtime configure failed: {exc}")
             toy_runtime_overrides = {}
+    runtime_config_fn = getattr(zocr_onefile_consensus, "toy_runtime_config", None)
+    if callable(runtime_config_fn):
+        try:
+            toy_runtime_snapshot = runtime_config_fn()
+        except Exception:
+            toy_runtime_snapshot = None
 
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
@@ -1448,6 +1455,10 @@ def _patched_run_full_pipeline(
 
     if force_numeric_flag is not None:
         summary["force_numeric_by_header"] = bool(force_numeric_flag)
+    if toy_runtime_overrides:
+        summary["toy_runtime_overrides"] = _json_ready(toy_runtime_overrides)
+    if toy_runtime_snapshot:
+        summary["toy_runtime_config"] = _json_ready(toy_runtime_snapshot)
     if toy_sweep_limit is not None:
         summary["toy_sweeps"] = int(toy_sweep_limit)
     if toy_runtime_overrides:
@@ -1530,6 +1541,14 @@ def _patched_run_full_pipeline(
         _append_hist(outdir, r)
         if not r.get("ok"):
             raise RuntimeError("Export failed")
+        export_stats_fn = getattr(zocr_onefile_consensus, "last_export_stats", None)
+        if callable(export_stats_fn):
+            try:
+                export_stats = export_stats_fn()
+            except Exception:
+                export_stats = None
+            if export_stats:
+                summary["export_stats"] = _json_ready(export_stats)
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
     export_signals = _load_export_signals(jsonl_path)
     if export_signals:

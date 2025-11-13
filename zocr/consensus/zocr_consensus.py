@@ -2198,6 +2198,7 @@ _FORCE_NUMERIC = _env_flag(
     "ZOCR_COERCE_NUMERIC",
     _env_flag("ZOCR_FORCE_NUMERIC", True),
 )
+_LAST_EXPORT_STATS: Dict[str, Any] = {}
 
 
 def toy_runtime_config() -> Dict[str, Any]:
@@ -2208,6 +2209,12 @@ def toy_runtime_config() -> Dict[str, Any]:
         "glyph_variant_limit": int(_GLYPH_VARIANT_LIMIT),
         "force_numeric": bool(_FORCE_NUMERIC),
     }
+
+
+def last_export_stats() -> Dict[str, Any]:
+    """Return metrics captured during the most recent contextual export."""
+
+    return dict(_LAST_EXPORT_STATS)
 
 
 def configure_toy_runtime(
@@ -3396,6 +3403,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
     learning_signals: List[Dict[str, Any]] = []
     low_conf_samples = 0
     surprisal_samples = 0
+    stats_start = time.time()
+    pages_processed = 0
+    tables_processed = 0
+    total_cells = 0
+    forced_cells = 0
+    numeric_tables = 0
+    numeric_columns_total = 0
+    numeric_columns_by_kind: Counter = Counter()
+    forced_fields: Counter = Counter()
     surprisal_threshold = (
         float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
@@ -3422,6 +3438,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         for enum_idx, p in enumerate(pages):
             if stop_due_to_limit:
                 break
+            pages_processed += 1
             pidx = p.get("index")
             page_image_path = p.get("image_path")
             lookup_idx: Optional[int]
@@ -3439,6 +3456,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     break
                 if not isinstance(t, dict):
                     continue
+                tables_processed += 1
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -3481,6 +3499,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
                     for c in range(C):
+                        total_cells += 1
                         cx1 = x1 + col_bounds[c]
                         cx2 = x1 + col_bounds[c+1]
                         left_pad = pad_edge_x if c == 0 else pad_inner_x
@@ -3545,6 +3564,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
                 header_fields = _numeric_header_kinds(headers)
+                if header_fields:
+                    table_numeric_cols = sum(1 for kind in header_fields if kind)
+                    if table_numeric_cols:
+                        numeric_tables += 1
+                        numeric_columns_total += table_numeric_cols
+                        for kind in header_fields:
+                            if kind:
+                                numeric_columns_by_kind[kind] += 1
                 if contextual:
                     _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
@@ -3596,6 +3623,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
                         if forced_filters:
+                            forced_cells += 1
+                            for forced_key in forced_filters:
+                                forced_fields[forced_key] += 1
                             filters.update(forced_filters)
                             filters["force_numeric"] = True
                         if note:
@@ -3701,6 +3731,28 @@ def export_jsonl_with_ocr(doc_json_path: str,
             os.remove(learn_path)
         except Exception:
             pass
+    duration = time.time() - stats_start if stats_start else 0.0
+    numeric_stats = {
+        "tables": int(numeric_tables),
+        "columns": int(numeric_columns_total),
+        "columns_by_kind": dict(numeric_columns_by_kind),
+        "forced_cells": int(forced_cells),
+        "forced_fields": dict(forced_fields),
+    }
+    runtime_state = toy_runtime_config()
+    export_stats = {
+        "ocr_engine": ocr_engine,
+        "records": int(count),
+        "pages": int(pages_processed),
+        "tables": int(tables_processed),
+        "cells_total": int(total_cells),
+        "duration_sec": round(duration, 3),
+        "numeric": numeric_stats,
+        "toy_runtime": runtime_state,
+        "force_numeric": bool(_FORCE_NUMERIC),
+    }
+    global _LAST_EXPORT_STATS
+    _LAST_EXPORT_STATS = export_stats
     return count
 
 
