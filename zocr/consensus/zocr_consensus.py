@@ -1171,7 +1171,21 @@ _ASCII_SET = (
     " +#=_[]{}"
 )
 
-_GLYPH_VARIANT_LIMIT = 6
+def _initial_toy_sweep_limit(default: int = 2) -> int:
+    candidates = ("ZOCR_TOY_SWEEPS", "ZOCR_TOY_SWEEP_LIMIT")
+    for key in candidates:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            return max(1, int(raw.strip()))
+        except Exception:
+            continue
+    return max(1, int(default))
+
+
+_INITIAL_TOY_SWEEP_LIMIT = _initial_toy_sweep_limit()
+_GLYPH_VARIANT_LIMIT = int(_INITIAL_TOY_SWEEP_LIMIT)
 
 
 def _parse_threshold_limit(value: str, default: int) -> int:
@@ -2179,8 +2193,11 @@ def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
 
 
 # --- Toy OCR knobs ----------------------------------------------------------
-_TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
-_FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
+_TOY_SWEEPS = int(_INITIAL_TOY_SWEEP_LIMIT)
+_FORCE_NUMERIC = _env_flag(
+    "ZOCR_COERCE_NUMERIC",
+    _env_flag("ZOCR_FORCE_NUMERIC", True),
+)
 
 
 def toy_runtime_config() -> Dict[str, Any]:
@@ -2188,6 +2205,7 @@ def toy_runtime_config() -> Dict[str, Any]:
 
     return {
         "threshold_sweeps": int(_TOY_SWEEPS),
+        "glyph_variant_limit": int(_GLYPH_VARIANT_LIMIT),
         "force_numeric": bool(_FORCE_NUMERIC),
     }
 
@@ -2198,7 +2216,7 @@ def configure_toy_runtime(
     """Update toy OCR runtime knobs at runtime."""
 
     updates: Dict[str, Any] = {}
-    global _TOY_SWEEPS, _FORCE_NUMERIC
+    global _TOY_SWEEPS, _FORCE_NUMERIC, _GLYPH_VARIANT_LIMIT
     if sweeps is not None:
         try:
             new_sweeps = max(1, int(sweeps))
@@ -2206,6 +2224,7 @@ def configure_toy_runtime(
             new_sweeps = _TOY_SWEEPS
         if new_sweeps != _TOY_SWEEPS:
             _TOY_SWEEPS = new_sweeps
+            _GLYPH_VARIANT_LIMIT = int(max(1, new_sweeps))
             updates["threshold_sweeps"] = new_sweeps
     if force_numeric is not None:
         new_flag = bool(force_numeric)
@@ -2214,36 +2233,107 @@ def configure_toy_runtime(
             updates["force_numeric"] = new_flag
     return updates
 _NUMERIC_HEADER_KIND = [
-    ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
-    ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),
-    ("amount", re.compile(r"(金額|合計|総計|税込|税別|小計|amount|total|subtotal|balance)", re.I)),
-    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat)", re.I)),
+    ("qty", re.compile(r"(数量|数|個|qty|q'?ty|quantity)", re.I)),
+    ("unit_price", re.compile(r"(単価|unit\s*price|price|unit\s*cost)", re.I)),
+    ("subtotal", re.compile(r"(小計|subtotal)", re.I)),
+    (
+        "amount",
+        re.compile(
+            r"(金額|合計|総計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
+            re.I,
+        ),
+    ),
+    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount)", re.I)),
+    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat|gst)", re.I)),
 ]
+
+_FULLWIDTH_NUMBERS = str.maketrans(
+    {
+        "０": "0",
+        "１": "1",
+        "２": "2",
+        "３": "3",
+        "４": "4",
+        "５": "5",
+        "６": "6",
+        "７": "7",
+        "８": "8",
+        "９": "9",
+        "．": ".",
+        "，": ",",
+        "－": "-",
+        "＋": "+",
+        "％": "%",
+    }
+)
+_NUMERIC_SANITIZE_RX = re.compile(r"[^0-9.+-]")
+
+
+def _normalize_numeric_bits(text: Any, kind: str) -> Tuple[str, Optional[float], Optional[bool]]:
+    raw = "" if text is None else str(text)
+    raw = raw.strip()
+    if not raw:
+        return "", None, None
+    work = raw.translate(_FULLWIDTH_NUMBERS)
+    work = work.replace("円", "").replace("￥", "").replace("¥", "").replace("$", "")
+    work = work.replace(",", "")
+    work = work.replace("，", "").replace("．", ".")
+    work = work.replace("％", "%")
+    neg = False
+    if work.startswith("(") and work.endswith(")"):
+        neg = True
+        work = work[1:-1]
+    work = work.strip()
+    percent = "%" in work
+    work = work.replace("%", "")
+    cleaned = _NUMERIC_SANITIZE_RX.sub("", work)
+    if neg and cleaned and not cleaned.startswith("-"):
+        cleaned = "-" + cleaned
+    if not cleaned:
+        return "", None, percent
+    try:
+        value = float(cleaned)
+    except Exception:
+        value = None
+    normalized = cleaned
+    if kind == "qty" and value is not None:
+        qty_val = int(round(value))
+        value = float(qty_val)
+        normalized = str(qty_val)
+    if percent and normalized:
+        normalized = f"{normalized}%"
+    return normalized, value, percent if percent else None
 
 
 def _normalize_numeric_text(text: str, kind: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return t
-    t = t.replace("，", ",").replace("．", ".")
-    t = re.sub(r"[¥￥$,]", "", t)
-    t = t.replace("円", "")
-    t = t.replace(",", "")
-    if kind == "tax_rate":
-        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
-        return (m.group(0) + "%") if m else (text or "")
-    if kind in ("amount", "unit_price"):
-        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
-        return m.group(0) if m else (text or "")
+    normalized, _, _ = _normalize_numeric_bits(text, kind)
+    return normalized or (text or "")
+
+
+def _coerce_numeric_filters(kind: Optional[str], text: str) -> Tuple[str, Dict[str, Any]]:
+    if not kind:
+        return text, {}
+    normalized, value, percent = _normalize_numeric_bits(text, kind)
+    payload: Dict[str, Any] = {}
+    result_text = normalized or (text or "")
+    if value is None:
+        return result_text, payload
     if kind == "qty":
-        m = re.search(r"\d+", t)
-        return m.group(0) if m else (text or "")
-    return t
+        payload["qty"] = int(round(value))
+        result_text = str(payload["qty"])
+    elif kind in ("amount", "subtotal", "tax_amount", "unit_price"):
+        payload[kind] = float(value)
+    elif kind == "tax_rate":
+        rate_val = float(value)
+        if percent or abs(rate_val) > 1.0:
+            rate_val = rate_val / 100.0
+        payload["tax_rate"] = rate_val
+    return result_text, payload
 
 
 def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
     kinds: List[Optional[str]] = []
-    if not headers:
+    if not headers or not _FORCE_NUMERIC:
         return kinds
     for header in headers:
         base = (header or "").strip().lower()
@@ -2280,6 +2370,8 @@ _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
     "qty": "0123456789",
     "unit_price": "0123456789.-",
     "amount": "0123456789.-",
+    "subtotal": "0123456789.-",
+    "tax_amount": "0123456789.-",
     "tax_rate": "0123456789.%",
 }
 
@@ -3452,6 +3544,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
+                header_fields = _numeric_header_kinds(headers)
                 if contextual:
                     _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
@@ -3460,8 +3553,18 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         cy1, cy2 = row_bands[r]
                         txt = grid_text[r][c]
                         conf = grid_conf[r][c]
-                        # build search/synthesis
+                        raw_txt = txt
+                        forced_filters: Dict[str, Any] = {}
+                        col_kind = header_fields[c] if header_fields and c < len(header_fields) else None
+                        if col_kind and r > 0:
+                            coerced_txt, forced_filters = _coerce_numeric_filters(col_kind, txt)
+                            if coerced_txt and coerced_txt != txt:
+                                txt = coerced_txt
+                                grid_text[r][c] = coerced_txt
+                            elif coerced_txt:
+                                txt = coerced_txt
                         row_texts = grid_text[r]
+                        # build search/synthesis
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
                         kws = _keywords_from_row(row_texts) if contextual and r>0 else []
                         low_conf = (conf is not None and conf < ocr_min_conf)
@@ -3478,15 +3581,23 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             review_reasons.append("high_surprisal")
                             surprisal_samples += 1
                         trace_id = f"page={pidx},table={ti},row={r},col={c}"
+                        has_currency = ("currency" in kws) or any(
+                            sym in (raw_txt or "") for sym in ["¥", "円", "$"]
+                        )
                         filters = {
-                            "has_currency": ("currency" in kws),
+                            "has_currency": has_currency,
                             "row_index": r,
                             "col_index": c,
                             "trace_id": trace_id
                         }
+                        if col_kind:
+                            filters["numeric_header_kind"] = col_kind
                         if r in footer_rows:
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
+                        if forced_filters:
+                            filters.update(forced_filters)
+                            filters["force_numeric"] = True
                         if note:
                             filters["linked"] = note
                         concepts = _conceptual_tags(txt, headers, row_texts)
@@ -4304,6 +4415,15 @@ def cli_export(args):
         source_images = [p for p in args.input if isinstance(p, str)]
     else:
         source_images = src
+    runtime_overrides: Dict[str, Any] = {}
+    sweeps = getattr(args, "toy_sweeps", None)
+    if sweeps is not None and sweeps > 0:
+        runtime_overrides["sweeps"] = sweeps
+    force_numeric = getattr(args, "force_numeric", None)
+    if force_numeric is not None:
+        runtime_overrides["force_numeric"] = force_numeric
+    if runtime_overrides:
+        configure_toy_runtime(**runtime_overrides)
     n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
     print("Exported", n, "records to", out_jsonl)
 
@@ -4334,6 +4454,26 @@ def _patch_cli_for_export_and_search(parser):
     def add_common(sp):
         sp.add_argument("--out", type=str, default="out_consensus")
         sp.add_argument("-i","--input", nargs="*", default=[])
+        sp.add_argument(
+            "--toy-sweeps",
+            type=int,
+            default=None,
+            help="Clamp toy OCR threshold sweeps (overrides ZOCR_TOY_SWEEPS)",
+        )
+        group = sp.add_mutually_exclusive_group()
+        group.add_argument(
+            "--force-numeric",
+            dest="force_numeric",
+            action="store_true",
+            help="Force numeric coercion based on headers",
+        )
+        group.add_argument(
+            "--no-force-numeric",
+            dest="force_numeric",
+            action="store_false",
+            help="Disable numeric coercion",
+        )
+        sp.set_defaults(force_numeric=None)
     sp = sub.add_parser("export", help="Export JSONL with toy OCR + contextual lines")
     add_common(sp); sp.set_defaults(func=cli_export)
     sp = sub.add_parser("index", help="Build local BM25 index from exported JSONL")
