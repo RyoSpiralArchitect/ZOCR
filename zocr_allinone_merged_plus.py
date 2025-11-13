@@ -2524,8 +2524,206 @@ _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
     "qty": "0123456789",
     "unit_price": "0123456789.-",
     "amount": "0123456789.-",
+    "subtotal": "0123456789.-",
+    "tax_amount": "0123456789.-",
     "tax_rate": "0123456789.%",
 }
+
+_ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
+    {
+        "key": "item",
+        "pattern": re.compile(r"(item|品目|description|desc|details)", re.I),
+        "title": "Item",
+        "normalizer": None,
+    },
+    {
+        "key": "qty",
+        "pattern": re.compile(r"(qty|数量|quantity|q'?ty|pcs?|units?)", re.I),
+        "title": "Qty",
+        "normalizer": "qty",
+    },
+    {
+        "key": "unit_price",
+        "pattern": re.compile(r"(unit\s*(price|cost)|単価)", re.I),
+        "title": "Unit Price",
+        "normalizer": "currency",
+    },
+    {
+        "key": "amount",
+        "pattern": re.compile(r"(amount|line\s*total|line\s*amount|金額|total)", re.I),
+        "title": "Amount",
+        "normalizer": "currency",
+    },
+]
+
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        return None
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+    }
+    return new_text, new_conf, new_bounds, stats
 
 
 def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
@@ -2863,6 +3061,53 @@ def _is_total_row(cells: List[str]) -> bool:
         if any(norm.startswith(pref) for pref in _TOTAL_PREFIXES):
             return True
     return False
+
+
+def _numeric_token_value(token: str) -> Optional[float]:
+    if not token:
+        return None
+    body = token.replace(",", "")
+    if body.endswith("%"):
+        return None
+    try:
+        return float(body)
+    except Exception:
+        return None
+
+
+def _relocate_total_amount(
+    row: List[str], conf_row: List[float], target_idx: int
+) -> bool:
+    if target_idx < 0 or target_idx >= len(row):
+        return False
+    existing = _NUMERIC_RX.search(row[target_idx] or "")
+    if existing and not (existing.group(0).endswith("%")):
+        return False
+    best_idx = None
+    best_token = None
+    best_score: Optional[Tuple[float, int]] = None
+    for idx, cell in enumerate(row):
+        if idx == target_idx:
+            continue
+        match = _NUMERIC_RX.search(cell or "")
+        if not match:
+            continue
+        token = match.group(0)
+        if token.endswith("%"):
+            continue
+        value = _numeric_token_value(token)
+        magnitude = abs(value) if value is not None else 0.0
+        score = (magnitude, idx)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = idx
+            best_token = token
+    if best_idx is None or best_token is None:
+        return False
+    row[target_idx] = best_token
+    if best_idx < len(conf_row):
+        conf_row[target_idx] = max(conf_row[target_idx], conf_row[best_idx])
+    return True
 
 def _resize_keep_ar(im, w, h):
     im = im.convert("L")
@@ -3526,6 +3771,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
     guard_timeouts = 0
     blank_cfg = _blank_skip_cfg_from_env()
     blank_skipped = 0
+    schema_tables = 0
+    schema_noise_columns = 0
+    schema_rows_adjusted = 0
+    schema_cells_salvaged = 0
+    schema_cells_cleared = 0
+    total_rows_seen = 0
+    total_rows_reflowed = 0
+    total_rows_ocr_attempts = 0
+    total_rows_ocr_success = 0
 
     doc_identifier = str(
         doc.get("doc_id")
@@ -3733,13 +3987,28 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         ti,
                         _row_band_midpoints(row_bands),
                     )
+                schema_adjust = _rectify_item_qty_amount_schema(grid_text, grid_conf, col_bounds)
+                if schema_adjust:
+                    grid_text, grid_conf, col_bounds, schema_meta = schema_adjust
+                    C = max(1, len(col_bounds) - 1)
+                    schema_tables += 1
+                    schema_noise_columns += int(schema_meta.get("noise_columns", 0))
+                    schema_rows_adjusted += int(schema_meta.get("rows_adjusted", 0))
+                    schema_cells_salvaged += int(schema_meta.get("cells_salvaged", 0))
+                    schema_cells_cleared += int(schema_meta.get("cells_cleared", 0))
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
                     if _is_total_row(grid_text[r]):
+                        total_rows_seen += 1
                         footer_rows.add(r)
+                        target_col = C - 1 if C > 0 else 0
+                        if C > 0 and _relocate_total_amount(grid_text[r], grid_conf[r], target_col):
+                            fallback_notes[(r, target_col)] = "total_realign"
+                            total_rows_reflowed += 1
                         has_numeric = any(_NUMERIC_RX.search(grid_text[r][c] or "") for c in range(C))
                         if not has_numeric and C > 0:
+                            total_rows_ocr_attempts += 1
                             target_col = C-1
                             cy1, cy2 = row_bands[r]
                             cx1 = x1 + col_bounds[target_col]
@@ -3758,6 +4027,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                     grid_conf[r][target_col], _normalize_confidence(alt_conf)
                                 )
                                 fallback_notes[(r, target_col)] = "footer_band"
+                                total_rows_reflowed += 1
+                                total_rows_ocr_success += 1
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
                 header_fields = _numeric_header_kinds(headers)
@@ -3939,6 +4210,21 @@ def export_jsonl_with_ocr(doc_json_path: str,
         export_stats["guard"] = {
             "timeout_ms": int(guard_ms),
             "timeouts": int(guard_timeouts),
+        }
+    if schema_tables:
+        export_stats["schema_alignment"] = {
+            "tables": int(schema_tables),
+            "noise_columns": int(schema_noise_columns),
+            "rows_adjusted": int(schema_rows_adjusted),
+            "cells_salvaged": int(schema_cells_salvaged),
+            "cells_cleared": int(schema_cells_cleared),
+        }
+    if total_rows_seen:
+        export_stats["total_rows"] = {
+            "rows": int(total_rows_seen),
+            "reflowed": int(total_rows_reflowed),
+            "ocr_attempts": int(total_rows_ocr_attempts),
+            "ocr_success": int(total_rows_ocr_success),
         }
     if motion_cfg.enabled:
         export_stats["motion_prior"] = {
