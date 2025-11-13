@@ -66,6 +66,11 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 | `--resume` | `pipeline_history.jsonl` を参照して段階をスキップ / Resume stages via `pipeline_history.jsonl` / Reprendre les étapes via `pipeline_history.jsonl`. |
 | `--seed` | 乱数シード / RNG seed / Graine aléatoire. |
 | `--snapshot` | `pipeline_meta.json` に環境情報を保存 / Persist environment metadata / Conserver les métadonnées d'environnement. |
+| `--toy-lite` | **[JA]** Toy OCR を軽量化（demo 入力では自動ON）。<br>**[EN]** Clamp toy OCR sweeps + force numeric columns (auto-enabled for `demo`).<br>**[FR]** Allège le Toy OCR (balayages bornés + colonnes numériques forcées, activé automatiquement pour `demo`). |
+| `--toy-sweeps` | **[JA]** Toy OCR の閾値スイープ上限を明示指定。<br>**[EN]** Explicit upper bound for toy OCR threshold sweeps.<br>**[FR]** Borne supérieure explicite pour les balayages de seuil du Toy OCR. |
+| `--force-numeric-by-header` | **[JA]** ヘッダ名に応じて数量/単価/金額/税率を数値に正規化。<br>**[EN]** Normalize qty/unit price/amount/tax columns according to headers.<br>**[FR]** Normalise les colonnes quantitatives selon les en-têtes. |
+| `--ingest-signature` | **[JA]** 別環境での再現ログ（signature JSON）を読み込み差分チェック。<br>**[EN]** Ingest reproducibility signature JSON from another run to compare diffs.<br>**[FR]** Ingère une signature de reproductibilité externe pour comparer les écarts. |
+| `--advisor-response` | **[JA]** 外部アドバイザ（LLM等）の助言ファイルを与えて再解析/監視の再実行に接続。<br>**[EN]** Feed advisor (LLM) responses so the orchestrator can trigger reruns based on the advice.<br>**[FR]** Fournit une réponse d’advisor afin de relancer réanalyse/monitoring selon les recommandations. |
 
 ## サブコマンド / Subcommands / Sous-commandes
 - `history --outdir out_invoice --limit 10` — 直近の処理履歴を表示 / show recent history / affiche l'historique récent。
@@ -98,6 +103,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** 再解析 (`reanalyze_learning_jsonl`) は Tesseract があれば追加エンジンとして併用し、未導入でも自前の合成フォールバックが閾値スイープ・単語分割・ポスタライズ・高精度シャープ処理まで試し、Tesseract 風の候補を生成します。文字のゆらぎ辞書で `??I` → `771` などの揺れも補正し、サマリーには `external_engines` に加え `fallback_transform_usage` / `fallback_variant_count` でフォールバックの内訳を記録します。
 - **[EN]** The reanalysis stage (`reanalyze_learning_jsonl`) still calls into Tesseract when present, but the synthetic fallback now sweeps adaptive thresholds, performs word segmentation, posterizes, and sharpens aggressively to emulate Tesseract-style outputs when the engine is missing. The ambiguity map continues to remap noisy glyphs such as `??I` → `771`, and the summary exposes both `external_engines` counts and the fallback breakdown via `fallback_transform_usage` / `fallback_variant_count`.
 - **[FR]** La phase de réanalyse (`reanalyze_learning_jsonl`) invoque Tesseract lorsqu’il est disponible, et sinon le repli synthétique effectue des balayages de seuils, segmente les mots, applique une posterization et un affûtage poussé afin d’approcher les sorties de Tesseract. La carte d’ambiguïtés convertit toujours des bruits tels que `??I` en `771`, et le résumé détaille désormais `external_engines` ainsi que la ventilation du repli via `fallback_transform_usage` / `fallback_variant_count`.
+- **[JA]** `learning_hotspots` / `selective_reanalysis_plan` が `*.learning.jsonl` からホットスポット行・列・セルを抽出し、再解析はそれらの `trace_ids` のみに集中します。`reanalyze_learning_jsonl` のサマリーには `focus_plan` / `focus_stats` が追加され、何件を対象にしたかを即確認できます。
+- **[EN]** A hotspot analyzer now scans `*.learning.jsonl` to populate `learning_hotspots` plus a `selective_reanalysis_plan`; reanalysis limits itself to the traced rows/columns so huge tables no longer trigger a full sweep. The `reanalyze_learning_jsonl` summary records the applied `focus_plan` and `focus_stats` so you can see how many cells were targeted.
+- **[FR]** L’analyseur de hotspots lit `*.learning.jsonl` et produit `learning_hotspots` ainsi qu’un `selective_reanalysis_plan`, de sorte que la réanalyse ne traite que les cellules/ lignes en cause. Le résumé `reanalyze_learning_jsonl` inclut désormais `focus_plan` et `focus_stats` pour indiquer la couverture réelle.
 - **[JA]** 再解析結果は自動で `doc.contextual.reanalyzed.jsonl`（または既存ファイルを書き換え）に反映され、`*.signals.json` には `applied_reanalysis` の集計（改善件数・平均Δなど）を追記します。パイプラインサマリーには `reanalysis_applied` として適用結果が積み上がり、後段の `augment/index/monitor` は更新済みテキストをそのまま利用します。
 - **[EN]** Reanalysis outputs now feed straight back into `doc.contextual.reanalyzed.jsonl` (or rewrite the original in place), updating the paired `*.signals.json` with an `applied_reanalysis` block that tracks improved counts and average deltas. The pipeline summary records each pass under `reanalysis_applied`, and downstream augment/index/monitor stages consume the refreshed text automatically.
 - **[FR]** Les résultats de réanalyse sont désormais réinjectés dans `doc.contextual.reanalyzed.jsonl` (ou dans le fichier d’origine réécrit), tandis que `*.signals.json` reçoit un bloc `applied_reanalysis` détaillant les gains et la moyenne des deltas. Chaque passage est archivé dans le résumé via `reanalysis_applied`, et les phases augment/index/monitor exploitent d’emblée ces textes mis à jour.
@@ -131,6 +139,21 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 
 ## モニタリング洞察 / Monitoring Insights / Analyse de la surveillance
 - `pipeline_summary.json` の `insights` は構造・ゲート・プロファイルの3本立てで、over/under・TEDS・行外れ率や Hit@K を数値付きで提示します。
+- `pipeline_summary.json` には `stage_trace` / `stage_stats` も追加され、各 `_safe_step` の経過時間・成功可否・代表的な出力を一覧できます（単体スクリプト版でも同様）。
+- **[EN]** `pipeline_summary.json` now ships with `stage_trace` / `stage_stats`, exposing every `_safe_step` duration, status, and a compact output preview (mirrored in the single-file runner).
+- **[FR]** `pipeline_summary.json` inclut désormais `stage_trace` / `stage_stats`, listant la durée, le statut et un aperçu d’output pour chaque `_safe_step` (identique dans le script monolithique).
+- `--print-stage-trace` または `ZOCR_STAGE_TRACE_CONSOLE=1` で実行直後にタイミング表を標準出力へ表示できます（遅延ステージや失敗箇所の即時可視化に便利）。
+- **[EN]** Use `--print-stage-trace` or set `ZOCR_STAGE_TRACE_CONSOLE=1` to dump the formatted stage timing table to stdout right after a run, making bottlenecks/failures obvious without opening the JSON summary.
+- **[FR]** Activez `--print-stage-trace` ou `ZOCR_STAGE_TRACE_CONSOLE=1` pour afficher aussitôt le tableau des temps d’étape sur la console et repérer goulots d’étranglement / échecs sans consulter le JSON.
+- **[JA]** Intent の上位には `meta_intent` 層を追加し、「なぜその意図を採択したのか」「どのホットスポットを狙うのか」を `story` と `focus_plan` に記録します。`pipeline_summary.json` や `rag/feedback_request.*` から理由付きをそのまま参照できます。
+- **[EN]** A meta-intent layer now narrates why an action was chosen and which hotspots it targets; `pipeline_summary.json` and the generated `rag/feedback_request.*` expose the `meta_intent` story plus its `focus_plan`, giving downstream agents a rationale to follow.
+- **[FR]** Une couche méta-intent raconte désormais pourquoi l’action a été retenue et quels hotspots sont visés ; `pipeline_summary.json` ainsi que `rag/feedback_request.*` publient cette `meta_intent` (story + `focus_plan`) pour guider les agents en aval.
+- **[JA]** `learning_hotspots` で抽出したセルを `rag/hotspots/*.png` に自動切り出し、`hotspot_gallery` としてサマリーと RAG リクエストに添付します。`ZOCR_HOTSPOT_GALLERY_LIMIT`（既定 12）で枚数を調整できます。
+- **[EN]** The orchestrator now builds a hotspot gallery by cropping the top learning signals into `rag/hotspots/*.png`; the `hotspot_gallery` block is written to `pipeline_summary.json` and the RAG feedback request. Tune the export count via `ZOCR_HOTSPOT_GALLERY_LIMIT` (default 12).
+- **[FR]** L’orchestrateur génère une galerie de hotspots (`rag/hotspots/*.png`) à partir des signaux `learning_hotspots` et ajoute `hotspot_gallery` au résumé et à la requête RAG. Ajustez le nombre d’extraits avec `ZOCR_HOTSPOT_GALLERY_LIMIT` (12 par défaut).
+- **[JA]** ギャラリーには `rag/hotspots/gallery.md` も追加され、各セルの位置・テキスト・理由とともに切り出し画像を Markdown で一覧できます。
+- **[EN]** A Markdown companion (`rag/hotspots/gallery.md`) now accompanies the PNG crops so advisors can skim every hotspot with its location, observed text, and reasons without opening the JSON.
+- **[FR]** Un fichier Markdown (`rag/hotspots/gallery.md`) accompagne la galerie PNG : chaque hotspot y est décrit (position, texte observé, raisons) afin de guider rapidement les conseillers.
 - インボイス系ドメインは金額 (`hit_amount>=0.8`) と日付 (`hit_date>=0.5`) の双方が揃わない限り PASS しません。欠損時はゲートが FAIL となり、`gate_reason` で要因を特定できます。
 - **[JA]** `monitor.csv` には `trust_amount` / `trust_date` / `trust_mean` を追加し、Top-K に混入した非出典セルの比率を観測できます。`tax_coverage` / `corporate_coverage` でレートが 0 の理由（候補なしなのか失敗か）も判別できます。
 - **[EN]** `monitor.csv` now records `trust_amount`, `trust_date`, and `trust_mean`, exposing how many Top-K hits carry proper provenance. Coverage counters (`tax_coverage`, `corporate_coverage`) clarify when rates are zero because no candidates were found.
@@ -142,6 +165,25 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - The intent payload now includes `intent_simulations`, providing what-if predictions for lowering/raising `ocr_min_conf` and `lambda_shape` plus the expected impact of reanalysis derived from toy-memory deltas.
 - Le résumé d’intent expose désormais `intent_simulations`, des scénarios « et si » pour modifier `ocr_min_conf` / `lambda_shape` et l’effet anticipé d’une réanalyse calculé à partir des deltas de mémoire du toy OCR.
 - autotune / `learn_from_monitor` が更新した `w_kw` / `w_img` / `ocr_min_conf` / `lambda_shape` を拾い、ヘッダ補完や再走査の微調整ヒントを返します。
+
+## Toy OCR ランタイムノブ / Toy OCR runtime knobs / Commandes Toy OCR
+- **[JA]** `ZOCR_TOY_SWEEPS`（既定: 5、`--toy-lite` や `--input demo` では 2〜4）で閾値スイープ回数を固定し、`ZOCR_FORCE_NUMERIC=0` でヘッダ由来の数値強制を無効化できます。
+- **[EN]** Bound threshold sweeps via `ZOCR_TOY_SWEEPS` (default 5, auto-clamped to ~2–4 in toy-lite/demo runs) and opt out of header-driven numeric coercion with `ZOCR_FORCE_NUMERIC=0`.
+- **[FR]** `ZOCR_TOY_SWEEPS` (par défaut 5, ~2–4 en mode toy-lite/demo) fixe le nombre de balayages ; `ZOCR_FORCE_NUMERIC=0` désactive la coercition numérique basée sur les en-têtes.
+- `ZOCR_TOY_MEMORY` で Toy OCR のメモリ保存先を固定でき、`ZOCR_GLYPH_CACHE_LIMIT` / `ZOCR_GLYPH_PENDING_LIMIT` / `ZOCR_NGRAM_EMA_ALPHA` がキャッシュ容量や忘却率を制御します。
+- `--toy-lite` または demo 入力では数値列の強制正規化と sweep クランプが既定で有効になり、`pipeline_summary.json` の `toy_runtime_config` と `last_export_stats` に適用結果が保存されます。
+
+## Export 進捗と高速化 / Export progress & acceleration / Export : progression et accélérations
+- `ZOCR_EXPORT_OCR` で Export 内の OCR バックエンドを切り替えられます（例: `fast` でセル OCR をスキップし構造のみ書き出し、`toy` / `tesseract` で再解析）。
+- `ZOCR_EXPORT_PROGRESS=1` と `ZOCR_EXPORT_LOG_EVERY=100`（任意）でセル処理数の進捗ログを標準出力に流し、長大なグリッドでも固まって見えません。
+- `ZOCR_EXPORT_MAX_CELLS` を指定すると巨大テーブルをサンプリングできます。進捗ログ有効時は `last_export_stats()` / `pipeline_summary.json` にページ数・セル数・数値強制件数・処理秒数が残ります。
+- Toy OCR と組み合わせる場合は `ZOCR_TOY_SWEEPS=2 ZOCR_EXPORT_OCR=fast` で 4 ページ超のインボイスでも即時に JSONL/SQL/RAG を生成できます。
+
+## アドバイザ/再現性ループ / Advisor & reproducibility loops / Boucles advisor + reproductibilité
+- **[JA]** `--ingest-signature foreign_summary.json` で別環境の `pipeline_summary.json` を読み込み、差分を `pipeline_summary.json` の `reproducibility` ブロックに記録します。
+- **[EN]** Supply `--advisor-response advisor.jsonl` (JSON or plaintext) to ingest LLM/agent feedback; parsed actions such as `reanalyze_cells` or `rerun_monitor` feed directly into the rerun controller and their effects are logged under `advisor_ingest` / `advisor_applied`.
+- **[FR]** `pipeline_summary.json` expose désormais `intent_stories`, `toy_learning_story`, `advisor_ingest`, `advisor_applied`, `reanalysis_outcome`, etc., ce qui documente pourquoi des réanalyses/monitors ont été relancés.
+- 再現署名は `pipeline_summary.json` の `repro_signature` に保存され、外部共有→`--ingest-signature` で読み込むことで「期待値との差分」を自動で可視化できます。
 
 ## 対応ドメイン / Supported Domains / Domaines pris en charge
 - インボイス (JP/EN/FR)、見積書、納品書、領収書、契約書、購入注文書、経費精算、タイムシート、出荷案内、銀行明細、公共料金請求書。
@@ -158,6 +200,13 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** 各セルは `trace`（`doc=...;page=...;row=...`）と `<fact trace="...">text</fact>` を保持し、`rag_trace_schema` / `rag_fact_tag_example` で下流 LLM へ「出典必須」のプロンプトを構築できます。
 - **[EN]** Each cell now ships with a `trace` string (`doc=...;page=...;row=...`) plus an immutable `<fact trace="...">…</fact>` tag so RAG/LLM stacks can demand provenance; see `rag_trace_schema` and `rag_fact_tag_example` in the summary.
 - **[FR]** Chaque cellule fournit désormais une `trace` (`doc=...;page=...;row=...`) et une balise `<fact trace="...">…</fact>` pour imposer la provenance côté LLM ; consultez `rag_trace_schema` et `rag_fact_tag_example` dans le résumé.
+- **Feedback loop / フィードバックループ** — `rag/manifest.json` に `"feedback": {"profile_overrides": {...}, "actions": ["reanalyze_cells"], "notes": "..."}` を追記すると、次回 `--resume` 実行時に自動で読み込みます。`auto_profile.json` へ上書きし、`actions` には `reanalyze_cells` / `rerun_monitor` / `rerun_augment` などを記載できます。
+- `--rag-feedback path/to/manifest.json` を指定すると、別ディレクトリで生成した RAG マニフェストでも同じ処理（プロファイル上書き + rerun 指示）を適用できます。適用結果は `pipeline_summary.json` の `rag_feedback`, `rag_feedback_actions(_applied)` に記録されます。
+- `rag/feedback_request.json` / `.md` が各実行後に生成され、現在のメトリクス・意図・進捗と共に「manifest の feedback ブロックをどのように編集すべきか」を JA/EN のガイド付きで提示します。LLM や外部エージェントに渡せば、そのまま `feedback` を追記して `--resume` で再投入できます。
+- 生成されるフィードバックリクエストには `meta_intent`・`learning_hotspots`・`selective_reanalysis_plan` も含まれるため、外部 LLM が「どのセルを直せばよいか」を即座に把握できます。
+- The feedback bundle now embeds the latest `meta_intent`, `learning_hotspots`, and `selective_reanalysis_plan`, so external LLMs can reason about root causes and suggest precise fixes instead of scanning the entire run.
+- Le paquet de feedback inclut désormais `meta_intent`, `learning_hotspots` et `selective_reanalysis_plan`, ce qui permet à un LLM externe d’identifier immédiatement les zones à corriger.
+- `hotspot_gallery` (JSON + `rag/hotspots/*.png`) is also exported so advisors can see the offending cells without reopening the PDFs; disable or resize the gallery via `ZOCR_HOTSPOT_GALLERY_LIMIT`.
 
 ## ビジュアライゼーション / Visualisation / Visualisation
 - 4 パネルのマイクロスコープ（原画、シャープ、二値、勾配）と X-Ray オーバーレイを自動生成。
