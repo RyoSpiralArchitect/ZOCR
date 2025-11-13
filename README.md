@@ -188,6 +188,8 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** 各セルは `trace`（`doc=...;page=...;row=...`）と `<fact trace="...">text</fact>` を保持し、`rag_trace_schema` / `rag_fact_tag_example` で下流 LLM へ「出典必須」のプロンプトを構築できます。
 - **[EN]** Each cell now ships with a `trace` string (`doc=...;page=...;row=...`) plus an immutable `<fact trace="...">…</fact>` tag so RAG/LLM stacks can demand provenance; see `rag_trace_schema` and `rag_fact_tag_example` in the summary.
 - **[FR]** Chaque cellule fournit désormais une `trace` (`doc=...;page=...;row=...`) et une balise `<fact trace="...">…</fact>` pour imposer la provenance côté LLM ; consultez `rag_trace_schema` et `rag_fact_tag_example` dans le résumé.
+- **Feedback loop / フィードバックループ** — `rag/manifest.json` に `"feedback": {"profile_overrides": {...}, "actions": ["reanalyze_cells"], "notes": "..."}` を追記すると、次回 `--resume` 実行時に自動で読み込みます。`auto_profile.json` へ上書きし、`actions` には `reanalyze_cells` / `rerun_monitor` / `rerun_augment` などを記載できます。
+- `--rag-feedback path/to/manifest.json` を指定すると、別ディレクトリで生成した RAG マニフェストでも同じ処理（プロファイル上書き + rerun 指示）を適用できます。適用結果は `pipeline_summary.json` の `rag_feedback`, `rag_feedback_actions(_applied)` に記録されます。
 
 ## ビジュアライゼーション / Visualisation / Visualisation
 - 4 パネルのマイクロスコープ（原画、シャープ、二値、勾配）と X-Ray オーバーレイを自動生成。

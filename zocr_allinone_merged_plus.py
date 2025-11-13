@@ -8552,30 +8552,79 @@ def _needs_rerun_for_keys(keys: List[str]) -> Dict[str, bool]:
     return rerun
 
 
-def _apply_rag_feedback(manifest_path: Optional[str], profile: Dict[str, Any], profile_path: str) -> Dict[str, Any]:
-    if not manifest_path or not os.path.exists(manifest_path):
-        return {"applied": []}
+def _apply_rag_feedback(
+    manifest_path: Optional[str],
+    profile: Optional[Dict[str, Any]],
+    profile_path: str,
+    *,
+    persist_profile: bool = True,
+) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"manifest": manifest_path, "applied": []}
+    if not manifest_path:
+        info["status"] = "missing"
+        return info
+    manifest_abs = os.path.abspath(manifest_path)
+    info["manifest"] = manifest_abs
+    if not os.path.exists(manifest_abs):
+        info["status"] = "not_found"
+        return info
     try:
-        with open(manifest_path, "r", encoding="utf-8") as fr:
+        with open(manifest_abs, "r", encoding="utf-8") as fr:
             payload = json.load(fr)
-    except Exception:
-        return {"applied": [], "error": "manifest_unreadable"}
+    except Exception as exc:
+        info["status"] = "manifest_unreadable"
+        info["error"] = str(exc)
+        return info
     feedback = payload.get("feedback") if isinstance(payload, dict) else None
-    applied: List[str] = []
-    if isinstance(feedback, dict):
-        profile_overrides = feedback.get("profile_overrides")
-        if isinstance(profile_overrides, dict):
-            for key, value in profile_overrides.items():
-                before = profile.get(key)
+    if not isinstance(feedback, dict):
+        info["status"] = "no_feedback"
+        return info
+    info["status"] = "ok"
+    note = feedback.get("notes") or feedback.get("summary") or feedback.get("reason")
+    if note:
+        info["note"] = note
+    overrides = feedback.get("profile_overrides") if isinstance(feedback, dict) else None
+    if isinstance(overrides, dict) and overrides:
+        info["overrides"] = {k: _json_ready(v) for k, v in overrides.items()}
+        applied: List[str] = []
+        for key, value in overrides.items():
+            applied.append(key)
+            if persist_profile and profile is not None:
                 profile[key] = value
-                applied.append(key)
-    if applied:
-        try:
-            with open(profile_path, "w", encoding="utf-8") as fw:
-                json.dump(_json_ready(profile), fw, ensure_ascii=False, indent=2)
-        except Exception as e:
-            return {"applied": applied, "error": str(e)}
-    return {"applied": applied}
+        info["applied"] = applied
+        if persist_profile and applied and profile is not None:
+            try:
+                with open(profile_path, "w", encoding="utf-8") as fw:
+                    json.dump(_json_ready(profile), fw, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                info["error"] = str(exc)
+    actions: Set[str] = set()
+
+    def _push_action(name: Optional[str]) -> None:
+        if not name:
+            return
+        canon = _canonical_advisor_action(name)
+        if canon:
+            actions.add(canon)
+        else:
+            actions.add(name)
+
+    for key in ("actions", "advisor_actions", "recommended_actions"):
+        block = feedback.get(key)
+        if isinstance(block, (list, tuple, set)):
+            for entry in block:
+                if isinstance(entry, str):
+                    _push_action(entry)
+    for key, value in feedback.items():
+        if key in {"profile_overrides", "actions", "advisor_actions", "recommended_actions", "notes", "summary", "reason"}:
+            continue
+        if isinstance(value, bool) and value:
+            _push_action(key)
+        elif isinstance(value, str) and value.lower() in {"true", "yes"}:
+            _push_action(key)
+    if actions:
+        info["actions"] = sorted(actions)
+    return info
 
 
 def _simulate_param_shift(
@@ -8739,6 +8788,7 @@ def _patched_run_full_pipeline(
     ingest_signature: Optional[str] = None,
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
+    rag_feedback: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
@@ -8850,6 +8900,20 @@ def _patched_run_full_pipeline(
     if advisor_ingest.get("actions"):
         advisor_actions = {str(a) for a in advisor_ingest.get("actions") if isinstance(a, str)}
 
+    rag_feedback_path = rag_feedback
+    if not rag_feedback_path:
+        default_manifest = os.path.join(outdir, "rag", "manifest.json")
+        if os.path.exists(default_manifest):
+            rag_feedback_path = default_manifest
+    rag_feedback_ingest: Optional[Dict[str, Any]] = None
+    rag_feedback_actions: Set[str] = set()
+    if rag_feedback_path:
+        rag_feedback_ingest = _apply_rag_feedback(rag_feedback_path, prof, prof_path)
+        if rag_feedback_ingest.get("actions"):
+            rag_feedback_actions = {
+                str(a) for a in rag_feedback_ingest.get("actions", []) if isinstance(a, str)
+            }
+
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
         "mm_jsonl": mm_jsonl,
@@ -8877,6 +8941,13 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+
+    if rag_feedback_ingest:
+        summary["rag_feedback"] = _json_ready(rag_feedback_ingest)
+    if rag_feedback_path:
+        summary["rag_feedback_source"] = rag_feedback_path
+    if rag_feedback_actions:
+        summary["rag_feedback_actions"] = sorted(rag_feedback_actions)
 
     if force_numeric_flag is not None:
         summary["force_numeric_by_header"] = bool(force_numeric_flag)
@@ -9364,25 +9435,41 @@ def _patched_run_full_pipeline(
         summary["intent_runs"] = intent_runs
     advisor_actions_applied: List[str] = []
     advisor_runs: List[str] = []
-    if learning_jsonl_path and "reanalyze_cells" in advisor_actions:
+    rag_feedback_actions_applied: List[str] = []
+    rag_feedback_runs: List[str] = []
+    combined_actions = set(advisor_actions)
+    combined_actions.update(rag_feedback_actions)
+    if learning_jsonl_path and "reanalyze_cells" in combined_actions:
         if _run_learning_reanalysis("ReanalyzeLearningAdvisor", "advisor_reanalyze"):
-            advisor_runs.append("reanalyze_learning")
+            if "reanalyze_cells" in advisor_actions:
+                advisor_runs.append("reanalyze_learning")
+                advisor_actions_applied.append("reanalyze_cells")
+            if "reanalyze_cells" in rag_feedback_actions:
+                rag_feedback_runs.append("reanalyze_learning")
+                rag_feedback_actions_applied.append("reanalyze_cells")
     if advisor_runs:
         summary["advisor_runs"] = advisor_runs
-        advisor_actions_applied.append("reanalyze_cells")
+    if rag_feedback_runs:
+        summary["rag_feedback_runs"] = rag_feedback_runs
     rerun_flags = _needs_rerun_for_keys(list(combined_updates.keys())) if combined_updates else {"augment": False, "monitor": False}
     new_reanalysis_reasons = reanalysis_reasons_done - pre_augment_reanalysis_reasons
     if new_reanalysis_reasons:
         rerun_flags["augment"] = True
         rerun_flags["monitor"] = True
         summary["reanalysis_post_augment"] = sorted(new_reanalysis_reasons)
-    if "rerun_augment" in advisor_actions:
+    if "rerun_augment" in combined_actions:
         rerun_flags["augment"] = True
         rerun_flags["monitor"] = True
-        advisor_actions_applied.append("rerun_augment")
-    elif "rerun_monitor" in advisor_actions:
+        if "rerun_augment" in advisor_actions:
+            advisor_actions_applied.append("rerun_augment")
+        if "rerun_augment" in rag_feedback_actions:
+            rag_feedback_actions_applied.append("rerun_augment")
+    elif "rerun_monitor" in combined_actions:
         rerun_flags["monitor"] = True
-        advisor_actions_applied.append("rerun_monitor")
+        if "rerun_monitor" in advisor_actions:
+            advisor_actions_applied.append("rerun_monitor")
+        if "rerun_monitor" in rag_feedback_actions:
+            rag_feedback_actions_applied.append("rerun_monitor")
     summary["feedback_rerun_flags"] = rerun_flags
     feedback_passes: List[str] = []
     prof = prof_after
@@ -9408,6 +9495,8 @@ def _patched_run_full_pipeline(
         summary["feedback_passes"] = feedback_passes
     if advisor_actions_applied:
         summary["advisor_actions_applied"] = sorted(set(advisor_actions_applied))
+    if rag_feedback_actions_applied:
+        summary["rag_feedback_actions_applied"] = sorted(set(rag_feedback_actions_applied))
 
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
@@ -9447,7 +9536,14 @@ def _patched_run_full_pipeline(
         fact_tag_example=summary.get("rag_fact_tag_example"),
     )
     if summary.get("rag_manifest"):
-        summary["rag_feedback"] = _apply_rag_feedback(summary.get("rag_manifest"), prof, prof_path)
+        summary["rag_feedback_scan"] = _json_ready(
+            _apply_rag_feedback(
+                summary.get("rag_manifest"),
+                prof,
+                prof_path,
+                persist_profile=False,
+            )
+        )
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
@@ -9668,6 +9764,11 @@ def main():
         default=None,
         help="Path to JSON/text advisor feedback to ingest before reruns",
     )
+    ap.add_argument(
+        "--rag-feedback",
+        default=None,
+        help="Optional rag/manifest.json to ingest feedback/profile overrides from",
+    )
     args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
@@ -9697,6 +9798,7 @@ def main():
             ingest_signature=args.ingest_signature,
             advisor_response=args.advisor_response,
             print_stage_trace=args.print_stage_trace,
+            rag_feedback=args.rag_feedback,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
