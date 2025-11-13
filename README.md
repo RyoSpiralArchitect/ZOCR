@@ -207,6 +207,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - The feedback bundle now embeds the latest `meta_intent`, `learning_hotspots`, and `selective_reanalysis_plan`, so external LLMs can reason about root causes and suggest precise fixes instead of scanning the entire run.
 - Le paquet de feedback inclut désormais `meta_intent`, `learning_hotspots` et `selective_reanalysis_plan`, ce qui permet à un LLM externe d’identifier immédiatement les zones à corriger.
 - `hotspot_gallery` (JSON + `rag/hotspots/*.png`) is also exported so advisors can see the offending cells without reopening the PDFs; disable or resize the gallery via `ZOCR_HOTSPOT_GALLERY_LIMIT`.
+- **[JA]** `rag/conversation.jsonl` にパイプライン→LLM→RAG 間の対話履歴を追記します。生成した feedback request / 取り込んだ manifest / advisor 回答が順番に記録され、`pipeline_summary.json` の `rag_conversation` から最新エントリを辿れます。
+- **[EN]** Every run now appends to `rag/conversation.jsonl`, logging the emitted feedback requests plus any ingested manifest/advisor responses. `pipeline_summary.json` exposes the path + last entry under `rag_conversation`, so external agents can replay or extend the dialog.
+- **[FR]** Chaque exécution ajoute désormais les requêtes de feedback et les réponses manifest/advisor ingérées dans `rag/conversation.jsonl`; le résumé (`rag_conversation`) expose le chemin et la dernière entrée afin que les agents externes puissent poursuivre le dialogue.
 
 ## ビジュアライゼーション / Visualisation / Visualisation
 - 4 パネルのマイクロスコープ（原画、シャープ、二値、勾配）と X-Ray オーバーレイを自動生成。

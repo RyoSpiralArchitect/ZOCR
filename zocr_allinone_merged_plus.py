@@ -9314,6 +9314,29 @@ def _emit_rag_feedback_request(
     }
 
 
+def _append_rag_conversation_entry(outdir: str, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not outdir:
+        return None
+    rag_dir = os.path.join(outdir, "rag")
+    try:
+        ensure_dir(rag_dir)
+    except Exception as exc:
+        print(f"[WARN] rag conversation dir failed: {exc}")
+        return None
+    convo_path = os.path.join(rag_dir, "conversation.jsonl")
+    record = dict(entry or {})
+    record.setdefault("role", "pipeline")
+    record.setdefault("kind", "note")
+    record.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+    try:
+        with open(convo_path, "a", encoding="utf-8") as fw:
+            fw.write(json.dumps(_json_ready(record), ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[WARN] rag conversation append failed: {exc}")
+        return None
+    return {"path": convo_path, "entry": record}
+
+
 def _simulate_param_shift(
     monitor_row: Optional[Dict[str, Any]],
     export_signals: Dict[str, Any],
@@ -9629,12 +9652,30 @@ def _patched_run_full_pipeline(
         "ingest_signature": ingest_signature,
     }
 
+    def _record_rag_conversation(entry: Dict[str, Any]) -> None:
+        info = _append_rag_conversation_entry(outdir, entry)
+        if not info:
+            return
+        convo = summary.setdefault("rag_conversation", {"path": info["path"]})
+        convo["last_entry"] = _json_ready(info["entry"])
+
     if rag_feedback_ingest:
         summary["rag_feedback"] = _json_ready(rag_feedback_ingest)
     if rag_feedback_path:
         summary["rag_feedback_source"] = rag_feedback_path
     if rag_feedback_actions:
         summary["rag_feedback_actions"] = sorted(rag_feedback_actions)
+    if rag_feedback_ingest and rag_feedback_ingest.get("status") == "ok":
+        _record_rag_conversation(
+            {
+                "role": "rag_agent",
+                "kind": "feedback",
+                "source": rag_feedback_ingest.get("manifest"),
+                "actions": rag_feedback_ingest.get("actions"),
+                "overrides": rag_feedback_ingest.get("overrides"),
+                "note": rag_feedback_ingest.get("note"),
+            }
+        )
 
     if force_numeric_flag is not None:
         summary["force_numeric_by_header"] = bool(force_numeric_flag)
@@ -10296,6 +10337,15 @@ def _patched_run_full_pipeline(
     )
     if rag_request_info:
         summary["rag_feedback_request"] = _json_ready(rag_request_info)
+        _record_rag_conversation(
+            {
+                "role": "pipeline",
+                "kind": "feedback_request",
+                "path": rag_request_info.get("request_markdown") or rag_request_info.get("request_json"),
+                "pending_actions": sorted(rag_feedback_actions) if rag_feedback_actions else None,
+                "meta_intent": summary.get("meta_intent", {}).get("story"),
+            }
+        )
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
@@ -10358,6 +10408,17 @@ def _patched_run_full_pipeline(
         summary["advisor_prompt"] = advisor_path
     if advisor_ingest:
         summary["advisor_ingest"] = _json_ready(advisor_ingest)
+        if advisor_ingest.get("status") == "ok":
+            preview = advisor_ingest.get("preview") or ""
+            _record_rag_conversation(
+                {
+                    "role": "advisor",
+                    "kind": "response",
+                    "source": advisor_ingest.get("path"),
+                    "actions": advisor_ingest.get("actions"),
+                    "note": preview[:400],
+                }
+            )
 
     if stage_trace:
         total_ms = sum(float(entry.get("elapsed_ms") or 0.0) for entry in stage_trace)
