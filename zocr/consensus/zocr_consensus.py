@@ -2697,6 +2697,206 @@ def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequ
             grid_text[r][:] = row
 
 
+_DATE_ROLE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
+    (
+        "due",
+        (
+            "due date",
+            "payment due",
+            "due on",
+            "due",
+            "支払期限",
+            "支払期日",
+            "支払日",
+            "期日",
+            "納期",
+        ),
+    ),
+    (
+        "issue",
+        (
+            "invoice date",
+            "issue date",
+            "billing date",
+            "請求日",
+            "発行日",
+            "作成日",
+            "交付日",
+            "売上日",
+        ),
+    ),
+    (
+        "service",
+        (
+            "service date",
+            "ship date",
+            "delivery date",
+            "利用日",
+            "作業日",
+            "搭乗日",
+            "乗車日",
+        ),
+    ),
+]
+
+_DATE_RX_SLASH = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})[./-](?P<month>0?[1-9]|1[0-2])(?:[./-](?P<day>0?[1-9]|[12]\d|3[01]))?"
+)
+_DATE_RX_KANJI = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_ERA = re.compile(
+    r"(?P<era>令和|平成|昭和)(?P<erayear>元|\d{1,2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_COMPACT = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})(?P<month>0?[1-9]|1[0-2])(?P<day>0?[1-9]|[12]\d|3[01])"
+)
+_JP_ERA_BASE = {"令和": 2018, "平成": 1988, "昭和": 1925}
+
+
+def _date_role_from_header(header: Optional[str]) -> Optional[str]:
+    if not header:
+        return None
+    base = header.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _date_header_roles(headers: Sequence[str]) -> List[Optional[str]]:
+    roles: List[Optional[str]] = []
+    if not headers:
+        return roles
+    for header in headers:
+        roles.append(_date_role_from_header(header))
+    return roles
+
+
+def _infer_date_role_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    base = text.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _normalize_japanese_era_year(era: str, era_year: str) -> Optional[int]:
+    base = _JP_ERA_BASE.get(era)
+    if base is None:
+        return None
+    token = era_year.strip()
+    if token == "元":
+        offset = 1
+    else:
+        try:
+            offset = int(token)
+        except Exception:
+            return None
+    if offset <= 0:
+        return None
+    return base + offset
+
+
+def _normalize_date_value(text: str) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    norm = str(text).strip()
+    if not norm:
+        return None
+    norm = norm.translate(_FULLWIDTH_NUMBERS)
+    compact = norm.replace(" ", "").replace("　", "")
+
+    def _format(year: int, month: int, day: Optional[int]) -> Optional[Tuple[str, str]]:
+        if year < 1900 or year > 2100:
+            return None
+        if not 1 <= month <= 12:
+            return None
+        precision = "ym"
+        value = f"{year:04d}-{month:02d}"
+        if day is not None:
+            if not 1 <= day <= 31:
+                return None
+            precision = "ymd"
+            value = f"{value}-{day:02d}"
+        return value, precision
+
+    for rx in (_DATE_RX_SLASH, _DATE_RX_KANJI):
+        m = rx.search(compact)
+        if not m:
+            continue
+        try:
+            year = int(m.group("year"))
+            month = int(m.group("month"))
+            day = int(m.group("day")) if m.group("day") else None
+        except Exception:
+            continue
+        formatted = _format(year, month, day)
+        if formatted:
+            return formatted
+
+    m_era = _DATE_RX_ERA.search(compact)
+    if m_era:
+        year = _normalize_japanese_era_year(m_era.group("era"), m_era.group("erayear"))
+        try:
+            month = int(m_era.group("month"))
+            day = int(m_era.group("day")) if m_era.group("day") else None
+        except Exception:
+            month = None
+            day = None
+        if year and month:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+
+    m_compact = _DATE_RX_COMPACT.search(compact)
+    if m_compact:
+        try:
+            year = int(m_compact.group("year"))
+            month = int(m_compact.group("month"))
+            day = int(m_compact.group("day"))
+        except Exception:
+            year = month = day = None
+        if year and month and day:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+    return None
+
+
+def _extract_date_filters(text: str, header_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_date_value(text)
+    if not normalized:
+        return None
+    value, precision = normalized
+    role = header_role or _infer_date_role_from_text(text)
+    payload: Dict[str, Any] = {
+        "date": value,
+        "date_precision": precision,
+    }
+    if role == "due":
+        payload["due_date"] = value
+    elif role == "issue":
+        payload["issue_date"] = value
+    elif role == "service":
+        payload["service_date"] = value
+    if role:
+        payload["date_role"] = role
+    return payload
+
+
 _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
     "qty": "0123456789",
     "unit_price": "0123456789.-",
@@ -4015,6 +4215,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
     numeric_columns_total = 0
     numeric_columns_by_kind: Counter = Counter()
     forced_fields: Counter = Counter()
+    date_tables = 0
+    date_columns_total = 0
+    date_columns_by_role: Counter = Counter()
+    date_cells_detected = 0
+    date_cells_by_role: Counter = Counter()
+    date_precision_counts: Counter = Counter()
     surprisal_threshold = (
         float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
@@ -4245,6 +4451,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
                 header_fields = _numeric_header_kinds(headers)
+                date_roles = _date_header_roles(headers)
+                if date_roles and any(date_roles):
+                    date_tables += 1
+                    for role in date_roles:
+                        if role:
+                            date_columns_total += 1
+                            date_columns_by_role[role] += 1
                 if header_fields:
                     table_numeric_cols = sum(1 for kind in header_fields if kind)
                     if table_numeric_cols:
@@ -4264,6 +4477,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         raw_txt = txt
                         forced_filters: Dict[str, Any] = {}
                         col_kind = header_fields[c] if header_fields and c < len(header_fields) else None
+                        date_role = date_roles[c] if date_roles and c < len(date_roles) else None
                         if col_kind and r > 0:
                             coerced_txt, forced_filters = _coerce_numeric_filters(col_kind, txt)
                             if coerced_txt and coerced_txt != txt:
@@ -4309,6 +4523,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 forced_fields[forced_key] += 1
                             filters.update(forced_filters)
                             filters["force_numeric"] = True
+                        if r > 0:
+                            date_payload = _extract_date_filters(txt, date_role)
+                        else:
+                            date_payload = None
+                        if date_payload:
+                            filters.update(date_payload)
+                            date_cells_detected += 1
+                            role_key = date_payload.get("date_role") or (date_role or "unlabeled")
+                            date_cells_by_role[role_key] += 1
+                            precision_key = date_payload.get("date_precision") or "unknown"
+                            date_precision_counts[precision_key] += 1
                         if note:
                             filters["linked"] = note
                         concepts = _conceptual_tags(txt, headers, row_texts)
@@ -4432,6 +4657,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
     }
+    if date_cells_detected or date_columns_total:
+        export_stats["date_fields"] = {
+            "tables": int(date_tables),
+            "columns": int(date_columns_total),
+            "columns_by_role": dict(date_columns_by_role),
+            "cells": int(date_cells_detected),
+            "cells_by_role": dict(date_cells_by_role),
+            "precision": dict(date_precision_counts),
+        }
     if blank_cfg.enabled:
         export_stats["blank_skip"] = {
             "skipped": int(blank_skipped),
