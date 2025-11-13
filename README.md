@@ -151,6 +151,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** `learning_hotspots` で抽出したセルを `rag/hotspots/*.png` に自動切り出し、`hotspot_gallery` としてサマリーと RAG リクエストに添付します。`ZOCR_HOTSPOT_GALLERY_LIMIT`（既定 12）で枚数を調整できます。
 - **[EN]** The orchestrator now builds a hotspot gallery by cropping the top learning signals into `rag/hotspots/*.png`; the `hotspot_gallery` block is written to `pipeline_summary.json` and the RAG feedback request. Tune the export count via `ZOCR_HOTSPOT_GALLERY_LIMIT` (default 12).
 - **[FR]** L’orchestrateur génère une galerie de hotspots (`rag/hotspots/*.png`) à partir des signaux `learning_hotspots` et ajoute `hotspot_gallery` au résumé et à la requête RAG. Ajustez le nombre d’extraits avec `ZOCR_HOTSPOT_GALLERY_LIMIT` (12 par défaut).
+- **[JA]** ギャラリーには `rag/hotspots/gallery.md` も追加され、各セルの位置・テキスト・理由とともに切り出し画像を Markdown で一覧できます。
+- **[EN]** A Markdown companion (`rag/hotspots/gallery.md`) now accompanies the PNG crops so advisors can skim every hotspot with its location, observed text, and reasons without opening the JSON.
+- **[FR]** Un fichier Markdown (`rag/hotspots/gallery.md`) accompagne la galerie PNG : chaque hotspot y est décrit (position, texte observé, raisons) afin de guider rapidement les conseillers.
 - インボイス系ドメインは金額 (`hit_amount>=0.8`) と日付 (`hit_date>=0.5`) の双方が揃わない限り PASS しません。欠損時はゲートが FAIL となり、`gate_reason` で要因を特定できます。
 - **[JA]** `monitor.csv` には `trust_amount` / `trust_date` / `trust_mean` を追加し、Top-K に混入した非出典セルの比率を観測できます。`tax_coverage` / `corporate_coverage` でレートが 0 の理由（候補なしなのか失敗か）も判別できます。
 - **[EN]** `monitor.csv` now records `trust_amount`, `trust_date`, and `trust_mean`, exposing how many Top-K hits carry proper provenance. Coverage counters (`tax_coverage`, `corporate_coverage`) clarify when rates are zero because no candidates were found.

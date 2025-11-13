@@ -8243,7 +8243,60 @@ def _generate_hotspot_gallery(
     }
     if missing:
         gallery["missing_traces"] = sorted(missing)
+    story_rel = _write_hotspot_gallery_story(outdir, gallery)
+    if story_rel:
+        gallery["story"] = story_rel
     return gallery
+
+
+def _write_hotspot_gallery_story(outdir: str, gallery: Dict[str, Any]) -> Optional[str]:
+    entries = gallery.get("entries") if isinstance(gallery, dict) else None
+    if not entries:
+        return None
+    story_dir = os.path.join(outdir, "rag", "hotspots")
+    try:
+        ensure_dir(story_dir)
+    except Exception as exc:
+        print(f"[WARN] hotspot gallery story dir failed: {exc}")
+        return None
+    story_path = os.path.join(story_dir, "gallery.md")
+    lines: List[str] = [
+        "# Hotspot Gallery",
+        "",
+        f"Extracted {len(entries)} hotspot crops for advisor review.",
+        "",
+        "Each section links the cropped cell image and highlights why the pipeline flagged it.",
+        "",
+    ]
+    for idx, entry in enumerate(entries, 1):
+        trace = entry.get("trace_id") or "unknown"
+        title = f"## Hotspot {idx}: trace `{trace}`"
+        lines.append(title)
+        bullet: List[str] = []
+        for label in ("page", "table", "row", "col"):
+            if entry.get(label) is not None:
+                bullet.append(f"{label}={entry[label]}")
+        if entry.get("text"):
+            bullet.append(f"text=`{entry['text']}`")
+        if entry.get("score") is not None:
+            bullet.append(f"score={entry['score']}")
+        if bullet:
+            lines.append("- " + ", ".join(bullet))
+        reasons = entry.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            lines.append("- reasons: " + "; ".join(reasons))
+        image_rel = entry.get("image")
+        if image_rel:
+            lines.append("")
+            lines.append(f"![Hotspot {idx}]({image_rel})")
+        lines.append("")
+    try:
+        with open(story_path, "w", encoding="utf-8") as fw:
+            fw.write("\n".join(lines).strip() + "\n")
+    except Exception as exc:
+        print(f"[WARN] hotspot gallery story write failed: {exc}")
+        return None
+    return os.path.relpath(story_path, outdir)
 
 
 def _summarize_toy_learning(
