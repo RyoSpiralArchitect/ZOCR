@@ -7694,6 +7694,283 @@ def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
     return {}
 
 
+def _summarize_toy_learning(
+    toy_memory_delta: Optional[Dict[str, Any]],
+    recognition_stats: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"signals": {}, "reasons": []}
+
+    if toy_memory_delta:
+        glyph_variants = toy_memory_delta.get("glyph_variants")
+        if isinstance(glyph_variants, (int, float)):
+            summary["signals"]["glyph_variants"] = float(glyph_variants)
+            if glyph_variants > 0:
+                summary["reasons"].append(f"learned {glyph_variants:.0f} glyph variants")
+        surprisal_shift = toy_memory_delta.get("avg_surprisal")
+        if isinstance(surprisal_shift, (int, float)) and abs(surprisal_shift) > 1e-6:
+            direction = "dropped" if surprisal_shift < 0 else "rose"
+            summary["signals"]["avg_surprisal_delta"] = float(surprisal_shift)
+            summary["reasons"].append(f"surprisal {direction} by {abs(surprisal_shift):.3f}")
+    stats = recognition_stats or {}
+    cells = stats.get("cells") if isinstance(stats.get("cells"), (int, float)) else 0
+    try:
+        cells = int(cells)
+    except Exception:
+        cells = 0
+    if cells > 0:
+        low_conf = stats.get("low_conf_cells")
+        high_surprisal = stats.get("high_surprisal_cells")
+        try:
+            low_conf_ratio = float(low_conf) / float(cells)
+        except Exception:
+            low_conf_ratio = None
+        try:
+            high_surprisal_ratio = float(high_surprisal) / float(cells)
+        except Exception:
+            high_surprisal_ratio = None
+        if low_conf_ratio is not None:
+            summary["signals"]["recognition_low_conf_ratio"] = low_conf_ratio
+            if low_conf_ratio > 0.25:
+                summary["reasons"].append(f"low-confidence cells at {low_conf_ratio:.2%}")
+        if high_surprisal_ratio is not None:
+            summary["signals"]["recognition_high_surprisal_ratio"] = high_surprisal_ratio
+            if high_surprisal_ratio > 0.18:
+                summary["reasons"].append(f"high surprisal at {high_surprisal_ratio:.2%}")
+    runtime_gain = stats.get("runtime_replay_improved")
+    if isinstance(runtime_gain, (int, float)) and runtime_gain:
+        summary["signals"]["runtime_replay_improved"] = float(runtime_gain)
+        summary["reasons"].append(f"runtime replay rescued {int(runtime_gain)} cells")
+
+    if not summary["reasons"]:
+        if summary["signals"]:
+            summary["reasons"].append("toy OCR steady; no explicit triggers")
+        else:
+            return {}
+    summary["narrative"] = " / ".join(summary["reasons"])
+    return summary
+
+
+def _intent_narrative(intent: Dict[str, Any]) -> str:
+    action = intent.get("action") or "steady"
+    reason = intent.get("reason") or ""
+    signals = intent.get("signals") or {}
+    fragments: List[str] = []
+    if reason:
+        fragments.append(reason)
+    key_pairs = [
+        ("low_conf_ratio", "low-conf ratio"),
+        ("high_surprisal_ratio", "surprisal"),
+        ("recognition_low_conf_ratio", "recognition low-conf"),
+        ("recognition_high_surprisal_ratio", "recognition surprisal"),
+        ("p95_ms", "latency"),
+    ]
+    for key, label in key_pairs:
+        value = signals.get(key)
+        if value is None:
+            continue
+        try:
+            val = float(value)
+        except Exception:
+            continue
+        fragments.append(f"{label}={val:.3f}")
+    narrative = f"Intent '{action}' chosen: " + ", ".join(fragments) if fragments else f"Intent '{action}' selected"
+    return narrative
+
+
+def _evaluate_learning_outcome(
+    before_signals: Optional[Dict[str, Any]],
+    after_signals: Optional[Dict[str, Any]],
+    reanalysis_summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not before_signals and not after_signals and not reanalysis_summary:
+        return {}
+
+    def _metric(payload: Optional[Dict[str, Any]], key: str) -> Optional[float]:
+        if not payload:
+            return None
+        value = payload.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    outcome: Dict[str, Any] = {"before": {}, "after": {}}
+    for label in ("low_conf_ratio", "high_surprisal_ratio"):
+        before_value = _metric(before_signals, label)
+        after_value = _metric(after_signals, label)
+        if before_value is not None:
+            outcome["before"][label] = before_value
+        if after_value is not None:
+            outcome["after"][label] = after_value
+        if before_value is not None or after_value is not None:
+            delta = (after_value if after_value is not None else before_value or 0.0) - (
+                before_value if before_value is not None else after_value or 0.0
+            )
+            outcome.setdefault("delta", {})[label] = delta
+
+    improved_cells = None
+    avg_conf_delta = None
+    if isinstance(reanalysis_summary, dict):
+        try:
+            improved_cells = int(reanalysis_summary.get("improved") or 0)
+        except Exception:
+            improved_cells = None
+        try:
+            avg_conf_delta = float(reanalysis_summary.get("avg_confidence_delta") or 0.0)
+        except Exception:
+            avg_conf_delta = None
+    success = False
+    reason: List[str] = []
+    delta_low = outcome.get("delta", {}).get("low_conf_ratio") if outcome.get("delta") else None
+    if delta_low is not None and delta_low < -0.02:
+        success = True
+        reason.append(f"low_conf_ratio improved by {abs(delta_low):.3f}")
+    if isinstance(improved_cells, int) and improved_cells > 0:
+        success = True
+        reason.append(f"reanalyzer fixed {improved_cells} cells")
+    if avg_conf_delta is not None and avg_conf_delta > 0:
+        reason.append(f"avg confidence +{avg_conf_delta:.3f}")
+    outcome["success"] = bool(success)
+    if reason:
+        outcome["reason"] = "; ".join(reason)
+    if not success:
+        outcome["needs_retry"] = True if reanalysis_summary else False
+    outcome["reanalysis_summary"] = reanalysis_summary or None
+    return outcome
+
+
+def _write_advice_packet(outdir: str, summary: Dict[str, Any]) -> Optional[str]:
+    payload = {
+        "task": "ZOCR advisor request",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "intent": summary.get("intent"),
+        "intent_story": summary.get("intent", {}).get("narrative") if isinstance(summary.get("intent"), dict) else None,
+        "learning_outcome": summary.get("learning_outcome"),
+        "toy_learning": summary.get("toy_memory", {}).get("learning_reason"),
+        "monitor_row": summary.get("monitor_row"),
+        "questions": [
+            "What should the next corrective action be?",
+            "Which headers or totals look unreliable?",
+        ],
+    }
+    path = os.path.join(outdir, "advisor_prompt.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(_json_ready(payload), fw, ensure_ascii=False, indent=2)
+        return path
+    except Exception as exc:
+        print(f"Advisor packet skipped: {exc}")
+        return None
+
+
+def _git_revision() -> Optional[str]:
+    try:
+        rev = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    return rev.decode("utf-8", "ignore").strip() or None
+
+
+def _fingerprint_page(path: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"path": path}
+    try:
+        st = os.stat(path)
+        info["size"] = int(st.st_size)
+        info["mtime"] = float(st.st_mtime)
+    except Exception:
+        pass
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as fr:
+            chunk = fr.read(512 * 1024)
+            h.update(chunk)
+        info["sha1_head"] = h.hexdigest()
+    except Exception:
+        info.setdefault("sha1_head", None)
+    return info
+
+
+def _build_repro_signature(
+    inputs: List[str],
+    page_images: Dict[int, str],
+    profile: Dict[str, Any],
+    toy_runtime_snapshot: Optional[Dict[str, Any]],
+    export_ocr_engine: str,
+    toy_runtime_overrides: Dict[str, Any],
+) -> Dict[str, Any]:
+    profile_digest = hashlib.sha256()
+    try:
+        profile_digest.update(json.dumps(profile, sort_keys=True).encode("utf-8"))
+    except Exception:
+        profile_digest.update(str(profile).encode("utf-8", "ignore"))
+    pages_fp = [_fingerprint_page(path) for path in page_images.values() if path and os.path.exists(path)]
+    inputs_digest = hashlib.sha256()
+    for fp in pages_fp:
+        inputs_digest.update((fp.get("path") or "").encode("utf-8", "ignore"))
+        if fp.get("sha1_head"):
+            inputs_digest.update(fp["sha1_head"].encode("utf-8"))
+    signature = {
+        "git_revision": _git_revision(),
+        "inputs": inputs,
+        "page_fingerprints": pages_fp,
+        "profile_hash": profile_digest.hexdigest(),
+        "inputs_hash": inputs_digest.hexdigest(),
+        "export_ocr_engine": export_ocr_engine,
+        "toy_runtime": toy_runtime_snapshot,
+        "toy_runtime_overrides": toy_runtime_overrides,
+    }
+    return signature
+
+
+def _diff_signatures(local: Dict[str, Any], foreign: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    diff: Dict[str, Any] = {}
+    keys = set(local.keys()) | set(foreign.keys())
+    for key in sorted(keys):
+        lval = local.get(key)
+        rval = foreign.get(key)
+        if lval == rval:
+            continue
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(lval, dict) and isinstance(rval, dict):
+            sub = _diff_signatures(lval, rval, path)
+            diff.update(sub)
+        else:
+            diff[path] = {"local": lval, "foreign": rval}
+    return diff
+
+
+def _write_repro_signature(
+    outdir: str,
+    signature: Dict[str, Any],
+    ingest_path: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    sig_path = os.path.join(outdir, "repro_signature.json")
+    ingest_result: Optional[Dict[str, Any]] = None
+    try:
+        with open(sig_path, "w", encoding="utf-8") as fw:
+            json.dump(_json_ready(signature), fw, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"Signature write skipped: {exc}")
+        sig_path = None
+    if ingest_path:
+        ingest_signature = ingest_path
+        if os.path.exists(ingest_signature):
+            try:
+                with open(ingest_signature, "r", encoding="utf-8") as fr:
+                    foreign = json.load(fr)
+                diff = _diff_signatures(signature, foreign if isinstance(foreign, dict) else {})
+                ingest_result = {
+                    "path": ingest_signature,
+                    "diff": diff,
+                    "match": not diff,
+                }
+            except Exception as exc:
+                ingest_result = {"path": ingest_path, "error": str(exc)}
+    return sig_path, ingest_result
+
+
 def _should_toy_self_correct(
     export_signals: Optional[Dict[str, Any]],
     recognition_stats: Optional[Dict[str, Any]],
@@ -7981,6 +8258,7 @@ def _derive_intent(
         "learning_samples": export_signals.get("learning_samples") if export_signals else None,
     }
     intent["profile_domain"] = profile.get("domain")
+    intent["narrative"] = _intent_narrative(intent)
     return intent
 
 
@@ -8211,6 +8489,7 @@ def _patched_run_full_pipeline(
     toy_lite: bool = False,
     toy_sweeps: Optional[int] = None,
     force_numeric_by_header: Optional[bool] = None,
+    ingest_signature: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     random.seed(seed)
@@ -8337,6 +8616,7 @@ def _patched_run_full_pipeline(
             "path": toy_memory_path,
             "load": _json_ready(toy_memory_info_load),
         },
+        "ingest_signature": ingest_signature,
     }
 
     if force_numeric_flag is not None:
@@ -8441,6 +8721,7 @@ def _patched_run_full_pipeline(
         summary["export_signals"] = export_signals
         if export_signals.get("learning_jsonl"):
             summary["learning_jsonl"] = export_signals.get("learning_jsonl")
+    export_signals_before_learning = json.loads(json.dumps(export_signals)) if export_signals else None
 
     reanalysis_summary: Optional[Dict[str, Any]] = None
     reanalysis_reasons_done: Set[str] = set()
@@ -8626,6 +8907,18 @@ def _patched_run_full_pipeline(
             "executed": bool(toy_executed),
             "details": _json_ready(toy_self_correction_details),
         }
+    learning_outcome = _evaluate_learning_outcome(
+        export_signals_before_learning,
+        export_signals,
+        reanalysis_summary,
+    )
+    if learning_outcome:
+        summary["learning_outcome"] = _json_ready(learning_outcome)
+        if summary.get("toy_self_correction"):
+            summary["toy_self_correction"].setdefault("details", {})
+            details_obj = summary["toy_self_correction"].get("details")
+            if isinstance(details_obj, dict):
+                details_obj["learning_outcome"] = learning_outcome
 
     pre_augment_reanalysis_reasons = set(reanalysis_reasons_done)
 
@@ -8903,6 +9196,9 @@ def _patched_run_full_pipeline(
     summary["toy_memory"]["before_run"] = _json_ready(toy_memory_run_baseline)
     summary["toy_memory"]["after_run"] = _json_ready(toy_memory_after_run)
     summary["toy_memory"]["delta_run"] = _json_ready(toy_memory_delta_run)
+    learning_story = _summarize_toy_learning(toy_memory_delta_run, toy_recognition_stats)
+    if learning_story:
+        summary["toy_memory"]["learning_reason"] = _json_ready(learning_story)
     if toy_recognition_stats is not None:
         summary["toy_memory"]["recognition"] = _json_ready(toy_recognition_stats)
         if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
@@ -8917,6 +9213,25 @@ def _patched_run_full_pipeline(
 
     toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
     summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
+
+    repro_signature = _build_repro_signature(
+        inputs,
+        page_images,
+        prof,
+        toy_runtime_snapshot,
+        export_ocr_engine,
+        toy_runtime_overrides,
+    )
+    summary["repro_signature"] = _json_ready(repro_signature)
+    sig_path, ingest_info = _write_repro_signature(outdir, repro_signature, ingest_signature)
+    if sig_path:
+        summary["repro_signature_path"] = sig_path
+    if ingest_info:
+        summary["repro_ingest"] = _json_ready(ingest_info)
+
+    advisor_path = _write_advice_packet(outdir, summary)
+    if advisor_path:
+        summary["advisor_prompt"] = advisor_path
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
@@ -9045,6 +9360,11 @@ def main():
         default=None,
         help="OCR backend to use (e.g. toy, tesseract, easyocr). Overrides ZOCR_OCR_ENGINE.",
     )
+    ap.add_argument(
+        "--ingest-signature",
+        default=None,
+        help="Optional reproducibility signature JSON to compare against",
+    )
     args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
@@ -9071,6 +9391,7 @@ def main():
             toy_lite=args.toy_lite,
             toy_sweeps=toy_sweeps,
             force_numeric_by_header=force_numeric_flag,
+            ingest_signature=args.ingest_signature,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
