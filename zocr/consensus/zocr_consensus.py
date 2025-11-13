@@ -13,8 +13,8 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass
 from collections import Counter, defaultdict, OrderedDict, deque
 
@@ -27,10 +27,71 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, 
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
+    from pytesseract import TesseractError as _PYTESS_ERR  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     pytesseract = None  # type: ignore
     _PYTESS_OUTPUT = None  # type: ignore
+    _PYTESS_ERR = None  # type: ignore
 from html.parser import HTMLParser
+
+_OCR_BACKEND_CACHE: Dict[str, Callable[["Image.Image"], Tuple[str, float]]] = {}
+_OCR_BACKEND_WARNED: Set[str] = set()
+_EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
+
+_TOY_SELF_CORRECTION_STACK: List[Dict[str, Any]] = []
+
+
+def _normalize_self_correction_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    if not isinstance(config, dict):
+        return normalized
+    for key, value in config.items():
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            normalized[key] = value
+        elif isinstance(value, (list, tuple)):
+            normalized[key] = [v for v in value]
+        elif isinstance(value, dict):
+            normalized[key] = {k: v for k, v in value.items()}
+    return normalized
+
+
+def push_toy_self_correction(config: Optional[Dict[str, Any]]) -> None:
+    """Push a new toy OCR self-correction configuration onto the active stack."""
+
+    _TOY_SELF_CORRECTION_STACK.append(_normalize_self_correction_config(config))
+
+
+def pop_toy_self_correction() -> None:
+    """Pop the most recent toy OCR self-correction configuration."""
+
+    if _TOY_SELF_CORRECTION_STACK:
+        _TOY_SELF_CORRECTION_STACK.pop()
+
+
+def current_toy_self_correction() -> Dict[str, Any]:
+    """Return the merged toy OCR self-correction configuration."""
+
+    merged: Dict[str, Any] = {}
+    for cfg in _TOY_SELF_CORRECTION_STACK:
+        for key, value in cfg.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                combined = dict(merged[key])  # type: ignore[index]
+                combined.update(value)
+                merged[key] = combined
+            else:
+                merged[key] = value
+    return merged
+
+
+@contextlib.contextmanager
+def toy_self_correction_scope(config: Optional[Dict[str, Any]]):
+    """Context manager helper to apply a temporary toy self-correction config."""
+
+    push_toy_self_correction(config)
+    try:
+        yield
+    finally:
+        pop_toy_self_correction()
 
 _thomas = None
 try:
@@ -1110,7 +1171,21 @@ _ASCII_SET = (
     " +#=_[]{}"
 )
 
-_GLYPH_VARIANT_LIMIT = 6
+def _initial_toy_sweep_limit(default: int = 2) -> int:
+    candidates = ("ZOCR_TOY_SWEEPS", "ZOCR_TOY_SWEEP_LIMIT")
+    for key in candidates:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            return max(1, int(raw.strip()))
+        except Exception:
+            continue
+    return max(1, int(default))
+
+
+_INITIAL_TOY_SWEEP_LIMIT = _initial_toy_sweep_limit()
+_GLYPH_VARIANT_LIMIT = int(_INITIAL_TOY_SWEEP_LIMIT)
 
 
 def _parse_threshold_limit(value: str, default: int) -> int:
@@ -1967,6 +2042,7 @@ def _update_ngram_model(text: str) -> None:
 
 def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> List[Tuple["np.ndarray", Dict[str, Any]]]:
     variants: List[Tuple["np.ndarray", Dict[str, Any]]] = []
+    cfg = current_toy_self_correction()
     try:
         gray_img = Image.fromarray(arr.astype(np.uint8)) if arr is not None else None
     except Exception:
@@ -1974,17 +2050,51 @@ def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> L
     if best_bw is not None:
         try:
             bw_img = Image.fromarray(best_bw.astype(np.uint8))
-            for size in (3, 5):
+            filter_sizes: List[int] = [3, 5]
+            if cfg and isinstance(cfg.get("augment_filter_sizes"), (list, tuple)):
+                for candidate in cfg.get("augment_filter_sizes", []):  # type: ignore[assignment]
+                    try:
+                        filt_size = int(round(float(candidate)))
+                    except Exception:
+                        continue
+                    if filt_size % 2 == 0 or filt_size <= 0:
+                        continue
+                    filter_sizes.append(filt_size)
+            max_filter = int(cfg.get("max_filter_size", 9)) if isinstance(cfg, dict) else 9
+            norm_sizes = sorted({s for s in filter_sizes if 1 <= s <= max_filter})
+            if not norm_sizes:
+                norm_sizes = [3, 5]
+            for size in norm_sizes:
                 try:
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MaxFilter(size)), dtype=np.uint8), {"type": "augment_max", "size": size}))
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MinFilter(size)), dtype=np.uint8), {"type": "augment_min", "size": size}))
                 except Exception:
                     continue
+            if cfg and cfg.get("augment_invert"):
+                try:
+                    inverted = 255 - np.asarray(bw_img, dtype=np.uint8)
+                    variants.append((inverted, {"type": "augment_invert"}))
+                except Exception:
+                    pass
         except Exception:
             pass
     if gray_img is not None:
         fill = int(float(np.median(arr))) if arr.size else 0
-        for angle in (-3, -1, 1, 3):
+        rotations = [-3, -1, 1, 3]
+        if cfg and isinstance(cfg.get("extra_rotations"), (list, tuple)):
+            limit = int(cfg.get("rotation_limit", 12))
+            for candidate in cfg.get("extra_rotations", []):  # type: ignore[assignment]
+                try:
+                    rot = int(round(float(candidate)))
+                except Exception:
+                    continue
+                if -limit <= rot <= limit:
+                    rotations.append(rot)
+        rotations = sorted({int(r) for r in rotations if -30 <= int(r) <= 30}) or [-3, -1, 1, 3]
+        if cfg and cfg.get("include_zero_rotation"):
+            rotations.append(0)
+            rotations = sorted({int(r) for r in rotations if -30 <= int(r) <= 30}) or [-3, -1, 1, 3]
+        for angle in rotations:
             try:
                 rotated = gray_img.rotate(angle, resample=Image.BILINEAR, fillcolor=fill)
                 rot_arr = np.asarray(rotated, dtype=np.uint8)
@@ -2001,7 +2111,281 @@ _TOTAL_LABEL_HINTS = [
     "合計", "総計", "総額", "小計", "税込合計", "税込総額", "請求額", "ご請求額", "支払金額", "合算", "合計金額"
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
-_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
+_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?%?")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+_PYTESS_TIMEOUT = max(0.0, _env_float("ZOCR_PYTESS_TIMEOUT", 3.5))
+_PYTESS_NICE = _env_int("ZOCR_PYTESS_NICE", None)
+
+
+def _pytesseract_env_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    if _PYTESS_TIMEOUT > 0.0:
+        kwargs["timeout"] = _PYTESS_TIMEOUT
+    if _PYTESS_NICE is not None:
+        kwargs["nice"] = _PYTESS_NICE
+    return kwargs
+
+
+_PYTESS_ENV_KWARGS = _pytesseract_env_kwargs()
+_PYTESS_ENV_SUPPORTED = True
+_PYTESS_TIMEOUT_WARNED = False
+
+
+def _note_pytesseract_exception(label: str, exc: Exception) -> None:
+    global _PYTESS_TIMEOUT_WARNED
+    if exc is None:
+        return
+    msg = str(exc).lower()
+    if "time" in msg and "out" in msg:
+        if not _PYTESS_TIMEOUT_WARNED:
+            limit = f"{_PYTESS_TIMEOUT:.1f}s" if _PYTESS_TIMEOUT > 0 else "configured limit"
+            print(f"[WARN] pytesseract {label} timed out ({limit}); continuing", flush=True)
+            _PYTESS_TIMEOUT_WARNED = True
+
+
+def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
+    global _PYTESS_ENV_SUPPORTED
+    extras = _PYTESS_ENV_KWARGS if _PYTESS_ENV_SUPPORTED else {}
+    if extras:
+        call_kwargs = dict(kwargs)
+        call_kwargs.update(extras)
+    else:
+        call_kwargs = kwargs
+    try:
+        return func(*args, **call_kwargs)
+    except TypeError as exc:
+        if extras:
+            _PYTESS_ENV_SUPPORTED = False
+            return _pytesseract_call(label, func, *args, **kwargs)
+        _note_pytesseract_exception(label, exc)
+        return None
+    except Exception as exc:  # pragma: no cover - best effort guard
+        _note_pytesseract_exception(label, exc)
+        return None
+
+
+# --- Toy OCR knobs ----------------------------------------------------------
+_TOY_SWEEPS = int(_INITIAL_TOY_SWEEP_LIMIT)
+_FORCE_NUMERIC = _env_flag(
+    "ZOCR_COERCE_NUMERIC",
+    _env_flag("ZOCR_FORCE_NUMERIC", True),
+)
+
+
+def toy_runtime_config() -> Dict[str, Any]:
+    """Return the currently active toy OCR runtime knobs."""
+
+    return {
+        "threshold_sweeps": int(_TOY_SWEEPS),
+        "glyph_variant_limit": int(_GLYPH_VARIANT_LIMIT),
+        "force_numeric": bool(_FORCE_NUMERIC),
+    }
+
+
+def configure_toy_runtime(
+    *, sweeps: Optional[int] = None, force_numeric: Optional[bool] = None
+) -> Dict[str, Any]:
+    """Update toy OCR runtime knobs at runtime."""
+
+    updates: Dict[str, Any] = {}
+    global _TOY_SWEEPS, _FORCE_NUMERIC, _GLYPH_VARIANT_LIMIT
+    if sweeps is not None:
+        try:
+            new_sweeps = max(1, int(sweeps))
+        except Exception:
+            new_sweeps = _TOY_SWEEPS
+        if new_sweeps != _TOY_SWEEPS:
+            _TOY_SWEEPS = new_sweeps
+            _GLYPH_VARIANT_LIMIT = int(max(1, new_sweeps))
+            updates["threshold_sweeps"] = new_sweeps
+    if force_numeric is not None:
+        new_flag = bool(force_numeric)
+        if new_flag != _FORCE_NUMERIC:
+            _FORCE_NUMERIC = new_flag
+            updates["force_numeric"] = new_flag
+    return updates
+_NUMERIC_HEADER_KIND = [
+    ("qty", re.compile(r"(数量|数|個|qty|q'?ty|quantity)", re.I)),
+    ("unit_price", re.compile(r"(単価|unit\s*price|price|unit\s*cost)", re.I)),
+    ("subtotal", re.compile(r"(小計|subtotal)", re.I)),
+    (
+        "amount",
+        re.compile(
+            r"(金額|合計|総計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
+            re.I,
+        ),
+    ),
+    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount)", re.I)),
+    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat|gst)", re.I)),
+]
+
+_FULLWIDTH_NUMBERS = str.maketrans(
+    {
+        "０": "0",
+        "１": "1",
+        "２": "2",
+        "３": "3",
+        "４": "4",
+        "５": "5",
+        "６": "6",
+        "７": "7",
+        "８": "8",
+        "９": "9",
+        "．": ".",
+        "，": ",",
+        "－": "-",
+        "＋": "+",
+        "％": "%",
+    }
+)
+_NUMERIC_SANITIZE_RX = re.compile(r"[^0-9.+-]")
+
+
+def _normalize_numeric_bits(text: Any, kind: str) -> Tuple[str, Optional[float], Optional[bool]]:
+    raw = "" if text is None else str(text)
+    raw = raw.strip()
+    if not raw:
+        return "", None, None
+    work = raw.translate(_FULLWIDTH_NUMBERS)
+    work = work.replace("円", "").replace("￥", "").replace("¥", "").replace("$", "")
+    work = work.replace(",", "")
+    work = work.replace("，", "").replace("．", ".")
+    work = work.replace("％", "%")
+    neg = False
+    if work.startswith("(") and work.endswith(")"):
+        neg = True
+        work = work[1:-1]
+    work = work.strip()
+    percent = "%" in work
+    work = work.replace("%", "")
+    cleaned = _NUMERIC_SANITIZE_RX.sub("", work)
+    if neg and cleaned and not cleaned.startswith("-"):
+        cleaned = "-" + cleaned
+    if not cleaned:
+        return "", None, percent
+    try:
+        value = float(cleaned)
+    except Exception:
+        value = None
+    normalized = cleaned
+    if kind == "qty" and value is not None:
+        qty_val = int(round(value))
+        value = float(qty_val)
+        normalized = str(qty_val)
+    if percent and normalized:
+        normalized = f"{normalized}%"
+    return normalized, value, percent if percent else None
+
+
+def _normalize_numeric_text(text: str, kind: str) -> str:
+    normalized, _, _ = _normalize_numeric_bits(text, kind)
+    return normalized or (text or "")
+
+
+def _coerce_numeric_filters(kind: Optional[str], text: str) -> Tuple[str, Dict[str, Any]]:
+    if not kind:
+        return text, {}
+    normalized, value, percent = _normalize_numeric_bits(text, kind)
+    payload: Dict[str, Any] = {}
+    result_text = normalized or (text or "")
+    if value is None:
+        return result_text, payload
+    if kind == "qty":
+        payload["qty"] = int(round(value))
+        result_text = str(payload["qty"])
+    elif kind in ("amount", "subtotal", "tax_amount", "unit_price"):
+        payload[kind] = float(value)
+    elif kind == "tax_rate":
+        rate_val = float(value)
+        if percent or abs(rate_val) > 1.0:
+            rate_val = rate_val / 100.0
+        payload["tax_rate"] = rate_val
+    return result_text, payload
+
+
+def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
+    kinds: List[Optional[str]] = []
+    if not headers or not _FORCE_NUMERIC:
+        return kinds
+    for header in headers:
+        base = (header or "").strip().lower()
+        kind: Optional[str] = None
+        for candidate, rx in _NUMERIC_HEADER_KIND:
+            if rx.search(base):
+                kind = candidate
+                break
+        kinds.append(kind)
+    return kinds
+
+
+def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
+    if not headers or not _FORCE_NUMERIC:
+        return
+    kinds = _numeric_header_kinds(headers)
+    if not kinds:
+        return
+    for r in range(1, len(grid_text)):
+        row = list(grid_text[r])
+        changed = False
+        for c, kind in enumerate(kinds):
+            if not kind or c >= len(row):
+                continue
+            normalized = _normalize_numeric_text(str(row[c] or ""), kind)
+            if normalized != row[c]:
+                row[c] = normalized
+                changed = True
+        if changed and isinstance(grid_text[r], list):
+            grid_text[r][:] = row
+
+
+_NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
+    "qty": "0123456789",
+    "unit_price": "0123456789.-",
+    "amount": "0123456789.-",
+    "subtotal": "0123456789.-",
+    "tax_amount": "0123456789.-",
+    "tax_rate": "0123456789.%",
+}
+
+
+def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
+    if not headers or not _FORCE_NUMERIC:
+        return []
+    kinds = _numeric_header_kinds(headers)
+    if not kinds:
+        return []
+    hints: List[Optional[str]] = []
+    for kind in kinds:
+        hints.append(_NUMERIC_COLUMN_CHARSETS.get(kind) if kind else None)
+    return hints
 
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "?": ("7", "1", "2"),
@@ -2046,10 +2430,13 @@ def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
         return []
     variants: List[Tuple[str, float, str]] = []
     config = "--psm 6"
-    try:
-        data = pytesseract.image_to_data(img, output_type=_PYTESS_OUTPUT.DICT, config=config)  # type: ignore[arg-type]
-    except Exception:
-        data = None
+    data = _pytesseract_call(
+        "image_to_data",
+        pytesseract.image_to_data,  # type: ignore[arg-type]
+        img,
+        output_type=_PYTESS_OUTPUT.DICT,
+        config=config,
+    )
     if isinstance(data, dict):
         words: List[str] = []
         confs: List[float] = []
@@ -2069,10 +2456,12 @@ def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
             joined = " ".join(words)
             conf_val = max(confs) if confs else 0.6
             variants.append((joined, float(max(0.0, min(1.0, conf_val))), "engine:pytesseract_data"))
-    try:
-        raw = pytesseract.image_to_string(img, config=config)  # type: ignore[arg-type]
-    except Exception:
-        raw = None
+    raw = _pytesseract_call(
+        "image_to_string",
+        pytesseract.image_to_string,  # type: ignore[arg-type]
+        img,
+        config=config,
+    )
     if raw:
         txt = raw.strip()
         if txt:
@@ -2347,7 +2736,7 @@ def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
         out[:, dx:] = 0
     return out
 
-def _match_glyph(cell_bin, atlas):
+def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None):
     # try best correlation over atlas with light shift tolerance and feature penalties
     cw, ch = cell_bin.size
     import numpy as _np
@@ -2364,8 +2753,13 @@ def _match_glyph(cell_bin, atlas):
         cell_style = float(_np.var(row_profile) + _np.var(col_profile))
     else:
         cell_style = 0.0
+    allowed: Optional[Set[str]] = None
+    if allowed_chars:
+        allowed = {str(ch) for ch in allowed_chars if str(ch)}
     best_ch, best_score = "", -1.0
     for ch_key, tpl in atlas.items():
+        if allowed is not None and ch_key not in allowed:
+            continue
         tpl_list = tpl if isinstance(tpl, (list, tuple)) else [tpl]
         variant_best = -1.0
         for glyph_img in tpl_list:
@@ -2432,7 +2826,7 @@ def _otsu_threshold_toy(arr):
             threshold = i
     return int(threshold)
 
-def _text_from_binary(bw):
+def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = _cc_label_rle(bw)
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
@@ -2487,7 +2881,7 @@ def _text_from_binary(bw):
                 patch = Image.fromarray(arr, mode="L")
             except Exception:
                 patch = Image.fromarray(sub)
-            ch, sc = _match_glyph(patch, atlas)
+            ch, sc = _match_glyph(patch, atlas, allowed_chars=allowed_chars)
             _glyph_runtime_store(sig, ch, sc)
             if not ch or ch == "?" or sc < 0.6:
                 _glyph_pending_enqueue(sig, arr, sc)
@@ -2510,12 +2904,26 @@ def _text_from_binary(bw):
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
 
-def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[str, float]:
+def toy_ocr_text_from_cell(
+    crop_img: "Image.Image", bin_k: int = 15, allowed_chars: Optional[Sequence[str]] = None
+) -> Tuple[str, float]:
     """Very small OCR to work with the demo font. Returns (text, confidence)."""
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
     g = g.filter(ImageFilter.MedianFilter(3))
     arr = _np.asarray(g, dtype=_np.uint8)
+    cfg = current_toy_self_correction()
+    if isinstance(cfg.get("bin_k_override"), (int, float)):
+        try:
+            bin_k = max(3, int(round(float(cfg["bin_k_override"]))))
+        except Exception:
+            pass
+    elif isinstance(cfg.get("bin_k_scale"), (int, float)):
+        try:
+            scale = float(cfg.get("bin_k_scale"))
+            bin_k = max(3, int(round(bin_k * scale)))
+        except Exception:
+            pass
     if arr.size == 0:
         return "", 0.0
     arr_f = arr.astype(_np.float32)
@@ -2569,12 +2977,31 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     thr_otsu = _otsu_threshold_toy(arr)
     _add_candidate((arr < thr_otsu).astype(_np.uint8) * 255, {"type": "otsu", "thr": thr_otsu})
     _add_candidate((arr > thr_otsu).astype(_np.uint8) * 255, {"type": "otsu_inv", "thr": thr_otsu})
-    thr_min = max(16, thr_med - 60)
-    thr_max = min(240, thr_med + 70)
-    for thr_candidate in range(thr_min, thr_max + 1, 10):
-        _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep", "thr": thr_candidate})
-    spread = int(max(6, arr.std()))
-    for delta in (-spread, spread):
+    threshold_expand = int(cfg.get("threshold_expand", 0)) if isinstance(cfg, dict) else 0
+    sweeps = int(cfg.get("threshold_sweeps", 0)) if isinstance(cfg, dict) else 0
+    if sweeps <= 0:
+        sweeps = _TOY_SWEEPS
+    thr_min = max(16, thr_med - 60 - threshold_expand)
+    thr_max = min(240, thr_med + 70 + threshold_expand)
+    if thr_max <= thr_min:
+        thr_max = min(240, thr_min + 6)
+    sweep_values = [int(x) for x in _np.linspace(thr_min, thr_max, num=max(1, sweeps))]
+    for thr_candidate in sweep_values:
+        thr_val = int(_np.clip(thr_candidate, 16, 240))
+        _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_global", "thr": thr_val})
+    spread_base = int(max(3, arr.std()))
+    extra_spread = int(cfg.get("extra_local_spread", 0)) if isinstance(cfg, dict) else 0
+    spread = max(3, min(24, spread_base + max(0, extra_spread)))
+    local_offsets: List[int] = [-spread, 0, spread]
+    if isinstance(cfg, dict) and isinstance(cfg.get("local_sweep_offsets"), (list, tuple)):
+        for candidate in cfg.get("local_sweep_offsets", []):  # type: ignore[assignment]
+            try:
+                offset = int(round(float(candidate)))
+            except Exception:
+                continue
+            if offset not in local_offsets:
+                local_offsets.append(offset)
+    for delta in local_offsets:
         thr_val = int(_np.clip(thr_med + delta, 16, 240))
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
 
@@ -2588,7 +3015,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         total = len(candidates)
         for i in range(idx, total):
             bw, meta = candidates[i]
-            text, conf = _text_from_binary(bw)
+            text, conf = _text_from_binary(bw, allowed_chars=allowed_chars)
             if text:
                 prev = candidate_scores.get(text)
                 if prev is None or conf > prev:
@@ -2598,11 +3025,19 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         return total
 
     _evaluate_from(0)
-    if best_conf < 0.5:
+    target_conf = float(cfg.get("target_confidence", 0.5)) if isinstance(cfg, dict) else 0.5
+    force_augment = bool(cfg.get("force_augment")) if isinstance(cfg, dict) else False
+    extra_augment_passes = int(cfg.get("extra_augment_passes", 0)) if isinstance(cfg, dict) else 0
+    extra_augment_passes = max(0, extra_augment_passes)
+    need_augment = force_augment or (best_conf < target_conf)
+    augment_cycles = max(1, 1 + extra_augment_passes) if need_augment else extra_augment_passes
+    for _ in range(augment_cycles):
         start_len = len(candidates)
         for bw_aug, meta_aug in _self_augment_views(arr, best_bw):
             _add_candidate(bw_aug, meta_aug)
         _evaluate_from(start_len)
+        if not force_augment and best_conf >= target_conf:
+            break
 
     if best_meta and best_meta.get("thr") is not None:
         _threshold_memory_store(key, int(best_meta["thr"]))
@@ -2624,6 +3059,171 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         _update_ngram_model(final_text)
         return final_text, float(max(0.0, min(1.0, final_conf)))
     return "", 0.0
+
+
+def _normalize_confidence(value: Any) -> float:
+    try:
+        conf = float(value)
+    except Exception:
+        conf = 0.0
+    if not math.isfinite(conf):
+        conf = 0.0
+    return float(max(0.0, min(1.0, conf)))
+
+
+def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple[str, float]]:
+    normalized = (name or "toy").strip()
+    cache_key = normalized.lower() or "toy"
+    cached = _OCR_BACKEND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    engine_name, _, engine_extra = normalized.partition(":")
+    engine_key = (engine_name or "toy").strip().lower() or "toy"
+    extra = engine_extra.strip()
+
+    runner: Callable[["Image.Image"], Tuple[str, float]]
+
+    if engine_key == "fast":
+
+        def _fast_runner(img: "Image.Image") -> Tuple[str, float]:
+            return "", 0.0
+
+        runner = _fast_runner
+    elif engine_key in ("toy", "mock", "demo"):
+        runner = toy_ocr_text_from_cell
+    elif engine_key.startswith("tess"):
+        if pytesseract is None or _PYTESS_OUTPUT is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract not available; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            lang = extra or os.environ.get("ZOCR_TESS_LANG", os.environ.get("TESS_LANG", "jpn+eng"))
+            psm = os.environ.get("ZOCR_TESS_PSM", "6")
+            oem = os.environ.get("ZOCR_TESS_OEM")
+            config_parts = []
+            if psm:
+                config_parts.append(f"--psm {psm}")
+            if oem:
+                config_parts.append(f"--oem {oem}")
+            tess_config = " ".join(config_parts)
+
+            def _tesseract_runner(img: "Image.Image") -> Tuple[str, float]:
+                try:
+                    target = img if getattr(img, "mode", "") in ("L", "RGB") else img.convert("RGB")
+                except Exception:
+                    target = img
+                data = _pytesseract_call(
+                    "image_to_data",
+                    pytesseract.image_to_data,  # type: ignore[arg-type]
+                    target,
+                    lang=lang or None,
+                    config=tess_config or "",
+                    output_type=_PYTESS_OUTPUT.DICT,
+                )
+                words: List[str] = []
+                confs: List[float] = []
+                if isinstance(data, dict):
+                    texts = data.get("text") or []
+                    conf_vals = data.get("conf") or []
+                    for raw_txt, raw_conf in zip(texts, conf_vals):
+                        txt = str(raw_txt or "").strip()
+                        if not txt:
+                            continue
+                        try:
+                            conf_val = float(raw_conf)
+                        except Exception:
+                            conf_val = -1.0
+                        if conf_val < 0:
+                            continue
+                        words.append(txt)
+                        confs.append(max(0.0, min(100.0, conf_val)))
+                if not words:
+                    raw = _pytesseract_call(
+                        "image_to_string",
+                        pytesseract.image_to_string,  # type: ignore[arg-type]
+                        target,
+                        lang=lang or None,
+                        config=tess_config or "",
+                    )
+                    text_raw = (raw or "").strip()
+                    if text_raw:
+                        words.append(text_raw)
+                        confs.append(62.0)
+                if not words:
+                    return "", 0.0
+                conf_avg = (sum(confs) / len(confs)) / 100.0 if confs else 0.0
+                return " ".join(words), _normalize_confidence(conf_avg)
+
+            runner = _tesseract_runner
+    elif engine_key.startswith("easy"):
+        if np is None:
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] easyocr requested but numpy is unavailable; falling back to toy OCR")
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        else:
+            try:
+                import easyocr  # type: ignore
+            except Exception:
+                if cache_key not in _OCR_BACKEND_WARNED:
+                    print("[WARN] easyocr not available; falling back to toy OCR")
+                    _OCR_BACKEND_WARNED.add(cache_key)
+                runner = toy_ocr_text_from_cell
+            else:
+                langs_raw = extra or os.environ.get("ZOCR_EASYOCR_LANGS", "ja,en")
+                langs = [tok.strip() for tok in langs_raw.split(",") if tok.strip()]
+                if not langs:
+                    langs = ["ja", "en"]
+                gpu_flag = (os.environ.get("ZOCR_EASYOCR_GPU", "").strip().lower())
+                gpu = gpu_flag not in ("0", "false", "no", "off")
+                reader_key = (tuple(langs), gpu)
+                reader = _EASYOCR_READER_CACHE.get(reader_key)
+                if reader is None:
+                    reader = easyocr.Reader(langs, gpu=gpu)
+                    _EASYOCR_READER_CACHE[reader_key] = reader
+
+                def _easyocr_runner(img: "Image.Image") -> Tuple[str, float]:
+                    try:
+                        target = img if getattr(img, "mode", "") == "RGB" else img.convert("RGB")
+                        arr = np.asarray(target)
+                    except Exception:
+                        return "", 0.0
+                    try:
+                        results = reader.readtext(arr, detail=1)
+                    except Exception:
+                        return "", 0.0
+                    texts: List[str] = []
+                    confs: List[float] = []
+                    for item in results:
+                        if not isinstance(item, (list, tuple)):
+                            continue
+                        text_val = item[1] if len(item) > 1 else ""
+                        conf_val = item[2] if len(item) > 2 else 0.0
+                        txt = str(text_val or "").strip()
+                        if not txt:
+                            continue
+                        texts.append(txt)
+                        try:
+                            conf_float = float(conf_val)
+                        except Exception:
+                            conf_float = 0.0
+                        confs.append(max(0.0, min(1.0, conf_float)))
+                    if not texts:
+                        return "", 0.0
+                    conf_avg = sum(confs) / len(confs) if confs else 0.0
+                    return " ".join(texts), _normalize_confidence(conf_avg)
+
+                runner = _easyocr_runner
+    else:
+        if cache_key not in _OCR_BACKEND_WARNED:
+            print(f"[WARN] Unknown OCR engine '{name}', falling back to toy OCR")
+            _OCR_BACKEND_WARNED.add(cache_key)
+        runner = toy_ocr_text_from_cell
+
+    _OCR_BACKEND_CACHE[cache_key] = runner
+    return runner
 
 def _keywords_from_row(row_cells: List[str]) -> List[str]:
     kws = set()
@@ -2745,6 +3345,30 @@ def export_jsonl_with_ocr(doc_json_path: str,
         page_lookup = {i: path for i, path in enumerate(seq)}
         default_image_path = seq[0] if seq else None
     image_cache: Dict[str, Image.Image] = {}
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
+
+    progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
+    log_progress = progress_flag not in {"", "0", "false", "no"}
+
+    def _parse_env_int(name: str, default: int, minimum: int = 0) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value)
+
+    log_every = max(1, _parse_env_int("ZOCR_EXPORT_LOG_EVERY", 200, 1))
+    max_cells = _parse_env_int("ZOCR_EXPORT_MAX_CELLS", 0, 0)
+    cells_done = 0
+    t0 = time.time()
+    stop_due_to_limit = False
+
+    pages = doc.get("pages") if isinstance(doc, dict) else None
+    if not isinstance(pages, list):
+        pages = []
 
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
@@ -2777,8 +3401,27 @@ def export_jsonl_with_ocr(doc_json_path: str,
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
         else 0.0
     )
+    if log_progress:
+        est_cells = 0
+        for p_est in pages:
+            if not isinstance(p_est, dict):
+                continue
+            for t_est in p_est.get("tables", []) or []:
+                dbg_est = t_est.get("dbg", {}) if isinstance(t_est, dict) else {}
+                col_bounds = dbg_est.get("col_bounds", []) if isinstance(dbg_est, dict) else []
+                cols = max(1, len(col_bounds) - 1)
+                baselines = dbg_est.get("baselines_segs", []) if isinstance(dbg_est, dict) else []
+                rows = max(2, len(baselines)) if baselines else 2
+                row_bands_rel = dbg_est.get("row_bands_rel") if isinstance(dbg_est, dict) else None
+                if isinstance(row_bands_rel, list) and row_bands_rel:
+                    rows = max(rows, len(row_bands_rel))
+                est_cells += max(1, rows) * max(1, cols)
+        print(f"[Export] engine={ocr_engine} pages={len(pages)} ~cells={est_cells}", flush=True)
+
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
-        for enum_idx, p in enumerate(doc["pages"]):
+        for enum_idx, p in enumerate(pages):
+            if stop_due_to_limit:
+                break
             pidx = p.get("index")
             page_image_path = p.get("image_path")
             lookup_idx: Optional[int]
@@ -2790,7 +3433,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
             if page_image is None:
                 continue
             page_w, page_h = page_image.size
-            for ti, t in enumerate(p["tables"]):
+            tables = p.get("tables", []) if isinstance(p, dict) else []
+            for ti, t in enumerate(tables):
+                if stop_due_to_limit:
+                    break
+                if not isinstance(t, dict):
+                    continue
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -2829,6 +3477,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 # OCR pass across grid
                 grid_text = [["" for _ in range(C)] for __ in range(R)]
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
+                col_charset_hints: List[Optional[str]] = []
+                toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]
@@ -2842,12 +3492,31 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_w, cx2 + right_pad),
                             min(page_h, cy2 + pad_y)
                         ))
-                        if ocr_engine=="toy":
-                            txt, conf = toy_ocr_text_from_cell(crop)
+                        allowed_chars = None
+                        if r > 0 and col_charset_hints and c < len(col_charset_hints):
+                            allowed_chars = col_charset_hints[c]
+                        if allowed_chars and toy_runner:
+                            txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
                         else:
-                            txt, conf = ("", 0.0)
+                            txt, conf = ocr_runner(crop)
+                        if not isinstance(txt, str):
+                            txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
-                        grid_conf[r][c] = conf
+                        grid_conf[r][c] = _normalize_confidence(conf)
+                        cells_done += 1
+                        if log_progress and (cells_done % log_every == 0):
+                            dt = time.time() - t0
+                            print(f"[Export] {cells_done} cells ({dt:.1f}s)", flush=True)
+                        if max_cells and cells_done >= max_cells:
+                            stop_due_to_limit = True
+                            break
+                    if r == 0 and not col_charset_hints:
+                        headers_sample = grid_text[0] if grid_text else []
+                        col_charset_hints = _column_charset_hints(headers_sample)
+                    if stop_due_to_limit:
+                        break
+                if stop_due_to_limit:
+                    break
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -2865,22 +3534,37 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 min(page_w, cx2),
                                 min(page_h, cy2 + pad_y)
                             ))
-                            alt_txt, alt_conf = toy_ocr_text_from_cell(crop)
+                            alt_txt, alt_conf = ocr_runner(crop)
                             m = _NUMERIC_RX.search(alt_txt or "")
                             if m:
                                 grid_text[r][target_col] = m.group(0)
-                                grid_conf[r][target_col] = max(grid_conf[r][target_col], alt_conf)
+                                grid_conf[r][target_col] = max(
+                                    grid_conf[r][target_col], _normalize_confidence(alt_conf)
+                                )
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
-                headers = grid_text[0] if contextual else []
+                headers = grid_text[0] if grid_text else []
+                header_fields = _numeric_header_kinds(headers)
+                if contextual:
+                    _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]; cx2 = x1 + col_bounds[c+1]
                         cy1, cy2 = row_bands[r]
                         txt = grid_text[r][c]
                         conf = grid_conf[r][c]
-                        # build search/synthesis
+                        raw_txt = txt
+                        forced_filters: Dict[str, Any] = {}
+                        col_kind = header_fields[c] if header_fields and c < len(header_fields) else None
+                        if col_kind and r > 0:
+                            coerced_txt, forced_filters = _coerce_numeric_filters(col_kind, txt)
+                            if coerced_txt and coerced_txt != txt:
+                                txt = coerced_txt
+                                grid_text[r][c] = coerced_txt
+                            elif coerced_txt:
+                                txt = coerced_txt
                         row_texts = grid_text[r]
+                        # build search/synthesis
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
                         kws = _keywords_from_row(row_texts) if contextual and r>0 else []
                         low_conf = (conf is not None and conf < ocr_min_conf)
@@ -2897,15 +3581,23 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             review_reasons.append("high_surprisal")
                             surprisal_samples += 1
                         trace_id = f"page={pidx},table={ti},row={r},col={c}"
+                        has_currency = ("currency" in kws) or any(
+                            sym in (raw_txt or "") for sym in ["¥", "円", "$"]
+                        )
                         filters = {
-                            "has_currency": ("currency" in kws),
+                            "has_currency": has_currency,
                             "row_index": r,
                             "col_index": c,
                             "trace_id": trace_id
                         }
+                        if col_kind:
+                            filters["numeric_header_kind"] = col_kind
                         if r in footer_rows:
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
+                        if forced_filters:
+                            filters.update(forced_filters)
+                            filters["force_numeric"] = True
                         if note:
                             filters["linked"] = note
                         concepts = _conceptual_tags(txt, headers, row_texts)
@@ -2972,6 +3664,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         count += 1
+                if log_progress:
+                    fw.flush()
+            if stop_due_to_limit:
+                break
+        if log_progress:
+            print(f"[Export] done: {count} records", flush=True)
     signals_path = out_jsonl_path + ".signals.json"
     learn_path = out_jsonl_path + ".learning.jsonl"
     summary_payload: Dict[str, Any] = {
@@ -3009,8 +3707,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
 def reanalyze_learning_jsonl(learning_jsonl_path: str,
                              out_dir: Optional[str] = None,
                              limit: int = 64,
-                             rotate: bool = True) -> Dict[str, Any]:
-    """Re-run toy OCR over low-confidence cells to propose improved readings."""
+                             rotate: bool = True,
+                             ocr_engine: str = "toy") -> Dict[str, Any]:
+    """Re-run the selected OCR backend over low-confidence cells to propose improved readings."""
     summary: Dict[str, Any] = {
         "input": learning_jsonl_path,
         "limit": int(limit),
@@ -3027,10 +3726,16 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         "ambiguous_variants": 0,
         "fallback_variant_count": 0,
         "fallback_transform_usage": {},
+        "ocr_engine": ocr_engine,
     }
+    active_cfg = current_toy_self_correction()
+    if active_cfg:
+        summary["toy_self_correction"] = _normalize_self_correction_config(active_cfg)
     if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
         summary["error"] = "learning_jsonl_missing"
         return summary
+
+    ocr_runner = _resolve_ocr_backend(ocr_engine)
 
     dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
     ensure_dir(dest_dir)
@@ -3122,21 +3827,24 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 crop = page_img.crop((x1, y1, x2, y2))
 
                 observed_text = sig.get("observed_text")
-                try:
-                    observed_conf = float(sig.get("confidence")) if sig.get("confidence") is not None else 0.0
-                except Exception:
-                    observed_conf = 0.0
+                observed_conf = _normalize_confidence(sig.get("confidence"))
 
                 variants_map: Dict[str, Dict[str, Any]] = {}
 
-                def _merge_variant(text: str, conf: float, transform: str) -> None:
+                def _merge_variant(text: Any, conf: Any, transform: str) -> None:
                     nonlocal ambiguous_total, fallback_used
-                    key = text or ""
-                    conf_f = float(conf or 0.0)
+                    if isinstance(text, str):
+                        normalized_text = text
+                    elif text is None:
+                        normalized_text = ""
+                    else:
+                        normalized_text = str(text)
+                    key = normalized_text
+                    conf_f = _normalize_confidence(conf)
                     created = key not in variants_map
                     if created:
                         variants_map[key] = {
-                            "text": text,
+                            "text": normalized_text,
                             "confidence": conf_f,
                             "transforms": [transform],
                         }
@@ -3165,20 +3873,27 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     elif transform.startswith("ambiguous") and created:
                         ambiguous_total += 1
 
-                base_text, base_conf = toy_ocr_text_from_cell(crop)
-                _merge_variant(base_text, base_conf, "base")
+                base_text_raw, base_conf_raw = ocr_runner(crop)
+                base_conf = _normalize_confidence(base_conf_raw)
+                _merge_variant(base_text_raw, base_conf, "base")
+                if isinstance(base_text_raw, str):
+                    base_text = base_text_raw
+                elif base_text_raw is None:
+                    base_text = ""
+                else:
+                    base_text = str(base_text_raw)
 
                 try:
                     bright_enhancer = ImageEnhance.Brightness(crop)
-                    txt_b1, conf_b1 = toy_ocr_text_from_cell(bright_enhancer.enhance(1.1))
+                    txt_b1, conf_b1 = ocr_runner(bright_enhancer.enhance(1.1))
                     _merge_variant(txt_b1, conf_b1, "brightness_1.1")
-                    txt_b2, conf_b2 = toy_ocr_text_from_cell(bright_enhancer.enhance(0.9))
+                    txt_b2, conf_b2 = ocr_runner(bright_enhancer.enhance(0.9))
                     _merge_variant(txt_b2, conf_b2, "brightness_0.9")
                 except Exception:
                     pass
                 try:
                     contrast_enhancer = ImageEnhance.Contrast(crop)
-                    txt_c, conf_c = toy_ocr_text_from_cell(contrast_enhancer.enhance(1.2))
+                    txt_c, conf_c = ocr_runner(contrast_enhancer.enhance(1.2))
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
@@ -3197,7 +3912,7 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                             rotated = crop.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=(255, 255, 255))
                         except Exception:
                             continue
-                        text_r, conf_r = toy_ocr_text_from_cell(rotated)
+                        text_r, conf_r = ocr_runner(rotated)
                         _merge_variant(text_r, conf_r, f"rotate_{angle:+.1f}")
 
                 if observed_text:
@@ -3700,6 +4415,15 @@ def cli_export(args):
         source_images = [p for p in args.input if isinstance(p, str)]
     else:
         source_images = src
+    runtime_overrides: Dict[str, Any] = {}
+    sweeps = getattr(args, "toy_sweeps", None)
+    if sweeps is not None and sweeps > 0:
+        runtime_overrides["sweeps"] = sweeps
+    force_numeric = getattr(args, "force_numeric", None)
+    if force_numeric is not None:
+        runtime_overrides["force_numeric"] = force_numeric
+    if runtime_overrides:
+        configure_toy_runtime(**runtime_overrides)
     n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
     print("Exported", n, "records to", out_jsonl)
 
@@ -3730,6 +4454,26 @@ def _patch_cli_for_export_and_search(parser):
     def add_common(sp):
         sp.add_argument("--out", type=str, default="out_consensus")
         sp.add_argument("-i","--input", nargs="*", default=[])
+        sp.add_argument(
+            "--toy-sweeps",
+            type=int,
+            default=None,
+            help="Clamp toy OCR threshold sweeps (overrides ZOCR_TOY_SWEEPS)",
+        )
+        group = sp.add_mutually_exclusive_group()
+        group.add_argument(
+            "--force-numeric",
+            dest="force_numeric",
+            action="store_true",
+            help="Force numeric coercion based on headers",
+        )
+        group.add_argument(
+            "--no-force-numeric",
+            dest="force_numeric",
+            action="store_false",
+            help="Disable numeric coercion",
+        )
+        sp.set_defaults(force_numeric=None)
     sp = sub.add_parser("export", help="Export JSONL with toy OCR + contextual lines")
     add_common(sp); sp.set_defaults(func=cli_export)
     sp = sub.add_parser("index", help="Build local BM25 index from exported JSONL")
