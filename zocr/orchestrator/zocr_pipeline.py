@@ -13,6 +13,7 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set
 from html import escape
@@ -941,6 +942,185 @@ def _load_export_signals(jsonl_path: str) -> Dict[str, Any]:
     return {}
 
 
+def _analyze_learning_hotspots(learning_jsonl_path: Optional[str], max_samples: int = 400) -> Dict[str, Any]:
+    if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
+        return {}
+    table_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"score": 0.0, "count": 0})
+    row_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"score": 0.0, "count": 0})
+    trace_scores: Dict[str, Dict[str, Any]] = {}
+    reason_counts: Counter = Counter()
+    total = 0
+    try:
+        with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
+            for raw in fr:
+                if max_samples and total >= max_samples:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    continue
+                total += 1
+                trace = sig.get("trace_id") or sig.get("meta", {}).get("trace") if isinstance(sig.get("meta"), dict) else None
+                page = sig.get("page")
+                table_idx = sig.get("table_index")
+                row_idx = sig.get("row")
+                col_idx = sig.get("col")
+                try:
+                    page_int = int(page) if page is not None else None
+                except Exception:
+                    page_int = None
+                try:
+                    table_int = int(table_idx) if table_idx is not None else None
+                except Exception:
+                    table_int = None
+                try:
+                    row_int = int(row_idx) if row_idx is not None else None
+                except Exception:
+                    row_int = None
+                try:
+                    col_int = int(col_idx) if col_idx is not None else None
+                except Exception:
+                    col_int = None
+                table_key = f"page={page_int};table={table_int}"
+                row_key = f"{table_key};row={row_int}"
+                if not trace:
+                    trace = f"{row_key};col={col_int}"
+                trace = str(trace)
+                conf = _coerce_float(sig.get("confidence"))
+                surprisal = _coerce_float(sig.get("ngram_surprisal") or sig.get("surprisal"))
+                reasons = [str(r) for r in sig.get("reasons", []) if isinstance(r, str) and r]
+                for reason in reasons:
+                    reason_counts[reason] += 1
+                score = 1.0
+                if conf is not None:
+                    score += max(0.0, 1.0 - conf)
+                if surprisal is not None and surprisal > 0:
+                    score += min(1.0, surprisal / 6.0)
+                if "high_surprisal" in reasons:
+                    score += 0.4
+                if "low_conf" in reasons:
+                    score += 0.3
+                if sig.get("hypotheses"):
+                    score += 0.2
+                table_stats[table_key]["score"] += score
+                table_stats[table_key]["count"] += 1
+                row_stats[row_key]["score"] += score
+                row_stats[row_key]["count"] += 1
+                entry = trace_scores.setdefault(trace, {"score": 0.0, "count": 0, "page": page_int, "table": table_int, "row": row_int})
+                entry["score"] += score
+                entry["count"] += 1
+                if conf is not None:
+                    entry.setdefault("avg_conf" , 0.0)
+                    entry["avg_conf"] = ((entry.get("avg_conf") or 0.0) * (entry["count"] - 1) + conf) / max(1, entry["count"])
+                if reasons:
+                    existing = entry.setdefault("reasons", set())
+                    for reason in reasons:
+                        existing.add(reason)
+                observed = sig.get("observed_text") or sig.get("text")
+                if observed and "text" not in entry:
+                    entry["text"] = str(observed)[:64]
+    except Exception as exc:
+        return {"error": str(exc), "path": learning_jsonl_path}
+    if total == 0:
+        return {}
+
+    def _rank(stats: Dict[str, Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        ranked: List[Dict[str, Any]] = []
+        for key, payload in stats.items():
+            ranked.append({
+                "key": key,
+                "score": round(float(payload.get("score") or 0.0), 3),
+                "count": int(payload.get("count") or 0),
+            })
+        ranked.sort(key=lambda item: (-item["score"], -item["count"]))
+        return ranked[:limit]
+
+    hot_tables = _rank(table_stats, 6)
+    hot_rows = _rank(row_stats, 8)
+    trace_rank = sorted(trace_scores.items(), key=lambda item: (-float(item[1].get("score") or 0.0), item[1].get("count", 0)),)[:24]
+    hot_cells: List[Dict[str, Any]] = []
+    for trace, payload in trace_rank:
+        cell_entry = {
+            "trace_id": trace,
+            "score": round(float(payload.get("score") or 0.0), 3),
+            "page": payload.get("page"),
+            "table": payload.get("table"),
+            "row": payload.get("row"),
+        }
+        if payload.get("text"):
+            cell_entry["text"] = payload.get("text")
+        if payload.get("reasons"):
+            cell_entry["reasons"] = sorted(payload["reasons"])
+        hot_cells.append(cell_entry)
+    reason_rank = [{"reason": name, "count": count} for name, count in reason_counts.most_common(6)]
+
+    plan = _selective_focus_from_hotspots(trace_scores, row_stats, table_stats, reason_counts)
+
+    result: Dict[str, Any] = {
+        "total_samples": total,
+        "table_hotspots": hot_tables,
+        "row_hotspots": hot_rows,
+        "reason_counts": reason_rank,
+        "hot_cells": hot_cells,
+    }
+    if plan:
+        result["focus_plan"] = plan
+    return result
+
+
+def _selective_focus_from_hotspots(
+    trace_scores: Dict[str, Dict[str, Any]],
+    row_stats: Dict[str, Dict[str, Any]],
+    table_stats: Dict[str, Dict[str, Any]],
+    reason_counts: Counter,
+    max_traces: int = 96,
+) -> Optional[Dict[str, Any]]:
+    if not trace_scores and not row_stats and not table_stats:
+        return None
+    trace_order = sorted(
+        trace_scores.items(), key=lambda item: (-float(item[1].get("score") or 0.0), item[1].get("count", 0))
+    )
+    trace_ids = [trace for trace, _ in trace_order[:max_traces] if trace]
+    row_order = sorted(
+        row_stats.items(), key=lambda item: (-float(item[1].get("score") or 0.0), -float(item[1].get("count") or 0))
+    )
+    row_keys = [row for row, _ in row_order[:16]]
+    table_order = sorted(
+        table_stats.items(), key=lambda item: (-float(item[1].get("score") or 0.0), -float(item[1].get("count") or 0))
+    )
+    table_keys = [table for table, _ in table_order[:10]]
+    reasons = [name for name, _ in reason_counts.most_common(6)]
+    if not trace_ids and not row_keys and not table_keys:
+        return None
+    total_row_score = sum(float(payload.get("score") or 0.0) for payload in row_stats.values())
+    focus_row_score = sum(float(row_stats[key].get("score") or 0.0) for key in row_keys if key in row_stats)
+    coverage = (focus_row_score / total_row_score) if total_row_score else None
+    story_bits: List[str] = []
+    if coverage is not None:
+        story_bits.append(f"{coverage * 100:.1f}% of review load in {len(row_keys)} rows")
+    if reasons:
+        story_bits.append(f"top signal {reasons[0]}")
+    if table_keys:
+        story_bits.append(f"priority table {table_keys[0]}")
+    story_text = "; ".join(story_bits)
+    plan: Dict[str, Any] = {
+        "trace_ids": trace_ids,
+        "row_keys": row_keys,
+        "table_keys": table_keys,
+        "reasons": reasons,
+        "coverage_ratio": coverage,
+        "source": "learning_hotspots",
+    }
+    if trace_ids:
+        plan["limit"] = len(trace_ids)
+    if story_text:
+        plan["story"] = story_text
+    return {k: v for k, v in plan.items() if v not in (None, [], {})}
+
+
 def _summarize_toy_learning(
     toy_memory_delta: Optional[Dict[str, Any]],
     recognition_stats: Optional[Dict[str, Any]],
@@ -1624,6 +1804,79 @@ def _derive_intent(
     return intent
 
 
+def _derive_meta_intent(
+    intent: Optional[Dict[str, Any]],
+    learning_hotspots: Optional[Dict[str, Any]],
+    focus_plan: Optional[Dict[str, Any]],
+    rag_feedback: Optional[Dict[str, Any]] = None,
+    advisor_ingest: Optional[Dict[str, Any]] = None,
+    learning_outcome: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not intent:
+        return {}
+    action = intent.get("action") or "steady"
+    meta: Dict[str, Any] = {
+        "intent_action": action,
+        "meta_action": "reflect_intent",
+        "priority": intent.get("priority"),
+        "signals": intent.get("signals"),
+    }
+    story_bits: List[str] = []
+    recommendations: List[str] = []
+    if focus_plan:
+        meta["focus_plan"] = focus_plan
+    coverage = focus_plan.get("coverage_ratio") if isinstance(focus_plan, dict) else None
+    top_reason = None
+    reasons = learning_hotspots.get("reason_counts") if isinstance(learning_hotspots, dict) else None
+    if isinstance(reasons, list) and reasons:
+        top_reason = reasons[0].get("reason")
+    if top_reason:
+        story_bits.append(f"top signal {top_reason}")
+    if coverage is not None:
+        story_bits.append(f"focus covers {coverage * 100:.1f}% of review load")
+    if action == "reanalyze_cells":
+        meta["meta_action"] = "prioritize_hotspots" if focus_plan else "validate_reanalysis_reason"
+        meta["reason"] = intent.get("reason")
+        recommendations.append("rerun_selective_reanalysis")
+        if not focus_plan:
+            recommendations.append("collect_hotspots")
+    elif action == "focus_headers":
+        meta["meta_action"] = "explain_header_shift"
+        meta["reason"] = intent.get("reason")
+        recommendations.append("compare_header_rows")
+    elif action == "optimize_speed":
+        meta["meta_action"] = "speed_accuracy_tradeoff"
+        meta["reason"] = intent.get("reason")
+        recommendations.append("audit_latency_trace")
+    elif action == "explore_footer":
+        meta["meta_action"] = "validate_footer_scan"
+    else:
+        meta["meta_action"] = "stabilize_intent"
+    if learning_outcome:
+        meta["learning_outcome"] = learning_outcome
+        if not learning_outcome.get("success"):
+            recommendations.append("escalate_learning_loop")
+            story_bits.append("learning outcome pending")
+        else:
+            story_bits.append("learning succeeded")
+    external_inputs: Dict[str, Any] = {}
+    if rag_feedback and rag_feedback.get("actions"):
+        external_inputs["rag_actions"] = rag_feedback.get("actions")
+        story_bits.append(f"RAG requested {', '.join(rag_feedback.get('actions', []))}")
+    if advisor_ingest and advisor_ingest.get("actions"):
+        external_inputs["advisor_actions"] = advisor_ingest.get("actions")
+        story_bits.append(f"Advisor requested {', '.join(advisor_ingest.get('actions', []))}")
+    if external_inputs:
+        meta["external_inputs"] = external_inputs
+    if not external_inputs:
+        recommendations.append("publish_feedback_request")
+    if story_bits:
+        meta["story"] = "; ".join(story_bits)
+    if recommendations:
+        meta["recommendations"] = sorted(set(recommendations))
+    return meta
+
+
 def _apply_intent_to_profile(intent: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
     updates: Dict[str, Tuple[Any, Any]] = {}
     action = intent.get("action")
@@ -1770,9 +2023,17 @@ def _feedback_observations(summary: Dict[str, Any]) -> Dict[str, Any]:
         "last_export_stats": summary.get("last_export_stats"),
         "stage_stats": stage_stats,
     }
+    meta_intent = summary.get("meta_intent") or {}
+    if isinstance(meta_intent, dict):
+        observations["meta_intent_action"] = meta_intent.get("meta_action")
+        observations["meta_intent_story"] = meta_intent.get("story")
     export_cells = summary.get("last_export_stats") or {}
     if export_cells:
         observations.setdefault("export_cells", export_cells.get("cells"))
+    if summary.get("learning_hotspots"):
+        observations["learning_hotspots"] = summary.get("learning_hotspots")
+    if summary.get("selective_reanalysis_plan"):
+        observations["selective_reanalysis_plan"] = summary.get("selective_reanalysis_plan")
     recognizer = summary.get("recognition_stats") or summary.get("toy_recognition_stats")
     if recognizer:
         observations["recognition_stats"] = recognizer
@@ -1819,6 +2080,12 @@ def _emit_rag_feedback_request(
         request_payload["current_feedback"] = _json_ready(rag_feedback_ingest)
     if advisor_ingest:
         request_payload["advisor_feedback"] = _json_ready(advisor_ingest)
+    if summary.get("meta_intent"):
+        request_payload["meta_intent"] = summary.get("meta_intent")
+    if summary.get("learning_hotspots"):
+        request_payload["learning_hotspots"] = summary.get("learning_hotspots")
+    if summary.get("selective_reanalysis_plan"):
+        request_payload["selective_reanalysis_plan"] = summary.get("selective_reanalysis_plan")
     req_json = os.path.join(rag_dir, "feedback_request.json")
     req_md = os.path.join(rag_dir, "feedback_request.md")
     try:
@@ -2301,11 +2568,29 @@ def _patched_run_full_pipeline(
             except Exception:
                 toy_snapshot = None
 
+    learning_hotspots: Optional[Dict[str, Any]] = None
+    selective_focus_plan: Optional[Dict[str, Any]] = None
+    if learning_jsonl_path and os.path.exists(learning_jsonl_path):
+        hotspots_payload = _analyze_learning_hotspots(learning_jsonl_path)
+        if hotspots_payload:
+            learning_hotspots = hotspots_payload
+            plan = hotspots_payload.get("focus_plan") if isinstance(hotspots_payload, dict) else None
+            if plan:
+                selective_focus_plan = plan
+            summary_hotspots = dict(hotspots_payload)
+            if "focus_plan" in summary_hotspots:
+                summary_hotspots.pop("focus_plan")
+            if summary_hotspots:
+                summary["learning_hotspots"] = _json_ready(summary_hotspots)
+            if selective_focus_plan:
+                summary["selective_reanalysis_plan"] = _json_ready(selective_focus_plan)
+
     def _run_learning_reanalysis(
         step_label: str,
         reason: str,
         resume_key: Optional[str] = None,
         toy_plan: Optional[Dict[str, Any]] = None,
+        focus_plan: Optional[Dict[str, Any]] = None,
     ) -> bool:
         nonlocal reanalysis_summary, jsonl_path, export_signals, reanalysis_last_execs
         if not learning_jsonl_path:
@@ -2361,6 +2646,7 @@ def _patched_run_full_pipeline(
                             re_dir,
                             re_limit,
                             ocr_engine=export_ocr_engine,
+                            focus=focus_plan,
                         )
                 else:
                     result = _safe_step(
@@ -2370,6 +2656,7 @@ def _patched_run_full_pipeline(
                         re_dir,
                         re_limit,
                         ocr_engine=export_ocr_engine,
+                        focus=focus_plan,
                     )
                 _append_hist(outdir, result)
                 if not result.get("ok"):
@@ -2427,7 +2714,12 @@ def _patched_run_full_pipeline(
 
     re_targets = {str(t) for t in (prof.get("reanalyze_target") or []) if t}
     if learning_jsonl_path and "learning_cells" in re_targets:
-        _run_learning_reanalysis("ReanalyzeLearning", "profile_reanalyze_target", "ReanalyzeLearning")
+        _run_learning_reanalysis(
+            "ReanalyzeLearning",
+            "profile_reanalyze_target",
+            "ReanalyzeLearning",
+            focus_plan=selective_focus_plan,
+        )
     toy_self_correction_details: Optional[Dict[str, Any]] = None
     toy_triggered = False
     toy_executed = False
@@ -2439,6 +2731,7 @@ def _patched_run_full_pipeline(
                 "ReanalyzeLearningAuto",
                 "toy_self_correction",
                 toy_plan=plan if isinstance(plan, dict) else None,
+                focus_plan=selective_focus_plan,
             )
             if reanalysis_last_execs and isinstance(toy_self_correction_details, dict):
                 toy_executed = True
@@ -2640,6 +2933,16 @@ def _patched_run_full_pipeline(
         toy_recognition_stats,
     )
     summary["intent"] = intent
+    meta_intent = _derive_meta_intent(
+        intent,
+        learning_hotspots,
+        selective_focus_plan,
+        rag_feedback_ingest,
+        advisor_ingest,
+        learning_outcome,
+    )
+    if meta_intent:
+        summary["meta_intent"] = _json_ready(meta_intent)
     simulations = _simulate_param_shift(
         summary.get("monitor_row"),
         export_signals,
@@ -2666,7 +2969,11 @@ def _patched_run_full_pipeline(
         summary["profile_updates"] = {k: _json_ready(v) for k, v in combined_updates.items()}
     intent_runs: List[str] = []
     if intent.get("action") == "reanalyze_cells" and learning_jsonl_path:
-        if _run_learning_reanalysis("ReanalyzeLearningIntent", "intent_reanalyze"):
+        if _run_learning_reanalysis(
+            "ReanalyzeLearningIntent",
+            "intent_reanalyze",
+            focus_plan=selective_focus_plan,
+        ):
             intent_runs.append("reanalyze_learning")
     if intent_runs:
         summary["intent_runs"] = intent_runs
@@ -2678,7 +2985,11 @@ def _patched_run_full_pipeline(
     combined_actions = set(advisor_actions)
     combined_actions.update(rag_feedback_actions)
     if learning_jsonl_path and "reanalyze_cells" in combined_actions:
-        if _run_learning_reanalysis("ReanalyzeLearningAdvisor", "advisor_reanalyze"):
+        if _run_learning_reanalysis(
+            "ReanalyzeLearningAdvisor",
+            "advisor_reanalyze",
+            focus_plan=selective_focus_plan,
+        ):
             if "reanalyze_cells" in advisor_actions:
                 advisor_runs.append("reanalyze_learning")
                 advisor_actions_applied.append("reanalyze_cells")

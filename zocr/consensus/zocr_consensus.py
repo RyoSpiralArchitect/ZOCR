@@ -3756,11 +3756,77 @@ def export_jsonl_with_ocr(doc_json_path: str,
     return count
 
 
+def _prepare_reanalysis_focus(focus: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Set[str]]]]:
+    if not isinstance(focus, dict):
+        return None, None
+    plan: Dict[str, Any] = {}
+    filters: Dict[str, Set[str]] = {}
+
+    def _collect(key: str, limit: int) -> None:
+        raw = focus.get(key)
+        if not isinstance(raw, (list, tuple, set)):
+            return
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for item in raw:
+            text = str(item)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            ordered.append(text)
+            if len(ordered) >= limit:
+                break
+        if ordered:
+            plan[key] = ordered
+            filters[key] = set(ordered)
+
+    _collect("trace_ids", 512)
+    _collect("row_keys", 128)
+    _collect("table_keys", 64)
+    _collect("reasons", 24)
+    coverage = focus.get("coverage_ratio")
+    if coverage is not None:
+        try:
+            plan["coverage_ratio"] = float(coverage)
+        except Exception:
+            pass
+    if focus.get("story"):
+        plan["story"] = str(focus.get("story"))
+    if focus.get("source"):
+        plan["source"] = str(focus.get("source"))
+    limit_value = focus.get("limit")
+    if isinstance(limit_value, int):
+        plan["limit"] = int(limit_value)
+    return (plan if plan else None), (filters if any(filters.values()) else None)
+
+
+def _focus_signal_match(sig: Dict[str, Any], filters: Optional[Dict[str, Set[str]]]) -> bool:
+    if not filters:
+        return True
+    trace = str(sig.get("trace_id") or "")
+    if filters.get("trace_ids") and trace in filters.get("trace_ids", set()):
+        return True
+    page = sig.get("page")
+    table_idx = sig.get("table_index")
+    row_idx = sig.get("row")
+    table_key = f"page={page};table={table_idx}"
+    row_key = f"{table_key};row={row_idx}"
+    if filters.get("row_keys") and row_key in filters.get("row_keys", set()):
+        return True
+    if filters.get("table_keys") and table_key in filters.get("table_keys", set()):
+        return True
+    reasons = [str(r) for r in sig.get("reasons", []) if isinstance(r, str)]
+    if filters.get("reasons") and any(reason in filters.get("reasons", set()) for reason in reasons):
+        return True
+    return False
+
+
 def reanalyze_learning_jsonl(learning_jsonl_path: str,
                              out_dir: Optional[str] = None,
                              limit: int = 64,
                              rotate: bool = True,
-                             ocr_engine: str = "toy") -> Dict[str, Any]:
+                             ocr_engine: str = "toy",
+                             focus: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Re-run the selected OCR backend over low-confidence cells to propose improved readings."""
     summary: Dict[str, Any] = {
         "input": learning_jsonl_path,
@@ -3788,6 +3854,11 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         return summary
 
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+
+    focus_plan, focus_filters = _prepare_reanalysis_focus(focus)
+    focus_stats = {"matched": 0, "skipped": 0} if focus_filters else None
+    if focus_plan:
+        summary["focus_plan"] = focus_plan
 
     dest_dir = out_dir or os.path.dirname(learning_jsonl_path) or "."
     ensure_dir(dest_dir)
@@ -3837,6 +3908,12 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                 except Exception:
                     summary["skipped"] += 1
                     continue
+                if focus_filters and not _focus_signal_match(sig, focus_filters):
+                    if focus_stats is not None:
+                        focus_stats["skipped"] += 1
+                    continue
+                if focus_stats is not None:
+                    focus_stats["matched"] += 1
                 raw_reasons = sig.get("reasons")
                 if isinstance(raw_reasons, list):
                     for reason in raw_reasons:
@@ -4067,6 +4144,9 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
             json.dump(_json_ready(summary), fw_sum, ensure_ascii=False, indent=2)
     else:
         summary["avg_confidence_delta"] = 0.0
+
+    if focus_stats is not None:
+        summary["focus_stats"] = focus_stats
 
     return summary
 
