@@ -6899,7 +6899,7 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 from html import escape
 
 try:
@@ -7865,6 +7865,122 @@ def _write_advice_packet(outdir: str, summary: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+_ADVISOR_TEXT_HINTS = {
+    "reanalyze_cells": [
+        "reanalyze",
+        "re-analyze",
+        "reanlysis",
+        "cell sweep",
+        "再解析",
+        "セル再解析",
+    ],
+    "rerun_monitor": [
+        "rerun monitor",
+        "monitor again",
+        "monitor once more",
+        "再モニタ",
+        "監視をやり直し",
+    ],
+    "rerun_augment": [
+        "rerun augment",
+        "augment again",
+        "再augment",
+        "再度augment",
+        "再増強",
+    ],
+}
+
+
+def _canonical_advisor_action(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    norm = name.strip().lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "reanalyze": "reanalyze_cells",
+        "reanalyze_cells": "reanalyze_cells",
+        "reanalyze_grid": "reanalyze_cells",
+        "reanalyze_learning": "reanalyze_cells",
+        "reanalyze_cells_now": "reanalyze_cells",
+        "rerun_monitor": "rerun_monitor",
+        "monitor_again": "rerun_monitor",
+        "rerun_augment": "rerun_augment",
+        "augment_again": "rerun_augment",
+        "rerun_aug": "rerun_augment",
+    }
+    if norm in mapping:
+        return mapping[norm]
+    if norm.startswith("reanalyze") or "再解析" in norm:
+        return "reanalyze_cells"
+    if norm.startswith("monitor") or "再モニタ" in norm or "監視" in norm:
+        return "rerun_monitor"
+    if norm.startswith("augment") or "増強" in norm:
+        return "rerun_augment"
+    return norm if norm else None
+
+
+def _parse_advisor_suggestions(text: Optional[str], payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    actions: Set[str] = set()
+
+    def _push(action: Optional[str]) -> None:
+        if action:
+            actions.add(action)
+
+    if isinstance(payload, dict):
+        raw_actions = payload.get("actions")
+        if isinstance(raw_actions, (list, tuple, set)):
+            for entry in raw_actions:
+                if isinstance(entry, str):
+                    _push(_canonical_advisor_action(entry))
+        for key, value in payload.items():
+            if isinstance(value, bool) and value:
+                _push(_canonical_advisor_action(str(key)))
+    lower_text = text.lower() if text else ""
+    if lower_text:
+        for action, hints in _ADVISOR_TEXT_HINTS.items():
+            for hint in hints:
+                if hint.lower() in lower_text:
+                    actions.add(action)
+                    break
+    suggestions = {action: True for action in sorted(actions)}
+    return {"actions": sorted(actions), "flags": suggestions}
+
+
+def _ingest_advisor_response(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    info: Dict[str, Any] = {"path": path}
+    if not os.path.exists(path):
+        info["error"] = "not_found"
+        info["status"] = "missing"
+        return info
+    raw_text = None
+    payload = None
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            raw_text = fr.read()
+    except Exception as exc:
+        info["error"] = str(exc)
+        info["status"] = "unreadable"
+        return info
+    if raw_text is None:
+        info["status"] = "empty"
+        return info
+    snippet = raw_text[:4000]
+    info["preview"] = snippet
+    try:
+        payload = json.loads(raw_text)
+    except Exception:
+        payload = None
+    if payload is not None:
+        info["payload"] = _json_ready(payload)
+    parsed = _parse_advisor_suggestions(raw_text, payload if isinstance(payload, dict) else None)
+    if parsed.get("actions"):
+        info["actions"] = parsed["actions"]
+        info["suggestions"] = parsed.get("flags")
+    info["status"] = "ok"
+    return info
+
+
 def _git_revision() -> Optional[str]:
     try:
         rev = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
@@ -8490,6 +8606,7 @@ def _patched_run_full_pipeline(
     toy_sweeps: Optional[int] = None,
     force_numeric_by_header: Optional[bool] = None,
     ingest_signature: Optional[str] = None,
+    advisor_response: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     random.seed(seed)
@@ -8590,6 +8707,11 @@ def _patched_run_full_pipeline(
             toy_runtime_snapshot = runtime_config_fn()
         except Exception:
             toy_runtime_snapshot = None
+
+    advisor_ingest = _ingest_advisor_response(advisor_response)
+    advisor_actions: Set[str] = set()
+    if advisor_ingest.get("actions"):
+        advisor_actions = {str(a) for a in advisor_ingest.get("actions") if isinstance(a, str)}
 
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
@@ -9103,12 +9225,27 @@ def _patched_run_full_pipeline(
             intent_runs.append("reanalyze_learning")
     if intent_runs:
         summary["intent_runs"] = intent_runs
+    advisor_actions_applied: List[str] = []
+    advisor_runs: List[str] = []
+    if learning_jsonl_path and "reanalyze_cells" in advisor_actions:
+        if _run_learning_reanalysis("ReanalyzeLearningAdvisor", "advisor_reanalyze"):
+            advisor_runs.append("reanalyze_learning")
+    if advisor_runs:
+        summary["advisor_runs"] = advisor_runs
+        advisor_actions_applied.append("reanalyze_cells")
     rerun_flags = _needs_rerun_for_keys(list(combined_updates.keys())) if combined_updates else {"augment": False, "monitor": False}
     new_reanalysis_reasons = reanalysis_reasons_done - pre_augment_reanalysis_reasons
     if new_reanalysis_reasons:
         rerun_flags["augment"] = True
         rerun_flags["monitor"] = True
         summary["reanalysis_post_augment"] = sorted(new_reanalysis_reasons)
+    if "rerun_augment" in advisor_actions:
+        rerun_flags["augment"] = True
+        rerun_flags["monitor"] = True
+        advisor_actions_applied.append("rerun_augment")
+    elif "rerun_monitor" in advisor_actions:
+        rerun_flags["monitor"] = True
+        advisor_actions_applied.append("rerun_monitor")
     summary["feedback_rerun_flags"] = rerun_flags
     feedback_passes: List[str] = []
     prof = prof_after
@@ -9132,6 +9269,8 @@ def _patched_run_full_pipeline(
             summary["monitor_row"] = monitor_row
     if feedback_passes:
         summary["feedback_passes"] = feedback_passes
+    if advisor_actions_applied:
+        summary["advisor_actions_applied"] = sorted(set(advisor_actions_applied))
 
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
@@ -9232,6 +9371,8 @@ def _patched_run_full_pipeline(
     advisor_path = _write_advice_packet(outdir, summary)
     if advisor_path:
         summary["advisor_prompt"] = advisor_path
+    if advisor_ingest:
+        summary["advisor_ingest"] = _json_ready(advisor_ingest)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
@@ -9365,6 +9506,11 @@ def main():
         default=None,
         help="Optional reproducibility signature JSON to compare against",
     )
+    ap.add_argument(
+        "--advisor-response",
+        default=None,
+        help="Path to JSON/text advisor feedback to ingest before reruns",
+    )
     args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
@@ -9392,6 +9538,7 @@ def main():
             toy_sweeps=toy_sweeps,
             force_numeric_by_header=force_numeric_flag,
             ingest_signature=args.ingest_signature,
+            advisor_response=args.advisor_response,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
