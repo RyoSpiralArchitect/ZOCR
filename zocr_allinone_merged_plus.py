@@ -8068,6 +8068,28 @@ def _patched_run_full_pipeline(
             filtered_pages.append(page)
         pages = filtered_pages
 
+
+    if len(inputs) == 1 and inputs[0].lower() == "demo":
+        real_demo_targets = []
+        if os.path.exists(inputs[0]):
+            real_demo_targets = [inputs[0]]
+        else:
+            real_demo_targets = _discover_demo_input_targets()
+
+        pages = _collect_pages(real_demo_targets, dpi=dpi) if real_demo_targets else []
+
+        filtered_pages: List[str] = []
+        seen_page_paths = set()
+        for page in pages:
+            norm = os.path.abspath(page)
+            if norm in seen_page_paths:
+                continue
+            if not os.path.exists(page):
+                continue
+            seen_page_paths.add(norm)
+            filtered_pages.append(page)
+        pages = filtered_pages
+
         if pages:
             annos = [None] * len(pages)
         else:
