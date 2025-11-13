@@ -2095,7 +2095,65 @@ _TOTAL_LABEL_HINTS = [
     "合計", "総計", "総額", "小計", "税込合計", "税込総額", "請求額", "ご請求額", "支払金額", "合算", "合計金額"
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
-_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
+_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?%?")
+
+# --- Toy OCR knobs ----------------------------------------------------------
+_TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
+_FORCE_NUMERIC = os.environ.get("ZOCR_FORCE_NUMERIC", "1").strip().lower() not in ("0", "false", "no", "off")
+_NUMERIC_HEADER_KIND = [
+    ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
+    ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),
+    ("amount", re.compile(r"(金額|合計|総計|税込|税別|小計|amount|total|subtotal|balance)", re.I)),
+    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat)", re.I)),
+]
+
+
+def _normalize_numeric_text(text: str, kind: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = t.replace("，", ",").replace("．", ".")
+    t = re.sub(r"[¥￥$,]", "", t)
+    t = t.replace("円", "")
+    t = t.replace(",", "")
+    if kind == "tax_rate":
+        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
+        return (m.group(0) + "%") if m else (text or "")
+    if kind in ("amount", "unit_price"):
+        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
+        return m.group(0) if m else (text or "")
+    if kind == "qty":
+        m = re.search(r"\d+", t)
+        return m.group(0) if m else (text or "")
+    return t
+
+
+def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
+    if not headers or not _FORCE_NUMERIC:
+        return
+    kinds: List[Optional[str]] = []
+    for header in headers:
+        base = (header or "").strip().lower()
+        kind: Optional[str] = None
+        for candidate, rx in _NUMERIC_HEADER_KIND:
+            if rx.search(base):
+                kind = candidate
+                break
+        kinds.append(kind)
+    if not kinds:
+        return
+    for r in range(1, len(grid_text)):
+        row = list(grid_text[r])
+        changed = False
+        for c, kind in enumerate(kinds):
+            if not kind or c >= len(row):
+                continue
+            normalized = _normalize_numeric_text(str(row[c] or ""), kind)
+            if normalized != row[c]:
+                row[c] = normalized
+                changed = True
+        if changed and isinstance(grid_text[r], list):
+            grid_text[r][:] = row
 
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "?": ("7", "1", "2"),
@@ -2676,21 +2734,21 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     _add_candidate((arr < thr_otsu).astype(_np.uint8) * 255, {"type": "otsu", "thr": thr_otsu})
     _add_candidate((arr > thr_otsu).astype(_np.uint8) * 255, {"type": "otsu_inv", "thr": thr_otsu})
     threshold_expand = int(cfg.get("threshold_expand", 0)) if isinstance(cfg, dict) else 0
-    threshold_step = int(cfg.get("threshold_step", 10)) if isinstance(cfg, dict) else 10
-    fine_step = int(cfg.get("fine_threshold_step", 0)) if isinstance(cfg, dict) else 0
-    threshold_step = max(2, min(24, threshold_step or 10))
-    fine_step = max(0, min(threshold_step, fine_step))
+    sweeps = int(cfg.get("threshold_sweeps", 0)) if isinstance(cfg, dict) else 0
+    if sweeps <= 0:
+        sweeps = _TOY_SWEEPS
     thr_min = max(16, thr_med - 60 - threshold_expand)
     thr_max = min(240, thr_med + 70 + threshold_expand)
-    for thr_candidate in range(thr_min, thr_max + 1, threshold_step):
-        _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep", "thr": thr_candidate})
-    if fine_step and fine_step < threshold_step:
-        for thr_candidate in range(thr_min, thr_max + 1, fine_step):
-            _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep_fine", "thr": thr_candidate})
-    spread_base = int(max(6, arr.std()))
+    if thr_max <= thr_min:
+        thr_max = min(240, thr_min + 6)
+    sweep_values = [int(x) for x in _np.linspace(thr_min, thr_max, num=max(1, sweeps))]
+    for thr_candidate in sweep_values:
+        thr_val = int(_np.clip(thr_candidate, 16, 240))
+        _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_global", "thr": thr_val})
+    spread_base = int(max(3, arr.std()))
     extra_spread = int(cfg.get("extra_local_spread", 0)) if isinstance(cfg, dict) else 0
-    spread = max(6, spread_base + max(0, extra_spread))
-    local_offsets: List[int] = [-spread, spread]
+    spread = max(3, min(24, spread_base + max(0, extra_spread)))
+    local_offsets: List[int] = [-spread, 0, spread]
     if isinstance(cfg, dict) and isinstance(cfg.get("local_sweep_offsets"), (list, tuple)):
         for candidate in cfg.get("local_sweep_offsets", []):  # type: ignore[assignment]
             try:
@@ -3232,7 +3290,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 )
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
-                headers = grid_text[0] if contextual else []
+                headers = grid_text[0] if grid_text else []
+                if contextual:
+                    _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]; cx2 = x1 + col_bounds[c+1]
