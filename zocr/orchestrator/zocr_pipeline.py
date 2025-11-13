@@ -19,6 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from html import escape
 
 try:
+    from PIL import Image  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Image = None  # type: ignore
+
+try:
     import numpy as _np  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     _np = None  # type: ignore
@@ -1121,6 +1126,168 @@ def _selective_focus_from_hotspots(
     return {k: v for k, v in plan.items() if v not in (None, [], {})}
 
 
+def _generate_hotspot_gallery(
+    outdir: str,
+    learning_jsonl_path: Optional[str],
+    learning_hotspots: Optional[Dict[str, Any]],
+    focus_plan: Optional[Dict[str, Any]],
+    page_images: Optional[Dict[int, str]],
+    limit: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if not learning_jsonl_path or not os.path.exists(learning_jsonl_path):
+        return None
+    if Image is None:
+        return None
+    try:
+        gallery_limit = int(limit if limit is not None else os.environ.get("ZOCR_HOTSPOT_GALLERY_LIMIT", "12"))
+    except Exception:
+        gallery_limit = 12
+    if gallery_limit <= 0:
+        return None
+    trace_order: List[str] = []
+    cell_lookup: Dict[str, Dict[str, Any]] = {}
+    if isinstance(learning_hotspots, dict):
+        for cell in learning_hotspots.get("hot_cells", []):
+            if not isinstance(cell, dict):
+                continue
+            trace = str(cell.get("trace_id") or "").strip()
+            if not trace:
+                continue
+            if trace not in trace_order:
+                trace_order.append(trace)
+            cell_lookup.setdefault(trace, cell)
+    if isinstance(focus_plan, dict):
+        for trace in focus_plan.get("trace_ids", []):
+            if trace is None:
+                continue
+            trace_str = str(trace).strip()
+            if not trace_str:
+                continue
+            if trace_str not in trace_order:
+                trace_order.append(trace_str)
+            cell_lookup.setdefault(trace_str, {"trace_id": trace_str})
+    if not trace_order:
+        return None
+    candidate_traces = trace_order[: max(gallery_limit * 3, gallery_limit)]
+    needed: Set[str] = set(candidate_traces)
+    samples: Dict[str, Dict[str, Any]] = {}
+    try:
+        with open(learning_jsonl_path, "r", encoding="utf-8") as fr:
+            for raw in fr:
+                if len(samples) >= gallery_limit:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    continue
+                trace = sig.get("trace_id") or sig.get("meta", {}).get("trace") if isinstance(sig.get("meta"), dict) else None
+                if trace is None:
+                    continue
+                trace_str = str(trace).strip()
+                if not trace_str or trace_str not in needed or trace_str in samples:
+                    continue
+                bbox = sig.get("bbox")
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                try:
+                    ints = [int(round(float(v))) for v in bbox]
+                except Exception:
+                    continue
+                image_path = sig.get("image_path")
+                page_idx = sig.get("page")
+                if (not image_path) and isinstance(page_images, dict):
+                    try:
+                        image_path = page_images.get(int(page_idx))
+                    except Exception:
+                        image_path = None
+                samples[trace_str] = {
+                    "bbox": ints,
+                    "page": page_idx,
+                    "table": sig.get("table_index"),
+                    "row": sig.get("row"),
+                    "col": sig.get("col"),
+                    "image_path": image_path,
+                    "text": sig.get("observed_text") or sig.get("text"),
+                    "reasons": [str(r) for r in sig.get("reasons", []) if isinstance(r, str)],
+                }
+    except Exception as exc:
+        print(f"[WARN] hotspot gallery read failed: {exc}")
+        return None
+    if not samples:
+        return None
+    gallery_dir = os.path.join(outdir, "rag", "hotspots")
+    try:
+        ensure_dir(gallery_dir)
+    except Exception as exc:
+        print(f"[WARN] hotspot gallery dir failed: {exc}")
+        return None
+    entries: List[Dict[str, Any]] = []
+    missing: Set[str] = set()
+    for trace in trace_order:
+        if len(entries) >= gallery_limit:
+            break
+        sample = samples.get(trace)
+        if not sample:
+            if trace in needed:
+                missing.add(trace)
+            continue
+        img_path = sample.get("image_path")
+        if not img_path or not os.path.exists(img_path):
+            missing.add(trace)
+            continue
+        bbox = sample.get("bbox")
+        if not bbox:
+            missing.add(trace)
+            continue
+        try:
+            with Image.open(img_path) as page_img:
+                pw, ph = page_img.size
+                x1, y1, x2, y2 = bbox
+                margin = 4
+                x1 = max(0, min(pw, x1 - margin))
+                y1 = max(0, min(ph, y1 - margin))
+                x2 = max(0, min(pw, x2 + margin))
+                y2 = max(0, min(ph, y2 + margin))
+                if x2 <= x1 or y2 <= y1:
+                    missing.add(trace)
+                    continue
+                crop = page_img.crop((x1, y1, x2, y2))
+                safe_trace = re.sub(r"[^A-Za-z0-9._-]", "_", trace)[:48] or "cell"
+                dest = os.path.join(gallery_dir, f"{len(entries)+1:02d}_{safe_trace}.png")
+                crop.save(dest)
+        except Exception:
+            missing.add(trace)
+            continue
+        cell_meta = cell_lookup.get(trace, {})
+        entry = {
+            "trace_id": trace,
+            "image": os.path.relpath(dest, outdir),
+            "page": sample.get("page"),
+            "table": sample.get("table"),
+            "row": sample.get("row"),
+            "col": sample.get("col"),
+            "text": sample.get("text"),
+            "reasons": sample.get("reasons") or cell_meta.get("reasons"),
+            "score": cell_meta.get("score"),
+        }
+        entries.append({k: v for k, v in entry.items() if v not in (None, [], {})})
+    if not entries:
+        return None
+    gallery = {
+        "count": len(entries),
+        "limit": gallery_limit,
+        "dir": os.path.relpath(gallery_dir, outdir),
+        "entries": entries,
+        "source": "learning_hotspots",
+    }
+    if missing:
+        gallery["missing_traces"] = sorted(missing)
+    return gallery
+
+
 def _summarize_toy_learning(
     toy_memory_delta: Optional[Dict[str, Any]],
     recognition_stats: Optional[Dict[str, Any]],
@@ -2034,6 +2201,8 @@ def _feedback_observations(summary: Dict[str, Any]) -> Dict[str, Any]:
         observations["learning_hotspots"] = summary.get("learning_hotspots")
     if summary.get("selective_reanalysis_plan"):
         observations["selective_reanalysis_plan"] = summary.get("selective_reanalysis_plan")
+    if summary.get("hotspot_gallery"):
+        observations["hotspot_gallery"] = summary.get("hotspot_gallery")
     recognizer = summary.get("recognition_stats") or summary.get("toy_recognition_stats")
     if recognizer:
         observations["recognition_stats"] = recognizer
@@ -2086,6 +2255,8 @@ def _emit_rag_feedback_request(
         request_payload["learning_hotspots"] = summary.get("learning_hotspots")
     if summary.get("selective_reanalysis_plan"):
         request_payload["selective_reanalysis_plan"] = summary.get("selective_reanalysis_plan")
+    if summary.get("hotspot_gallery"):
+        request_payload["hotspot_gallery"] = summary.get("hotspot_gallery")
     req_json = os.path.join(rag_dir, "feedback_request.json")
     req_md = os.path.join(rag_dir, "feedback_request.md")
     try:
@@ -2570,6 +2741,7 @@ def _patched_run_full_pipeline(
 
     learning_hotspots: Optional[Dict[str, Any]] = None
     selective_focus_plan: Optional[Dict[str, Any]] = None
+    hotspot_gallery: Optional[Dict[str, Any]] = None
     if learning_jsonl_path and os.path.exists(learning_jsonl_path):
         hotspots_payload = _analyze_learning_hotspots(learning_jsonl_path)
         if hotspots_payload:
@@ -2584,6 +2756,15 @@ def _patched_run_full_pipeline(
                 summary["learning_hotspots"] = _json_ready(summary_hotspots)
             if selective_focus_plan:
                 summary["selective_reanalysis_plan"] = _json_ready(selective_focus_plan)
+        hotspot_gallery = _generate_hotspot_gallery(
+            outdir,
+            learning_jsonl_path,
+            learning_hotspots,
+            selective_focus_plan,
+            page_images,
+        )
+        if hotspot_gallery:
+            summary["hotspot_gallery"] = _json_ready(hotspot_gallery)
 
     def _run_learning_reanalysis(
         step_label: str,
