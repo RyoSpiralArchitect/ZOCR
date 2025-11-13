@@ -10321,6 +10321,11 @@ def _patched_run_full_pipeline(
     motion_accept_ratio: Optional[float] = None,
     export_guard_ms: Optional[int] = None,
     sweeps_fixed: Optional[int] = None,
+    blank_skip: Optional[bool] = None,
+    blank_threshold: Optional[int] = None,
+    blank_min_pixels: Optional[int] = None,
+    blank_min_ratio: Optional[float] = None,
+    blank_min_area: Optional[int] = None,
 ) -> Dict[str, Any]:
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
@@ -10342,6 +10347,16 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_EXPORT_MOTION_ACCEPT"] = str(motion_accept_ratio)
     if export_guard_ms is not None:
         os.environ["ZOCR_EXPORT_GUARD_MS"] = str(max(0, int(export_guard_ms)))
+    if blank_skip is not None:
+        os.environ["ZOCR_EXPORT_SKIP_BLANK"] = "1" if blank_skip else "0"
+    if blank_threshold is not None:
+        os.environ["ZOCR_EXPORT_BLANK_THRESHOLD"] = str(int(blank_threshold))
+    if blank_min_pixels is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_PIXELS"] = str(int(blank_min_pixels))
+    if blank_min_ratio is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_RATIO"] = str(float(blank_min_ratio))
+    if blank_min_area is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_AREA"] = str(int(blank_min_area))
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -11569,6 +11584,43 @@ def main():
         help="Force toy OCR threshold sweeps to a fixed count",
     )
     ap.add_argument(
+        "--blank-skip",
+        dest="blank_skip",
+        action="store_true",
+        default=None,
+        help="Enable blank-cell skip heuristic during export",
+    )
+    ap.add_argument(
+        "--no-blank-skip",
+        dest="blank_skip",
+        action="store_false",
+        help="Disable blank-cell skipping",
+    )
+    ap.add_argument(
+        "--blank-threshold",
+        type=int,
+        default=None,
+        help="Grayscale threshold (0-255) for blank detection",
+    )
+    ap.add_argument(
+        "--blank-min-pixels",
+        type=int,
+        default=None,
+        help="Minimum dark pixel count required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-ratio",
+        type=float,
+        default=None,
+        help="Minimum dark pixel ratio required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-area",
+        type=int,
+        default=None,
+        help="Minimum crop area required before blank skip applies",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -11629,6 +11681,11 @@ def main():
             motion_accept_ratio=args.motion_accept_ratio,
             export_guard_ms=args.export_guard_ms,
             sweeps_fixed=args.sweeps_fixed,
+            blank_skip=args.blank_skip,
+            blank_threshold=args.blank_threshold,
+            blank_min_pixels=args.blank_min_pixels,
+            blank_min_ratio=args.blank_min_ratio,
+            blank_min_area=args.blank_min_area,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
