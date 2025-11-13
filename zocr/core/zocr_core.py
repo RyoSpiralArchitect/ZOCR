@@ -36,6 +36,21 @@ from PIL import Image, ImageOps
 import numpy as np
 from functools import lru_cache
 
+# -------------------- Numeric header hints --------------------
+_NUMERIC_HEADER_HINTS = {
+    "qty": "qty",
+    "quantity": "qty",
+    "unit price": "unit_price",
+    "price": "unit_price",
+    "unit cost": "unit_price",
+    "amount": "amount",
+    "total": "total",
+    "subtotal": "subtotal",
+    "tax": "tax",
+    "tax %": "tax_rate",
+    "tax rate": "tax_rate",
+}
+
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
 try:
@@ -1528,6 +1543,53 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 return (1, k)
         return sorted(keys, key=_key)
 
+    def _header_text(cell: Dict[str, Any]) -> str:
+        txt = ""
+        if isinstance(cell, dict):
+            txt = cell.get("normalized") or cell.get("text") or ""
+        txt = re.sub(r"\s+", " ", str(txt).strip().lower())
+        return txt
+
+    def _infer_numeric_columns(rows: Dict[str, Dict[str, Dict[str, Any]]]) -> Tuple[Dict[str, str], Optional[str]]:
+        if not rows:
+            return {}, None
+        ordered_rows = _sorted_numeric(list(rows.keys()))
+        if not ordered_rows:
+            return {}, None
+        header_key = ordered_rows[0]
+        header_cells = rows.get(header_key, {})
+        numeric_cols: Dict[str, str] = {}
+        for col_key, cell in header_cells.items():
+            base = _header_text(cell)
+            if base in _NUMERIC_HEADER_HINTS:
+                numeric_cols[col_key] = _NUMERIC_HEADER_HINTS[base]
+        return numeric_cols, header_key
+
+    def _parse_numeric_value(text: Optional[str]) -> Optional[float]:
+        if text is None:
+            return None
+        body = str(text).strip()
+        if not body:
+            return None
+        negative = False
+        if body.startswith("(") and body.endswith(")"):
+            negative = True
+            body = body[1:-1]
+        body = body.replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", body)
+        if not match:
+            return None
+        token = match.group(0)
+        try:
+            value = float(token)
+        except ValueError:
+            return None
+        if negative and value > 0:
+            value = -value
+        if not math.isfinite(value):
+            return None
+        return value
+
     with open(sections_path, "w", encoding="utf-8") as fw:
         for page in sorted(page_sections.keys()):
             sec = page_sections[page]
@@ -1546,19 +1608,31 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         for table_id in _sorted_numeric(list(tables.keys())):
             table = tables[table_id]
             rows_out = []
+            numeric_cols, header_row_key = _infer_numeric_columns(table.get("rows", {}))
             for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
                 cols = table["rows"][row_key]
                 ordered = []
                 for col_key in _sorted_numeric(list(cols.keys())):
                     cell_info = cols[col_key]
-                    ordered.append({
+                    numeric_kind = numeric_cols.get(col_key)
+                    numeric_value = None
+                    if numeric_kind and row_key != header_row_key:
+                        numeric_value = _parse_numeric_value(
+                            cell_info.get("normalized") or cell_info.get("text")
+                        )
+                    payload = {
                         "cell_id": cell_info.get("cell_id"),
                         "col": col_key,
                         "text": cell_info.get("text"),
                         "normalized": cell_info.get("normalized"),
                         "filters": cell_info.get("filters"),
                         "trace": cell_info.get("trace"),
-                    })
+                    }
+                    if numeric_kind:
+                        payload["numeric_kind"] = numeric_kind
+                    if numeric_value is not None:
+                        payload["numeric_value"] = numeric_value
+                    ordered.append(payload)
                 rows_out.append({"row_index": row_key, "cells": ordered})
             payload = {
                 "section_id": f"table-{table_id}",
@@ -1568,27 +1642,50 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 "rows": rows_out,
                 "fact_tags": table.get("facts", []),
             }
+            if numeric_cols:
+                payload["numeric_columns"] = [
+                    {"col": col_key, "kind": numeric_cols[col_key]}
+                    for col_key in _sorted_numeric(list(numeric_cols.keys()))
+                ]
             fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     tables_payload = []
     for table_id in _sorted_numeric(list(tables.keys())):
         table = tables[table_id]
         rows_out = []
+        numeric_cols, header_row_key = _infer_numeric_columns(table.get("rows", {}))
         for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
             cols = table["rows"][row_key]
             ordered = []
             for col_key in _sorted_numeric(list(cols.keys())):
                 cell_info = cols[col_key]
-                ordered.append({
+                numeric_kind = numeric_cols.get(col_key)
+                numeric_value = None
+                if numeric_kind and row_key != header_row_key:
+                    numeric_value = _parse_numeric_value(
+                        cell_info.get("normalized") or cell_info.get("text")
+                    )
+                payload = {
                     "cell_id": cell_info.get("cell_id"),
                     "row": row_key,
                     "col": col_key,
                     "text": cell_info.get("text"),
                     "normalized": cell_info.get("normalized"),
                     "trace": cell_info.get("trace"),
-                })
+                }
+                if numeric_kind:
+                    payload["numeric_kind"] = numeric_kind
+                if numeric_value is not None:
+                    payload["numeric_value"] = numeric_value
+                ordered.append(payload)
             rows_out.append({"row_index": row_key, "cells": ordered})
-        tables_payload.append({"table_id": table_id, "rows": rows_out, "fact_tags": table.get("facts", [])})
+        table_payload = {"table_id": table_id, "rows": rows_out, "fact_tags": table.get("facts", [])}
+        if numeric_cols:
+            table_payload["numeric_columns"] = [
+                {"col": col_key, "kind": numeric_cols[col_key]}
+                for col_key in _sorted_numeric(list(numeric_cols.keys()))
+            ]
+        tables_payload.append(table_payload)
     with open(tables_path, "w", encoding="utf-8") as tf:
         json.dump(tables_payload, tf, ensure_ascii=False, indent=2)
 

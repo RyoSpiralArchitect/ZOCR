@@ -88,9 +88,9 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
 
 try:
@@ -98,7 +98,7 @@ try:
 except Exception:
     np = None
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
@@ -2251,6 +2251,174 @@ _FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
 _LAST_EXPORT_STATS: Dict[str, Any] = {}
 
 
+@dataclass
+class MotionPriorCfg:
+    enabled: bool = False
+    sigma_px: float = 8.0
+    cutoff_sigma: float = 2.5
+    accept_ratio: float = 0.5
+
+
+@dataclass
+class _BlankSkipConfig:
+    enabled: bool = False
+    dark_threshold: int = 210
+    min_dark_pixels: int = 8
+    min_dark_ratio: float = 0.002
+    min_area: int = 36
+
+
+@dataclass
+class _ExportSweepTracker:
+    prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
+
+    def get(self, doc_id: str, page_index: int, table_index: int) -> Optional[List[float]]:
+        return self.prev_y.get((doc_id, page_index, table_index))
+
+    def put(
+        self,
+        doc_id: str,
+        page_index: int,
+        table_index: int,
+        y_keys: Sequence[float],
+    ) -> None:
+        self.prev_y[(doc_id, page_index, table_index)] = [float(y) for y in y_keys]
+
+
+_EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
+
+
+def _motion_prior_cfg_from_env() -> MotionPriorCfg:
+    cfg = MotionPriorCfg(enabled=_env_flag("ZOCR_EXPORT_MOTION_PRIOR", False))
+    if cfg.enabled:
+        sigma = _env_float("ZOCR_EXPORT_MOTION_SIGMA", cfg.sigma_px)
+        cutoff = _env_float("ZOCR_EXPORT_MOTION_CUTOFF", cfg.cutoff_sigma)
+        accept = _env_float("ZOCR_EXPORT_MOTION_ACCEPT", cfg.accept_ratio)
+        cfg.sigma_px = max(0.5, float(sigma))
+        cfg.cutoff_sigma = max(0.1, float(cutoff))
+        cfg.accept_ratio = float(max(0.0, min(1.0, accept)))
+    return cfg
+
+
+def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
+    cfg = _BlankSkipConfig(enabled=_env_flag("ZOCR_EXPORT_SKIP_BLANK", True))
+    if not cfg.enabled:
+        return cfg
+    thr = _env_int("ZOCR_EXPORT_BLANK_THRESHOLD", cfg.dark_threshold)
+    if thr is not None:
+        cfg.dark_threshold = int(max(1, min(255, thr)))
+    min_px = _env_int("ZOCR_EXPORT_BLANK_MIN_PIXELS", cfg.min_dark_pixels)
+    if min_px is not None:
+        cfg.min_dark_pixels = int(max(1, min_px))
+    min_ratio = _env_float("ZOCR_EXPORT_BLANK_MIN_RATIO", cfg.min_dark_ratio)
+    if isinstance(min_ratio, (int, float)):
+        cfg.min_dark_ratio = float(max(0.0, min(0.1, min_ratio)))
+    min_area = _env_int("ZOCR_EXPORT_BLANK_MIN_AREA", cfg.min_area)
+    if min_area is not None:
+        cfg.min_area = int(max(1, min_area))
+    return cfg
+
+
+def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
+    if not cfg.enabled:
+        return False
+    try:
+        w, h = img.size
+    except Exception:
+        return False
+    area = max(1, int(w) * int(h))
+    if area < cfg.min_area:
+        return False
+    try:
+        gray = img.convert("L")
+        hist = gray.histogram()
+    except Exception:
+        return False
+    if not hist:
+        return False
+    thr = max(1, min(256, int(cfg.dark_threshold)))
+    dark = int(sum(hist[:thr]))
+    if dark < cfg.min_dark_pixels:
+        return True
+    ratio = dark / float(area)
+    if ratio <= cfg.min_dark_ratio:
+        return True
+    return False
+
+
+def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
+    mids: List[float] = []
+    for top, bottom in row_bands:
+        try:
+            mid = (float(top) + float(bottom)) * 0.5
+        except Exception:
+            continue
+        if math.isfinite(mid):
+            mids.append(mid)
+    return mids
+
+
+def _reseed_row_bands_with_prior(
+    prev_keys: Sequence[float],
+    row_bands: Sequence[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[float, float]]]:
+    if not prev_keys or not row_bands:
+        return list(row_bands), []
+    mids = _row_band_midpoints(row_bands)
+    if not mids:
+        return list(row_bands), []
+    ordered = sorted(((mid, idx) for idx, mid in enumerate(mids)), key=lambda item: item[0])
+    ordered_mids = [mid for mid, _ in ordered]
+    used = [False] * len(ordered)
+    matches: List[Tuple[float, float]] = []
+    reseed_indices: List[int] = []
+    for prev_val in prev_keys:
+        pos = bisect.bisect_left(ordered_mids, prev_val)
+        best_idx = None
+        best_dist = float("inf")
+        for offset in (pos - 1, pos, pos + 1):
+            if 0 <= offset < len(ordered) and not used[offset]:
+                cand_mid, cand_idx = ordered[offset]
+                dist = abs(cand_mid - prev_val)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = offset
+        if best_idx is None:
+            continue
+        used[best_idx] = True
+        cand_mid, cand_idx = ordered[best_idx]
+        matches.append((cand_mid, float(prev_val)))
+        reseed_indices.append(cand_idx)
+    for offset, (_, idx) in enumerate(ordered):
+        if not used[offset]:
+            reseed_indices.append(idx)
+    reseeded = [row_bands[idx] for idx in reseed_indices]
+    return reseeded, matches
+
+
+def _apply_motion_prior_to_bands(
+    prev_keys: Optional[Sequence[float]],
+    row_bands: List[Tuple[int, int]],
+    cfg: MotionPriorCfg,
+) -> Tuple[List[Tuple[int, int]], bool]:
+    if not cfg.enabled or not prev_keys or not row_bands:
+        return row_bands, False
+    reseeded, matches = _reseed_row_bands_with_prior(prev_keys, row_bands)
+    if not reseeded:
+        return row_bands, False
+    sigma = max(1e-3, float(cfg.sigma_px))
+    cutoff = float(cfg.cutoff_sigma) * sigma
+    inside = 0
+    total = len(matches)
+    for cand_mid, prev_val in matches:
+        if abs(cand_mid - prev_val) <= cutoff:
+            inside += 1
+    actual_ratio = inside / float(total or 1)
+    if actual_ratio >= cfg.accept_ratio:
+        return reseeded, True
+    return row_bands, False
+
+
 def toy_runtime_config() -> Dict[str, Any]:
     """Return the currently active toy OCR runtime knobs."""
 
@@ -3331,6 +3499,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
 
+    motion_cfg = _motion_prior_cfg_from_env()
+    sweep_tracker = _EXPORT_SWEEP_TRACKER
+    motion_applied = 0
+    motion_rejected = 0
+
     progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
     log_progress = progress_flag not in {"", "0", "false", "no"}
 
@@ -3349,6 +3522,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
     cells_done = 0
     t0 = time.time()
     stop_due_to_limit = False
+    guard_ms = _parse_env_int("ZOCR_EXPORT_GUARD_MS", 0, 0)
+    guard_timeouts = 0
+    blank_cfg = _blank_skip_cfg_from_env()
+    blank_skipped = 0
+
+    doc_identifier = str(
+        doc.get("doc_id")
+        or doc.get("document_id")
+        or doc.get("id")
+        or os.path.splitext(os.path.basename(doc_json_path))[0]
+    )
 
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
@@ -3423,6 +3607,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 lookup_idx = pidx
             else:
                 lookup_idx = enum_idx
+            page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
             page_image = _load_page_image(page_image_path, lookup_idx)
             if page_image is None:
                 continue
@@ -3434,6 +3619,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 if not isinstance(t, dict):
                     continue
                 tables_processed += 1
+                guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
+                guard_triggered = False
+                prev_keys: Optional[List[float]] = None
+                if motion_cfg.enabled:
+                    prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -3459,6 +3649,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         yt = int(y1 + (y2-y1)*r/R)
                         yb = int(y1 + (y2-y1)*(r+1)/R)
                         row_bands.append((yt, yb))
+                if motion_cfg.enabled:
+                    row_bands_prior, applied = _apply_motion_prior_to_bands(prev_keys, row_bands, motion_cfg)
+                    if applied:
+                        row_bands = row_bands_prior
+                        motion_applied += 1
+                    elif prev_keys:
+                        motion_rejected += 1
                 R = len(row_bands)
                 if len(baselines) < R:
                     baselines.extend([[] for _ in range(R - len(baselines))])
@@ -3475,7 +3672,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 col_charset_hints: List[Optional[str]] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
+                    if guard_deadline and time.time() >= guard_deadline:
+                        guard_triggered = True
+                        break
                     for c in range(C):
+                        if guard_deadline and time.time() >= guard_deadline:
+                            guard_triggered = True
+                            break
                         total_cells += 1
                         cx1 = x1 + col_bounds[c]
                         cx2 = x1 + col_bounds[c+1]
@@ -3491,7 +3694,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         allowed_chars = None
                         if r > 0 and col_charset_hints and c < len(col_charset_hints):
                             allowed_chars = col_charset_hints[c]
-                        if allowed_chars and toy_runner:
+                        if blank_cfg.enabled and _should_skip_blank_crop(crop, blank_cfg):
+                            blank_skipped += 1
+                            txt, conf = "", 0.0
+                        elif allowed_chars and toy_runner:
                             txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
                         else:
                             txt, conf = ocr_runner(crop)
@@ -3509,10 +3715,24 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     if r == 0 and not col_charset_hints:
                         headers_sample = grid_text[0] if grid_text else []
                         col_charset_hints = _column_charset_hints(headers_sample)
-                    if stop_due_to_limit:
+                    if guard_triggered or stop_due_to_limit:
                         break
+                if guard_triggered:
+                    guard_timeouts += 1
+                    print(
+                        f"[WARN] [Export] guard timeout (page={page_index_int}, table={ti})",
+                        flush=True,
+                    )
+                    continue
                 if stop_due_to_limit:
                     break
+                if motion_cfg.enabled:
+                    sweep_tracker.put(
+                        doc_identifier,
+                        page_index_int,
+                        ti,
+                        _row_band_midpoints(row_bands),
+                    )
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -3695,6 +3915,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "forced_cells": int(forced_cells),
         "forced_fields": dict(forced_fields),
     }
+    runtime_state = toy_runtime_config()
     export_stats = {
         "ocr_engine": ocr_engine,
         "records": int(count),
@@ -3703,9 +3924,30 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "cells_total": int(total_cells),
         "duration_sec": round(duration, 3),
         "numeric": numeric_stats,
-        "toy_runtime": toy_runtime_config(),
+        "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
     }
+    if blank_cfg.enabled:
+        export_stats["blank_skip"] = {
+            "skipped": int(blank_skipped),
+            "ratio": float(blank_skipped / float(max(1, total_cells))),
+            "dark_threshold": int(blank_cfg.dark_threshold),
+            "min_dark_ratio": float(blank_cfg.min_dark_ratio),
+            "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        }
+    if guard_ms > 0:
+        export_stats["guard"] = {
+            "timeout_ms": int(guard_ms),
+            "timeouts": int(guard_timeouts),
+        }
+    if motion_cfg.enabled:
+        export_stats["motion_prior"] = {
+            "sigma_px": float(motion_cfg.sigma_px),
+            "cutoff_sigma": float(motion_cfg.cutoff_sigma),
+            "accept_ratio": float(motion_cfg.accept_ratio),
+            "applied": int(motion_applied),
+            "rejected": int(motion_rejected),
+        }
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
     return count
@@ -10073,7 +10315,48 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
     rag_feedback: Optional[str] = None,
+    motion_prior: bool = False,
+    motion_sigma_px: Optional[float] = None,
+    motion_cutoff_sigma: Optional[float] = None,
+    motion_accept_ratio: Optional[float] = None,
+    export_guard_ms: Optional[int] = None,
+    sweeps_fixed: Optional[int] = None,
+    blank_skip: Optional[bool] = None,
+    blank_threshold: Optional[int] = None,
+    blank_min_pixels: Optional[int] = None,
+    blank_min_ratio: Optional[float] = None,
+    blank_min_area: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if sweeps_fixed is not None and sweeps_fixed > 0:
+        toy_sweeps = int(sweeps_fixed)
+        os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
+        os.environ["ZOCR_TOY_SWEEP_LIMIT"] = str(toy_sweeps)
+    if motion_prior:
+        os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1"
+    if motion_prior and motion_sigma_px is None:
+        motion_sigma_px = 10.0
+    if motion_prior and motion_cutoff_sigma is None:
+        motion_cutoff_sigma = 2.5
+    if motion_prior and motion_accept_ratio is None:
+        motion_accept_ratio = 0.6
+    if motion_sigma_px is not None:
+        os.environ["ZOCR_EXPORT_MOTION_SIGMA"] = str(motion_sigma_px)
+    if motion_cutoff_sigma is not None:
+        os.environ["ZOCR_EXPORT_MOTION_CUTOFF"] = str(motion_cutoff_sigma)
+    if motion_accept_ratio is not None:
+        os.environ["ZOCR_EXPORT_MOTION_ACCEPT"] = str(motion_accept_ratio)
+    if export_guard_ms is not None:
+        os.environ["ZOCR_EXPORT_GUARD_MS"] = str(max(0, int(export_guard_ms)))
+    if blank_skip is not None:
+        os.environ["ZOCR_EXPORT_SKIP_BLANK"] = "1" if blank_skip else "0"
+    if blank_threshold is not None:
+        os.environ["ZOCR_EXPORT_BLANK_THRESHOLD"] = str(int(blank_threshold))
+    if blank_min_pixels is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_PIXELS"] = str(int(blank_min_pixels))
+    if blank_min_ratio is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_RATIO"] = str(float(blank_min_ratio))
+    if blank_min_area is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_AREA"] = str(int(blank_min_area))
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -10387,6 +10670,10 @@ def _patched_run_full_pipeline(
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
+        os.environ.setdefault("ZOCR_EXPORT_EXT_VARIANTS", "0")
+        os.environ.setdefault("ZOCR_EXPORT_PROGRESS", "1")
+        os.environ.setdefault("ZOCR_EXPORT_LOG_EVERY", "100")
+        os.environ.setdefault("ZOCR_EXPORT_SKIP_BLANK", "1")
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
@@ -11262,6 +11549,78 @@ def main():
         help="Normalize numeric columns according to header heuristics",
     )
     ap.add_argument(
+        "--motion-prior",
+        action="store_true",
+        help="Enable motion prior seeding between export sweeps",
+    )
+    ap.add_argument(
+        "--motion-sigma-px",
+        type=float,
+        default=None,
+        help="Motion prior std-dev in pixels (default: 10 when enabled)",
+    )
+    ap.add_argument(
+        "--motion-cutoff-sigma",
+        type=float,
+        default=None,
+        help="Reject motion priors when deviation exceeds this multiple of sigma",
+    )
+    ap.add_argument(
+        "--motion-accept-ratio",
+        type=float,
+        default=None,
+        help="Minimum inlier ratio required to accept motion prior reseeding",
+    )
+    ap.add_argument(
+        "--export-guard-ms",
+        type=int,
+        default=15000,
+        help="Abort per-table export loops after this many milliseconds",
+    )
+    ap.add_argument(
+        "--sweeps-fixed",
+        type=int,
+        default=None,
+        help="Force toy OCR threshold sweeps to a fixed count",
+    )
+    ap.add_argument(
+        "--blank-skip",
+        dest="blank_skip",
+        action="store_true",
+        default=None,
+        help="Enable blank-cell skip heuristic during export",
+    )
+    ap.add_argument(
+        "--no-blank-skip",
+        dest="blank_skip",
+        action="store_false",
+        help="Disable blank-cell skipping",
+    )
+    ap.add_argument(
+        "--blank-threshold",
+        type=int,
+        default=None,
+        help="Grayscale threshold (0-255) for blank detection",
+    )
+    ap.add_argument(
+        "--blank-min-pixels",
+        type=int,
+        default=None,
+        help="Minimum dark pixel count required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-ratio",
+        type=float,
+        default=None,
+        help="Minimum dark pixel ratio required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-area",
+        type=int,
+        default=None,
+        help="Minimum crop area required before blank skip applies",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -11316,6 +11675,17 @@ def main():
             advisor_response=args.advisor_response,
             print_stage_trace=args.print_stage_trace,
             rag_feedback=args.rag_feedback,
+            motion_prior=args.motion_prior,
+            motion_sigma_px=args.motion_sigma_px,
+            motion_cutoff_sigma=args.motion_cutoff_sigma,
+            motion_accept_ratio=args.motion_accept_ratio,
+            export_guard_ms=args.export_guard_ms,
+            sweeps_fixed=args.sweeps_fixed,
+            blank_skip=args.blank_skip,
+            blank_threshold=args.blank_threshold,
+            blank_min_pixels=args.blank_min_pixels,
+            blank_min_ratio=args.blank_min_ratio,
+            blank_min_area=args.blank_min_area,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
