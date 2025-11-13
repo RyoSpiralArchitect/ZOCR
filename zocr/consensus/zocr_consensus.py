@@ -2128,10 +2128,10 @@ def _normalize_numeric_text(text: str, kind: str) -> str:
     return t
 
 
-def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
-    if not headers or not _FORCE_NUMERIC:
-        return
+def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
     kinds: List[Optional[str]] = []
+    if not headers:
+        return kinds
     for header in headers:
         base = (header or "").strip().lower()
         kind: Optional[str] = None
@@ -2140,6 +2140,13 @@ def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequ
                 kind = candidate
                 break
         kinds.append(kind)
+    return kinds
+
+
+def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
+    if not headers or not _FORCE_NUMERIC:
+        return
+    kinds = _numeric_header_kinds(headers)
     if not kinds:
         return
     for r in range(1, len(grid_text)):
@@ -2154,6 +2161,26 @@ def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequ
                 changed = True
         if changed and isinstance(grid_text[r], list):
             grid_text[r][:] = row
+
+
+_NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
+    "qty": "0123456789",
+    "unit_price": "0123456789.-",
+    "amount": "0123456789.-",
+    "tax_rate": "0123456789.%",
+}
+
+
+def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
+    if not headers or not _FORCE_NUMERIC:
+        return []
+    kinds = _numeric_header_kinds(headers)
+    if not kinds:
+        return []
+    hints: List[Optional[str]] = []
+    for kind in kinds:
+        hints.append(_NUMERIC_COLUMN_CHARSETS.get(kind) if kind else None)
+    return hints
 
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "?": ("7", "1", "2"),
@@ -2499,7 +2526,7 @@ def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
         out[:, dx:] = 0
     return out
 
-def _match_glyph(cell_bin, atlas):
+def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None):
     # try best correlation over atlas with light shift tolerance and feature penalties
     cw, ch = cell_bin.size
     import numpy as _np
@@ -2516,8 +2543,13 @@ def _match_glyph(cell_bin, atlas):
         cell_style = float(_np.var(row_profile) + _np.var(col_profile))
     else:
         cell_style = 0.0
+    allowed: Optional[Set[str]] = None
+    if allowed_chars:
+        allowed = {str(ch) for ch in allowed_chars if str(ch)}
     best_ch, best_score = "", -1.0
     for ch_key, tpl in atlas.items():
+        if allowed is not None and ch_key not in allowed:
+            continue
         tpl_list = tpl if isinstance(tpl, (list, tuple)) else [tpl]
         variant_best = -1.0
         for glyph_img in tpl_list:
@@ -2584,7 +2616,7 @@ def _otsu_threshold_toy(arr):
             threshold = i
     return int(threshold)
 
-def _text_from_binary(bw):
+def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = _cc_label_rle(bw)
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
@@ -2639,7 +2671,7 @@ def _text_from_binary(bw):
                 patch = Image.fromarray(arr, mode="L")
             except Exception:
                 patch = Image.fromarray(sub)
-            ch, sc = _match_glyph(patch, atlas)
+            ch, sc = _match_glyph(patch, atlas, allowed_chars=allowed_chars)
             _glyph_runtime_store(sig, ch, sc)
             if not ch or ch == "?" or sc < 0.6:
                 _glyph_pending_enqueue(sig, arr, sc)
@@ -2662,7 +2694,9 @@ def _text_from_binary(bw):
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
 
-def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[str, float]:
+def toy_ocr_text_from_cell(
+    crop_img: "Image.Image", bin_k: int = 15, allowed_chars: Optional[Sequence[str]] = None
+) -> Tuple[str, float]:
     """Very small OCR to work with the demo font. Returns (text, confidence)."""
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
@@ -2771,7 +2805,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         total = len(candidates)
         for i in range(idx, total):
             bw, meta = candidates[i]
-            text, conf = _text_from_binary(bw)
+            text, conf = _text_from_binary(bw, allowed_chars=allowed_chars)
             if text:
                 prev = candidate_scores.get(text)
                 if prev is None or conf > prev:
@@ -3235,6 +3269,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 # OCR pass across grid
                 grid_text = [["" for _ in range(C)] for __ in range(R)]
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
+                col_charset_hints: List[Optional[str]] = []
+                toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]
@@ -3248,7 +3284,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_w, cx2 + right_pad),
                             min(page_h, cy2 + pad_y)
                         ))
-                        txt, conf = ocr_runner(crop)
+                        allowed_chars = None
+                        if r > 0 and col_charset_hints and c < len(col_charset_hints):
+                            allowed_chars = col_charset_hints[c]
+                        if allowed_chars and toy_runner:
+                            txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
+                        else:
+                            txt, conf = ocr_runner(crop)
                         if not isinstance(txt, str):
                             txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
@@ -3260,6 +3302,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if max_cells and cells_done >= max_cells:
                             stop_due_to_limit = True
                             break
+                    if r == 0 and not col_charset_hints:
+                        headers_sample = grid_text[0] if grid_text else []
+                        col_charset_hints = _column_charset_hints(headers_sample)
                     if stop_due_to_limit:
                         break
                 if stop_due_to_limit:
