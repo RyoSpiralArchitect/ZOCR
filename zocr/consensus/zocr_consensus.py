@@ -2181,6 +2181,38 @@ def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
 # --- Toy OCR knobs ----------------------------------------------------------
 _TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
 _FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
+
+
+def toy_runtime_config() -> Dict[str, Any]:
+    """Return the currently active toy OCR runtime knobs."""
+
+    return {
+        "threshold_sweeps": int(_TOY_SWEEPS),
+        "force_numeric": bool(_FORCE_NUMERIC),
+    }
+
+
+def configure_toy_runtime(
+    *, sweeps: Optional[int] = None, force_numeric: Optional[bool] = None
+) -> Dict[str, Any]:
+    """Update toy OCR runtime knobs at runtime."""
+
+    updates: Dict[str, Any] = {}
+    global _TOY_SWEEPS, _FORCE_NUMERIC
+    if sweeps is not None:
+        try:
+            new_sweeps = max(1, int(sweeps))
+        except Exception:
+            new_sweeps = _TOY_SWEEPS
+        if new_sweeps != _TOY_SWEEPS:
+            _TOY_SWEEPS = new_sweeps
+            updates["threshold_sweeps"] = new_sweeps
+    if force_numeric is not None:
+        new_flag = bool(force_numeric)
+        if new_flag != _FORCE_NUMERIC:
+            _FORCE_NUMERIC = new_flag
+            updates["force_numeric"] = new_flag
+    return updates
 _NUMERIC_HEADER_KIND = [
     ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
     ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),

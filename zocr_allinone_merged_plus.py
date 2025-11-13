@@ -2248,6 +2248,40 @@ def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
 # --- Toy OCR knobs ----------------------------------------------------------
 _TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
 _FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
+
+
+def toy_runtime_config() -> Dict[str, Any]:
+    """Return the currently active toy OCR runtime knobs."""
+
+    return {
+        "threshold_sweeps": int(_TOY_SWEEPS),
+        "force_numeric": bool(_FORCE_NUMERIC),
+    }
+
+
+def configure_toy_runtime(
+    *, sweeps: Optional[int] = None, force_numeric: Optional[bool] = None
+) -> Dict[str, Any]:
+    """Update toy OCR runtime knobs at runtime."""
+
+    updates: Dict[str, Any] = {}
+    global _TOY_SWEEPS, _FORCE_NUMERIC
+    if sweeps is not None:
+        try:
+            new_sweeps = max(1, int(sweeps))
+        except Exception:
+            new_sweeps = _TOY_SWEEPS
+        if new_sweeps != _TOY_SWEEPS:
+            _TOY_SWEEPS = new_sweeps
+            updates["threshold_sweeps"] = new_sweeps
+    if force_numeric is not None:
+        new_flag = bool(force_numeric)
+        if new_flag != _FORCE_NUMERIC:
+            _FORCE_NUMERIC = new_flag
+            updates["force_numeric"] = new_flag
+    return updates
+
+
 _NUMERIC_HEADER_KIND = [
     ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
     ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),
@@ -6926,6 +6960,20 @@ def _resolve_toy_memory_path(outdir: str) -> str:
     return os.path.join(outdir, "toy_memory.json")
 
 
+def _default_toy_sweeps() -> int:
+    base = getattr(zocr_onefile_consensus, "toy_runtime_config", None)
+    if callable(base):
+        cfg = base()
+        sweeps = cfg.get("threshold_sweeps") if isinstance(cfg, dict) else None
+        if isinstance(sweeps, int) and sweeps > 0:
+            return sweeps
+    raw = os.environ.get("ZOCR_TOY_SWEEPS")
+    try:
+        return max(1, int(raw)) if raw is not None else 5
+    except Exception:
+        return 5
+
+
 def _collect_dependency_diagnostics() -> Dict[str, Any]:
     """Summarise optional dependencies so operators can self-check the environment."""
     diag: Dict[str, Any] = {}
@@ -8111,6 +8159,9 @@ def _patched_run_full_pipeline(
     seed: int = 24601,
     snapshot: bool = False,
     ocr_engine: Optional[str] = None,
+    toy_lite: bool = False,
+    toy_sweeps: Optional[int] = None,
+    force_numeric_by_header: Optional[bool] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     random.seed(seed)
@@ -8131,7 +8182,9 @@ def _patched_run_full_pipeline(
     if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
         zocr_onefile_consensus.reset_toy_recognition_stats()
 
-    if len(inputs) == 1 and inputs[0].lower() == "demo":
+    demo_requested = len(inputs) == 1 and inputs[0].lower() == "demo"
+
+    if demo_requested:
         real_demo_targets = []
         if os.path.exists(inputs[0]):
             real_demo_targets = [inputs[0]]
@@ -8174,10 +8227,34 @@ def _patched_run_full_pipeline(
     prof_path = os.path.join(outdir, "auto_profile.json")
     prof = _load_profile(outdir, domain_hint)
 
+    auto_demo_lite = demo_requested
+    effective_toy_lite = bool(toy_lite or auto_demo_lite)
+    toy_sweep_limit: Optional[int] = None
+    if toy_sweeps is not None and toy_sweeps > 0:
+        toy_sweep_limit = int(toy_sweeps)
+    elif effective_toy_lite:
+        toy_sweep_limit = _default_toy_sweeps()
+    force_numeric_flag = force_numeric_by_header
+    if effective_toy_lite and force_numeric_flag is None:
+        force_numeric_flag = True
+    if toy_sweep_limit is not None and tune_budget is not None and tune_budget > 0:
+        tune_budget = min(int(tune_budget), toy_sweep_limit)
+
     env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
     effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
     export_ocr_override = os.environ.get("ZOCR_EXPORT_OCR")
     export_ocr_engine = export_ocr_override or effective_ocr_engine
+
+    toy_runtime_overrides: Dict[str, Any] = {}
+    configure_runtime = getattr(zocr_onefile_consensus, "configure_toy_runtime", None)
+    if callable(configure_runtime) and (toy_sweep_limit is not None or force_numeric_flag is not None):
+        try:
+            toy_runtime_overrides = configure_runtime(
+                sweeps=toy_sweep_limit, force_numeric=force_numeric_flag
+            ) or {}
+        except Exception as exc:
+            print(f"[WARN] Toy runtime configure failed: {exc}")
+            toy_runtime_overrides = {}
 
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
@@ -8198,11 +8275,20 @@ def _patched_run_full_pipeline(
         "tune_budget": int(tune_budget) if tune_budget is not None else None,
         "ocr_engine": effective_ocr_engine,
         "export_ocr_engine": export_ocr_engine,
+        "toy_lite": bool(effective_toy_lite),
+        "toy_lite_auto": bool(auto_demo_lite),
         "toy_memory": {
             "path": toy_memory_path,
             "load": _json_ready(toy_memory_info_load),
         },
     }
+
+    if force_numeric_flag is not None:
+        summary["force_numeric_by_header"] = bool(force_numeric_flag)
+    if toy_sweep_limit is not None:
+        summary["toy_sweeps"] = int(toy_sweep_limit)
+    if toy_runtime_overrides:
+        summary["toy_runtime_overrides"] = _json_ready(toy_runtime_overrides)
 
     prof.setdefault("ocr_engine", effective_ocr_engine)
 
@@ -8871,6 +8957,22 @@ def main():
     ap.add_argument("--seed", type=int, default=24601)
     ap.add_argument("--snapshot", action="store_true")
     ap.add_argument(
+        "--toy-lite",
+        action="store_true",
+        help="Clamp toy OCR sweeps and force numeric columns for faster demo-style runs",
+    )
+    ap.add_argument(
+        "--toy-sweeps",
+        type=int,
+        default=None,
+        help="Upper bound for toy OCR threshold sweeps (defaults to env/auto)",
+    )
+    ap.add_argument(
+        "--force-numeric-by-header",
+        action="store_true",
+        help="Normalize numeric columns according to header heuristics",
+    )
+    ap.add_argument(
         "--ocr-engine",
         default=None,
         help="OCR backend to use (e.g. toy, tesseract, easyocr). Overrides ZOCR_OCR_ENGINE.",
@@ -8878,6 +8980,10 @@ def main():
     args = ap.parse_args(argv)
 
     ensure_dir(args.outdir)
+    toy_sweeps = args.toy_sweeps
+    if toy_sweeps is not None and toy_sweeps <= 0:
+        toy_sweeps = None
+    force_numeric_flag = True if args.force_numeric_by_header else None
     try:
         res = _patched_run_full_pipeline(
             inputs=args.input,
@@ -8894,6 +9000,9 @@ def main():
             seed=args.seed,
             snapshot=args.snapshot,
             ocr_engine=args.ocr_engine,
+            toy_lite=args.toy_lite,
+            toy_sweeps=toy_sweeps,
+            force_numeric_by_header=force_numeric_flag,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
