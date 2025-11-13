@@ -27,9 +27,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, 
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
+    from pytesseract import TesseractError as _PYTESS_ERR  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     pytesseract = None  # type: ignore
     _PYTESS_OUTPUT = None  # type: ignore
+    _PYTESS_ERR = None  # type: ignore
 from html.parser import HTMLParser
 
 _OCR_BACKEND_CACHE: Dict[str, Callable[["Image.Image"], Tuple[str, float]]] = {}
@@ -2097,9 +2099,88 @@ _TOTAL_LABEL_HINTS = [
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?%?")
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+_PYTESS_TIMEOUT = max(0.0, _env_float("ZOCR_PYTESS_TIMEOUT", 3.5))
+_PYTESS_NICE = _env_int("ZOCR_PYTESS_NICE", None)
+
+
+def _pytesseract_env_kwargs() -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    if _PYTESS_TIMEOUT > 0.0:
+        kwargs["timeout"] = _PYTESS_TIMEOUT
+    if _PYTESS_NICE is not None:
+        kwargs["nice"] = _PYTESS_NICE
+    return kwargs
+
+
+_PYTESS_ENV_KWARGS = _pytesseract_env_kwargs()
+_PYTESS_ENV_SUPPORTED = True
+_PYTESS_TIMEOUT_WARNED = False
+
+
+def _note_pytesseract_exception(label: str, exc: Exception) -> None:
+    global _PYTESS_TIMEOUT_WARNED
+    if exc is None:
+        return
+    msg = str(exc).lower()
+    if "time" in msg and "out" in msg:
+        if not _PYTESS_TIMEOUT_WARNED:
+            limit = f"{_PYTESS_TIMEOUT:.1f}s" if _PYTESS_TIMEOUT > 0 else "configured limit"
+            print(f"[WARN] pytesseract {label} timed out ({limit}); continuing", flush=True)
+            _PYTESS_TIMEOUT_WARNED = True
+
+
+def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
+    global _PYTESS_ENV_SUPPORTED
+    extras = _PYTESS_ENV_KWARGS if _PYTESS_ENV_SUPPORTED else {}
+    if extras:
+        call_kwargs = dict(kwargs)
+        call_kwargs.update(extras)
+    else:
+        call_kwargs = kwargs
+    try:
+        return func(*args, **call_kwargs)
+    except TypeError as exc:
+        if extras:
+            _PYTESS_ENV_SUPPORTED = False
+            return _pytesseract_call(label, func, *args, **kwargs)
+        _note_pytesseract_exception(label, exc)
+        return None
+    except Exception as exc:  # pragma: no cover - best effort guard
+        _note_pytesseract_exception(label, exc)
+        return None
+
+
 # --- Toy OCR knobs ----------------------------------------------------------
 _TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
-_FORCE_NUMERIC = os.environ.get("ZOCR_FORCE_NUMERIC", "1").strip().lower() not in ("0", "false", "no", "off")
+_FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
 _NUMERIC_HEADER_KIND = [
     ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
     ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),
@@ -2225,10 +2306,13 @@ def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
         return []
     variants: List[Tuple[str, float, str]] = []
     config = "--psm 6"
-    try:
-        data = pytesseract.image_to_data(img, output_type=_PYTESS_OUTPUT.DICT, config=config)  # type: ignore[arg-type]
-    except Exception:
-        data = None
+    data = _pytesseract_call(
+        "image_to_data",
+        pytesseract.image_to_data,  # type: ignore[arg-type]
+        img,
+        output_type=_PYTESS_OUTPUT.DICT,
+        config=config,
+    )
     if isinstance(data, dict):
         words: List[str] = []
         confs: List[float] = []
@@ -2248,10 +2332,12 @@ def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
             joined = " ".join(words)
             conf_val = max(confs) if confs else 0.6
             variants.append((joined, float(max(0.0, min(1.0, conf_val))), "engine:pytesseract_data"))
-    try:
-        raw = pytesseract.image_to_string(img, config=config)  # type: ignore[arg-type]
-    except Exception:
-        raw = None
+    raw = _pytesseract_call(
+        "image_to_string",
+        pytesseract.image_to_string,  # type: ignore[arg-type]
+        img,
+        config=config,
+    )
     if raw:
         txt = raw.strip()
         if txt:
@@ -2904,15 +2990,14 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
                     target = img if getattr(img, "mode", "") in ("L", "RGB") else img.convert("RGB")
                 except Exception:
                     target = img
-                try:
-                    data = pytesseract.image_to_data(  # type: ignore[arg-type]
-                        target,
-                        lang=lang or None,
-                        config=tess_config or "",
-                        output_type=_PYTESS_OUTPUT.DICT,
-                    )
-                except Exception:
-                    data = None
+                data = _pytesseract_call(
+                    "image_to_data",
+                    pytesseract.image_to_data,  # type: ignore[arg-type]
+                    target,
+                    lang=lang or None,
+                    config=tess_config or "",
+                    output_type=_PYTESS_OUTPUT.DICT,
+                )
                 words: List[str] = []
                 confs: List[float] = []
                 if isinstance(data, dict):
@@ -2931,14 +3016,13 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
                         words.append(txt)
                         confs.append(max(0.0, min(100.0, conf_val)))
                 if not words:
-                    try:
-                        raw = pytesseract.image_to_string(  # type: ignore[arg-type]
-                            target,
-                            lang=lang or None,
-                            config=tess_config or "",
-                        )
-                    except Exception:
-                        raw = None
+                    raw = _pytesseract_call(
+                        "image_to_string",
+                        pytesseract.image_to_string,  # type: ignore[arg-type]
+                        target,
+                        lang=lang or None,
+                        config=tess_config or "",
+                    )
                     text_raw = (raw or "").strip()
                     if text_raw:
                         words.append(text_raw)
