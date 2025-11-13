@@ -15,7 +15,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
 
 try:
