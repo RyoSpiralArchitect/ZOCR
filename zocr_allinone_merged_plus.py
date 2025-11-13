@@ -8303,6 +8303,30 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
 
     return insights
 
+
+def _dedupe_insights_and_queries(summary: Dict[str, Any]) -> None:
+    insights = summary.get("insights")
+    queries = summary.get("rag_suggested_queries")
+    if not insights or not queries:
+        return
+
+    def _canon(val: Any) -> Optional[str]:
+        if not isinstance(val, str):
+            return None
+        return " ".join(val.split()).strip().lower()
+
+    insight_keys = {c for c in (_canon(v) for v in insights) if c}
+    if not insight_keys:
+        return
+
+    filtered: List[Any] = []
+    for q in queries:
+        canon = _canon(q)
+        if canon and canon in insight_keys:
+            continue
+        filtered.append(q)
+    summary["rag_suggested_queries"] = filtered
+
 def _generate_report(
     outdir: str,
     dest: Optional[str] = None,
@@ -11247,6 +11271,7 @@ def _patched_run_full_pipeline(
         summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
         summary["rag_trace_schema"] = rag_manifest.get("trace_schema")
         summary["rag_fact_tag_example"] = rag_manifest.get("fact_tag_example")
+        _dedupe_insights_and_queries(summary)
     except Exception as e:
         print("RAG bundle export skipped:", e)
         summary["rag_trace_schema"] = summary.get("rag_trace_schema") or None
