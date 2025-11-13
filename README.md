@@ -136,6 +136,7 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `monitor.csv` — UTF-8 (BOM 付き) で出力し、Excel/Numbers でも文字化けなく開けます。
 - `pipeline_meta.json` — `--snapshot` 有効時の環境情報。
 - `pipeline_report.html` — trilingual ダッシュボード（`report` サブコマンドでも再生成可）。
+- `episodes/<ID>/` — 各実行のスナップショットを格納（`pipeline_summary.json` / `monitor.csv` / `pipeline_history.jsonl` / `auto_profile.json` / `rag/manifest.json` / `repro_signature.json` / `stage_trace.json` などを丸ごと複製し、`learning_hotspots` や `hotspot_gallery` も JSON 化）。`pipeline_history.jsonl` の各行には `episode_id` が付与され、`episodes_index.json` でドメイン・Hit@K・p95・ゲート結果を一覧できます。
 
 ## モニタリング洞察 / Monitoring Insights / Analyse de la surveillance
 - `pipeline_summary.json` の `insights` は構造・ゲート・プロファイルの3本立てで、over/under・TEDS・行外れ率や Hit@K を数値付きで提示します。
@@ -145,12 +146,14 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `--print-stage-trace` または `ZOCR_STAGE_TRACE_CONSOLE=1` で実行直後にタイミング表を標準出力へ表示できます（遅延ステージや失敗箇所の即時可視化に便利）。
 - **[EN]** Use `--print-stage-trace` or set `ZOCR_STAGE_TRACE_CONSOLE=1` to dump the formatted stage timing table to stdout right after a run, making bottlenecks/failures obvious without opening the JSON summary.
 - **[FR]** Activez `--print-stage-trace` ou `ZOCR_STAGE_TRACE_CONSOLE=1` pour afficher aussitôt le tableau des temps d’étape sur la console et repérer goulots d’étranglement / échecs sans consulter le JSON.
+- `profile_guard` ブロックには、1ランで変更されたプロファイル項目（既定で最大3件）と、ガードによって拒否/調整されたオーバーライドが記録されます。`ZOCR_PROFILE_MAX_CHANGES` 環境変数で許可数を調整できます。
+- `safety_flags.gate_fail_streak` は連続ゲート失敗数を数え、閾値 (`ZOCR_GATE_FAIL_ESCALATE`, 既定3) に到達すると `escalate_to_human` を推奨します。値は `auto_profile.json` にも保存され、次回の run で継続されます。
 - **[JA]** Intent の上位には `meta_intent` 層を追加し、「なぜその意図を採択したのか」「どのホットスポットを狙うのか」を `story` と `focus_plan` に記録します。`pipeline_summary.json` や `rag/feedback_request.*` から理由付きをそのまま参照できます。
 - **[EN]** A meta-intent layer now narrates why an action was chosen and which hotspots it targets; `pipeline_summary.json` and the generated `rag/feedback_request.*` expose the `meta_intent` story plus its `focus_plan`, giving downstream agents a rationale to follow.
 - **[FR]** Une couche méta-intent raconte désormais pourquoi l’action a été retenue et quels hotspots sont visés ; `pipeline_summary.json` ainsi que `rag/feedback_request.*` publient cette `meta_intent` (story + `focus_plan`) pour guider les agents en aval.
-- **[JA]** `learning_hotspots` で抽出したセルを `rag/hotspots/*.png` に自動切り出し、`hotspot_gallery` としてサマリーと RAG リクエストに添付します。`ZOCR_HOTSPOT_GALLERY_LIMIT`（既定 12）で枚数を調整できます。
-- **[EN]** The orchestrator now builds a hotspot gallery by cropping the top learning signals into `rag/hotspots/*.png`; the `hotspot_gallery` block is written to `pipeline_summary.json` and the RAG feedback request. Tune the export count via `ZOCR_HOTSPOT_GALLERY_LIMIT` (default 12).
-- **[FR]** L’orchestrateur génère une galerie de hotspots (`rag/hotspots/*.png`) à partir des signaux `learning_hotspots` et ajoute `hotspot_gallery` au résumé et à la requête RAG. Ajustez le nombre d’extraits avec `ZOCR_HOTSPOT_GALLERY_LIMIT` (12 par défaut).
+- **[JA]** `learning_hotspots` で抽出したセルを `rag/hotspots/*.png` に自動切り出し、`hotspot_gallery` としてサマリーと RAG リクエストに添付します。各エントリには役割（ヘッダ/本文/フッタ）、理由のランク、再解析前後のテキストも記録されるため、JSON を開かずに違和感のあるセルを即確認できます。`ZOCR_HOTSPOT_GALLERY_LIMIT`（既定 12）で枚数を調整できます。
+- **[EN]** The orchestrator now crops `learning_hotspots` into `rag/hotspots/*.png`; every gallery entry carries its inferred role (header/body/footer), the ranked reason, and before/after text so reviewers can see the drift without opening JSON. The `hotspot_gallery` block is stored in `pipeline_summary.json` and the RAG request. Tune the export count via `ZOCR_HOTSPOT_GALLERY_LIMIT` (default 12).
+- **[FR]** Les hotspots sont découpés en `rag/hotspots/*.png` et chaque entrée mentionne désormais son rôle (en-tête/corps/pied), le rang du signal et les textes avant/après, ce qui permet de repérer les anomalies sans JSON. Le bloc `hotspot_gallery` figure dans le résumé et la requête RAG. Ajustez le nombre d’images via `ZOCR_HOTSPOT_GALLERY_LIMIT` (12 par défaut).
 - **[JA]** ギャラリーには `rag/hotspots/gallery.md` も追加され、各セルの位置・テキスト・理由とともに切り出し画像を Markdown で一覧できます。
 - **[EN]** A Markdown companion (`rag/hotspots/gallery.md`) now accompanies the PNG crops so advisors can skim every hotspot with its location, observed text, and reasons without opening the JSON.
 - **[FR]** Un fichier Markdown (`rag/hotspots/gallery.md`) accompagne la galerie PNG : chaque hotspot y est décrit (position, texte observé, raisons) afin de guider rapidement les conseillers.
@@ -206,6 +209,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - 生成されるフィードバックリクエストには `meta_intent`・`learning_hotspots`・`selective_reanalysis_plan` も含まれるため、外部 LLM が「どのセルを直せばよいか」を即座に把握できます。
 - The feedback bundle now embeds the latest `meta_intent`, `learning_hotspots`, and `selective_reanalysis_plan`, so external LLMs can reason about root causes and suggest precise fixes instead of scanning the entire run.
 - Le paquet de feedback inclut désormais `meta_intent`, `learning_hotspots` et `selective_reanalysis_plan`, ce qui permet à un LLM externe d’identifier immédiatement les zones à corriger.
+- **[JA]** `rag/feedback_request.*` にはホットスポットや meta-intent を踏まえた質問テンプレ（低信頼率をどう下げるか、どの trace を直すべきか等）が自動生成され、人間/LLM がそのまま回答ブロックとして追記できます。
+- **[EN]** The `rag/feedback_request.*` bundle now ships with reviewer questions tailored to the current hotspots, meta-intent story, and low-confidence metrics, so a human or LLM can answer them directly before pasting the response back into the manifest.
+- **[FR]** Le paquet `rag/feedback_request.*` comprend désormais des questions ciblées (hotspots, meta-intent, faible confiance) afin qu’un humain ou un LLM puisse y répondre immédiatement avant de réinjecter le feedback dans le manifeste.
 - `hotspot_gallery` (JSON + `rag/hotspots/*.png`) is also exported so advisors can see the offending cells without reopening the PDFs; disable or resize the gallery via `ZOCR_HOTSPOT_GALLERY_LIMIT`.
 - **[JA]** `rag/conversation.jsonl` にパイプライン→LLM→RAG 間の対話履歴を追記します。生成した feedback request / 取り込んだ manifest / advisor 回答が順番に記録され、`pipeline_summary.json` の `rag_conversation` から最新エントリを辿れます。
 - **[EN]** Every run now appends to `rag/conversation.jsonl`, logging the emitted feedback requests plus any ingested manifest/advisor responses. `pipeline_summary.json` exposes the path + last entry under `rag_conversation`, so external agents can replay or extend the dialog.

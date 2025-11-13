@@ -15,7 +15,11 @@ Outputs are consolidated under a single outdir.
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, TypedDict
+try:
+    from typing import Literal  # py39+
+except ImportError:  # pragma: no cover - fallback for very old Python
+    from typing_extensions import Literal  # type: ignore
 from html import escape
 
 try:
@@ -198,6 +202,30 @@ def _print_stage_trace_console(stage_trace: List[Dict[str, Any]], stats: Optiona
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
+
+
+class IntentPayload(TypedDict, total=False):
+    action: str
+    priority: Literal["low", "medium", "high"]
+    reason: str
+    signals: Dict[str, Any]
+    profile_domain: Optional[str]
+    narrative: str
+
+
+class MetaIntentPayload(TypedDict, total=False):
+    intent_action: str
+    meta_action: str
+    priority: Optional[str]
+    reason: Optional[str]
+    story: Optional[str]
+    focus_plan: Dict[str, Any]
+    recommendations: List[str]
+    external_inputs: Dict[str, Any]
+    learning_outcome: Dict[str, Any]
+
+
+_EPISODE_CONTEXT: Dict[str, Any] = {}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
@@ -425,8 +453,197 @@ def _read_ok_steps(outdir: str) -> set:
 def _append_hist(outdir: str, rec: dict):
     rec = dict(rec)
     rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if _EPISODE_CONTEXT.get("id"):
+        rec.setdefault("episode_id", _EPISODE_CONTEXT.get("id"))
     with open(os.path.join(outdir, "pipeline_history.jsonl"), "a", encoding="utf-8") as fw:
         fw.write(json.dumps(_json_ready(rec), ensure_ascii=False) + "\n")
+
+
+def _episodes_root(outdir: str) -> str:
+    return os.path.join(outdir, "episodes")
+
+
+def _load_episode_index(outdir: str) -> Dict[str, Any]:
+    path = os.path.join(_episodes_root(outdir), "episodes_index.json")
+    if not os.path.exists(path):
+        return {"episodes": []}
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            data = json.load(fr)
+            if isinstance(data, dict) and isinstance(data.get("episodes"), list):
+                return data
+    except Exception:
+        pass
+    return {"episodes": []}
+
+
+def _save_episode_index(outdir: str, payload: Dict[str, Any]) -> None:
+    root = _episodes_root(outdir)
+    ensure_dir(root)
+    path = os.path.join(root, "episodes_index.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(_json_ready(payload), fw, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[WARN] episode index write failed: {exc}")
+
+
+def _current_episode_id() -> Optional[str]:
+    eid = _EPISODE_CONTEXT.get("id")
+    return str(eid) if eid else None
+
+
+def _begin_episode(outdir: str) -> Optional[Dict[str, Any]]:
+    if not outdir:
+        return None
+    root = _episodes_root(outdir)
+    ensure_dir(root)
+    index = _load_episode_index(outdir)
+    episodes = index.get("episodes") if isinstance(index, dict) else []
+    parent = None
+    next_num = 1
+    if isinstance(episodes, list) and episodes:
+        try:
+            last = episodes[-1]
+            parent = str(last.get("id")) if last.get("id") is not None else None
+        except Exception:
+            parent = None
+        values: List[int] = []
+        for entry in episodes:
+            try:
+                values.append(int(str(entry.get("id")), 10))
+            except Exception:
+                continue
+        if values:
+            next_num = max(values) + 1
+        elif parent:
+            try:
+                next_num = int(parent, 10) + 1
+            except Exception:
+                next_num = 1
+    episode_id = f"{next_num:06d}"
+    ep_dir = os.path.join(root, episode_id)
+    ensure_dir(ep_dir)
+    _EPISODE_CONTEXT.clear()
+    _EPISODE_CONTEXT.update({"id": episode_id, "parent": parent, "path": ep_dir, "outdir": outdir})
+    return {"id": episode_id, "parent": parent, "path": ep_dir}
+
+
+def _episode_artifact_path(outdir: str, episode_id: str, filename: str) -> str:
+    return os.path.join(_episodes_root(outdir), episode_id, filename)
+
+
+def _finalize_episode(outdir: str, summary: Dict[str, Any]) -> None:
+    info = summary.get("episode") or {}
+    if not info.get("id"):
+        info = _EPISODE_CONTEXT
+    episode_id = str(info.get("id") or "").strip()
+    if not episode_id:
+        return
+    ep_dir = info.get("path") or _episode_artifact_path(outdir, episode_id, "")
+    if not ep_dir:
+        ep_dir = _episode_artifact_path(outdir, episode_id, "")
+    ensure_dir(ep_dir)
+    artifacts: Dict[str, str] = {}
+
+    def _rel(dest: str) -> str:
+        return os.path.relpath(dest, outdir)
+
+    def _copy_artifact(src: Optional[str], name: str) -> None:
+        if not src:
+            return
+        abs_src = src if os.path.isabs(src) else os.path.join(outdir, src)
+        if not os.path.exists(abs_src):
+            return
+        dest = os.path.join(ep_dir, os.path.basename(name))
+        try:
+            shutil.copy2(abs_src, dest)
+        except Exception as exc:
+            print(f"[WARN] episode artifact copy failed ({name}): {exc}")
+            return
+        artifacts[name] = _rel(dest)
+
+    _copy_artifact(os.path.join(outdir, "pipeline_summary.json"), "pipeline_summary.json")
+    _copy_artifact(summary.get("history"), "pipeline_history.jsonl")
+    _copy_artifact(summary.get("monitor_csv"), "monitor.csv")
+    _copy_artifact(summary.get("profile_json"), "auto_profile.json")
+    rag_manifest = os.path.join(outdir, "rag", "manifest.json")
+    if os.path.exists(rag_manifest):
+        _copy_artifact(rag_manifest, "rag_manifest.json")
+    _copy_artifact(summary.get("repro_signature_path"), "repro_signature.json")
+
+    stage_trace = summary.get("stage_trace")
+    if stage_trace:
+        stage_path = os.path.join(ep_dir, "stage_trace.json")
+        try:
+            with open(stage_path, "w", encoding="utf-8") as fw:
+                json.dump(_json_ready(stage_trace), fw, ensure_ascii=False, indent=2)
+            artifacts["stage_trace.json"] = _rel(stage_path)
+        except Exception as exc:
+            print(f"[WARN] episode stage trace write failed: {exc}")
+
+    toy_delta = ((summary.get("toy_memory") or {}).get("delta_run"))
+    if toy_delta:
+        toy_path = os.path.join(ep_dir, "toy_memory_delta.json")
+        try:
+            with open(toy_path, "w", encoding="utf-8") as fw:
+                json.dump(_json_ready(toy_delta), fw, ensure_ascii=False, indent=2)
+            artifacts["toy_memory_delta.json"] = _rel(toy_path)
+        except Exception as exc:
+            print(f"[WARN] episode toy delta write failed: {exc}")
+
+    for key in ("learning_hotspots", "selective_reanalysis_plan", "hotspot_gallery"):
+        if not summary.get(key):
+            continue
+        path = os.path.join(ep_dir, f"{key}.json")
+        try:
+            with open(path, "w", encoding="utf-8") as fw:
+                json.dump(_json_ready(summary.get(key)), fw, ensure_ascii=False, indent=2)
+            artifacts[f"{key}.json"] = _rel(path)
+        except Exception as exc:
+            print(f"[WARN] episode {key} snapshot failed: {exc}")
+
+    summary.setdefault("episode", {})
+    summary["episode"].update({
+        "id": episode_id,
+        "parent": info.get("parent"),
+        "path": _rel(ep_dir),
+        "artifacts": artifacts,
+    })
+
+    index = _load_episode_index(outdir)
+    episodes = [entry for entry in index.get("episodes", []) if entry.get("id") != episode_id]
+    monitor = summary.get("monitor_row") or {}
+    intent = summary.get("intent") or {}
+    meta_intent = summary.get("meta_intent") or {}
+    repro_sig = summary.get("repro_signature") or {}
+
+    def _as_float(val: Any) -> Optional[float]:
+        try:
+            if val is None:
+                return None
+            return float(val)
+        except Exception:
+            return None
+
+    entry = {
+        "id": episode_id,
+        "created_at": summary.get("generated_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "domain": summary.get("domain"),
+        "inputs_hash": repro_sig.get("inputs_hash"),
+        "profile_hash": repro_sig.get("profile_hash"),
+        "parent": info.get("parent"),
+        "hit_mean": _as_float(monitor.get("hit_mean") or monitor.get("hit_mean_gt")),
+        "p95_ms": _as_float(monitor.get("p95_ms")),
+        "gate_pass": monitor.get("gate_pass"),
+        "gate_reason": monitor.get("gate_reason"),
+        "intent_action": intent.get("action"),
+        "meta_intent": meta_intent.get("meta_action"),
+        "episode_path": summary["episode"]["path"],
+    }
+    episodes.append({k: v for k, v in entry.items() if v is not None})
+    episodes.sort(key=lambda item: item.get("id"))
+    _save_episode_index(outdir, {"episodes": episodes})
 
 def _load_history(outdir: str) -> List[Dict[str, Any]]:
     path = os.path.join(outdir, "pipeline_history.jsonl")
@@ -546,6 +763,79 @@ def _render_history_table(records: List[Dict[str, Any]]) -> str:
     return "<table class=\"history\">" + header + "<tbody>" + "".join(body_rows) + "</tbody></table>"
 
 
+def _render_hotspots_section(summary: Dict[str, Any]) -> str:
+    hotspots = summary.get("learning_hotspots") if isinstance(summary, dict) else None
+    plan = summary.get("selective_reanalysis_plan") if isinstance(summary, dict) else None
+    gallery = summary.get("hotspot_gallery") if isinstance(summary, dict) else None
+    if not any([hotspots, plan, gallery]):
+        return ""
+    parts: List[str] = ["<section>", "<h2>ホットスポット / Hotspots</h2>"]
+    if isinstance(hotspots, dict) and hotspots:
+        reasons = hotspots.get("reason_counts") if isinstance(hotspots.get("reason_counts"), list) else []
+        if reasons:
+            parts.append("<h3>Signals</h3><ul>")
+            for rec in reasons[:6]:
+                if not isinstance(rec, dict):
+                    continue
+                label = escape(str(rec.get("reason") or "?"))
+                count = escape(str(rec.get("count") or ""))
+                parts.append(f"<li>{label}: {count}</li>")
+            parts.append("</ul>")
+        cells = hotspots.get("hot_cells") if isinstance(hotspots.get("hot_cells"), list) else []
+        if cells:
+            rows = ["<thead><tr><th>trace</th><th>page,row</th><th>score</th><th>reasons</th></tr></thead>"]
+            body: List[str] = []
+            for cell in cells[:6]:
+                if not isinstance(cell, dict):
+                    continue
+                trace = escape(str(cell.get("trace_id") or "?"))
+                loc = f"p{cell.get('page')} r{cell.get('row')}"
+                score = escape(str(cell.get("score") or ""))
+                reasons_txt = ", ".join(escape(str(r)) for r in cell.get("reasons", [])[:4]) if cell.get("reasons") else ""
+                body.append(f"<tr><td><code>{trace}</code></td><td>{escape(loc)}</td><td>{score}</td><td>{reasons_txt}</td></tr>")
+            if body:
+                rows.append("<tbody>" + "".join(body) + "</tbody>")
+                parts.append("<details open><summary>Top cells</summary><table class=\"history\">" + "".join(rows) + "</table></details>")
+    if isinstance(plan, dict) and plan:
+        parts.append(_render_table(plan, "選択的再解析計画 / Selective plan"))
+    if isinstance(gallery, dict) and gallery.get("entries"):
+        entries = gallery.get("entries")
+        limit = min(6, len(entries)) if isinstance(entries, list) else 0
+        if limit:
+            parts.append("<h3>Hotspot gallery</h3>")
+            parts.append("<div class=\"hotspot-gallery\">")
+            for entry in entries[:limit]:
+                if not isinstance(entry, dict):
+                    continue
+                img = entry.get("image")
+                caption_bits: List[str] = []
+                if entry.get("trace_id"):
+                    caption_bits.append(f"trace {escape(str(entry['trace_id']))}")
+                if entry.get("role"):
+                    caption_bits.append(f"role {escape(str(entry['role']))}")
+                if entry.get("reason_rank"):
+                    caption_bits.append(f"reason #{escape(str(entry['reason_rank']))}")
+                caption = " ・ ".join(caption_bits) or "cell"
+                before = entry.get("before_text") or entry.get("text")
+                after = entry.get("after_text")
+                text_lines = []
+                if before:
+                    text_lines.append(f"<div class=\"muted\">before</div><div>{escape(str(before))}</div>")
+                if after and after != before:
+                    text_lines.append(f"<div class=\"muted\">after</div><div>{escape(str(after))}</div>")
+                img_html = f"<img src=\"{escape(str(img))}\" alt=\"hotspot\">" if img else ""
+                parts.append(
+                    "<figure>" + img_html + f"<figcaption>{caption}</figcaption>" + "".join(text_lines) + "</figure>"
+                )
+            parts.append("</div>")
+        if gallery.get("story"):
+            parts.append(
+                f"<p class=\"muted\"><a href=\"{escape(str(gallery['story']))}\">gallery notes</a></p>"
+            )
+    parts.append("</section>")
+    return "".join(parts)
+
+
 def _coerce_float(val: Any) -> Optional[float]:
     try:
         if val is None:
@@ -555,6 +845,190 @@ def _coerce_float(val: Any) -> Optional[float]:
         return float(val)
     except Exception:
         return None
+
+
+
+_PROFILE_GUARD_KEYS = {
+    "ocr_min_conf",
+    "lambda_shape",
+    "header_boost",
+    "w_kw",
+    "w_img",
+    "reanalyze_target",
+    "force_monitor_refresh",
+    "speed_priority",
+}
+
+
+def _profile_guard_max_changes() -> int:
+    try:
+        return max(1, int(os.environ.get("ZOCR_PROFILE_MAX_CHANGES", "3")))
+    except Exception:
+        return 3
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower in {"0", "false", "no", "off"}:
+            return False
+        if lower in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
+def _guard_profile_value(
+    key: str,
+    requested: Any,
+    current: Any,
+    baseline: Any,
+) -> Tuple[bool, Any, Optional[str]]:
+    reason: Optional[str] = None
+    if key == "ocr_min_conf":
+        val = _coerce_float(requested)
+        if val is None:
+            return False, current, "invalid_value"
+        orig = _coerce_float(baseline if baseline is not None else current)
+        val = max(0.3, min(0.95, val))
+        if orig is not None and abs(val - orig) > 0.1:
+            direction = 1.0 if val > orig else -1.0
+            val = float(orig) + 0.1 * direction
+            reason = "delta_clamped"
+        if reason is None and (val <= 0.3 or val >= 0.95):
+            reason = "clamped_range"
+        return True, float(f"{val:.4f}"), reason
+    if key == "lambda_shape":
+        val = _coerce_float(requested)
+        if val is None:
+            return False, current, "invalid_value"
+        orig_val = val
+        val = max(2.5, min(6.0, val))
+        if val != orig_val:
+            reason = "clamped_range"
+        return True, float(f"{val:.4f}"), reason
+    if key in {"w_kw", "w_img"}:
+        val = _coerce_float(requested)
+        if val is None:
+            return False, current, "invalid_value"
+        orig_val = val
+        val = max(0.2, min(6.0, val))
+        if val != orig_val:
+            reason = "clamped_range"
+        return True, float(f"{val:.4f}"), reason
+    if key == "header_boost":
+        val = _coerce_float(requested)
+        if val is None:
+            return False, current, "invalid_value"
+        orig_val = val
+        val = max(0.5, min(5.0, val))
+        if val != orig_val:
+            reason = "clamped_range"
+        return True, float(f"{val:.4f}"), reason
+    if key in {"force_monitor_refresh", "speed_priority"}:
+        val = _coerce_bool(requested)
+        return True, val, None
+    return True, requested, None
+
+
+class _ProfileGuard:
+    def __init__(
+        self,
+        baseline: Optional[Dict[str, Any]],
+        *,
+        max_changes: Optional[int] = None,
+        keys: Optional[Set[str]] = None,
+    ) -> None:
+        self.baseline = json.loads(json.dumps(baseline or {}))
+        self.max_changes = max_changes or _profile_guard_max_changes()
+        self.keys = set(keys) if keys else set(_PROFILE_GUARD_KEYS)
+        self.changed: Dict[str, List[Dict[str, Any]]] = {}
+        self.blocked: Dict[str, Dict[str, Any]] = {}
+        self.adjusted: Dict[str, str] = {}
+
+    def _within_scope(self, key: str) -> bool:
+        if not self.keys:
+            return True
+        return key in self.keys
+
+    def apply(
+        self,
+        key: str,
+        requested: Any,
+        current: Any,
+        *,
+        source: Optional[str] = None,
+    ) -> Tuple[bool, Any, Optional[str]]:
+        if not self._within_scope(key):
+            return True, requested, None
+        already = key in self.changed
+        if not already and len(self.changed) >= self.max_changes:
+            self.blocked[key] = {
+                "reason": "max_changes",
+                "requested": _json_ready(requested),
+                "source": source,
+            }
+            return False, current, "max_changes"
+        allowed, final, reason = _guard_profile_value(
+            key, requested, current, self.baseline.get(key)
+        )
+        if not allowed:
+            self.blocked[key] = {
+                "reason": reason or "invalid",
+                "requested": _json_ready(requested),
+                "source": source,
+            }
+            return False, current, reason
+        if reason:
+            self.adjusted[key] = reason
+        self.changed.setdefault(key, []).append(
+            {"source": source, "requested": _json_ready(requested), "applied": _json_ready(final)}
+        )
+        return True, final, reason
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "max_changes": self.max_changes,
+            "guarded_keys": sorted(self.keys),
+            "applied": _json_ready(self.changed),
+            "blocked": _json_ready(self.blocked),
+            "adjusted": _json_ready(self.adjusted),
+        }
+
+
+_GATE_FAIL_ESCALATE_THRESHOLD = max(1, int(os.environ.get("ZOCR_GATE_FAIL_ESCALATE", "3")))
+
+
+def _gate_fail_safety(
+    profile: Optional[Dict[str, Any]],
+    monitor_row: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not profile or not monitor_row:
+        return None
+    gate_flag = monitor_row.get("gate_pass")
+    if gate_flag is None:
+        return None
+    gate_pass = _coerce_bool(gate_flag)
+    prev_raw = profile.get("gate_fail_streak")
+    try:
+        prev = int(prev_raw)
+    except Exception:
+        prev = 0
+    new_val = 0 if gate_pass else prev + 1
+    info: Dict[str, Any] = {
+        "gate_pass": gate_pass,
+        "previous": prev,
+        "value": new_val,
+        "threshold": _GATE_FAIL_ESCALATE_THRESHOLD,
+    }
+    if not gate_pass and new_val >= _GATE_FAIL_ESCALATE_THRESHOLD:
+        info["escalate"] = True
+        info["recommendation"] = "escalate_to_human"
+    if new_val != prev:
+        profile["gate_fail_streak"] = new_val
+        info["updated"] = True
+    return info
 
 
 def _derive_insights(summary: Dict[str, Any]) -> List[str]:
@@ -677,6 +1151,10 @@ def _generate_report(
     .status-skip .badge { background: rgba(201, 148, 0, 0.2); color: #c99400; }
     details { margin-top: 1rem; }
     summary { cursor: pointer; }
+    .hotspot-gallery { display: flex; flex-wrap: wrap; gap: 1rem; }
+    .hotspot-gallery figure { width: 220px; background: #161b22; border: 1px solid #30363d; padding: 0.5rem; border-radius: 8px; }
+    .hotspot-gallery img { max-width: 100%; border-radius: 4px; margin-bottom: 0.35rem; }
+    .hotspot-gallery figcaption { font-weight: 600; margin-bottom: 0.35rem; }
     footer { margin-top: 3rem; font-size: 0.85rem; opacity: 0.7; }
     """
 
@@ -749,6 +1227,7 @@ def _generate_report(
     learn_html = ""
     if summary.get("learn"):
         learn_html = _render_table(summary.get("learn"), "学習 / Learning / Apprentissage")
+    hotspot_html = _render_hotspots_section(summary)
 
     history_html = _render_history_table(history)
 
@@ -792,6 +1271,7 @@ def _generate_report(
   {monitor_html}
   {tune_html}
   {learn_html}
+  {hotspot_html}
   {plugin_html}
   <section>
     <h2>履歴 / History / Historique</h2>
@@ -1146,7 +1626,14 @@ def _generate_hotspot_gallery(
         return None
     trace_order: List[str] = []
     cell_lookup: Dict[str, Dict[str, Any]] = {}
+    reason_order: Dict[str, int] = {}
     if isinstance(learning_hotspots, dict):
+        rank = learning_hotspots.get("reason_counts")
+        if isinstance(rank, list):
+            for idx, rec in enumerate(rank, 1):
+                name = rec.get("reason") if isinstance(rec, dict) else None
+                if name:
+                    reason_order.setdefault(str(name), idx)
         for cell in learning_hotspots.get("hot_cells", []):
             if not isinstance(cell, dict):
                 continue
@@ -1203,6 +1690,16 @@ def _generate_hotspot_gallery(
                         image_path = page_images.get(int(page_idx))
                     except Exception:
                         image_path = None
+                hypotheses = sig.get("hypotheses") if isinstance(sig.get("hypotheses"), list) else None
+                after_text = None
+                if isinstance(hypotheses, list):
+                    for hypo in hypotheses:
+                        if not isinstance(hypo, dict):
+                            continue
+                        cand = hypo.get("text") or hypo.get("candidate")
+                        if cand:
+                            after_text = str(cand)
+                            break
                 samples[trace_str] = {
                     "bbox": ints,
                     "page": page_idx,
@@ -1210,7 +1707,8 @@ def _generate_hotspot_gallery(
                     "row": sig.get("row"),
                     "col": sig.get("col"),
                     "image_path": image_path,
-                    "text": sig.get("observed_text") or sig.get("text"),
+                    "before_text": sig.get("observed_text") or sig.get("text"),
+                    "after_text": after_text,
                     "reasons": [str(r) for r in sig.get("reasons", []) if isinstance(r, str)],
                 }
     except Exception as exc:
@@ -1262,6 +1760,30 @@ def _generate_hotspot_gallery(
             missing.add(trace)
             continue
         cell_meta = cell_lookup.get(trace, {})
+        reasons = sample.get("reasons") or cell_meta.get("reasons")
+        role = None
+        row_idx = sample.get("row") if sample.get("row") is not None else cell_meta.get("row")
+        try:
+            row_int = int(row_idx) if row_idx is not None else None
+        except Exception:
+            row_int = None
+        if isinstance(reasons, list):
+            joined = " ".join(reasons).lower()
+            if "header" in joined:
+                role = "header"
+            elif "footer" in joined or "total" in joined:
+                role = "footer"
+        if role is None and row_int == 0:
+            role = "header"
+        if role is None and row_int is not None and row_int < 0:
+            role = "footer"
+        if role is None:
+            role = "body"
+        reason_rank = None
+        if isinstance(reasons, list):
+            ranks = [reason_order.get(r) for r in reasons if reason_order.get(r)]
+            if ranks:
+                reason_rank = min(ranks)
         entry = {
             "trace_id": trace,
             "image": os.path.relpath(dest, outdir),
@@ -1269,8 +1791,12 @@ def _generate_hotspot_gallery(
             "table": sample.get("table"),
             "row": sample.get("row"),
             "col": sample.get("col"),
-            "text": sample.get("text"),
-            "reasons": sample.get("reasons") or cell_meta.get("reasons"),
+            "text": sample.get("before_text") or cell_meta.get("text"),
+            "role": role,
+            "before_text": sample.get("before_text") or cell_meta.get("text"),
+            "after_text": sample.get("after_text"),
+            "reasons": reasons,
+            "reason_rank": reason_rank,
             "score": cell_meta.get("score"),
         }
         entries.append({k: v for k, v in entry.items() if v not in (None, [], {})})
@@ -1318,6 +1844,10 @@ def _write_hotspot_gallery_story(outdir: str, gallery: Dict[str, Any]) -> Option
         for label in ("page", "table", "row", "col"):
             if entry.get(label) is not None:
                 bullet.append(f"{label}={entry[label]}")
+        if entry.get("role"):
+            bullet.append(f"role={entry['role']}")
+        if entry.get("reason_rank"):
+            bullet.append(f"reason_rank={entry['reason_rank']}")
         if entry.get("text"):
             bullet.append(f"text=`{entry['text']}`")
         if entry.get("score") is not None:
@@ -1327,6 +1857,10 @@ def _write_hotspot_gallery_story(outdir: str, gallery: Dict[str, Any]) -> Option
         reasons = entry.get("reasons")
         if isinstance(reasons, list) and reasons:
             lines.append("- reasons: " + "; ".join(reasons))
+        if entry.get("before_text"):
+            lines.append(f"- before: `{entry['before_text']}`")
+        if entry.get("after_text") and entry.get("after_text") != entry.get("before_text"):
+            lines.append(f"- after: `{entry['after_text']}`")
         image_rel = entry.get("image")
         if image_rel:
             lines.append("")
@@ -1397,7 +1931,7 @@ def _summarize_toy_learning(
     return summary
 
 
-def _intent_narrative(intent: Dict[str, Any]) -> str:
+def _intent_narrative(intent: IntentPayload) -> str:
     action = intent.get("action") or "steady"
     reason = intent.get("reason") or ""
     signals = intent.get("signals") or {}
@@ -1914,8 +2448,8 @@ def _derive_intent(
     profile: Dict[str, Any],
     toy_memory_delta: Optional[Dict[str, Any]] = None,
     recognition_stats: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    intent: Dict[str, Any] = {"action": "steady", "reason": "metrics within guardrails"}
+) -> IntentPayload:
+    intent: IntentPayload = {"action": "steady", "reason": "metrics within guardrails", "priority": "low"}
     hit_mean = None
     p95 = None
     if monitor_row:
@@ -2025,17 +2559,17 @@ def _derive_intent(
 
 
 def _derive_meta_intent(
-    intent: Optional[Dict[str, Any]],
+    intent: Optional[IntentPayload],
     learning_hotspots: Optional[Dict[str, Any]],
     focus_plan: Optional[Dict[str, Any]],
     rag_feedback: Optional[Dict[str, Any]] = None,
     advisor_ingest: Optional[Dict[str, Any]] = None,
     learning_outcome: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+) -> MetaIntentPayload:
     if not intent:
         return {}
     action = intent.get("action") or "steady"
-    meta: Dict[str, Any] = {
+    meta: MetaIntentPayload = {
         "intent_action": action,
         "meta_action": "reflect_intent",
         "priority": intent.get("priority"),
@@ -2097,35 +2631,51 @@ def _derive_meta_intent(
     return meta
 
 
-def _apply_intent_to_profile(intent: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Tuple[Any, Any]]:
+def _apply_intent_to_profile(
+    intent: IntentPayload,
+    profile: Dict[str, Any],
+    guard: Optional[_ProfileGuard] = None,
+) -> Dict[str, Tuple[Any, Any]]:
     updates: Dict[str, Tuple[Any, Any]] = {}
+
+    def _set_value(key: str, value: Any) -> bool:
+        old = profile.get(key)
+        new_value = value
+        if guard:
+            applied, final, _ = guard.apply(key, value, old, source="intent")
+            if not applied:
+                return False
+            new_value = final
+        profile[key] = new_value
+        updates[key] = (old, profile.get(key))
+        return True
+
     action = intent.get("action")
     if action == "focus_headers":
         old = profile.get("header_boost", 1.0)
-        profile["header_boost"] = float(old) * 1.15 if isinstance(old, (int, float)) else 1.2
-        updates["header_boost"] = (old, profile["header_boost"])
+        new_val = float(old) * 1.15 if isinstance(old, (int, float)) else 1.2
+        _set_value("header_boost", new_val)
         targets = list(profile.get("reanalyze_target") or [])
         if "headers" not in targets:
             targets.append("headers")
-        profile["reanalyze_target"] = targets
+            _set_value("reanalyze_target", targets)
     elif action == "optimize_speed":
         old = profile.get("lambda_shape", 4.5)
         try:
             new_val = max(2.5, float(old) * 0.9)
         except Exception:
             new_val = 3.8
-        profile["lambda_shape"] = new_val
-        updates["lambda_shape"] = (old, new_val)
-        profile.setdefault("speed_priority", True)
+        _set_value("lambda_shape", new_val)
+        if not _coerce_bool(profile.get("speed_priority")):
+            _set_value("speed_priority", True)
     elif action == "reanalyze_cells":
         prev = list(profile.get("reanalyze_target") or [])
         if "learning_cells" not in prev:
             prev.append("learning_cells")
-        profile["reanalyze_target"] = prev
-        updates["reanalyze_target"] = (None, prev)
+            _set_value("reanalyze_target", prev)
     elif action == "recover":
-        profile.setdefault("force_monitor_refresh", True)
-        updates["force_monitor_refresh"] = (None, True)
+        if not _coerce_bool(profile.get("force_monitor_refresh")):
+            _set_value("force_monitor_refresh", True)
     return updates
 
 
@@ -2146,6 +2696,7 @@ def _apply_rag_feedback(
     profile_path: str,
     *,
     persist_profile: bool = True,
+    guard: Optional[_ProfileGuard] = None,
 ) -> Dict[str, Any]:
     info: Dict[str, Any] = {"manifest": manifest_path, "applied": []}
     if not manifest_path:
@@ -2178,7 +2729,15 @@ def _apply_rag_feedback(
         for key, value in overrides.items():
             applied.append(key)
             if persist_profile and profile is not None:
-                profile[key] = value
+                target_value = value
+                if guard:
+                    allowed, final, _ = guard.apply(
+                        key, value, profile.get(key), source="rag_feedback"
+                    )
+                    if not allowed:
+                        continue
+                    target_value = final
+                profile[key] = target_value
         info["applied"] = applied
         if persist_profile and applied and profile is not None:
             try:
@@ -2280,6 +2839,28 @@ def _emit_rag_feedback_request(
     target_manifest = manifest_path or os.path.join(rag_dir, "manifest.json")
     context = _feedback_observations(summary)
     generated_at = datetime.utcnow().isoformat() + "Z"
+    intent = summary.get("intent") or {}
+    meta_intent = summary.get("meta_intent") or {}
+    low_conf = context.get("low_conf_ratio")
+    questions: List[str] = []
+    if summary.get("hotspot_gallery"):
+        questions.append(
+            "Which hotspot traces show the clearest header/footer mistakes? Reference trace_id and suggest corrections."
+        )
+    if summary.get("selective_reanalysis_plan"):
+        questions.append("Should we expand or shrink the selective reanalysis plan? Name the rows/tables to change.")
+    if isinstance(low_conf, (int, float)):
+        questions.append(
+            f"Propose up to 3 profile_overrides that would reduce low_conf_ratio (current≈{low_conf:.2f})."
+        )
+    if intent.get("action"):
+        questions.append(
+            f"Does the current intent `{intent.get('action')}` still make sense? Suggest an alternative action or confirm it."
+        )
+    if meta_intent.get("story"):
+        questions.append(
+            "Summarize the meta-intent story back in 1 sentence to ensure alignment, then state the next manual check."
+        )
     request_payload: Dict[str, Any] = {
         "generated_at": generated_at,
         "outdir": outdir,
@@ -2297,6 +2878,7 @@ def _emit_rag_feedback_request(
         },
         "observations": context,
         "pending_actions": rag_feedback_actions or summary.get("feedback_passes"),
+        "questions": questions,
     }
     if rag_feedback_ingest:
         request_payload["current_feedback"] = _json_ready(rag_feedback_ingest)
@@ -2337,6 +2919,11 @@ def _emit_rag_feedback_request(
             "3. Save it and run `python -m zocr run --resume --outdir ...` (or pass --rag-feedback).",
         ]
     )
+    if questions:
+        lines.append("")
+        lines.append("## Questions for reviewers")
+        for q in questions:
+            lines.append(f"- {q}")
     if rag_feedback_actions:
         lines.append("")
         lines.append("### Pending actions")
@@ -2608,6 +3195,64 @@ def _patched_run_full_pipeline(
     mon_csv = os.path.join(outdir, "monitor.csv")
     prof_path = os.path.join(outdir, "auto_profile.json")
     prof = _load_profile(outdir, domain_hint)
+    profile_guard = _ProfileGuard(prof)
+
+    auto_demo_lite = demo_requested
+    effective_toy_lite = bool(toy_lite or auto_demo_lite)
+    toy_sweep_limit: Optional[int] = None
+    if toy_sweeps is not None and toy_sweeps > 0:
+        toy_sweep_limit = int(toy_sweeps)
+    elif effective_toy_lite:
+        toy_sweep_limit = _default_toy_sweeps()
+    force_numeric_flag = force_numeric_by_header
+    if effective_toy_lite and force_numeric_flag is None:
+        force_numeric_flag = True
+    if toy_sweep_limit is not None and tune_budget is not None and tune_budget > 0:
+        tune_budget = min(int(tune_budget), toy_sweep_limit)
+
+    env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
+    effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+    export_ocr_override = os.environ.get("ZOCR_EXPORT_OCR")
+    export_ocr_engine = export_ocr_override or effective_ocr_engine
+
+    toy_runtime_overrides: Dict[str, Any] = {}
+    toy_runtime_snapshot: Optional[Dict[str, Any]] = None
+    configure_runtime = getattr(zocr_onefile_consensus, "configure_toy_runtime", None)
+    if callable(configure_runtime) and (toy_sweep_limit is not None or force_numeric_flag is not None):
+        try:
+            toy_runtime_overrides = configure_runtime(
+                sweeps=toy_sweep_limit, force_numeric=force_numeric_flag
+            ) or {}
+        except Exception as exc:
+            print(f"[WARN] Toy runtime configure failed: {exc}")
+            toy_runtime_overrides = {}
+    runtime_config_fn = getattr(zocr_onefile_consensus, "toy_runtime_config", None)
+    if callable(runtime_config_fn):
+        try:
+            toy_runtime_snapshot = runtime_config_fn()
+        except Exception:
+            toy_runtime_snapshot = None
+
+    advisor_ingest = _ingest_advisor_response(advisor_response)
+    advisor_actions: Set[str] = set()
+    if advisor_ingest.get("actions"):
+        advisor_actions = {str(a) for a in advisor_ingest.get("actions") if isinstance(a, str)}
+
+    rag_feedback_path = rag_feedback
+    if not rag_feedback_path:
+        default_manifest = os.path.join(outdir, "rag", "manifest.json")
+        if os.path.exists(default_manifest):
+            rag_feedback_path = default_manifest
+    rag_feedback_ingest: Optional[Dict[str, Any]] = None
+    rag_feedback_actions: Set[str] = set()
+    if rag_feedback_path:
+        rag_feedback_ingest = _apply_rag_feedback(
+            rag_feedback_path, prof, prof_path, guard=profile_guard
+        )
+        if rag_feedback_ingest.get("actions"):
+            rag_feedback_actions = {
+                str(a) for a in rag_feedback_ingest.get("actions", []) if isinstance(a, str)
+            }
 
     auto_demo_lite = demo_requested
     effective_toy_lite = bool(toy_lite or auto_demo_lite)
@@ -2691,6 +3336,10 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+
+    episode_info = _begin_episode(outdir)
+    if episode_info:
+        summary["episode"] = {"id": episode_info.get("id"), "parent": episode_info.get("parent")}
 
     def _record_rag_conversation(entry: Dict[str, Any]) -> None:
         info = _append_rag_conversation_entry(outdir, entry)
@@ -3227,7 +3876,7 @@ def _patched_run_full_pipeline(
     )
     if simulations:
         summary["intent_simulations"] = _json_ready(simulations)
-    intent_updates = _apply_intent_to_profile(intent, prof_after)
+    intent_updates = _apply_intent_to_profile(intent, prof_after, guard=profile_guard)
     combined_updates: Dict[str, Tuple[Any, Any]] = {}
     if profile_diff:
         summary["profile_diff"] = {k: _json_ready(v) for k, v in profile_diff.items()}
@@ -3321,6 +3970,24 @@ def _patched_run_full_pipeline(
         summary["advisor_actions_applied"] = sorted(set(advisor_actions_applied))
     if rag_feedback_actions_applied:
         summary["rag_feedback_actions_applied"] = sorted(set(rag_feedback_actions_applied))
+
+    safety_flags: Dict[str, Any] = {}
+    gate_safety = _gate_fail_safety(prof, summary.get("monitor_row"))
+    if gate_safety:
+        safety_flags["gate_fail_streak"] = _json_ready(gate_safety)
+        summary["gate_fail_streak"] = gate_safety.get("value")
+        if gate_safety.get("updated"):
+            combined_updates["gate_fail_streak"] = (
+                gate_safety.get("previous"),
+                gate_safety.get("value"),
+            )
+            try:
+                with open(prof_path, "w", encoding="utf-8") as pf:
+                    json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                print("Profile save skipped (gate streak):", exc)
+    if safety_flags:
+        summary["safety_flags"] = safety_flags
 
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
@@ -3426,6 +4093,8 @@ def _patched_run_full_pipeline(
         summary["toy_memory"]["recognition"] = _json_ready(
             zocr_onefile_consensus.toy_recognition_stats(reset=True)
         )
+    if profile_guard:
+        summary["profile_guard"] = profile_guard.report()
 
     toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
     summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
@@ -3475,6 +4144,8 @@ def _patched_run_full_pipeline(
         }
         if stage_trace_console:
             _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
+
+    _finalize_episode(outdir, summary)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
