@@ -3854,6 +3854,10 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         return summary
 
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    use_ext_variants = (
+        os.environ.get("ZOCR_EXPORT_EXT_VARIANTS", "0") == "1"
+        and ocr_engine in ("tess", "easyocr")
+    )
 
     focus_plan, focus_filters = _prepare_reanalysis_focus(focus)
     focus_stats = {"matched": 0, "skipped": 0} if focus_filters else None
@@ -4026,8 +4030,9 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
-                for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
-                    _merge_variant(txt_ext, conf_ext, transform_ext)
+                if use_ext_variants:
+                    for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
+                        _merge_variant(txt_ext, conf_ext, transform_ext)
                 seen_ambiguous: Set[str] = set()
                 for candidate in _ambiguous_variants(observed_text) + _ambiguous_variants(base_text):
                     if not candidate or candidate in seen_ambiguous:
