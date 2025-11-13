@@ -6949,6 +6949,13 @@ def _json_ready(obj: Any):
 _STAGE_TRACE_SINK: Optional[List[Dict[str, Any]]] = None
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def _set_stage_trace_sink(sink: Optional[List[Dict[str, Any]]]) -> None:
     global _STAGE_TRACE_SINK
     _STAGE_TRACE_SINK = sink
@@ -7009,6 +7016,62 @@ def _record_stage_trace(rec: Dict[str, Any]) -> None:
     if preview is not None:
         snapshot["out"] = preview
     _STAGE_TRACE_SINK.append(snapshot)
+
+
+def _summarize_stage_preview(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bool, int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value if len(value) <= 80 else value[:77] + "..."
+    if isinstance(value, dict):
+        items: List[str] = []
+        for idx, (key, val) in enumerate(value.items()):
+            if idx >= 3:
+                items.append("…")
+                break
+            items.append(f"{key}={val}")
+        return ", ".join(items)
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        if not seq:
+            return ""
+        snippet = ", ".join(str(item) for item in seq[:3])
+        if len(seq) > 3:
+            snippet += ", …"
+        return snippet
+    return str(value)
+
+
+def _print_stage_trace_console(stage_trace: List[Dict[str, Any]], stats: Optional[Dict[str, Any]] = None) -> None:
+    if not stage_trace:
+        return
+    print("\n[Stage Trace]")
+    header = f"{'Stage':<28} {'OK':<4} {'Elapsed (ms)':>12}  Details"
+    print(header)
+    print("-" * len(header))
+    for entry in stage_trace:
+        name = (entry.get("name") or "?")
+        ok_val = entry.get("ok")
+        status = "ok" if ok_val is True else ("fail" if ok_val is False else "…")
+        elapsed = float(entry.get("elapsed_ms") or 0.0)
+        detail = _summarize_stage_preview(entry.get("out"))
+        if entry.get("error"):
+            err = str(entry.get("error"))
+            detail = f"{detail} | {err}" if detail else err
+        if len(detail) > 96:
+            detail = detail[:93] + "..."
+        print(f"{name:<28.28} {status:<4} {elapsed:>12.1f}  {detail}")
+    if stats:
+        total = float(stats.get("total_elapsed_ms") or 0.0)
+        fail = stats.get("failures")
+        count = stats.get("count")
+        print("-" * len(header))
+        print(f"Total stages: {count}, failures: {fail}, elapsed: {total:.1f} ms")
+        slowest = stats.get("slowest") if isinstance(stats, dict) else None
+        if isinstance(slowest, dict) and slowest.get("name"):
+            print(f"Slowest: {slowest.get('name')} ({slowest.get('elapsed_ms')} ms)")
 
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -8675,10 +8738,14 @@ def _patched_run_full_pipeline(
     force_numeric_by_header: Optional[bool] = None,
     ingest_signature: Optional[str] = None,
     advisor_response: Optional[str] = None,
+    print_stage_trace: Optional[bool] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
+    stage_trace_console = _env_truthy("ZOCR_STAGE_TRACE_CONSOLE", False)
+    if print_stage_trace is not None:
+        stage_trace_console = bool(print_stage_trace)
     random.seed(seed)
     try:
         import numpy as _np
@@ -9455,6 +9522,8 @@ def _patched_run_full_pipeline(
             "total_elapsed_ms": total_ms,
             "slowest": {"name": slowest.get("name"), "elapsed_ms": slowest.get("elapsed_ms")} if slowest else None,
         }
+        if stage_trace_console:
+            _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
@@ -9580,6 +9649,11 @@ def main():
         help="Normalize numeric columns according to header heuristics",
     )
     ap.add_argument(
+        "--print-stage-trace",
+        action="store_true",
+        help="Print the stage timing table after the run",
+    )
+    ap.add_argument(
         "--ocr-engine",
         default=None,
         help="OCR backend to use (e.g. toy, tesseract, easyocr). Overrides ZOCR_OCR_ENGINE.",
@@ -9622,6 +9696,7 @@ def main():
             force_numeric_by_header=force_numeric_flag,
             ingest_signature=args.ingest_signature,
             advisor_response=args.advisor_response,
+            print_stage_trace=args.print_stage_trace,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))

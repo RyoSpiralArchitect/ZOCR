@@ -139,6 +139,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `pipeline_summary.json` には `stage_trace` / `stage_stats` も追加され、各 `_safe_step` の経過時間・成功可否・代表的な出力を一覧できます（単体スクリプト版でも同様）。
 - **[EN]** `pipeline_summary.json` now ships with `stage_trace` / `stage_stats`, exposing every `_safe_step` duration, status, and a compact output preview (mirrored in the single-file runner).
 - **[FR]** `pipeline_summary.json` inclut désormais `stage_trace` / `stage_stats`, listant la durée, le statut et un aperçu d’output pour chaque `_safe_step` (identique dans le script monolithique).
+- `--print-stage-trace` または `ZOCR_STAGE_TRACE_CONSOLE=1` で実行直後にタイミング表を標準出力へ表示できます（遅延ステージや失敗箇所の即時可視化に便利）。
+- **[EN]** Use `--print-stage-trace` or set `ZOCR_STAGE_TRACE_CONSOLE=1` to dump the formatted stage timing table to stdout right after a run, making bottlenecks/failures obvious without opening the JSON summary.
+- **[FR]** Activez `--print-stage-trace` ou `ZOCR_STAGE_TRACE_CONSOLE=1` pour afficher aussitôt le tableau des temps d’étape sur la console et repérer goulots d’étranglement / échecs sans consulter le JSON.
 - インボイス系ドメインは金額 (`hit_amount>=0.8`) と日付 (`hit_date>=0.5`) の双方が揃わない限り PASS しません。欠損時はゲートが FAIL となり、`gate_reason` で要因を特定できます。
 - **[JA]** `monitor.csv` には `trust_amount` / `trust_date` / `trust_mean` を追加し、Top-K に混入した非出典セルの比率を観測できます。`tax_coverage` / `corporate_coverage` でレートが 0 の理由（候補なしなのか失敗か）も判別できます。
 - **[EN]** `monitor.csv` now records `trust_amount`, `trust_date`, and `trust_mean`, exposing how many Top-K hits carry proper provenance. Coverage counters (`tax_coverage`, `corporate_coverage`) clarify when rates are zero because no candidates were found.
