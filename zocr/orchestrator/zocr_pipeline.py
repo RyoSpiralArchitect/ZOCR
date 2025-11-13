@@ -3254,6 +3254,61 @@ def _patched_run_full_pipeline(
                 str(a) for a in rag_feedback_ingest.get("actions", []) if isinstance(a, str)
             }
 
+    auto_demo_lite = demo_requested
+    effective_toy_lite = bool(toy_lite or auto_demo_lite)
+    toy_sweep_limit: Optional[int] = None
+    if toy_sweeps is not None and toy_sweeps > 0:
+        toy_sweep_limit = int(toy_sweeps)
+    elif effective_toy_lite:
+        toy_sweep_limit = _default_toy_sweeps()
+    force_numeric_flag = force_numeric_by_header
+    if effective_toy_lite and force_numeric_flag is None:
+        force_numeric_flag = True
+    if toy_sweep_limit is not None and tune_budget is not None and tune_budget > 0:
+        tune_budget = min(int(tune_budget), toy_sweep_limit)
+
+    env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
+    effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+    export_ocr_override = os.environ.get("ZOCR_EXPORT_OCR")
+    export_ocr_engine = export_ocr_override or effective_ocr_engine
+
+    toy_runtime_overrides: Dict[str, Any] = {}
+    toy_runtime_snapshot: Optional[Dict[str, Any]] = None
+    configure_runtime = getattr(zocr_onefile_consensus, "configure_toy_runtime", None)
+    if callable(configure_runtime) and (toy_sweep_limit is not None or force_numeric_flag is not None):
+        try:
+            toy_runtime_overrides = configure_runtime(
+                sweeps=toy_sweep_limit, force_numeric=force_numeric_flag
+            ) or {}
+        except Exception as exc:
+            print(f"[WARN] Toy runtime configure failed: {exc}")
+            toy_runtime_overrides = {}
+    runtime_config_fn = getattr(zocr_onefile_consensus, "toy_runtime_config", None)
+    if callable(runtime_config_fn):
+        try:
+            toy_runtime_snapshot = runtime_config_fn()
+        except Exception:
+            toy_runtime_snapshot = None
+
+    advisor_ingest = _ingest_advisor_response(advisor_response)
+    advisor_actions: Set[str] = set()
+    if advisor_ingest.get("actions"):
+        advisor_actions = {str(a) for a in advisor_ingest.get("actions") if isinstance(a, str)}
+
+    rag_feedback_path = rag_feedback
+    if not rag_feedback_path:
+        default_manifest = os.path.join(outdir, "rag", "manifest.json")
+        if os.path.exists(default_manifest):
+            rag_feedback_path = default_manifest
+    rag_feedback_ingest: Optional[Dict[str, Any]] = None
+    rag_feedback_actions: Set[str] = set()
+    if rag_feedback_path:
+        rag_feedback_ingest = _apply_rag_feedback(rag_feedback_path, prof, prof_path)
+        if rag_feedback_ingest.get("actions"):
+            rag_feedback_actions = {
+                str(a) for a in rag_feedback_ingest.get("actions", []) if isinstance(a, str)
+            }
+
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
         "mm_jsonl": mm_jsonl,

@@ -10201,6 +10201,61 @@ def _patched_run_full_pipeline(
                 str(a) for a in rag_feedback_ingest.get("actions", []) if isinstance(a, str)
             }
 
+    auto_demo_lite = demo_requested
+    effective_toy_lite = bool(toy_lite or auto_demo_lite)
+    toy_sweep_limit: Optional[int] = None
+    if toy_sweeps is not None and toy_sweeps > 0:
+        toy_sweep_limit = int(toy_sweeps)
+    elif effective_toy_lite:
+        toy_sweep_limit = _default_toy_sweeps()
+    force_numeric_flag = force_numeric_by_header
+    if effective_toy_lite and force_numeric_flag is None:
+        force_numeric_flag = True
+    if toy_sweep_limit is not None and tune_budget is not None and tune_budget > 0:
+        tune_budget = min(int(tune_budget), toy_sweep_limit)
+
+    env_ocr_engine = os.environ.get("ZOCR_OCR_ENGINE")
+    effective_ocr_engine = ocr_engine or env_ocr_engine or prof.get("ocr_engine") or "toy"
+    export_ocr_override = os.environ.get("ZOCR_EXPORT_OCR")
+    export_ocr_engine = export_ocr_override or effective_ocr_engine
+
+    toy_runtime_overrides: Dict[str, Any] = {}
+    toy_runtime_snapshot: Optional[Dict[str, Any]] = None
+    configure_runtime = getattr(zocr_onefile_consensus, "configure_toy_runtime", None)
+    if callable(configure_runtime) and (toy_sweep_limit is not None or force_numeric_flag is not None):
+        try:
+            toy_runtime_overrides = configure_runtime(
+                sweeps=toy_sweep_limit, force_numeric=force_numeric_flag
+            ) or {}
+        except Exception as exc:
+            print(f"[WARN] Toy runtime configure failed: {exc}")
+            toy_runtime_overrides = {}
+    runtime_config_fn = getattr(zocr_onefile_consensus, "toy_runtime_config", None)
+    if callable(runtime_config_fn):
+        try:
+            toy_runtime_snapshot = runtime_config_fn()
+        except Exception:
+            toy_runtime_snapshot = None
+
+    advisor_ingest = _ingest_advisor_response(advisor_response)
+    advisor_actions: Set[str] = set()
+    if advisor_ingest.get("actions"):
+        advisor_actions = {str(a) for a in advisor_ingest.get("actions") if isinstance(a, str)}
+
+    rag_feedback_path = rag_feedback
+    if not rag_feedback_path:
+        default_manifest = os.path.join(outdir, "rag", "manifest.json")
+        if os.path.exists(default_manifest):
+            rag_feedback_path = default_manifest
+    rag_feedback_ingest: Optional[Dict[str, Any]] = None
+    rag_feedback_actions: Set[str] = set()
+    if rag_feedback_path:
+        rag_feedback_ingest = _apply_rag_feedback(rag_feedback_path, prof, prof_path)
+        if rag_feedback_ingest.get("actions"):
+            rag_feedback_actions = {
+                str(a) for a in rag_feedback_ingest.get("actions", []) if isinstance(a, str)
+            }
+
     summary: Dict[str, Any] = {
         "contextual_jsonl": jsonl_path,
         "mm_jsonl": mm_jsonl,
@@ -11036,6 +11091,52 @@ def _patched_run_full_pipeline(
             _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
 
     _finalize_episode(outdir, summary)
+
+    repro_signature = _build_repro_signature(
+        inputs,
+        page_images,
+        prof,
+        toy_runtime_snapshot,
+        export_ocr_engine,
+        toy_runtime_overrides,
+    )
+    summary["repro_signature"] = _json_ready(repro_signature)
+    sig_path, ingest_info = _write_repro_signature(outdir, repro_signature, ingest_signature)
+    if sig_path:
+        summary["repro_signature_path"] = sig_path
+    if ingest_info:
+        summary["repro_ingest"] = _json_ready(ingest_info)
+
+    advisor_path = _write_advice_packet(outdir, summary)
+    if advisor_path:
+        summary["advisor_prompt"] = advisor_path
+    if advisor_ingest:
+        summary["advisor_ingest"] = _json_ready(advisor_ingest)
+        if advisor_ingest.get("status") == "ok":
+            preview = advisor_ingest.get("preview") or ""
+            _record_rag_conversation(
+                {
+                    "role": "advisor",
+                    "kind": "response",
+                    "source": advisor_ingest.get("path"),
+                    "actions": advisor_ingest.get("actions"),
+                    "note": preview[:400],
+                }
+            )
+
+    if stage_trace:
+        total_ms = sum(float(entry.get("elapsed_ms") or 0.0) for entry in stage_trace)
+        failures = sum(1 for entry in stage_trace if entry.get("ok") is False)
+        slowest = max(stage_trace, key=lambda e: float(e.get("elapsed_ms") or 0.0)) if stage_trace else None
+        summary["stage_trace"] = _json_ready(stage_trace)
+        summary["stage_stats"] = {
+            "count": len(stage_trace),
+            "failures": failures,
+            "total_elapsed_ms": total_ms,
+            "slowest": {"name": slowest.get("name"), "elapsed_ms": slowest.get("elapsed_ms")} if slowest else None,
+        }
+        if stage_trace_console:
+            _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
