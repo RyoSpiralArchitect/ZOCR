@@ -2164,6 +2164,91 @@ _TOTAL_LABEL_HINTS = [
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
 
+# --- Toy OCR knobs ----------------------------------------------------------
+_TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
+_FORCE_NUMERIC = os.environ.get("ZOCR_FORCE_NUMERIC", "1").strip().lower() not in ("0", "false", "no", "off")
+_NUMERIC_HEADER_KIND = [
+    ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
+    ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),
+    ("amount", re.compile(r"(金額|合計|総計|税込|税別|小計|amount|total|subtotal|balance)", re.I)),
+    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat)", re.I)),
+]
+
+
+def _normalize_numeric_text(text: str, kind: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = t.replace("，", ",").replace("．", ".")
+    t = re.sub(r"[¥￥$,]", "", t)
+    t = t.replace("円", "")
+    t = t.replace(",", "")
+    if kind == "tax_rate":
+        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
+        return (m.group(0) + "%") if m else (text or "")
+    if kind in ("amount", "unit_price"):
+        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
+        return m.group(0) if m else (text or "")
+    if kind == "qty":
+        m = re.search(r"\d+", t)
+        return m.group(0) if m else (text or "")
+    return t
+
+
+def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
+    kinds: List[Optional[str]] = []
+    if not headers:
+        return kinds
+    for header in headers:
+        base = (header or "").strip().lower()
+        kind: Optional[str] = None
+        for candidate, rx in _NUMERIC_HEADER_KIND:
+            if rx.search(base):
+                kind = candidate
+                break
+        kinds.append(kind)
+    return kinds
+
+
+def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
+    if not headers or not _FORCE_NUMERIC:
+        return
+    kinds = _numeric_header_kinds(headers)
+    if not kinds:
+        return
+    for r in range(1, len(grid_text)):
+        row = list(grid_text[r])
+        changed = False
+        for c, kind in enumerate(kinds):
+            if not kind or c >= len(row):
+                continue
+            normalized = _normalize_numeric_text(str(row[c] or ""), kind)
+            if normalized != row[c]:
+                row[c] = normalized
+                changed = True
+        if changed and isinstance(grid_text[r], list):
+            grid_text[r][:] = row
+
+
+_NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
+    "qty": "0123456789",
+    "unit_price": "0123456789.-",
+    "amount": "0123456789.-",
+    "tax_rate": "0123456789.%",
+}
+
+
+def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
+    if not headers or not _FORCE_NUMERIC:
+        return []
+    kinds = _numeric_header_kinds(headers)
+    if not kinds:
+        return []
+    hints: List[Optional[str]] = []
+    for kind in kinds:
+        hints.append(_NUMERIC_COLUMN_CHARSETS.get(kind) if kind else None)
+    return hints
+
 _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "?": ("7", "1", "2"),
     "I": ("1", "l"),
@@ -2508,7 +2593,7 @@ def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
         out[:, dx:] = 0
     return out
 
-def _match_glyph(cell_bin, atlas):
+def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None):
     # try best correlation over atlas with light shift tolerance and feature penalties
     cw, ch = cell_bin.size
     import numpy as _np
@@ -2525,8 +2610,13 @@ def _match_glyph(cell_bin, atlas):
         cell_style = float(_np.var(row_profile) + _np.var(col_profile))
     else:
         cell_style = 0.0
+    allowed: Optional[Set[str]] = None
+    if allowed_chars:
+        allowed = {str(ch) for ch in allowed_chars if str(ch)}
     best_ch, best_score = "", -1.0
     for ch_key, tpl in atlas.items():
+        if allowed is not None and ch_key not in allowed:
+            continue
         tpl_list = tpl if isinstance(tpl, (list, tuple)) else [tpl]
         variant_best = -1.0
         for glyph_img in tpl_list:
@@ -2593,7 +2683,7 @@ def _otsu_threshold_toy(arr):
             threshold = i
     return int(threshold)
 
-def _text_from_binary(bw):
+def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = _cc_label_rle(bw)
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
@@ -2648,7 +2738,7 @@ def _text_from_binary(bw):
                 patch = Image.fromarray(arr, mode="L")
             except Exception:
                 patch = Image.fromarray(sub)
-            ch, sc = _match_glyph(patch, atlas)
+            ch, sc = _match_glyph(patch, atlas, allowed_chars=allowed_chars)
             _glyph_runtime_store(sig, ch, sc)
             if not ch or ch == "?" or sc < 0.6:
                 _glyph_pending_enqueue(sig, arr, sc)
@@ -2671,7 +2761,9 @@ def _text_from_binary(bw):
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
 
-def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[str, float]:
+def toy_ocr_text_from_cell(
+    crop_img: "Image.Image", bin_k: int = 15, allowed_chars: Optional[Sequence[str]] = None
+) -> Tuple[str, float]:
     """Very small OCR to work with the demo font. Returns (text, confidence)."""
     import numpy as _np
     g = ImageOps.autocontrast(crop_img.convert("L"))
@@ -2743,21 +2835,21 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
     _add_candidate((arr < thr_otsu).astype(_np.uint8) * 255, {"type": "otsu", "thr": thr_otsu})
     _add_candidate((arr > thr_otsu).astype(_np.uint8) * 255, {"type": "otsu_inv", "thr": thr_otsu})
     threshold_expand = int(cfg.get("threshold_expand", 0)) if isinstance(cfg, dict) else 0
-    threshold_step = int(cfg.get("threshold_step", 10)) if isinstance(cfg, dict) else 10
-    fine_step = int(cfg.get("fine_threshold_step", 0)) if isinstance(cfg, dict) else 0
-    threshold_step = max(2, min(24, threshold_step or 10))
-    fine_step = max(0, min(threshold_step, fine_step))
+    sweeps = int(cfg.get("threshold_sweeps", 0)) if isinstance(cfg, dict) else 0
+    if sweeps <= 0:
+        sweeps = _TOY_SWEEPS
     thr_min = max(16, thr_med - 60 - threshold_expand)
     thr_max = min(240, thr_med + 70 + threshold_expand)
-    for thr_candidate in range(thr_min, thr_max + 1, threshold_step):
-        _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep", "thr": thr_candidate})
-    if fine_step and fine_step < threshold_step:
-        for thr_candidate in range(thr_min, thr_max + 1, fine_step):
-            _add_candidate((arr < thr_candidate).astype(_np.uint8) * 255, {"type": "sweep_fine", "thr": thr_candidate})
-    spread_base = int(max(6, arr.std()))
+    if thr_max <= thr_min:
+        thr_max = min(240, thr_min + 6)
+    sweep_values = [int(x) for x in _np.linspace(thr_min, thr_max, num=max(1, sweeps))]
+    for thr_candidate in sweep_values:
+        thr_val = int(_np.clip(thr_candidate, 16, 240))
+        _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_global", "thr": thr_val})
+    spread_base = int(max(3, arr.std()))
     extra_spread = int(cfg.get("extra_local_spread", 0)) if isinstance(cfg, dict) else 0
-    spread = max(6, spread_base + max(0, extra_spread))
-    local_offsets: List[int] = [-spread, spread]
+    spread = max(3, min(24, spread_base + max(0, extra_spread)))
+    local_offsets: List[int] = [-spread, 0, spread]
     if isinstance(cfg, dict) and isinstance(cfg.get("local_sweep_offsets"), (list, tuple)):
         for candidate in cfg.get("local_sweep_offsets", []):  # type: ignore[assignment]
             try:
@@ -2780,7 +2872,7 @@ def toy_ocr_text_from_cell(crop_img: "Image.Image", bin_k: int = 15) -> Tuple[st
         total = len(candidates)
         for i in range(idx, total):
             bw, meta = candidates[i]
-            text, conf = _text_from_binary(bw)
+            text, conf = _text_from_binary(bw, allowed_chars=allowed_chars)
             if text:
                 prev = candidate_scores.get(text)
                 if prev is None or conf > prev:
@@ -3244,6 +3336,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 # OCR pass across grid
                 grid_text = [["" for _ in range(C)] for __ in range(R)]
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
+                col_charset_hints: List[Optional[str]] = []
+                toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]
@@ -3257,7 +3351,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_w, cx2 + right_pad),
                             min(page_h, cy2 + pad_y)
                         ))
-                        txt, conf = ocr_runner(crop)
+                        allowed_chars = None
+                        if r > 0 and col_charset_hints and c < len(col_charset_hints):
+                            allowed_chars = col_charset_hints[c]
+                        if allowed_chars and toy_runner:
+                            txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
+                        else:
+                            txt, conf = ocr_runner(crop)
                         if not isinstance(txt, str):
                             txt = "" if txt is None else str(txt)
                         grid_text[r][c] = txt
@@ -3269,6 +3369,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if max_cells and cells_done >= max_cells:
                             stop_due_to_limit = True
                             break
+                    if r == 0 and not col_charset_hints:
+                        headers_sample = grid_text[0] if grid_text else []
+                        col_charset_hints = _column_charset_hints(headers_sample)
                     if stop_due_to_limit:
                         break
                 if stop_due_to_limit:
@@ -3299,7 +3402,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 )
                                 fallback_notes[(r, target_col)] = "footer_band"
                 # contextual one-liners
-                headers = grid_text[0] if contextual else []
+                headers = grid_text[0] if grid_text else []
+                if contextual:
+                    _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
                     for c in range(C):
                         cx1 = x1 + col_bounds[c]; cx2 = x1 + col_bounds[c+1]
@@ -7941,6 +8046,28 @@ def _patched_run_full_pipeline(
     toy_memory_after_load = toy_memory_info_load.get("snapshot_after") or toy_memory_info_load.get("snapshot_before")
     if hasattr(zocr_onefile_consensus, "reset_toy_recognition_stats"):
         zocr_onefile_consensus.reset_toy_recognition_stats()
+
+    if len(inputs) == 1 and inputs[0].lower() == "demo":
+        real_demo_targets = []
+        if os.path.exists(inputs[0]):
+            real_demo_targets = [inputs[0]]
+        else:
+            real_demo_targets = _discover_demo_input_targets()
+
+        pages = _collect_pages(real_demo_targets, dpi=dpi) if real_demo_targets else []
+
+        filtered_pages: List[str] = []
+        seen_page_paths = set()
+        for page in pages:
+            norm = os.path.abspath(page)
+            if norm in seen_page_paths:
+                continue
+            if not os.path.exists(page):
+                continue
+            seen_page_paths.add(norm)
+            filtered_pages.append(page)
+        pages = filtered_pages
+
 
     if len(inputs) == 1 and inputs[0].lower() == "demo":
         real_demo_targets = []
