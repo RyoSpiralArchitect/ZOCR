@@ -6899,6 +6899,7 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set
 from html import escape
 
@@ -8627,6 +8628,128 @@ def _apply_rag_feedback(
     return info
 
 
+def _feedback_observations(summary: Dict[str, Any]) -> Dict[str, Any]:
+    monitor = summary.get("monitor_row") or {}
+    export_signals = summary.get("export_signals") or {}
+    stage_stats = summary.get("stage_stats") or {}
+    observations: Dict[str, Any] = {
+        "domain": summary.get("domain"),
+        "domain_guess": summary.get("domain_autodetect", {})
+        .get("from_inputs", {})
+        .get("guess"),
+        "domain_confidence": summary.get("domain_autodetect", {})
+        .get("from_inputs", {})
+        .get("best_score"),
+        "intent_action": (summary.get("intent") or {}).get("action"),
+        "intent_reason": (summary.get("intent") or {}).get("reason"),
+        "intent_story": (summary.get("intent") or {}).get("narrative"),
+        "low_conf_ratio": _coerce_float(export_signals.get("low_conf_ratio")),
+        "high_surprisal_ratio": _coerce_float(export_signals.get("high_surprisal_ratio")),
+        "hit_amount": _coerce_float(monitor.get("hit_amount") or monitor.get("hit_amount_gt")),
+        "hit_date": _coerce_float(monitor.get("hit_date") or monitor.get("hit_date_gt")),
+        "hit_mean": _coerce_float(monitor.get("hit_mean") or monitor.get("hit_mean_gt")),
+        "gate_pass": monitor.get("gate_pass"),
+        "gate_reason": monitor.get("gate_reason"),
+        "p95_ms": _coerce_float(monitor.get("p95_ms")),
+        "toy_runtime": summary.get("toy_runtime_config"),
+        "toy_runtime_overrides": summary.get("toy_runtime_overrides"),
+        "toy_sweeps": summary.get("toy_sweeps"),
+        "last_export_stats": summary.get("last_export_stats"),
+        "stage_stats": stage_stats,
+    }
+    export_cells = summary.get("last_export_stats") or {}
+    if export_cells:
+        observations.setdefault("export_cells", export_cells.get("cells"))
+    recognizer = summary.get("recognition_stats") or summary.get("toy_recognition_stats")
+    if recognizer:
+        observations["recognition_stats"] = recognizer
+    return _json_ready({k: v for k, v in observations.items() if v is not None})
+
+
+def _emit_rag_feedback_request(
+    outdir: str,
+    summary: Dict[str, Any],
+    *,
+    manifest_path: Optional[str] = None,
+    rag_feedback_ingest: Optional[Dict[str, Any]] = None,
+    advisor_ingest: Optional[Dict[str, Any]] = None,
+    rag_feedback_actions: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    rag_dir = os.path.join(outdir, "rag")
+    try:
+        ensure_dir(rag_dir)
+    except Exception as exc:
+        print(f"[WARN] feedback_request dir failed: {exc}")
+        return None
+    target_manifest = manifest_path or os.path.join(rag_dir, "manifest.json")
+    context = _feedback_observations(summary)
+    generated_at = datetime.utcnow().isoformat() + "Z"
+    request_payload: Dict[str, Any] = {
+        "generated_at": generated_at,
+        "outdir": outdir,
+        "target_manifest": target_manifest,
+        "instructions": {
+            "ja": "rag/manifest.json の feedback ブロックに profile_overrides/actions を追記して --resume で再実行してください。",
+            "en": "Edit the manifest's feedback block (notes/profile_overrides/actions) then re-run the pipeline with --resume.",
+        },
+        "example_feedback": {
+            "feedback": {
+                "notes": "ex: high surprisal on footer, please reanalyze",
+                "profile_overrides": {"ocr_min_conf": 0.52},
+                "actions": ["reanalyze_cells", "rerun_monitor"],
+            }
+        },
+        "observations": context,
+        "pending_actions": rag_feedback_actions or summary.get("feedback_passes"),
+    }
+    if rag_feedback_ingest:
+        request_payload["current_feedback"] = _json_ready(rag_feedback_ingest)
+    if advisor_ingest:
+        request_payload["advisor_feedback"] = _json_ready(advisor_ingest)
+    req_json = os.path.join(rag_dir, "feedback_request.json")
+    req_md = os.path.join(rag_dir, "feedback_request.md")
+    try:
+        with open(req_json, "w", encoding="utf-8") as fw:
+            json.dump(_json_ready(request_payload), fw, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[WARN] feedback_request.json write failed: {exc}")
+        return None
+    lines = [
+        "# RAG Feedback Request",
+        f"Generated: {generated_at}",
+        "",
+        f"Target manifest: {target_manifest}",
+        "",
+        "## Observations",
+    ]
+    for key, value in context.items():
+        lines.append(f"- {key}: {value}")
+    lines.extend(
+        [
+            "",
+            "## Next steps",
+            "1. Open the manifest above (or copy it elsewhere).",
+            "2. Add/adjust the `feedback` block with notes, profile_overrides, and actions.",
+            "3. Save it and run `python -m zocr run --resume --outdir ...` (or pass --rag-feedback).",
+        ]
+    )
+    if rag_feedback_actions:
+        lines.append("")
+        lines.append("### Pending actions")
+        for act in rag_feedback_actions:
+            lines.append(f"- {act}")
+    try:
+        with open(req_md, "w", encoding="utf-8") as fw:
+            fw.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        print(f"[WARN] feedback_request.md write failed: {exc}")
+    return {
+        "target_manifest": target_manifest,
+        "request_json": req_json,
+        "request_markdown": req_md,
+    }
+
+
 def _simulate_param_shift(
     monitor_row: Optional[Dict[str, Any]],
     export_signals: Dict[str, Any],
@@ -9544,6 +9667,17 @@ def _patched_run_full_pipeline(
                 persist_profile=False,
             )
         )
+
+    rag_request_info = _emit_rag_feedback_request(
+        outdir,
+        summary,
+        manifest_path=summary.get("rag_manifest") or rag_feedback_path,
+        rag_feedback_ingest=rag_feedback_ingest,
+        advisor_ingest=advisor_ingest,
+        rag_feedback_actions=sorted(rag_feedback_actions) if rag_feedback_actions else None,
+    )
+    if rag_request_info:
+        summary["rag_feedback_request"] = _json_ready(rag_request_info)
 
     if PLUGINS:
         summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
