@@ -14,6 +14,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 
 from __future__ import annotations
 import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect
+from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -1194,6 +1195,13 @@ class MotionPriorCfg:
     sigma_px: float = 8.0
     cutoff_sigma: float = 2.5
     accept_ratio: float = 0.5
+    k_sigma_window: float = 2.5
+    auto_sigma: bool = False
+    sigma_min_ratio: float = 0.15
+    sigma_max_ratio: float = 1.5
+    table_signature: Optional[str] = None
+    cache_dir: Optional[str] = None
+    bandit_action: Optional[str] = None
 
 
 @dataclass
@@ -1203,6 +1211,26 @@ class _BlankSkipConfig:
     min_dark_pixels: int = 8
     min_dark_ratio: float = 0.002
     min_area: int = 36
+
+
+try:  # pragma: no cover - optional orchestrator helper
+    from ..orchestrator.prior import estimate_sigma_px as _estimate_sigma_px  # type: ignore
+except Exception:  # pragma: no cover - fallback when orchestrator is unavailable
+
+    def _estimate_sigma_px(
+        delta_y: Sequence[float],
+        median_row_h: float,
+        s_min_ratio: float = 0.15,
+        s_max_ratio: float = 1.5,
+    ) -> float:
+        if not delta_y:
+            return max(1.0, 0.5 * float(median_row_h or 1.0))
+        med = median(delta_y)
+        mad = median([abs(d - med) for d in delta_y])
+        sigma = 1.4826 * mad
+        sigma_min = s_min_ratio * max(1.0, median_row_h)
+        sigma_max = s_max_ratio * max(1.0, median_row_h)
+        return float(min(max(sigma, sigma_min), sigma_max))
 
 
 @dataclass
@@ -1226,14 +1254,48 @@ _EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
 
 
 def _motion_prior_cfg_from_env() -> MotionPriorCfg:
-    cfg = MotionPriorCfg(enabled=_env_flag("ZOCR_EXPORT_MOTION_PRIOR", False))
-    if cfg.enabled:
-        sigma = _env_float("ZOCR_EXPORT_MOTION_SIGMA", cfg.sigma_px)
-        cutoff = _env_float("ZOCR_EXPORT_MOTION_CUTOFF", cfg.cutoff_sigma)
-        accept = _env_float("ZOCR_EXPORT_MOTION_ACCEPT", cfg.accept_ratio)
-        cfg.sigma_px = max(0.5, float(sigma))
-        cfg.cutoff_sigma = max(0.1, float(cutoff))
-        cfg.accept_ratio = float(max(0.0, min(1.0, accept)))
+    enabled = _env_flag("ZOCR_EXPORT_MOTION_PRIOR", False) or _env_flag("ZOCR_USE_PRIOR", False)
+    cfg = MotionPriorCfg(enabled=enabled)
+    cfg.table_signature = os.environ.get("ZOCR_TABLE_SIGNATURE")
+    cfg.cache_dir = os.environ.get("ZOCR_PRIOR_CACHE")
+    cfg.bandit_action = os.environ.get("ZOCR_PRIOR_ACTION")
+    cfg.k_sigma_window = float(max(0.1, _env_float("ZOCR_K_SIGMA_WINDOW", cfg.k_sigma_window)))
+    cfg.sigma_min_ratio = float(max(0.01, _env_float("ZOCR_PRIOR_SIGMA_MIN_RATIO", cfg.sigma_min_ratio)))
+    cfg.sigma_max_ratio = float(max(cfg.sigma_min_ratio, _env_float("ZOCR_PRIOR_SIGMA_MAX_RATIO", cfg.sigma_max_ratio)))
+    sigma_raw = os.environ.get("ZOCR_PRIOR_SIGMA")
+    sigma_override: Optional[float] = None
+    if sigma_raw:
+        if sigma_raw.strip().lower() == "auto":
+            cfg.auto_sigma = True
+        else:
+            try:
+                sigma_override = float(sigma_raw)
+            except Exception:
+                sigma_override = None
+    elif cfg.enabled:
+        cfg.auto_sigma = True
+    if sigma_override is None:
+        sigma_env = os.environ.get("ZOCR_EXPORT_MOTION_SIGMA")
+        if sigma_env:
+            try:
+                sigma_override = float(sigma_env)
+            except Exception:
+                sigma_override = None
+    if sigma_override is not None:
+        cfg.sigma_px = max(0.5, float(sigma_override))
+        cfg.auto_sigma = False
+    cutoff_raw = os.environ.get("ZOCR_EXPORT_MOTION_CUTOFF")
+    if cutoff_raw:
+        try:
+            cfg.cutoff_sigma = max(0.1, float(cutoff_raw))
+        except Exception:
+            pass
+    accept_raw = os.environ.get("ZOCR_EXPORT_MOTION_ACCEPT")
+    if accept_raw:
+        try:
+            cfg.accept_ratio = float(max(0.0, min(1.0, float(accept_raw))))
+        except Exception:
+            pass
     return cfg
 
 
@@ -1295,6 +1357,53 @@ def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
     return mids
 
 
+def _prior_cache_path(cache_dir: str, signature: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", signature.strip()) or "unknown"
+    return os.path.join(cache_dir, f"{safe}.ykeys.json")
+
+
+def _load_prior_cache_ykeys(signature: Optional[str], cache_dir: Optional[str]) -> Optional[List[float]]:
+    if not signature or not cache_dir:
+        return None
+    path = _prior_cache_path(cache_dir, signature)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    values = payload.get("y_keys") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return None
+    result: List[float] = []
+    for val in values:
+        try:
+            result.append(float(val))
+        except Exception:
+            continue
+    return result or None
+
+
+def _store_prior_cache_ykeys(
+    signature: Optional[str], cache_dir: Optional[str], y_keys: Sequence[float]
+) -> bool:
+    if not signature or not cache_dir or not y_keys:
+        return False
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        return False
+    path = _prior_cache_path(cache_dir, signature)
+    payload = {"y_keys": [float(y) for y in y_keys]}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 def _reseed_row_bands_with_prior(
     prev_keys: Sequence[float],
     row_bands: Sequence[Tuple[int, int]],
@@ -1337,23 +1446,70 @@ def _apply_motion_prior_to_bands(
     prev_keys: Optional[Sequence[float]],
     row_bands: List[Tuple[int, int]],
     cfg: MotionPriorCfg,
-) -> Tuple[List[Tuple[int, int]], bool]:
+    row_heights: Optional[Sequence[int]] = None,
+) -> Tuple[List[Tuple[int, int]], bool, Dict[str, Any]]:
+    stats: Dict[str, Any] = {}
     if not cfg.enabled or not prev_keys or not row_bands:
-        return row_bands, False
+        return row_bands, False, stats
     reseeded, matches = _reseed_row_bands_with_prior(prev_keys, row_bands)
     if not reseeded:
-        return row_bands, False
-    sigma = max(1e-3, float(cfg.sigma_px))
-    cutoff = float(cfg.cutoff_sigma) * sigma
+        return row_bands, False, stats
+    heights = row_heights or [int(max(1, band[1] - band[0])) for band in row_bands]
+    med_height = float(median(heights)) if heights else max(1.0, abs(row_bands[0][1] - row_bands[0][0]))
+    deltas = [cand_mid - prev_val for cand_mid, prev_val in matches]
+    sigma_px = float(cfg.sigma_px)
+    auto_used = False
+    if cfg.auto_sigma:
+        sigma_px = _estimate_sigma_px(deltas, med_height, cfg.sigma_min_ratio, cfg.sigma_max_ratio)
+        auto_used = True
+    sigma_px = max(1e-3, float(sigma_px))
+    k_sigma = max(0.1, float(cfg.k_sigma_window))
+    window = k_sigma * sigma_px
+    cutoff = float(cfg.cutoff_sigma) * sigma_px
+    stats.update(
+        {
+            "sigma_px": float(sigma_px),
+            "window_px": float(window),
+            "auto_sigma": bool(auto_used),
+            "deltas": len(deltas),
+            "median_row_h": float(med_height),
+            "k_sigma_window": float(k_sigma),
+        }
+    )
+    limited: List[Tuple[int, int]] = []
+    trimmed = 0
+    if window > 0:
+        for idx, band in enumerate(reseeded):
+            top, bottom = band
+            mid = (float(top) + float(bottom)) * 0.5
+            target = float(prev_keys[idx]) if idx < len(prev_keys) else mid
+            if abs(mid - target) > window:
+                trimmed += 1
+                height = max(1.0, float(bottom - top))
+                center = target + max(-window, min(window, mid - target))
+                half = height * 0.5
+                new_top = int(round(center - half))
+                new_bottom = int(round(center + half))
+                limited.append((new_top, new_bottom))
+            else:
+                limited.append(band)
+    else:
+        limited = list(reseeded)
+    if trimmed:
+        stats["trimmed"] = int(trimmed)
+    reseeded = limited
     inside = 0
     total = len(matches)
     for cand_mid, prev_val in matches:
         if abs(cand_mid - prev_val) <= cutoff:
             inside += 1
+    stats["inliers"] = int(inside)
+    stats["matches"] = int(total)
     actual_ratio = inside / float(total or 1)
+    stats["accept_ratio"] = float(actual_ratio)
     if actual_ratio >= cfg.accept_ratio:
-        return reseeded, True
-    return row_bands, False
+        return reseeded, True, stats
+    return row_bands, False, stats
 
 
 def _parse_threshold_limit(value: str, default: int) -> int:
@@ -3544,6 +3700,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
     sweep_tracker = _EXPORT_SWEEP_TRACKER
     motion_applied = 0
     motion_rejected = 0
+    motion_sigma_samples: List[float] = []
+    motion_window_samples: List[float] = []
+    motion_auto_estimated = 0
+    motion_prior_attempts: List[Dict[str, Any]] = []
     guard_ms = _parse_env_int("ZOCR_EXPORT_GUARD_MS", 0, 0)
     guard_timeouts = 0
     doc_identifier = str(
@@ -3554,6 +3714,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
     )
     blank_cfg = _blank_skip_cfg_from_env()
     blank_skipped = 0
+    prior_cache_seed: Optional[List[float]] = None
+    prior_cache_hits = 0
+    prior_cache_writes = 0
+    if motion_cfg.enabled:
+        cached = _load_prior_cache_ykeys(motion_cfg.table_signature, motion_cfg.cache_dir)
+        if cached:
+            prior_cache_seed = list(cached)
+            prior_cache_hits += 1
 
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
@@ -3665,9 +3833,28 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         yt = int(y1 + (y2-y1)*r/R)
                         yb = int(y1 + (y2-y1)*(r+1)/R)
                         row_bands.append((yt, yb))
+                row_heights = [int(max(1, band[1] - band[0])) for band in row_bands]
+                prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
+                if not prev_keys and prior_cache_seed:
+                    prev_keys = list(prior_cache_seed)
+                motion_entry_stats: Dict[str, Any] = {}
                 if motion_cfg.enabled:
-                    prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
-                    row_bands_prior, applied = _apply_motion_prior_to_bands(prev_keys, row_bands, motion_cfg)
+                    row_bands_prior, applied, motion_entry_stats = _apply_motion_prior_to_bands(
+                        prev_keys,
+                        row_bands,
+                        motion_cfg,
+                        row_heights=row_heights,
+                    )
+                    if motion_entry_stats:
+                        motion_prior_attempts.append(motion_entry_stats)
+                        sigma_val = motion_entry_stats.get("sigma_px")
+                        window_val = motion_entry_stats.get("window_px")
+                        if isinstance(sigma_val, (int, float)):
+                            motion_sigma_samples.append(float(sigma_val))
+                        if isinstance(window_val, (int, float)):
+                            motion_window_samples.append(float(window_val))
+                        if motion_entry_stats.get("auto_sigma"):
+                            motion_auto_estimated += 1
                     if applied:
                         row_bands = row_bands_prior
                         motion_applied += 1
@@ -3746,12 +3933,20 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 if stop_due_to_limit:
                     break
                 if motion_cfg.enabled:
+                    mids = _row_band_midpoints(row_bands)
                     sweep_tracker.put(
                         doc_identifier,
                         page_index_int,
                         ti,
-                        _row_band_midpoints(row_bands),
+                        mids,
                     )
+                    if _store_prior_cache_ykeys(
+                        motion_cfg.table_signature,
+                        motion_cfg.cache_dir,
+                        mids,
+                    ):
+                        prior_cache_writes += 1
+                        prior_cache_seed = list(mids)
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -3981,12 +4176,39 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "timeouts": int(guard_timeouts),
         }
     if motion_cfg.enabled:
+        sigma_summary = None
+        if motion_sigma_samples:
+            sigma_summary = {
+                "median": float(median(motion_sigma_samples)),
+                "min": float(min(motion_sigma_samples)),
+                "max": float(max(motion_sigma_samples)),
+                "count": len(motion_sigma_samples),
+            }
+        window_summary = None
+        if motion_window_samples:
+            window_summary = {
+                "median": float(median(motion_window_samples)),
+                "min": float(min(motion_window_samples)),
+                "max": float(max(motion_window_samples)),
+                "count": len(motion_window_samples),
+            }
         export_stats["motion_prior"] = {
             "sigma_px": float(motion_cfg.sigma_px),
             "cutoff_sigma": float(motion_cfg.cutoff_sigma),
             "accept_ratio": float(motion_cfg.accept_ratio),
+            "k_sigma_window": float(motion_cfg.k_sigma_window),
             "applied": int(motion_applied),
             "rejected": int(motion_rejected),
+            "auto_estimated": int(motion_auto_estimated),
+            "bandit_action": motion_cfg.bandit_action,
+            "table_signature": motion_cfg.table_signature,
+            "sigma_summary": sigma_summary,
+            "window_summary": window_summary,
+            "cache": {
+                "hits": int(prior_cache_hits),
+                "writes": int(prior_cache_writes),
+            },
+            "attempts": len(motion_prior_attempts),
         }
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
