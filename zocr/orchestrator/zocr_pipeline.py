@@ -60,6 +60,71 @@ def _json_ready(obj: Any):
             return obj.tolist()
     return obj
 
+
+_STAGE_TRACE_SINK: Optional[List[Dict[str, Any]]] = None
+
+
+def _set_stage_trace_sink(sink: Optional[List[Dict[str, Any]]]) -> None:
+    global _STAGE_TRACE_SINK
+    _STAGE_TRACE_SINK = sink
+
+
+def _stage_output_preview(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        interesting = (
+            "path",
+            "paths",
+            "count",
+            "records",
+            "pages",
+            "tables",
+            "cells",
+            "reason",
+            "summary",
+            "output",
+            "metrics",
+        )
+        preview: Dict[str, Any] = {}
+        for key in interesting:
+            if key in value:
+                preview[key] = value[key]
+        if preview:
+            return _json_ready(preview)
+        if len(value) <= 4:
+            return _json_ready(value)
+        return f"{len(value)} keys"
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        if not seq:
+            return []
+        if len(seq) <= 4 and all(isinstance(item, (bool, int, float, str)) for item in seq):
+            return seq
+        return f"{len(seq)} items"
+    return str(type(value).__name__)
+
+
+def _record_stage_trace(rec: Dict[str, Any]) -> None:
+    if _STAGE_TRACE_SINK is None:
+        return
+    snapshot: Dict[str, Any] = {
+        "name": rec.get("name"),
+        "elapsed_ms": float(rec.get("elapsed_ms") or 0.0),
+    }
+    if rec.get("ok") is None:
+        snapshot["ok"] = None
+    else:
+        snapshot["ok"] = bool(rec.get("ok"))
+    if rec.get("error"):
+        snapshot["error"] = rec.get("error")
+    preview = _stage_output_preview(rec.get("out"))
+    if preview is not None:
+        snapshot["out"] = preview
+    _STAGE_TRACE_SINK.append(snapshot)
+
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
@@ -686,12 +751,16 @@ def _safe_step(name, fn, *a, **kw):
         out = fn(*a, **kw)
         dt = (time.perf_counter() - t0) * 1000.0
         print(f"[OK]   {name} ({dt:.1f} ms)")
-        return {"ok": True, "elapsed_ms": dt, "out": out, "name": name}
+        result = {"ok": True, "elapsed_ms": dt, "out": out, "name": name}
+        _record_stage_trace(result)
+        return result
     except Exception as e:
         dt = (time.perf_counter() - t0) * 1000.0
         print(f"[FAIL] {name} ({dt:.1f} ms): {type(e).__name__}: {e}")
         traceback.print_exc()
-        return {"ok": False, "elapsed_ms": dt, "error": f"{type(e).__name__}: {e}", "name": name}
+        result = {"ok": False, "elapsed_ms": dt, "error": f"{type(e).__name__}: {e}", "name": name}
+        _record_stage_trace(result)
+        return result
 
 def _sha256(p):
     h = hashlib.sha256()
@@ -1722,6 +1791,8 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_dir(outdir)
+    stage_trace: List[Dict[str, Any]] = []
+    _set_stage_trace_sink(stage_trace)
     random.seed(seed)
     try:
         import numpy as _np
@@ -2489,12 +2560,25 @@ def _patched_run_full_pipeline(
     if advisor_ingest:
         summary["advisor_ingest"] = _json_ready(advisor_ingest)
 
+    if stage_trace:
+        total_ms = sum(float(entry.get("elapsed_ms") or 0.0) for entry in stage_trace)
+        failures = sum(1 for entry in stage_trace if entry.get("ok") is False)
+        slowest = max(stage_trace, key=lambda e: float(e.get("elapsed_ms") or 0.0)) if stage_trace else None
+        summary["stage_trace"] = _json_ready(stage_trace)
+        summary["stage_stats"] = {
+            "count": len(stage_trace),
+            "failures": failures,
+            "total_elapsed_ms": total_ms,
+            "slowest": {"name": slowest.get("name"), "elapsed_ms": slowest.get("elapsed_ms")} if slowest else None,
+        }
+
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
     try:
         _generate_report(outdir, dest=report_path, summary=summary, history=history_records, meta=_read_meta(outdir))
     except Exception as e:
         print("Report generation skipped:", e)
+    _set_stage_trace_sink(None)
     return summary
 
 run_full_pipeline = _patched_run_full_pipeline
