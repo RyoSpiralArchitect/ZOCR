@@ -23,7 +23,7 @@ try:
 except Exception:
     np = None
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
@@ -1197,6 +1197,15 @@ class MotionPriorCfg:
 
 
 @dataclass
+class _BlankSkipConfig:
+    enabled: bool = False
+    dark_threshold: int = 210
+    min_dark_pixels: int = 8
+    min_dark_ratio: float = 0.002
+    min_area: int = 36
+
+
+@dataclass
 class _ExportSweepTracker:
     prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
 
@@ -1226,6 +1235,52 @@ def _motion_prior_cfg_from_env() -> MotionPriorCfg:
         cfg.cutoff_sigma = max(0.1, float(cutoff))
         cfg.accept_ratio = float(max(0.0, min(1.0, accept)))
     return cfg
+
+
+def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
+    cfg = _BlankSkipConfig(enabled=_env_flag("ZOCR_EXPORT_SKIP_BLANK", True))
+    if not cfg.enabled:
+        return cfg
+    thr = _env_int("ZOCR_EXPORT_BLANK_THRESHOLD", cfg.dark_threshold)
+    if thr is not None:
+        cfg.dark_threshold = int(max(1, min(255, thr)))
+    min_px = _env_int("ZOCR_EXPORT_BLANK_MIN_PIXELS", cfg.min_dark_pixels)
+    if min_px is not None:
+        cfg.min_dark_pixels = int(max(1, min_px))
+    min_ratio = _env_float("ZOCR_EXPORT_BLANK_MIN_RATIO", cfg.min_dark_ratio)
+    if isinstance(min_ratio, (int, float)):
+        cfg.min_dark_ratio = float(max(0.0, min(0.1, min_ratio)))
+    min_area = _env_int("ZOCR_EXPORT_BLANK_MIN_AREA", cfg.min_area)
+    if min_area is not None:
+        cfg.min_area = int(max(1, min_area))
+    return cfg
+
+
+def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
+    if not cfg.enabled:
+        return False
+    try:
+        w, h = img.size
+    except Exception:
+        return False
+    area = max(1, int(w) * int(h))
+    if area < cfg.min_area:
+        return False
+    try:
+        gray = img.convert("L")
+        hist = gray.histogram()
+    except Exception:
+        return False
+    if not hist:
+        return False
+    thr = max(1, min(256, int(cfg.dark_threshold)))
+    dark = int(sum(hist[:thr]))
+    if dark < cfg.min_dark_pixels:
+        return True
+    ratio = dark / float(area)
+    if ratio <= cfg.min_dark_ratio:
+        return True
+    return False
 
 
 def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
@@ -3497,6 +3552,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
         or doc.get("id")
         or os.path.splitext(os.path.basename(doc_json_path))[0]
     )
+    blank_cfg = _blank_skip_cfg_from_env()
+    blank_skipped = 0
 
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
@@ -3656,7 +3713,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         allowed_chars = None
                         if r > 0 and col_charset_hints and c < len(col_charset_hints):
                             allowed_chars = col_charset_hints[c]
-                        if allowed_chars and toy_runner:
+                        if blank_cfg.enabled and _should_skip_blank_crop(crop, blank_cfg):
+                            blank_skipped += 1
+                            txt, conf = "", 0.0
+                        elif allowed_chars and toy_runner:
                             txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
                         else:
                             txt, conf = ocr_runner(crop)
@@ -3907,6 +3967,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
     }
+    if blank_cfg.enabled:
+        export_stats["blank_skip"] = {
+            "skipped": int(blank_skipped),
+            "ratio": float(blank_skipped / float(max(1, total_cells))),
+            "dark_threshold": int(blank_cfg.dark_threshold),
+            "min_dark_ratio": float(blank_cfg.min_dark_ratio),
+            "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        }
     if guard_ms > 0:
         export_stats["guard"] = {
             "timeout_ms": int(guard_ms),

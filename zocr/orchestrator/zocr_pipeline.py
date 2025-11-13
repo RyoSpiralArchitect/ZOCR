@@ -3470,6 +3470,7 @@ def _patched_run_full_pipeline(
         os.environ.setdefault("ZOCR_EXPORT_EXT_VARIANTS", "0")
         os.environ.setdefault("ZOCR_EXPORT_PROGRESS", "1")
         os.environ.setdefault("ZOCR_EXPORT_LOG_EVERY", "100")
+        os.environ.setdefault("ZOCR_EXPORT_SKIP_BLANK", "1")
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
