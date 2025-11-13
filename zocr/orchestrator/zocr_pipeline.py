@@ -3126,7 +3126,34 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
     rag_feedback: Optional[str] = None,
+    motion_prior: bool = False,
+    motion_sigma_px: Optional[float] = None,
+    motion_cutoff_sigma: Optional[float] = None,
+    motion_accept_ratio: Optional[float] = None,
+    export_guard_ms: Optional[int] = None,
+    sweeps_fixed: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if sweeps_fixed is not None and sweeps_fixed > 0:
+        toy_sweeps = int(sweeps_fixed)
+        os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
+        os.environ["ZOCR_TOY_SWEEP_LIMIT"] = str(toy_sweeps)
+    if motion_prior:
+        os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1"
+    if motion_prior and motion_sigma_px is None:
+        motion_sigma_px = 10.0
+    if motion_prior and motion_cutoff_sigma is None:
+        motion_cutoff_sigma = 2.5
+    if motion_prior and motion_accept_ratio is None:
+        motion_accept_ratio = 0.6
+    if motion_sigma_px is not None:
+        os.environ["ZOCR_EXPORT_MOTION_SIGMA"] = str(motion_sigma_px)
+    if motion_cutoff_sigma is not None:
+        os.environ["ZOCR_EXPORT_MOTION_CUTOFF"] = str(motion_cutoff_sigma)
+    if motion_accept_ratio is not None:
+        os.environ["ZOCR_EXPORT_MOTION_ACCEPT"] = str(motion_accept_ratio)
+    if export_guard_ms is not None:
+        os.environ["ZOCR_EXPORT_GUARD_MS"] = str(max(0, int(export_guard_ms)))
+
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -3440,6 +3467,10 @@ def _patched_run_full_pipeline(
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
+        os.environ.setdefault("ZOCR_EXPORT_EXT_VARIANTS", "0")
+        os.environ.setdefault("ZOCR_EXPORT_PROGRESS", "1")
+        os.environ.setdefault("ZOCR_EXPORT_LOG_EVERY", "100")
+        os.environ.setdefault("ZOCR_EXPORT_SKIP_BLANK", "1")
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
@@ -4271,6 +4302,41 @@ def main():
         help="Normalize numeric columns according to header heuristics",
     )
     ap.add_argument(
+        "--motion-prior",
+        action="store_true",
+        help="Enable motion prior seeding between export sweeps",
+    )
+    ap.add_argument(
+        "--motion-sigma-px",
+        type=float,
+        default=None,
+        help="Motion prior std-dev in pixels (default: 10 when enabled)",
+    )
+    ap.add_argument(
+        "--motion-cutoff-sigma",
+        type=float,
+        default=None,
+        help="Reject motion priors when deviation exceeds this multiple of sigma",
+    )
+    ap.add_argument(
+        "--motion-accept-ratio",
+        type=float,
+        default=None,
+        help="Minimum inlier ratio required to accept motion prior reseeding",
+    )
+    ap.add_argument(
+        "--export-guard-ms",
+        type=int,
+        default=15000,
+        help="Abort per-table export loops after this many milliseconds",
+    )
+    ap.add_argument(
+        "--sweeps-fixed",
+        type=int,
+        default=None,
+        help="Force toy OCR threshold sweeps to a fixed count",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -4325,6 +4391,12 @@ def main():
             advisor_response=args.advisor_response,
             print_stage_trace=args.print_stage_trace,
             rag_feedback=args.rag_feedback,
+            motion_prior=args.motion_prior,
+            motion_sigma_px=args.motion_sigma_px,
+            motion_cutoff_sigma=args.motion_cutoff_sigma,
+            motion_accept_ratio=args.motion_accept_ratio,
+            export_guard_ms=args.export_guard_ms,
+            sweeps_fixed=args.sweeps_fixed,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
