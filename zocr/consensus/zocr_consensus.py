@@ -394,6 +394,52 @@ def _dp_means_1d(points, lam, iters=3):
             if xs: centers[i]=sum(xs)/len(xs)
     return sorted(centers)
 
+
+def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -> List[List[float]]:
+    """Recursively partition column centers using a B-tree like split rule."""
+
+    ordered = sorted(float(v) for v in values if math.isfinite(v))
+    if not ordered:
+        return []
+
+    buckets: List[List[float]] = []
+
+    def _split(bucket: List[float], depth: int) -> None:
+        if len(bucket) <= max(1, min_bucket) or depth >= max_depth:
+            buckets.append(bucket)
+            return
+        mid_idx = len(bucket) // 2
+        pivot = bucket[mid_idx]
+        left = [v for v in bucket if v <= pivot]
+        right = [v for v in bucket if v > pivot]
+        if not left or not right:
+            buckets.append(bucket)
+            return
+        _split(left, depth + 1)
+        _split(right, depth + 1)
+
+    _split(ordered, 0)
+    return buckets
+
+
+def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_depth: int = 5) -> List[float]:
+    """Return stable column centers derived from a B-tree style recursive sort."""
+
+    buckets = _btree_partition(points, min_bucket=max(1, min_bucket), max_depth=max(1, max_depth))
+    centers: List[float] = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        centers.append(float(median(bucket)))
+    centers.sort()
+    deduped: List[float] = []
+    for value in centers:
+        if not deduped or abs(value - deduped[-1]) > 1.0:
+            deduped.append(value)
+        else:
+            deduped[-1] = (deduped[-1] + value) * 0.5
+    return deduped
+
 # ----------------- Column smoothing (D²-like + λ scheduling) -----------------
 def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
     R = len(candidates_by_row)
@@ -741,15 +787,23 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     # DP-means for columns with λ補正（列モード吸着）
     xcenters=[(ch[0]+ch[2])/2.0 for row in chunks_by_row for ch in row]
     med_w=float(np.median([(ch[2]-ch[0]) for row in chunks_by_row for ch in row])) if xcenters else 12.0
+    btree_seed=_btree_column_centers(
+        xcenters,
+        min_bucket=max(3, int(math.sqrt(len(xcenters) + 1))) if xcenters else 3,
+        max_depth=6,
+    )
     lam_base=float(params.get("dp_lambda_factor", 2.2))*max(6.0, med_w)
-    centers0=_dp_means_1d(sorted(xcenters), lam=lam_base, iters=3)
+    seed_points = btree_seed if len(btree_seed) >= 2 else xcenters
+    if not seed_points:
+        seed_points = [W * 0.5]
+    centers0=_dp_means_1d(sorted(seed_points), lam=lam_base, iters=3)
     K_pred0=len(centers0)
     K_mode=_robust_k_mode(row_counts) or max(2, K_pred0)
     alpha=float(params.get("lambda_alpha", 0.7))
     # clip the scaling to avoid extreme swings
     scale = ( (K_pred0 / float(max(1,K_mode))) ** alpha )
     lam_eff = clamp(lam_base * scale, 0.6*lam_base, 1.8*lam_base)
-    centers=_dp_means_1d(sorted(xcenters), lam=lam_eff, iters=3)
+    centers=_dp_means_1d(sorted(xcenters or seed_points), lam=lam_eff, iters=3)
     # candidates
     candidates_by_row=[]
     for row in chunks_by_row:
@@ -760,9 +814,17 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 gap=row[i+1][0]-row[i][2]
                 if gap>1.6*mw: mids.append(int((row[i][2]+row[i+1][0])/2.0))
         candidates_by_row.append(mids)
+    global_mid_seeds: List[int] = []
+    if len(btree_seed) >= 2:
+        global_mid_seeds.extend(int((btree_seed[i]+btree_seed[i+1])/2.0) for i in range(len(btree_seed)-1))
     if len(centers)>=2:
-        mids_global=[int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1)]
-        candidates_by_row = [[*mids_global, *row] for row in candidates_by_row]
+        global_mid_seeds.extend(int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1))
+    if global_mid_seeds:
+        mids_global = sorted({int(val) for val in global_mid_seeds})
+        merged_rows: List[List[int]] = []
+        for row in candidates_by_row:
+            merged_rows.append(sorted({*row, *mids_global}))
+        candidates_by_row = merged_rows
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
     R=len(row_bands); C=max(1,len(col_bounds)-1)
@@ -3706,6 +3768,142 @@ def _resize_keep_ar(im, w, h):
     out.paste(imr, ((w-tw)//2,(h-th)//2))
     return out
 
+
+_TOKEN_TEMPLATE_SIZE = (96, 28)
+_TOKEN_TEMPLATE_MAX_VARIANTS = 8
+_TOKEN_TEMPLATE_PRESETS = [
+    "item",
+    "qty",
+    "unit price",
+    "amount",
+    "total",
+    "subtotal",
+    "tax",
+    "due",
+    "date",
+    "見積金額",
+    "御見積金額",
+    "数量",
+    "単価",
+    "金額",
+    "小計",
+    "合計",
+]
+
+
+def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+_TOKEN_TEMPLATE_FONT = _load_template_font()
+
+
+def _render_template_bitmap(token: str) -> Optional["Image.Image"]:
+    text = (token or "").strip()
+    if not text:
+        return None
+    font = _TOKEN_TEMPLATE_FONT
+    try:
+        bbox = font.getbbox(text)
+    except Exception:
+        bbox = None
+    if bbox:
+        width = max(12, bbox[2] - bbox[0] + 6)
+        height = max(12, bbox[3] - bbox[1] + 6)
+    else:
+        width = max(12, len(text) * 8)
+        height = 24
+    img = Image.new("L", (width, height), 0)
+    dr = ImageDraw.Draw(img)
+    try:
+        dr.text((3, 2), text, fill=255, font=font)
+    except Exception:
+        return None
+    if not img.getbbox():
+        return None
+    return img
+
+
+def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
+    import numpy as _np
+
+    try:
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+    except Exception:
+        return None
+    resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
+    arr_f = _np.asarray(resized, dtype=_np.float32)
+    if arr_f.size == 0:
+        return None
+    std = float(arr_f.std())
+    if std < 1e-3:
+        return None
+    normed = (arr_f - float(arr_f.mean())) / (std + 1e-3)
+    return normed
+
+
+def _init_token_template_library() -> Dict[str, deque]:
+    library: Dict[str, deque] = {}
+    for token in _TOKEN_TEMPLATE_PRESETS:
+        bmp = _render_template_bitmap(token)
+        if bmp is None:
+            continue
+        norm = _normalize_template_bitmap(bmp)
+        if norm is None:
+            continue
+        dq = library.setdefault(token, deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS))
+        dq.append(norm)
+    return library
+
+
+_TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+
+
+def _observe_token_template(token: str, arr: Any) -> None:
+    if not token:
+        return
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[token] = dq
+    dq.append(norm)
+
+
+def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
+    import numpy as _np
+
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return "", 0.0
+    best_token = ""
+    best_score = -1.0
+    for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not variants:
+            continue
+        for tpl in variants:
+            if tpl.shape != norm.shape:
+                continue
+            score = float((norm * tpl).mean())
+            if score > best_score:
+                best_score = score
+                best_token = token
+    if best_score < 0.35:
+        return "", 0.0
+    conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
+    return best_token, conf
+
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     if dx == 0 and dy == 0:
         return arr
@@ -4067,6 +4265,19 @@ def toy_ocr_text_from_cell(
                 final_quality = reranked_quality
                 final_effective_conf = reranked_conf
 
+    ref_bitmap = best_bw
+    if ref_bitmap is None and candidates:
+        ref_bitmap = candidates[0][0]
+    template_text, template_conf = ("", 0.0)
+    if ref_bitmap is not None:
+        template_text, template_conf = _match_token_template_from_cache(ref_bitmap)
+    if template_text and (template_conf > final_effective_conf + 1e-3 or not final_text):
+        final_text = template_text
+        final_conf = max(final_conf, template_conf)
+        final_effective_conf = max(final_effective_conf, template_conf)
+        final_quality = max(final_quality, 0.95)
+        _GLYPH_RUNTIME_STATS["template_matches"] += 1.0
+
     if final_text:
         coherence = _ngram_coherence(final_text)
         surprisal = _ngram_surprisal(final_text)
@@ -4081,6 +4292,9 @@ def toy_ocr_text_from_cell(
             lexical_quality=float(max(0.0, min(1.6, final_quality))),
         )
         _update_ngram_model(final_text)
+        if ref_bitmap is not None:
+            _observe_token_template(final_text, ref_bitmap)
+            _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
         return final_text, bounded_conf
     return "", 0.0
 
