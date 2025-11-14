@@ -48,7 +48,7 @@
 #      sys.modules['zocr_onefile_consensus'], sys.modules['zocr_multidomain_core'], sys.modules['zocr_pipeline_allinone'].
 
 
-import sys, types, os, tempfile, pathlib
+import sys, types, os, tempfile, pathlib, unicodedata
 
 _BUNDLE_DIR = os.path.join(tempfile.gettempdir(), "zocr_bundle_runtime")
 os.makedirs(_BUNDLE_DIR, exist_ok=True)
@@ -2566,6 +2566,44 @@ _NUMERIC_HEADER_KIND = [
 ]
 
 
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+def _header_variants_for_numeric(label: str) -> List[str]:
+    base = _canonicalize_header_label(label)
+    variants: List[str] = []
+    if not base:
+        return variants
+
+    def _add(val: str) -> None:
+        val = val.strip()
+        if val and val not in variants:
+            variants.append(val)
+
+    _add(base)
+    _add(base.replace(" ", ""))
+    honorific = base.lstrip("御お")
+    _add(honorific)
+    no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", base)
+    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+    _add(no_brackets)
+    simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", base)
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    _add(simplified)
+    _add(simplified.replace(" ", ""))
+    for token in re.split(r"[/｜\|・,、]", base):
+        token = token.strip()
+        if not token:
+            continue
+        _add(token)
+        _add(token.replace(" ", ""))
+    return variants
+
+
 def _normalize_numeric_text(text: str, kind: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -2591,11 +2629,13 @@ def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
     if not headers:
         return kinds
     for header in headers:
-        base = (header or "").strip().lower()
         kind: Optional[str] = None
-        for candidate, rx in _NUMERIC_HEADER_KIND:
-            if rx.search(base):
-                kind = candidate
+        for variant in _header_variants_for_numeric(header) or [""]:
+            for key, rx in _NUMERIC_HEADER_KIND:
+                if variant and rx.search(variant):
+                    kind = key
+                    break
+            if kind:
                 break
         kinds.append(kind)
     return kinds

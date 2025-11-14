@@ -29,7 +29,7 @@ ZOCR Multi‑Domain Core (single file)
 ※ 依存：標準 Python + Pillow + numpy（Numba があれば自動使用。無ければフォールバック）。
 """
 
-import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys, html, platform
+import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys, html, platform, unicodedata
 from collections import defaultdict, Counter
 from typing import List, Optional, Dict, Any, Tuple, Set, Sequence
 from PIL import Image, ImageOps
@@ -1697,7 +1697,8 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         txt = ""
         if isinstance(cell, dict):
             txt = cell.get("normalized") or cell.get("text") or ""
-        txt = str(txt).strip().lower()
+        txt = unicodedata.normalize("NFKC", str(txt))
+        txt = txt.strip().lower()
         txt = txt.replace("：", ":").replace("　", " ")
         txt = re.sub(r"\s+", " ", txt)
         return txt
@@ -1708,9 +1709,18 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         if not body:
             return variants
         variants.append(body)
+        # honorific prefixes (e.g., 御見積金額 → 見積金額)
+        honorific_stripped = body.lstrip("御お")
+        if honorific_stripped and honorific_stripped not in variants:
+            variants.append(honorific_stripped)
         collapsed = body.replace(" ", "")
         if collapsed and collapsed not in variants:
             variants.append(collapsed)
+        # remove bracketed suffixes such as （税込）／(tax)
+        no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", body)
+        no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+        if no_brackets and no_brackets not in variants:
+            variants.append(no_brackets)
         simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", body)
         simplified = re.sub(r"\s+", " ", simplified).strip()
         if simplified and simplified not in variants:
@@ -1718,6 +1728,17 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         simplified_compact = simplified.replace(" ", "")
         if simplified_compact and simplified_compact not in variants:
             variants.append(simplified_compact)
+        # split by typical separators (/,｜,|,・,、) to capture bilingual headers
+        split_tokens = re.split(r"[/｜\|・,、]", body)
+        for token in split_tokens:
+            token = token.strip()
+            if not token:
+                continue
+            token_compact = token.replace(" ", "")
+            if token and token not in variants:
+                variants.append(token)
+            if token_compact and token_compact not in variants:
+                variants.append(token_compact)
         return variants
 
     def _infer_numeric_columns(rows: Dict[str, Dict[str, Dict[str, Any]]]) -> Tuple[Dict[str, str], Optional[str]]:
