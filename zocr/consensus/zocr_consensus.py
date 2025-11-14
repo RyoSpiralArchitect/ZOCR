@@ -2659,18 +2659,18 @@ def configure_toy_runtime(
             updates["force_numeric"] = new_flag
     return updates
 _NUMERIC_HEADER_KIND = [
-    ("qty", re.compile(r"(数量|数|個|qty|q'?ty|quantity)", re.I)),
+    ("qty", re.compile(r"(数量|数|個|台数|件数|口数|本数|点数|qty|q'?ty|quantity)", re.I)),
     ("unit_price", re.compile(r"(単価|unit\s*price|price|unit\s*cost)", re.I)),
     ("subtotal", re.compile(r"(小計|subtotal)", re.I)),
     (
         "amount",
         re.compile(
-            r"(金額|合計|総計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
+            r"(金額|見積金額|御見積金額|御見積合計|合計金額|合計|総計|計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
             re.I,
         ),
     ),
-    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount)", re.I)),
-    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat|gst)", re.I)),
+    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount|gst\s*amount)", re.I)),
+    ("tax_rate", re.compile(r"(税率|消費税率|税%|tax%|tax(\s*rate)?|vat|gst)", re.I)),
 ]
 
 _FULLWIDTH_NUMBERS = str.maketrans(

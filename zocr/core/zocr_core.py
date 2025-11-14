@@ -39,17 +39,117 @@ from functools import lru_cache
 # -------------------- Numeric header hints --------------------
 _NUMERIC_HEADER_HINTS = {
     "qty": "qty",
+    "q'ty": "qty",
     "quantity": "qty",
     "unit price": "unit_price",
     "price": "unit_price",
     "unit cost": "unit_price",
     "amount": "amount",
     "total": "total",
+    "total amount": "total",
     "subtotal": "subtotal",
     "tax": "tax",
+    "tax amount": "tax_amount",
     "tax %": "tax_rate",
+    "tax%": "tax_rate",
     "tax rate": "tax_rate",
+    "vat": "tax",
 }
+
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "qty"
+        for alias in (
+            "数量",
+            "個数",
+            "台数",
+            "件数",
+            "口数",
+            "本数",
+            "点数",
+            "数量/qty",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "unit_price"
+        for alias in (
+            "単価",
+            "単価(円)",
+            "単価[円]",
+            "単価(税込)",
+            "単価(税抜)",
+            "単価(税別)",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "amount"
+        for alias in (
+            "金額",
+            "金額(税込)",
+            "金額(税抜)",
+            "金額(税別)",
+            "金額[円]",
+            "金額(円)",
+            "税込",
+            "税抜",
+            "税別",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "total"
+        for alias in (
+            "見積金額",
+            "御見積金額",
+            "御見積合計",
+            "合計金額",
+            "合計",
+            "総計",
+            "総額",
+            "計",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {alias: "subtotal" for alias in ("小計", "小計(税込)", "小計(税抜)")}
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "tax"
+        for alias in (
+            "消費税",
+            "tax",
+            "vat",
+            "gst",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "tax_amount"
+        for alias in (
+            "消費税額",
+            "税額",
+            "税金",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "tax_rate"
+        for alias in (
+            "税率",
+            "消費税率",
+            "税%",
+            "tax率",
+        )
+    }
+)
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
@@ -483,13 +583,27 @@ DOMAIN_KW = {
     "estimate": [("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
     "estimate_jp": [
         ("見積書", 4.0),
-        ("見積日", 2.5),
-        ("有効期限", 2.5),
+        ("御見積書", 3.6),
+        ("見積日", 2.3),
         ("見積金額", 3.0),
+        ("御見積金額", 3.0),
+        ("御見積合計", 2.7),
+        ("合計金額", 2.4),
         ("合計", 2.0),
-        ("小計", 1.5),
+        ("総計", 1.8),
+        ("総額", 1.8),
+        ("計", 1.5),
+        ("小計", 1.6),
+        ("数量", 1.2),
+        ("単価", 1.2),
+        ("金額", 1.2),
+        ("有効期限", 2.5),
+        ("お見積有効期限", 2.3),
+        ("見積有効期限", 2.3),
+        ("納期", 1.4),
         ("消費税", 1.5),
         ("税込", 1.2),
+        ("税抜", 1.0),
     ],
     "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
     "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
@@ -622,6 +736,15 @@ _DOMAIN_HEADER_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
         ("tva", 0.75),
         ("sous-total", 0.6),
     ],
+    "estimate_jp": [
+        ("見積金額", 0.9),
+        ("御見積金額", 0.9),
+        ("数量", 0.7),
+        ("単価", 0.7),
+        ("金額", 0.6),
+        ("有効期限", 0.65),
+        ("納期", 0.55),
+    ],
 }
 
 _HEADER_CONCEPT_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
@@ -657,7 +780,7 @@ DOMAIN_SUGGESTED_QUERIES = {
     "contract_jp_v2": ["契約期間", "甲", "乙", "締結日"],
     "contract_en": ["effective date", "party", "term", "signature"],
     "delivery_jp": ["納品日", "数量", "品番", "受領印"],
-    "estimate_jp": ["見積金額", "有効期限", "数量", "単価"],
+    "estimate_jp": ["御見積金額", "見積金額", "有効期限", "納期"],
     "receipt_jp": ["領収金額", "発行日", "支払方法", "住所"],
     "bank_statement_en": ["ending balance", "transaction", "deposit", "withdrawal"],
     "bank_statement_jp": ["残高", "入金", "出金", "取引日"],
@@ -695,9 +818,9 @@ DOMAIN_MONITOR_QUERIES = {
         "q_due": "契約期間 支払期日 締結日",
     },
     "estimate_jp": {
-        "q_amount": "見積金額 合計 金額 税込 税抜 円",
-        "q_date": "見積日 発行日 作成日 2023 2024 2025",
-        "q_due": "有効期限 納期 2023 2024 2025",
+        "q_amount": "見積金額 御見積金額 御見積総額 合計 合計金額 総計 計 金額 税込 税抜 円",
+        "q_date": "見積日 発行日 作成日 提出日 2023 2024 2025",
+        "q_due": "有効期限 お見積有効期限 見積有効期限 納期 納入期限 2023 2024 2025",
     },
 }
 
@@ -1574,8 +1697,28 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         txt = ""
         if isinstance(cell, dict):
             txt = cell.get("normalized") or cell.get("text") or ""
-        txt = re.sub(r"\s+", " ", str(txt).strip().lower())
+        txt = str(txt).strip().lower()
+        txt = txt.replace("：", ":").replace("　", " ")
+        txt = re.sub(r"\s+", " ", txt)
         return txt
+
+    def _header_key_variants(base: str) -> List[str]:
+        variants: List[str] = []
+        body = base.strip()
+        if not body:
+            return variants
+        variants.append(body)
+        collapsed = body.replace(" ", "")
+        if collapsed and collapsed not in variants:
+            variants.append(collapsed)
+        simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", body)
+        simplified = re.sub(r"\s+", " ", simplified).strip()
+        if simplified and simplified not in variants:
+            variants.append(simplified)
+        simplified_compact = simplified.replace(" ", "")
+        if simplified_compact and simplified_compact not in variants:
+            variants.append(simplified_compact)
+        return variants
 
     def _infer_numeric_columns(rows: Dict[str, Dict[str, Dict[str, Any]]]) -> Tuple[Dict[str, str], Optional[str]]:
         if not rows:
@@ -1588,8 +1731,10 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         numeric_cols: Dict[str, str] = {}
         for col_key, cell in header_cells.items():
             base = _header_text(cell)
-            if base in _NUMERIC_HEADER_HINTS:
-                numeric_cols[col_key] = _NUMERIC_HEADER_HINTS[base]
+            for candidate in _header_key_variants(base) or [base]:
+                if candidate in _NUMERIC_HEADER_HINTS:
+                    numeric_cols[col_key] = _NUMERIC_HEADER_HINTS[candidate]
+                    break
         return numeric_cols, header_key
 
     def _parse_numeric_value(text: Optional[str]) -> Optional[float]:
@@ -2036,7 +2181,7 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
         "delivery_jp":   ["納品", "数量", "品番", "伝票", "受領"],
         "delivery_en":   ["delivery", "tracking", "carrier", "qty", "item"],
         "estimate":      ["見積", "単価", "小計", "有効期限"],
-        "estimate_jp":   ["見積金額", "小計", "数量", "有効期限"],
+        "estimate_jp":   ["御見積金額", "見積金額", "有効期限", "納期"],
         "estimate_en":   ["estimate", "quote", "valid", "subtotal", "project"],
         "receipt":       ["領収", "合計", "発行日", "住所", "税込"],
         "receipt_jp":    ["領収書", "税込", "受領", "発行日", "現金"],
