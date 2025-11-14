@@ -3648,6 +3648,10 @@ def _patched_run_full_pipeline(
             ensure_dir(prior_cache_dir)
             os.environ["ZOCR_PRIOR_CACHE"] = prior_cache_dir
             os.environ["ZOCR_TABLE_SIGNATURE"] = bandit_signature
+            if not os.environ.get("ZOCR_TEMPLATE_CACHE"):
+                template_cache_path = os.path.join(outdir, "toy_template_cache.json")
+                os.environ["ZOCR_TEMPLATE_CACHE"] = template_cache_path
+                summary.setdefault("toy_templates", {})["cache"] = template_cache_path
             summary["prior_bandit"] = {
                 "signature": bandit_signature,
                 "action": bandit_action,

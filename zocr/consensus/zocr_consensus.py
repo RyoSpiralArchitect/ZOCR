@@ -13,7 +13,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit
 from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
@@ -1870,6 +1870,14 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
     result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
     result["lexical_penalties"] = int(_GLYPH_RUNTIME_STATS.get("lexical_penalty", 0))
+    result["template_matches"] = int(_GLYPH_RUNTIME_STATS.get("template_matches", 0))
+    result["template_observed"] = int(_GLYPH_RUNTIME_STATS.get("template_observed", 0))
+    result["template_cache_hits"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_hits", 0))
+    result["template_cache_misses"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_misses", 0))
+    result["template_cache_variants"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_variants", 0))
+    result["template_cache_saved"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_saved", 0))
+    result["template_cache_loaded"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_loaded", 0))
+    result["template_cache_errors"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_errors", 0))
     if reset:
         reset_toy_recognition_stats()
     return result
@@ -3867,10 +3875,165 @@ def _init_token_template_library() -> Dict[str, deque]:
 
 _TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
 
+_TEMPLATE_CACHE_STATE: Dict[str, Any] = {
+    "loaded_path": None,
+    "loaded": False,
+    "autosave": False,
+    "dirty": False,
+}
+
+
+def _template_cache_path() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TEMPLATE_CACHE")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "false", "none"}:
+        return None
+    return os.path.abspath(raw)
+
+
+def _update_template_variant_stats() -> None:
+    total = 0
+    for dq in _TOKEN_TEMPLATE_LIBRARY.values():
+        if dq:
+            total += len(dq)
+    _GLYPH_RUNTIME_STATS["template_cache_variants"] = float(total)
+
+
+def _ensure_template_cache_autosave() -> None:
+    if _TEMPLATE_CACHE_STATE.get("autosave"):
+        return
+    if not _template_cache_path():
+        return
+    atexit.register(_autosave_template_cache)
+    _TEMPLATE_CACHE_STATE["autosave"] = True
+
+
+def _ensure_template_cache_loaded() -> None:
+    path = _template_cache_path()
+    if not path:
+        return
+    state_path = _TEMPLATE_CACHE_STATE.get("loaded_path")
+    if _TEMPLATE_CACHE_STATE.get("loaded") and state_path == path:
+        return
+    _load_token_template_cache(path)
+
+
+def _load_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except FileNotFoundError:
+        _TEMPLATE_CACHE_STATE["loaded_path"] = path
+        _TEMPLATE_CACHE_STATE["loaded"] = True
+        _TEMPLATE_CACHE_STATE["dirty"] = False
+        _ensure_template_cache_autosave()
+        return
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    restored = 0
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if isinstance(tokens, dict):
+        for token, entry in tokens.items():
+            variants = []
+            if isinstance(entry, dict):
+                seq = entry.get("variants")
+                if isinstance(seq, list):
+                    variants = seq
+            elif isinstance(entry, list):
+                variants = entry
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                shape = variant.get("shape")
+                data = variant.get("data")
+                if not shape or not data:
+                    continue
+                try:
+                    arr = np.asarray(data, dtype=np.float32)
+                    dims = tuple(int(v) for v in shape)
+                    if len(dims) != 2 or arr.size != (dims[0] * dims[1]):
+                        continue
+                    arr = arr.reshape(dims)
+                except Exception:
+                    continue
+                dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+                if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+                    dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+                    _TOKEN_TEMPLATE_LIBRARY[token] = dq
+                dq.append(arr)
+                restored += 1
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _ensure_template_cache_autosave()
+    _update_template_variant_stats()
+    _GLYPH_RUNTIME_STATS["template_cache_loaded"] = float(restored)
+
+
+def _serialize_template_variants(dq: "deque[Any]") -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for tpl in dq:
+        try:
+            arr = np.asarray(tpl, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        payload = {
+            "shape": [int(dim) for dim in arr.shape],
+            "data": [round(float(val), 4) for val in arr.flatten().tolist()],
+        }
+        serialized.append(payload)
+    return serialized
+
+
+def _save_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    tokens: Dict[str, Any] = {}
+    total = 0
+    for token, dq in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not dq:
+            continue
+        variants = _serialize_template_variants(dq)
+        if not variants:
+            continue
+        tokens[token] = {"variants": variants}
+        total += len(variants)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {"version": 1, "tokens": tokens, "updated_at": time.time()}
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _GLYPH_RUNTIME_STATS["template_cache_saved"] = float(total)
+    _update_template_variant_stats()
+
+
+def _autosave_template_cache() -> None:
+    if not _TEMPLATE_CACHE_STATE.get("dirty"):
+        return
+    path = _template_cache_path()
+    if not path:
+        return
+    _save_token_template_cache(path)
+
 
 def _observe_token_template(token: str, arr: Any) -> None:
     if not token:
         return
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
     norm = _normalize_template_bitmap(arr)
     if norm is None:
         return
@@ -3879,16 +4042,21 @@ def _observe_token_template(token: str, arr: Any) -> None:
         dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
         _TOKEN_TEMPLATE_LIBRARY[token] = dq
     dq.append(norm)
+    _TEMPLATE_CACHE_STATE["dirty"] = True
+    _update_template_variant_stats()
 
 
 def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
     import numpy as _np
 
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
     norm = _normalize_template_bitmap(arr)
     if norm is None:
         return "", 0.0
     best_token = ""
     best_score = -1.0
+    _GLYPH_RUNTIME_STATS["template_cache_checks"] += 1.0
     for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
         if not variants:
             continue
@@ -3900,8 +4068,10 @@ def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
                 best_score = score
                 best_token = token
     if best_score < 0.35:
+        _GLYPH_RUNTIME_STATS["template_cache_misses"] += 1.0
         return "", 0.0
     conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
+    _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
     return best_token, conf
 
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
