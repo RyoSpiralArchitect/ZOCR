@@ -13,7 +13,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata
 from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
@@ -2531,6 +2531,7 @@ _TOTAL_LABEL_HINTS = [
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?%?")
+_NUMERIC_HEADER_INFERRED_LAST = 0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -2757,25 +2758,138 @@ def _coerce_numeric_filters(kind: Optional[str], text: str) -> Tuple[str, Dict[s
     return result_text, payload
 
 
-def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
-    kinds: List[Optional[str]] = []
-    if not headers or not _FORCE_NUMERIC:
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+def _header_variants_for_numeric(label: str) -> List[str]:
+    base = _canonicalize_header_label(label)
+    variants: List[str] = []
+    if not base:
+        return variants
+
+    def _add(val: str) -> None:
+        val = val.strip()
+        if val and val not in variants:
+            variants.append(val)
+
+    _add(base)
+    _add(base.replace(" ", ""))
+    honorific = base.lstrip("御お")
+    _add(honorific)
+    no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", base)
+    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+    _add(no_brackets)
+    simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", base)
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    _add(simplified)
+    _add(simplified.replace(" ", ""))
+    for token in re.split(r"[/｜\|・,、]", base):
+        token = token.strip()
+        if not token:
+            continue
+        _add(token)
+        _add(token.replace(" ", ""))
+    return variants
+
+
+def _infer_numeric_kinds_from_values(
+    grid_text: Sequence[Sequence[str]],
+    kinds: List[Optional[str]],
+) -> List[Optional[str]]:
+    global _NUMERIC_HEADER_INFERRED_LAST
+    inferred = 0
+    if not grid_text:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
         return kinds
-    for header in headers:
-        base = (header or "").strip().lower()
-        kind: Optional[str] = None
-        for candidate, rx in _NUMERIC_HEADER_KIND:
-            if rx.search(base):
-                kind = candidate
-                break
-        kinds.append(kind)
+    num_cols = max(len(row) for row in grid_text)
+    if len(kinds) < num_cols:
+        kinds.extend([None] * (num_cols - len(kinds)))
+    currency_rx = re.compile(r"[¥￥円＄$元]")
+    for c in range(num_cols):
+        if c < len(kinds) and kinds[c]:
+            continue
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimals = 0
+        values: List[float] = []
+        for r in range(1, len(grid_text)):
+            row = grid_text[r]
+            if c >= len(row):
+                continue
+            txt = str(row[c] or "").strip()
+            if not txt:
+                continue
+            total += 1
+            if currency_rx.search(txt):
+                currency_hits += 1
+            cleaned = txt.replace("，", ",").replace("．", ".")
+            cleaned = cleaned.replace(",", "")
+            match = re.search(r"[+\-]?\d+(?:\.\d+)?", cleaned)
+            if not match:
+                continue
+            numeric_hits += 1
+            token = match.group(0)
+            try:
+                val = float(token)
+            except ValueError:
+                continue
+            values.append(abs(val))
+            if "." in token:
+                decimals += 1
+        if total < 2:
+            continue
+        ratio = numeric_hits / float(total)
+        if ratio < 0.65:
+            continue
+        avg_val = sum(values) / float(len(values)) if values else 0.0
+        if currency_hits >= max(1, math.ceil(total * 0.4)) or avg_val >= 1000:
+            new_kind = "total" if c >= num_cols - 1 else "amount"
+        elif decimals > 0 and avg_val >= 1:
+            new_kind = "unit_price"
+        else:
+            new_kind = "qty"
+        kinds[c] = new_kind
+        inferred += 1
+    _NUMERIC_HEADER_INFERRED_LAST = inferred
+    return kinds
+
+
+def _numeric_header_kinds(
+    headers: Sequence[str],
+    grid_text: Optional[Sequence[Sequence[str]]] = None,
+) -> List[Optional[str]]:
+    global _NUMERIC_HEADER_INFERRED_LAST
+    kinds: List[Optional[str]] = []
+    if not _FORCE_NUMERIC:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
+        return kinds
+    if headers:
+        for header in headers:
+            kind: Optional[str] = None
+            for variant in _header_variants_for_numeric(header) or [""]:
+                for candidate, rx in _NUMERIC_HEADER_KIND:
+                    if variant and rx.search(variant):
+                        kind = candidate
+                        break
+                if kind:
+                    break
+            kinds.append(kind)
+    if grid_text:
+        kinds = _infer_numeric_kinds_from_values(grid_text, kinds)
+    else:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
     return kinds
 
 
 def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
-    if not headers or not _FORCE_NUMERIC:
+    if not _FORCE_NUMERIC:
         return
-    kinds = _numeric_header_kinds(headers)
+    kinds = _numeric_header_kinds(headers, grid_text)
     if not kinds:
         return
     for r in range(1, len(grid_text)):
@@ -4347,7 +4461,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
     total_cells = 0
     forced_cells = 0
     numeric_tables = 0
+    numeric_tables_inferred = 0
     numeric_columns_total = 0
+    numeric_columns_inferred = 0
     numeric_columns_by_kind: Counter = Counter()
     forced_fields: Counter = Counter()
     date_tables = 0
@@ -4585,7 +4701,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 total_rows_ocr_success += 1
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
-                header_fields = _numeric_header_kinds(headers)
+                header_fields = _numeric_header_kinds(headers, grid_text)
+                inferred_columns = _NUMERIC_HEADER_INFERRED_LAST
                 date_roles = _date_header_roles(headers)
                 if date_roles and any(date_roles):
                     date_tables += 1
@@ -4598,6 +4715,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     if table_numeric_cols:
                         numeric_tables += 1
                         numeric_columns_total += table_numeric_cols
+                        if inferred_columns:
+                            numeric_tables_inferred += 1
+                            numeric_columns_inferred += inferred_columns
                         for kind in header_fields:
                             if kind:
                                 numeric_columns_by_kind[kind] += 1
@@ -4776,7 +4896,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
     duration = time.time() - stats_start if stats_start else 0.0
     numeric_stats = {
         "tables": int(numeric_tables),
+        "tables_with_inferred": int(numeric_tables_inferred),
         "columns": int(numeric_columns_total),
+        "columns_inferred": int(numeric_columns_inferred),
         "columns_by_kind": dict(numeric_columns_by_kind),
         "forced_cells": int(forced_cells),
         "forced_fields": dict(forced_fields),

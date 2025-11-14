@@ -1750,12 +1750,68 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         header_key = ordered_rows[0]
         header_cells = rows.get(header_key, {})
         numeric_cols: Dict[str, str] = {}
-        for col_key, cell in header_cells.items():
+        all_col_keys: List[str] = []
+        for cols in rows.values():
+            for col_key in cols.keys():
+                if col_key not in all_col_keys:
+                    all_col_keys.append(col_key)
+        all_col_keys = _sorted_numeric(all_col_keys)
+        col_positions = {col: idx for idx, col in enumerate(all_col_keys)}
+
+        def _infer_from_values(col_key: str) -> Optional[str]:
+            total = 0
+            numeric_hits = 0
+            currency_hits = 0
+            decimals = 0
+            values: List[float] = []
+            for row_key in ordered_rows:
+                if row_key == header_key:
+                    continue
+                row_bucket = rows.get(row_key) or {}
+                cell = row_bucket.get(col_key)
+                if not cell:
+                    continue
+                text = cell.get("normalized") or cell.get("text")
+                if not text:
+                    continue
+                total += 1
+                if re.search(r"[¥￥円＄$元]", str(text)):
+                    currency_hits += 1
+                value = _parse_numeric_value(text)
+                if value is None:
+                    continue
+                numeric_hits += 1
+                values.append(abs(value))
+                if not float(value).is_integer():
+                    decimals += 1
+            if total < 2:
+                return None
+            ratio = numeric_hits / float(total)
+            if ratio < 0.65:
+                return None
+            avg_val = sum(values) / float(len(values)) if values else 0.0
+            col_pos = col_positions.get(col_key, 0)
+            col_count = max(1, len(all_col_keys))
+            if currency_hits >= max(1, math.ceil(total * 0.4)) or avg_val >= 1000:
+                return "total" if col_pos >= col_count - 1 else "amount"
+            if decimals > 0 and avg_val >= 1:
+                return "unit_price"
+            return "qty"
+
+        for col_key in all_col_keys:
+            cell = header_cells.get(col_key)
             base = _header_text(cell)
+            matched = False
             for candidate in _header_key_variants(base) or [base]:
                 if candidate in _NUMERIC_HEADER_HINTS:
                     numeric_cols[col_key] = _NUMERIC_HEADER_HINTS[candidate]
+                    matched = True
                     break
+            if matched:
+                continue
+            inferred_kind = _infer_from_values(col_key)
+            if inferred_kind:
+                numeric_cols[col_key] = inferred_kind
         return numeric_cols, header_key
 
     def _parse_numeric_value(text: Optional[str]) -> Optional[float]:
