@@ -48,7 +48,7 @@
 #      sys.modules['zocr_onefile_consensus'], sys.modules['zocr_multidomain_core'], sys.modules['zocr_pipeline_allinone'].
 
 
-import sys, types, os, tempfile, pathlib
+import sys, types, os, tempfile, pathlib, unicodedata, math
 
 _BUNDLE_DIR = os.path.join(tempfile.gettempdir(), "zocr_bundle_runtime")
 os.makedirs(_BUNDLE_DIR, exist_ok=True)
@@ -88,9 +88,9 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
 
 try:
@@ -98,7 +98,7 @@ try:
 except Exception:
     np = None
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
@@ -460,6 +460,48 @@ def _dp_means_1d(points, lam, iters=3):
             if xs: centers[i]=sum(xs)/len(xs)
     return sorted(centers)
 
+
+def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -> List[List[float]]:
+    ordered = sorted(float(v) for v in values if math.isfinite(v))
+    if not ordered:
+        return []
+
+    buckets: List[List[float]] = []
+
+    def _split(bucket: List[float], depth: int) -> None:
+        if len(bucket) <= max(1, min_bucket) or depth >= max_depth:
+            buckets.append(bucket)
+            return
+        mid_idx = len(bucket) // 2
+        pivot = bucket[mid_idx]
+        left = [v for v in bucket if v <= pivot]
+        right = [v for v in bucket if v > pivot]
+        if not left or not right:
+            buckets.append(bucket)
+            return
+        _split(left, depth + 1)
+        _split(right, depth + 1)
+
+    _split(ordered, 0)
+    return buckets
+
+
+def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_depth: int = 5) -> List[float]:
+    buckets = _btree_partition(points, min_bucket=max(1, min_bucket), max_depth=max(1, max_depth))
+    centers: List[float] = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        centers.append(float(median(bucket)))
+    centers.sort()
+    deduped: List[float] = []
+    for value in centers:
+        if not deduped or abs(value - deduped[-1]) > 1.0:
+            deduped.append(value)
+        else:
+            deduped[-1] = (deduped[-1] + value) * 0.5
+    return deduped
+
 # ----------------- Column smoothing (D²-like + λ scheduling) -----------------
 def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
     R = len(candidates_by_row)
@@ -807,15 +849,23 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     # DP-means for columns with λ補正（列モード吸着）
     xcenters=[(ch[0]+ch[2])/2.0 for row in chunks_by_row for ch in row]
     med_w=float(np.median([(ch[2]-ch[0]) for row in chunks_by_row for ch in row])) if xcenters else 12.0
+    btree_seed=_btree_column_centers(
+        xcenters,
+        min_bucket=max(3, int(math.sqrt(len(xcenters) + 1))) if xcenters else 3,
+        max_depth=6,
+    )
     lam_base=float(params.get("dp_lambda_factor", 2.2))*max(6.0, med_w)
-    centers0=_dp_means_1d(sorted(xcenters), lam=lam_base, iters=3)
+    seed_points = btree_seed if len(btree_seed) >= 2 else xcenters
+    if not seed_points:
+        seed_points = [W * 0.5]
+    centers0=_dp_means_1d(sorted(seed_points), lam=lam_base, iters=3)
     K_pred0=len(centers0)
     K_mode=_robust_k_mode(row_counts) or max(2, K_pred0)
     alpha=float(params.get("lambda_alpha", 0.7))
     # clip the scaling to avoid extreme swings
     scale = ( (K_pred0 / float(max(1,K_mode))) ** alpha )
     lam_eff = clamp(lam_base * scale, 0.6*lam_base, 1.8*lam_base)
-    centers=_dp_means_1d(sorted(xcenters), lam=lam_eff, iters=3)
+    centers=_dp_means_1d(sorted(xcenters or seed_points), lam=lam_eff, iters=3)
     # candidates
     candidates_by_row=[]
     for row in chunks_by_row:
@@ -826,9 +876,17 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 gap=row[i+1][0]-row[i][2]
                 if gap>1.6*mw: mids.append(int((row[i][2]+row[i+1][0])/2.0))
         candidates_by_row.append(mids)
+    global_mid_seeds: List[int] = []
+    if len(btree_seed) >= 2:
+        global_mid_seeds.extend(int((btree_seed[i]+btree_seed[i+1])/2.0) for i in range(len(btree_seed)-1))
     if len(centers)>=2:
-        mids_global=[int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1)]
-        candidates_by_row = [[*mids_global, *row] for row in candidates_by_row]
+        global_mid_seeds.extend(int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1))
+    if global_mid_seeds:
+        mids_global = sorted({int(val) for val in global_mid_seeds})
+        merged_rows: List[List[int]] = []
+        for row in candidates_by_row:
+            merged_rows.append(sorted({*row, *mids_global}))
+        candidates_by_row = merged_rows
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
     R=len(row_bands); C=max(1,len(col_bounds)-1)
@@ -1451,6 +1509,8 @@ def _blank_recognition_stats() -> Dict[str, Any]:
         "surprisal_sum": 0.0,
         "low_conf_cells": 0,
         "high_surprisal_cells": 0,
+        "lexical_quality_sum": 0.0,
+        "garbled_cells": 0,
         "examples": [],
     }
 
@@ -1468,13 +1528,22 @@ def reset_toy_recognition_stats() -> None:
     _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
 
 
-def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal: float) -> None:
+def _record_toy_recognition(
+    text: str,
+    conf: float,
+    coherence: float,
+    surprisal: float,
+    lexical_quality: float = 0.0,
+) -> None:
     stats = _TOY_RECOGNITION_STATS
     stats["cells"] = int(stats.get("cells", 0) + 1)
     stats["characters"] = int(stats.get("characters", 0) + len(text))
     stats["conf_sum"] = float(stats.get("conf_sum", 0.0) + float(conf))
     stats["coherence_sum"] = float(stats.get("coherence_sum", 0.0) + float(coherence))
     stats["surprisal_sum"] = float(stats.get("surprisal_sum", 0.0) + float(surprisal))
+    stats["lexical_quality_sum"] = float(
+        stats.get("lexical_quality_sum", 0.0) + float(max(0.0, min(1.5, lexical_quality)))
+    )
     if conf < 0.6:
         stats["low_conf_cells"] = int(stats.get("low_conf_cells", 0) + 1)
     if surprisal > 1.6:
@@ -1488,6 +1557,8 @@ def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal:
                 "surprisal": float(surprisal),
                 "length": len(text),
             })
+    if lexical_quality and lexical_quality < 0.55:
+        stats["garbled_cells"] = int(stats.get("garbled_cells", 0) + 1)
 
 
 def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
@@ -1501,8 +1572,10 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
         "avg_confidence": float(stats.get("conf_sum", 0.0) / cells) if cells else 0.0,
         "avg_coherence": float(stats.get("coherence_sum", 0.0) / cells) if cells else 0.0,
         "avg_surprisal": float(stats.get("surprisal_sum", 0.0) / cells) if cells else 0.0,
+        "avg_lexical_quality": float(stats.get("lexical_quality_sum", 0.0) / cells) if cells else 0.0,
         "low_conf_cells": int(stats.get("low_conf_cells", 0)),
         "high_surprisal_cells": int(stats.get("high_surprisal_cells", 0)),
+        "garbled_cells": int(stats.get("garbled_cells", 0)),
         "examples": [
             {
                 "text": ex.get("text"),
@@ -1521,6 +1594,7 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["runtime_replay_attempts"] = int(_GLYPH_RUNTIME_STATS.get("replay_attempts", 0))
     result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
     result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
+    result["lexical_penalties"] = int(_GLYPH_RUNTIME_STATS.get("lexical_penalty", 0))
     if reset:
         reset_toy_recognition_stats()
     return result
@@ -1979,6 +2053,85 @@ def _looks_like_numeric_token(text: str) -> bool:
 def _looks_like_upper_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
 
+
+_TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
+_TOY_NOISE_CHARS = set("?`~^|'\"¤")
+_TOY_GARBLED_PATTERN = re.compile(r"[?]{2,}|[|\\/_]{3,}|={2,}|\bfax\b", re.IGNORECASE)
+_TOY_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?(?:[¥$]\s*)?[0-9][0-9,]*(?:\.[0-9]+)?%?$")
+_TOY_CANONICAL_TOKEN_HINTS: Dict[str, float] = {
+    "item": 0.35,
+    "items": 0.28,
+    "qty": 0.30,
+    "quantity": 0.28,
+    "unitprice": 0.32,
+    "price": 0.22,
+    "amount": 0.35,
+    "total": 0.30,
+    "subtotal": 0.22,
+    "tax": 0.18,
+    "taxtotal": 0.2,
+    "estimate": 0.2,
+    "invoice": 0.18,
+    "description": 0.2,
+    "unit": 0.15,
+    "remarks": 0.18,
+    "date": 0.18,
+    "duedate": 0.24,
+    "servicedate": 0.24,
+    "shipdate": 0.18,
+    "payment": 0.2,
+    "discount": 0.2,
+    "project": 0.18,
+    "code": 0.15,
+    "client": 0.2,
+}
+
+
+def _canonicalize_toy_token(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", (text or "").lower())
+
+
+def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return 0.0, {"reason": "empty"}
+    length = len(normalized)
+    allowed = 0
+    ascii_like = 0
+    weird = 0
+    for ch in normalized:
+        if ord(ch) < 128:
+            ascii_like += 1
+        if ch.isalnum() or ch in _TOY_ALLOWED_SYMBOLS:
+            allowed += 1
+        elif ch in _TOY_NOISE_CHARS or ord(ch) >= 0x2500:
+            weird += 1
+    allowed_ratio = float(allowed) / float(length or 1)
+    weird_ratio = float(weird) / float(length or 1)
+    base = 0.4 + 0.6 * allowed_ratio
+    if ascii_like < max(1, length - 1) and not _TOY_NUMERIC_TOKEN_RE.match(normalized):
+        base *= 0.9
+    if weird_ratio > 0:
+        base *= max(0.35, 1.0 - 0.45 * weird_ratio)
+    canonical = _canonicalize_toy_token(normalized)
+    lex_boost = 1.0
+    if canonical:
+        lex_boost += _TOY_CANONICAL_TOKEN_HINTS.get(canonical, 0.0)
+    if _TOY_NUMERIC_TOKEN_RE.match(normalized):
+        lex_boost = max(lex_boost, 1.05)
+    elif len(canonical) <= 1 and canonical not in {"x", "y", "z", "a"}:
+        base *= 0.9
+    if _TOY_GARBLED_PATTERN.search(normalized):
+        base *= 0.6
+    quality = float(max(0.2, min(1.6, base * lex_boost)))
+    diag = {
+        "canonical": canonical,
+        "allowed_ratio": allowed_ratio,
+        "weird_ratio": weird_ratio,
+        "lex_boost": lex_boost,
+    }
+    return quality, diag
+
 def _ngram_probability(prev: str, ch: str) -> float:
     counts = _NGRAM_COUNTS.get(prev)
     totals = _NGRAM_TOTALS.get(prev, 0)
@@ -2251,6 +2404,174 @@ _FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
 _LAST_EXPORT_STATS: Dict[str, Any] = {}
 
 
+@dataclass
+class MotionPriorCfg:
+    enabled: bool = False
+    sigma_px: float = 8.0
+    cutoff_sigma: float = 2.5
+    accept_ratio: float = 0.5
+
+
+@dataclass
+class _BlankSkipConfig:
+    enabled: bool = False
+    dark_threshold: int = 210
+    min_dark_pixels: int = 8
+    min_dark_ratio: float = 0.002
+    min_area: int = 36
+
+
+@dataclass
+class _ExportSweepTracker:
+    prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
+
+    def get(self, doc_id: str, page_index: int, table_index: int) -> Optional[List[float]]:
+        return self.prev_y.get((doc_id, page_index, table_index))
+
+    def put(
+        self,
+        doc_id: str,
+        page_index: int,
+        table_index: int,
+        y_keys: Sequence[float],
+    ) -> None:
+        self.prev_y[(doc_id, page_index, table_index)] = [float(y) for y in y_keys]
+
+
+_EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
+
+
+def _motion_prior_cfg_from_env() -> MotionPriorCfg:
+    cfg = MotionPriorCfg(enabled=_env_flag("ZOCR_EXPORT_MOTION_PRIOR", False))
+    if cfg.enabled:
+        sigma = _env_float("ZOCR_EXPORT_MOTION_SIGMA", cfg.sigma_px)
+        cutoff = _env_float("ZOCR_EXPORT_MOTION_CUTOFF", cfg.cutoff_sigma)
+        accept = _env_float("ZOCR_EXPORT_MOTION_ACCEPT", cfg.accept_ratio)
+        cfg.sigma_px = max(0.5, float(sigma))
+        cfg.cutoff_sigma = max(0.1, float(cutoff))
+        cfg.accept_ratio = float(max(0.0, min(1.0, accept)))
+    return cfg
+
+
+def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
+    cfg = _BlankSkipConfig(enabled=_env_flag("ZOCR_EXPORT_SKIP_BLANK", True))
+    if not cfg.enabled:
+        return cfg
+    thr = _env_int("ZOCR_EXPORT_BLANK_THRESHOLD", cfg.dark_threshold)
+    if thr is not None:
+        cfg.dark_threshold = int(max(1, min(255, thr)))
+    min_px = _env_int("ZOCR_EXPORT_BLANK_MIN_PIXELS", cfg.min_dark_pixels)
+    if min_px is not None:
+        cfg.min_dark_pixels = int(max(1, min_px))
+    min_ratio = _env_float("ZOCR_EXPORT_BLANK_MIN_RATIO", cfg.min_dark_ratio)
+    if isinstance(min_ratio, (int, float)):
+        cfg.min_dark_ratio = float(max(0.0, min(0.1, min_ratio)))
+    min_area = _env_int("ZOCR_EXPORT_BLANK_MIN_AREA", cfg.min_area)
+    if min_area is not None:
+        cfg.min_area = int(max(1, min_area))
+    return cfg
+
+
+def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
+    if not cfg.enabled:
+        return False
+    try:
+        w, h = img.size
+    except Exception:
+        return False
+    area = max(1, int(w) * int(h))
+    if area < cfg.min_area:
+        return False
+    try:
+        gray = img.convert("L")
+        hist = gray.histogram()
+    except Exception:
+        return False
+    if not hist:
+        return False
+    thr = max(1, min(256, int(cfg.dark_threshold)))
+    dark = int(sum(hist[:thr]))
+    if dark < cfg.min_dark_pixels:
+        return True
+    ratio = dark / float(area)
+    if ratio <= cfg.min_dark_ratio:
+        return True
+    return False
+
+
+def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
+    mids: List[float] = []
+    for top, bottom in row_bands:
+        try:
+            mid = (float(top) + float(bottom)) * 0.5
+        except Exception:
+            continue
+        if math.isfinite(mid):
+            mids.append(mid)
+    return mids
+
+
+def _reseed_row_bands_with_prior(
+    prev_keys: Sequence[float],
+    row_bands: Sequence[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[float, float]]]:
+    if not prev_keys or not row_bands:
+        return list(row_bands), []
+    mids = _row_band_midpoints(row_bands)
+    if not mids:
+        return list(row_bands), []
+    ordered = sorted(((mid, idx) for idx, mid in enumerate(mids)), key=lambda item: item[0])
+    ordered_mids = [mid for mid, _ in ordered]
+    used = [False] * len(ordered)
+    matches: List[Tuple[float, float]] = []
+    reseed_indices: List[int] = []
+    for prev_val in prev_keys:
+        pos = bisect.bisect_left(ordered_mids, prev_val)
+        best_idx = None
+        best_dist = float("inf")
+        for offset in (pos - 1, pos, pos + 1):
+            if 0 <= offset < len(ordered) and not used[offset]:
+                cand_mid, cand_idx = ordered[offset]
+                dist = abs(cand_mid - prev_val)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = offset
+        if best_idx is None:
+            continue
+        used[best_idx] = True
+        cand_mid, cand_idx = ordered[best_idx]
+        matches.append((cand_mid, float(prev_val)))
+        reseed_indices.append(cand_idx)
+    for offset, (_, idx) in enumerate(ordered):
+        if not used[offset]:
+            reseed_indices.append(idx)
+    reseeded = [row_bands[idx] for idx in reseed_indices]
+    return reseeded, matches
+
+
+def _apply_motion_prior_to_bands(
+    prev_keys: Optional[Sequence[float]],
+    row_bands: List[Tuple[int, int]],
+    cfg: MotionPriorCfg,
+) -> Tuple[List[Tuple[int, int]], bool]:
+    if not cfg.enabled or not prev_keys or not row_bands:
+        return row_bands, False
+    reseeded, matches = _reseed_row_bands_with_prior(prev_keys, row_bands)
+    if not reseeded:
+        return row_bands, False
+    sigma = max(1e-3, float(cfg.sigma_px))
+    cutoff = float(cfg.cutoff_sigma) * sigma
+    inside = 0
+    total = len(matches)
+    for cand_mid, prev_val in matches:
+        if abs(cand_mid - prev_val) <= cutoff:
+            inside += 1
+    actual_ratio = inside / float(total or 1)
+    if actual_ratio >= cfg.accept_ratio:
+        return reseeded, True
+    return row_bands, False
+
+
 def toy_runtime_config() -> Dict[str, Any]:
     """Return the currently active toy OCR runtime knobs."""
 
@@ -2290,11 +2611,57 @@ def configure_toy_runtime(
 
 
 _NUMERIC_HEADER_KIND = [
-    ("qty", re.compile(r"(数量|数|個|qty|quantity)", re.I)),
-    ("unit_price", re.compile(r"(単価|unit\s*price|price)", re.I)),
-    ("amount", re.compile(r"(金額|合計|総計|税込|税別|小計|amount|total|subtotal|balance)", re.I)),
-    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat)", re.I)),
+    ("qty", re.compile(r"(数量|数|個|台数|件数|口数|本数|点数|qty|q'?ty|quantity)", re.I)),
+    ("unit_price", re.compile(r"(単価|unit\s*price|price|unit\s*cost)", re.I)),
+    (
+        "amount",
+        re.compile(
+            r"(金額|見積金額|御見積金額|御見積合計|合計金額|合計|総計|計|税込|税別|小計|amount|total|subtotal|balance)",
+            re.I,
+        ),
+    ),
+    ("tax_rate", re.compile(r"(税率|消費税率|税%|tax%|tax(\s*rate)?|vat|gst)", re.I)),
 ]
+
+_NUMERIC_HEADER_INFERRED_LAST = 0
+
+
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+def _header_variants_for_numeric(label: str) -> List[str]:
+    base = _canonicalize_header_label(label)
+    variants: List[str] = []
+    if not base:
+        return variants
+
+    def _add(val: str) -> None:
+        val = val.strip()
+        if val and val not in variants:
+            variants.append(val)
+
+    _add(base)
+    _add(base.replace(" ", ""))
+    honorific = base.lstrip("御お")
+    _add(honorific)
+    no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", base)
+    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+    _add(no_brackets)
+    simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", base)
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    _add(simplified)
+    _add(simplified.replace(" ", ""))
+    for token in re.split(r"[/｜\|・,、]", base):
+        token = token.strip()
+        if not token:
+            continue
+        _add(token)
+        _add(token.replace(" ", ""))
+    return variants
 
 
 def _normalize_numeric_text(text: str, kind: str) -> str:
@@ -2317,25 +2684,100 @@ def _normalize_numeric_text(text: str, kind: str) -> str:
     return t
 
 
-def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
-    kinds: List[Optional[str]] = []
-    if not headers:
+def _infer_numeric_kinds_from_values(
+    grid_text: Sequence[Sequence[str]],
+    kinds: List[Optional[str]],
+) -> List[Optional[str]]:
+    global _NUMERIC_HEADER_INFERRED_LAST
+    inferred = 0
+    if not grid_text:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
         return kinds
-    for header in headers:
-        base = (header or "").strip().lower()
-        kind: Optional[str] = None
-        for candidate, rx in _NUMERIC_HEADER_KIND:
-            if rx.search(base):
-                kind = candidate
-                break
-        kinds.append(kind)
+    num_cols = max(len(row) for row in grid_text)
+    if len(kinds) < num_cols:
+        kinds.extend([None] * (num_cols - len(kinds)))
+    currency_rx = re.compile(r"[¥￥円＄$元]")
+    for c in range(num_cols):
+        if kinds[c]:
+            continue
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimals = 0
+        values: List[float] = []
+        for r in range(1, len(grid_text)):
+            row = grid_text[r]
+            if c >= len(row):
+                continue
+            txt = str(row[c] or "").strip()
+            if not txt:
+                continue
+            total += 1
+            if currency_rx.search(txt):
+                currency_hits += 1
+            cleaned = txt.replace("，", ",").replace("．", ".")
+            cleaned = cleaned.replace(",", "")
+            match = re.search(r"[+\-]?\d+(?:\.\d+)?", cleaned)
+            if not match:
+                continue
+            numeric_hits += 1
+            token = match.group(0)
+            try:
+                val = float(token)
+            except ValueError:
+                continue
+            values.append(abs(val))
+            if "." in token:
+                decimals += 1
+        if total < 2:
+            continue
+        ratio = numeric_hits / float(total)
+        if ratio < 0.65:
+            continue
+        avg_val = sum(values) / float(len(values)) if values else 0.0
+        if currency_hits >= max(1, math.ceil(total * 0.4)) or avg_val >= 1000:
+            new_kind = "total" if c >= num_cols - 1 else "amount"
+        elif decimals > 0 and avg_val >= 1:
+            new_kind = "unit_price"
+        else:
+            new_kind = "qty"
+        kinds[c] = new_kind
+        inferred += 1
+    _NUMERIC_HEADER_INFERRED_LAST = inferred
+    return kinds
+
+
+def _numeric_header_kinds(
+    headers: Sequence[str],
+    grid_text: Optional[Sequence[Sequence[str]]] = None,
+) -> List[Optional[str]]:
+    global _NUMERIC_HEADER_INFERRED_LAST
+    kinds: List[Optional[str]] = []
+    if not _FORCE_NUMERIC:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
+        return kinds
+    if headers:
+        for header in headers:
+            kind: Optional[str] = None
+            for variant in _header_variants_for_numeric(header) or [""]:
+                for key, rx in _NUMERIC_HEADER_KIND:
+                    if variant and rx.search(variant):
+                        kind = key
+                        break
+                if kind:
+                    break
+            kinds.append(kind)
+    if grid_text:
+        kinds = _infer_numeric_kinds_from_values(grid_text, kinds)
+    else:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
     return kinds
 
 
 def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
-    if not headers or not _FORCE_NUMERIC:
+    if not _FORCE_NUMERIC:
         return
-    kinds = _numeric_header_kinds(headers)
+    kinds = _numeric_header_kinds(headers, grid_text)
     if not kinds:
         return
     for r in range(1, len(grid_text)):
@@ -2352,12 +2794,425 @@ def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequ
             grid_text[r][:] = row
 
 
+_DATE_FULLWIDTH = str.maketrans(
+    {
+        "０": "0",
+        "１": "1",
+        "２": "2",
+        "３": "3",
+        "４": "4",
+        "５": "5",
+        "６": "6",
+        "７": "7",
+        "８": "8",
+        "９": "9",
+        "－": "-",
+        "．": ".",
+        "／": "/",
+        "年": "年",
+        "月": "月",
+        "日": "日",
+    }
+)
+
+_DATE_ROLE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
+    (
+        "due",
+        (
+            "due date",
+            "payment due",
+            "due",
+            "支払期限",
+            "支払期日",
+            "期日",
+            "納期",
+        ),
+    ),
+    (
+        "issue",
+        (
+            "invoice date",
+            "issue date",
+            "billing date",
+            "請求日",
+            "発行日",
+            "作成日",
+        ),
+    ),
+    (
+        "service",
+        (
+            "service date",
+            "ship date",
+            "delivery date",
+            "利用日",
+            "作業日",
+        ),
+    ),
+]
+
+_DATE_RX_SLASH = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})[./-](?P<month>0?[1-9]|1[0-2])(?:[./-](?P<day>0?[1-9]|[12]\d|3[01]))?"
+)
+_DATE_RX_KANJI = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_ERA = re.compile(
+    r"(?P<era>令和|平成|昭和)(?P<erayear>元|\d{1,2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_COMPACT = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})(?P<month>0?[1-9]|1[0-2])(?P<day>0?[1-9]|[12]\d|3[01])"
+)
+_JP_ERA_BASE = {"令和": 2018, "平成": 1988, "昭和": 1925}
+
+
+def _date_role_from_header(header: Optional[str]) -> Optional[str]:
+    if not header:
+        return None
+    base = header.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _date_header_roles(headers: Sequence[str]) -> List[Optional[str]]:
+    roles: List[Optional[str]] = []
+    if not headers:
+        return roles
+    for header in headers:
+        roles.append(_date_role_from_header(header))
+    return roles
+
+
+def _infer_date_role_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    base = text.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _normalize_japanese_era_year(era: str, era_year: str) -> Optional[int]:
+    base = _JP_ERA_BASE.get(era)
+    if base is None:
+        return None
+    token = era_year.strip()
+    if token == "元":
+        offset = 1
+    else:
+        try:
+            offset = int(token)
+        except Exception:
+            return None
+    if offset <= 0:
+        return None
+    return base + offset
+
+
+def _normalize_date_value(text: str) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    norm = str(text).strip()
+    if not norm:
+        return None
+    norm = norm.translate(_DATE_FULLWIDTH)
+    compact = norm.replace(" ", "").replace("　", "")
+
+    def _format(year: int, month: int, day: Optional[int]) -> Optional[Tuple[str, str]]:
+        if year < 1900 or year > 2100:
+            return None
+        if not 1 <= month <= 12:
+            return None
+        precision = "ym"
+        value = f"{year:04d}-{month:02d}"
+        if day is not None:
+            if not 1 <= day <= 31:
+                return None
+            precision = "ymd"
+            value = f"{value}-{day:02d}"
+        return value, precision
+
+    for rx in (_DATE_RX_SLASH, _DATE_RX_KANJI):
+        m = rx.search(compact)
+        if not m:
+            continue
+        try:
+            year = int(m.group("year"))
+            month = int(m.group("month"))
+            day = int(m.group("day")) if m.group("day") else None
+        except Exception:
+            continue
+        formatted = _format(year, month, day)
+        if formatted:
+            return formatted
+
+    m_era = _DATE_RX_ERA.search(compact)
+    if m_era:
+        year = _normalize_japanese_era_year(m_era.group("era"), m_era.group("erayear"))
+        try:
+            month = int(m_era.group("month"))
+            day = int(m_era.group("day")) if m_era.group("day") else None
+        except Exception:
+            month = None
+            day = None
+        if year and month:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+
+    m_compact = _DATE_RX_COMPACT.search(compact)
+    if m_compact:
+        try:
+            year = int(m_compact.group("year"))
+            month = int(m_compact.group("month"))
+            day = int(m_compact.group("day"))
+        except Exception:
+            year = month = day = None
+        if year and month and day:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+    return None
+
+
+def _extract_date_filters(text: str, header_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_date_value(text)
+    if not normalized:
+        return None
+    value, precision = normalized
+    role = header_role or _infer_date_role_from_text(text)
+    payload: Dict[str, Any] = {
+        "date": value,
+        "date_precision": precision,
+    }
+    if role == "due":
+        payload["due_date"] = value
+    elif role == "issue":
+        payload["issue_date"] = value
+    elif role == "service":
+        payload["service_date"] = value
+    if role:
+        payload["date_role"] = role
+    return payload
+
+
 _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
     "qty": "0123456789",
     "unit_price": "0123456789.-",
     "amount": "0123456789.-",
+    "subtotal": "0123456789.-",
+    "tax_amount": "0123456789.-",
     "tax_rate": "0123456789.%",
 }
+
+_ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
+    {
+        "key": "item",
+        "pattern": re.compile(r"(item|品目|description|desc|details)", re.I),
+        "title": "Item",
+        "normalizer": None,
+    },
+    {
+        "key": "qty",
+        "pattern": re.compile(r"(qty|数量|quantity|q'?ty|pcs?|units?)", re.I),
+        "title": "Qty",
+        "normalizer": "qty",
+    },
+    {
+        "key": "unit_price",
+        "pattern": re.compile(r"(unit\s*(price|cost)|単価)", re.I),
+        "title": "Unit Price",
+        "normalizer": "currency",
+    },
+    {
+        "key": "amount",
+        "pattern": re.compile(r"(amount|line\s*total|line\s*amount|金額|total)", re.I),
+        "title": "Amount",
+        "normalizer": "currency",
+    },
+]
+
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        return None
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+    }
+    return new_text, new_conf, new_bounds, stats
 
 
 def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
@@ -2696,6 +3551,53 @@ def _is_total_row(cells: List[str]) -> bool:
             return True
     return False
 
+
+def _numeric_token_value(token: str) -> Optional[float]:
+    if not token:
+        return None
+    body = token.replace(",", "")
+    if body.endswith("%"):
+        return None
+    try:
+        return float(body)
+    except Exception:
+        return None
+
+
+def _relocate_total_amount(
+    row: List[str], conf_row: List[float], target_idx: int
+) -> bool:
+    if target_idx < 0 or target_idx >= len(row):
+        return False
+    existing = _NUMERIC_RX.search(row[target_idx] or "")
+    if existing and not (existing.group(0).endswith("%")):
+        return False
+    best_idx = None
+    best_token = None
+    best_score: Optional[Tuple[float, int]] = None
+    for idx, cell in enumerate(row):
+        if idx == target_idx:
+            continue
+        match = _NUMERIC_RX.search(cell or "")
+        if not match:
+            continue
+        token = match.group(0)
+        if token.endswith("%"):
+            continue
+        value = _numeric_token_value(token)
+        magnitude = abs(value) if value is not None else 0.0
+        score = (magnitude, idx)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = idx
+            best_token = token
+    if best_idx is None or best_token is None:
+        return False
+    row[target_idx] = best_token
+    if best_idx < len(conf_row):
+        conf_row[target_idx] = max(conf_row[target_idx], conf_row[best_idx])
+    return True
+
 def _resize_keep_ar(im, w, h):
     im = im.convert("L")
     iw, ih = im.size
@@ -2705,6 +3607,142 @@ def _resize_keep_ar(im, w, h):
     out = Image.new("L", (w,h), 0)
     out.paste(imr, ((w-tw)//2,(h-th)//2))
     return out
+
+
+_TOKEN_TEMPLATE_SIZE = (96, 28)
+_TOKEN_TEMPLATE_MAX_VARIANTS = 8
+_TOKEN_TEMPLATE_PRESETS = [
+    "item",
+    "qty",
+    "unit price",
+    "amount",
+    "total",
+    "subtotal",
+    "tax",
+    "due",
+    "date",
+    "見積金額",
+    "御見積金額",
+    "数量",
+    "単価",
+    "金額",
+    "小計",
+    "合計",
+]
+
+
+def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+_TOKEN_TEMPLATE_FONT = _load_template_font()
+
+
+def _render_template_bitmap(token: str) -> Optional["Image.Image"]:
+    text = (token or "").strip()
+    if not text:
+        return None
+    font = _TOKEN_TEMPLATE_FONT
+    try:
+        bbox = font.getbbox(text)
+    except Exception:
+        bbox = None
+    if bbox:
+        width = max(12, bbox[2] - bbox[0] + 6)
+        height = max(12, bbox[3] - bbox[1] + 6)
+    else:
+        width = max(12, len(text) * 8)
+        height = 24
+    img = Image.new("L", (width, height), 0)
+    dr = ImageDraw.Draw(img)
+    try:
+        dr.text((3, 2), text, fill=255, font=font)
+    except Exception:
+        return None
+    if not img.getbbox():
+        return None
+    return img
+
+
+def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
+    import numpy as _np
+
+    try:
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+    except Exception:
+        return None
+    resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
+    arr_f = _np.asarray(resized, dtype=_np.float32)
+    if arr_f.size == 0:
+        return None
+    std = float(arr_f.std())
+    if std < 1e-3:
+        return None
+    normed = (arr_f - float(arr_f.mean())) / (std + 1e-3)
+    return normed
+
+
+def _init_token_template_library() -> Dict[str, deque]:
+    library: Dict[str, deque] = {}
+    for token in _TOKEN_TEMPLATE_PRESETS:
+        bmp = _render_template_bitmap(token)
+        if bmp is None:
+            continue
+        norm = _normalize_template_bitmap(bmp)
+        if norm is None:
+            continue
+        dq = library.setdefault(token, deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS))
+        dq.append(norm)
+    return library
+
+
+_TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+
+
+def _observe_token_template(token: str, arr: Any) -> None:
+    if not token:
+        return
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[token] = dq
+    dq.append(norm)
+
+
+def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
+    import numpy as _np
+
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return "", 0.0
+    best_token = ""
+    best_score = -1.0
+    for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not variants:
+            continue
+        for tpl in variants:
+            if tpl.shape != norm.shape:
+                continue
+            score = float((norm * tpl).mean())
+            if score > best_score:
+                best_score = score
+                best_token = token
+    if best_score < 0.35:
+        return "", 0.0
+    conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
+    return best_token, conf
 
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     if dx == 0 and dy == 0:
@@ -2990,22 +4028,36 @@ def toy_ocr_text_from_cell(
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
 
     candidate_scores: Dict[str, float] = {}
+    candidate_actual_conf: Dict[str, float] = {}
+    candidate_quality: Dict[str, float] = {}
     best_text, best_conf = "", 0.0
     best_meta: Optional[Dict[str, Any]] = None
     best_bw: Optional[np.ndarray] = None
+    best_effective_conf = 0.0
 
     def _evaluate_from(idx: int) -> int:
-        nonlocal best_text, best_conf, best_meta, best_bw
+        nonlocal best_text, best_conf, best_meta, best_bw, best_effective_conf
         total = len(candidates)
         for i in range(idx, total):
             bw, meta = candidates[i]
             text, conf = _text_from_binary(bw, allowed_chars=allowed_chars)
             if text:
+                lexical_quality, _ = _toy_text_quality(text)
+                candidate_quality[text] = max(candidate_quality.get(text, 0.0), float(lexical_quality))
+                candidate_actual_conf[text] = max(candidate_actual_conf.get(text, 0.0), float(conf))
+                effective_conf = float(conf) * float(lexical_quality or 1.0)
+                effective_conf = float(max(0.0, min(1.5, effective_conf)))
                 prev = candidate_scores.get(text)
-                if prev is None or conf > prev:
-                    candidate_scores[text] = conf
-            if text and conf > best_conf:
-                best_text, best_conf, best_meta, best_bw = text, conf, meta, bw
+                if prev is None or effective_conf > prev:
+                    candidate_scores[text] = effective_conf
+                if lexical_quality < 0.6:
+                    _GLYPH_RUNTIME_STATS["lexical_penalty"] += 1.0
+            else:
+                lexical_quality = 0.0
+                effective_conf = float(conf)
+            if text and effective_conf > best_effective_conf:
+                best_text, best_conf, best_meta, best_bw = text, float(conf), meta, bw
+                best_effective_conf = effective_conf
         return total
 
     _evaluate_from(0)
@@ -3027,21 +4079,63 @@ def toy_ocr_text_from_cell(
         _threshold_memory_store(key, int(best_meta["thr"]))
 
     final_text, final_conf = best_text, best_conf
+    final_effective_conf = best_effective_conf
+    final_quality = candidate_quality.get(final_text, 0.0)
     if candidate_scores:
         reranked_text, reranked_conf = _contextual_rerank_candidates(candidate_scores)
         if reranked_text:
-            if reranked_conf >= final_conf - 1e-6:
+            reranked_actual = candidate_actual_conf.get(reranked_text, reranked_conf)
+            reranked_quality = candidate_quality.get(reranked_text, 0.0)
+            if reranked_quality <= 0.0 and reranked_text:
+                reranked_quality, _ = _toy_text_quality(reranked_text)
+            if (
+                reranked_conf > final_effective_conf + 1e-6
+                or (
+                    abs(reranked_conf - final_effective_conf) <= 1e-6
+                    and reranked_actual > final_conf
+                )
+            ):
                 final_text = reranked_text
-                final_conf = max(final_conf, reranked_conf)
+                final_conf = float(reranked_actual)
+                final_quality = reranked_quality
+                final_effective_conf = reranked_conf
             elif not final_text:
-                final_text, final_conf = reranked_text, reranked_conf
+                final_text = reranked_text
+                final_conf = float(reranked_actual)
+                final_quality = reranked_quality
+                final_effective_conf = reranked_conf
+
+    ref_bitmap = best_bw
+    if ref_bitmap is None and candidates:
+        ref_bitmap = candidates[0][0]
+    template_text, template_conf = ("", 0.0)
+    if ref_bitmap is not None:
+        template_text, template_conf = _match_token_template_from_cache(ref_bitmap)
+    if template_text and (template_conf > final_effective_conf + 1e-3 or not final_text):
+        final_text = template_text
+        final_conf = max(final_conf, template_conf)
+        final_effective_conf = max(final_effective_conf, template_conf)
+        final_quality = max(final_quality, 0.95)
+        _GLYPH_RUNTIME_STATS["template_matches"] += 1.0
 
     if final_text:
         coherence = _ngram_coherence(final_text)
         surprisal = _ngram_surprisal(final_text)
-        _record_toy_recognition(final_text, float(final_conf), coherence, surprisal)
+        if final_quality <= 0.0:
+            final_quality, _ = _toy_text_quality(final_text)
+        bounded_conf = float(max(0.0, min(1.0, final_conf)))
+        _record_toy_recognition(
+            final_text,
+            bounded_conf,
+            coherence,
+            surprisal,
+            lexical_quality=float(max(0.0, min(1.6, final_quality))),
+        )
         _update_ngram_model(final_text)
-        return final_text, float(max(0.0, min(1.0, final_conf)))
+        if ref_bitmap is not None:
+            _observe_token_template(final_text, ref_bitmap)
+            _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
+        return final_text, bounded_conf
     return "", 0.0
 
 
@@ -3331,6 +4425,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
 
+    motion_cfg = _motion_prior_cfg_from_env()
+    sweep_tracker = _EXPORT_SWEEP_TRACKER
+    motion_applied = 0
+    motion_rejected = 0
+
     progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
     log_progress = progress_flag not in {"", "0", "false", "no"}
 
@@ -3349,6 +4448,26 @@ def export_jsonl_with_ocr(doc_json_path: str,
     cells_done = 0
     t0 = time.time()
     stop_due_to_limit = False
+    guard_ms = _parse_env_int("ZOCR_EXPORT_GUARD_MS", 0, 0)
+    guard_timeouts = 0
+    blank_cfg = _blank_skip_cfg_from_env()
+    blank_skipped = 0
+    schema_tables = 0
+    schema_noise_columns = 0
+    schema_rows_adjusted = 0
+    schema_cells_salvaged = 0
+    schema_cells_cleared = 0
+    total_rows_seen = 0
+    total_rows_reflowed = 0
+    total_rows_ocr_attempts = 0
+    total_rows_ocr_success = 0
+
+    doc_identifier = str(
+        doc.get("doc_id")
+        or doc.get("document_id")
+        or doc.get("id")
+        or os.path.splitext(os.path.basename(doc_json_path))[0]
+    )
 
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
@@ -3386,9 +4505,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
     total_cells = 0
     forced_cells = 0
     numeric_tables = 0
+    numeric_tables_inferred = 0
     numeric_columns_total = 0
+    numeric_columns_inferred = 0
     numeric_columns_by_kind: Counter = Counter()
     forced_fields: Counter = Counter()
+    date_tables = 0
+    date_columns_total = 0
+    date_columns_by_role: Counter = Counter()
+    date_cells_detected = 0
+    date_cells_by_role: Counter = Counter()
+    date_precision_counts: Counter = Counter()
     surprisal_threshold = (
         float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
@@ -3423,6 +4550,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 lookup_idx = pidx
             else:
                 lookup_idx = enum_idx
+            page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
             page_image = _load_page_image(page_image_path, lookup_idx)
             if page_image is None:
                 continue
@@ -3434,6 +4562,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 if not isinstance(t, dict):
                     continue
                 tables_processed += 1
+                guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
+                guard_triggered = False
+                prev_keys: Optional[List[float]] = None
+                if motion_cfg.enabled:
+                    prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -3459,6 +4592,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         yt = int(y1 + (y2-y1)*r/R)
                         yb = int(y1 + (y2-y1)*(r+1)/R)
                         row_bands.append((yt, yb))
+                if motion_cfg.enabled:
+                    row_bands_prior, applied = _apply_motion_prior_to_bands(prev_keys, row_bands, motion_cfg)
+                    if applied:
+                        row_bands = row_bands_prior
+                        motion_applied += 1
+                    elif prev_keys:
+                        motion_rejected += 1
                 R = len(row_bands)
                 if len(baselines) < R:
                     baselines.extend([[] for _ in range(R - len(baselines))])
@@ -3475,7 +4615,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 col_charset_hints: List[Optional[str]] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
                 for r in range(R):
+                    if guard_deadline and time.time() >= guard_deadline:
+                        guard_triggered = True
+                        break
                     for c in range(C):
+                        if guard_deadline and time.time() >= guard_deadline:
+                            guard_triggered = True
+                            break
                         total_cells += 1
                         cx1 = x1 + col_bounds[c]
                         cx2 = x1 + col_bounds[c+1]
@@ -3491,7 +4637,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         allowed_chars = None
                         if r > 0 and col_charset_hints and c < len(col_charset_hints):
                             allowed_chars = col_charset_hints[c]
-                        if allowed_chars and toy_runner:
+                        if blank_cfg.enabled and _should_skip_blank_crop(crop, blank_cfg):
+                            blank_skipped += 1
+                            txt, conf = "", 0.0
+                        elif allowed_chars and toy_runner:
                             txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
                         else:
                             txt, conf = ocr_runner(crop)
@@ -3509,17 +4658,46 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     if r == 0 and not col_charset_hints:
                         headers_sample = grid_text[0] if grid_text else []
                         col_charset_hints = _column_charset_hints(headers_sample)
-                    if stop_due_to_limit:
+                    if guard_triggered or stop_due_to_limit:
                         break
+                if guard_triggered:
+                    guard_timeouts += 1
+                    print(
+                        f"[WARN] [Export] guard timeout (page={page_index_int}, table={ti})",
+                        flush=True,
+                    )
+                    continue
                 if stop_due_to_limit:
                     break
+                if motion_cfg.enabled:
+                    sweep_tracker.put(
+                        doc_identifier,
+                        page_index_int,
+                        ti,
+                        _row_band_midpoints(row_bands),
+                    )
+                schema_adjust = _rectify_item_qty_amount_schema(grid_text, grid_conf, col_bounds)
+                if schema_adjust:
+                    grid_text, grid_conf, col_bounds, schema_meta = schema_adjust
+                    C = max(1, len(col_bounds) - 1)
+                    schema_tables += 1
+                    schema_noise_columns += int(schema_meta.get("noise_columns", 0))
+                    schema_rows_adjusted += int(schema_meta.get("rows_adjusted", 0))
+                    schema_cells_salvaged += int(schema_meta.get("cells_salvaged", 0))
+                    schema_cells_cleared += int(schema_meta.get("cells_cleared", 0))
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
                     if _is_total_row(grid_text[r]):
+                        total_rows_seen += 1
                         footer_rows.add(r)
+                        target_col = C - 1 if C > 0 else 0
+                        if C > 0 and _relocate_total_amount(grid_text[r], grid_conf[r], target_col):
+                            fallback_notes[(r, target_col)] = "total_realign"
+                            total_rows_reflowed += 1
                         has_numeric = any(_NUMERIC_RX.search(grid_text[r][c] or "") for c in range(C))
                         if not has_numeric and C > 0:
+                            total_rows_ocr_attempts += 1
                             target_col = C-1
                             cy1, cy2 = row_bands[r]
                             cx1 = x1 + col_bounds[target_col]
@@ -3538,14 +4716,27 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                     grid_conf[r][target_col], _normalize_confidence(alt_conf)
                                 )
                                 fallback_notes[(r, target_col)] = "footer_band"
+                                total_rows_reflowed += 1
+                                total_rows_ocr_success += 1
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
-                header_fields = _numeric_header_kinds(headers)
+                header_fields = _numeric_header_kinds(headers, grid_text)
+                inferred_columns = _NUMERIC_HEADER_INFERRED_LAST
+                date_roles = _date_header_roles(headers)
+                if date_roles and any(date_roles):
+                    date_tables += 1
+                    for role in date_roles:
+                        if role:
+                            date_columns_total += 1
+                            date_columns_by_role[role] += 1
                 if header_fields:
                     table_numeric_cols = sum(1 for kind in header_fields if kind)
                     if table_numeric_cols:
                         numeric_tables += 1
                         numeric_columns_total += table_numeric_cols
+                        if inferred_columns:
+                            numeric_tables_inferred += 1
+                            numeric_columns_inferred += inferred_columns
                         for kind in header_fields:
                             if kind:
                                 numeric_columns_by_kind[kind] += 1
@@ -3575,6 +4766,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             review_reasons.append("high_surprisal")
                             surprisal_samples += 1
                         trace_id = f"page={pidx},table={ti},row={r},col={c}"
+                        date_role = date_roles[c] if date_roles and c < len(date_roles) else None
                         filters = {
                             "has_currency": ("currency" in kws),
                             "row_index": r,
@@ -3584,6 +4776,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if r in footer_rows:
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
+                        if r > 0:
+                            date_payload = _extract_date_filters(txt, date_role)
+                        else:
+                            date_payload = None
+                        if date_payload:
+                            filters.update(date_payload)
+                            date_cells_detected += 1
+                            role_key = date_payload.get("date_role") or (date_role or "unlabeled")
+                            date_cells_by_role[role_key] += 1
+                            precision_key = date_payload.get("date_precision") or "unknown"
+                            date_precision_counts[precision_key] += 1
                         if note:
                             filters["linked"] = note
                         concepts = _conceptual_tags(txt, headers, row_texts)
@@ -3592,6 +4795,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             hypotheses = _hypothesize_from_text(txt, headers, concepts)
                         needs_review = bool(review_reasons)
                         rec = {
+                            "type": "cell",
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
                             "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
@@ -3690,11 +4894,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
     duration = time.time() - stats_start if stats_start else 0.0
     numeric_stats = {
         "tables": int(numeric_tables),
+        "tables_with_inferred": int(numeric_tables_inferred),
         "columns": int(numeric_columns_total),
+        "columns_inferred": int(numeric_columns_inferred),
         "columns_by_kind": dict(numeric_columns_by_kind),
         "forced_cells": int(forced_cells),
         "forced_fields": dict(forced_fields),
     }
+    runtime_state = toy_runtime_config()
     export_stats = {
         "ocr_engine": ocr_engine,
         "records": int(count),
@@ -3703,9 +4910,54 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "cells_total": int(total_cells),
         "duration_sec": round(duration, 3),
         "numeric": numeric_stats,
-        "toy_runtime": toy_runtime_config(),
+        "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
     }
+    if date_cells_detected or date_columns_total:
+        export_stats["date_fields"] = {
+            "tables": int(date_tables),
+            "columns": int(date_columns_total),
+            "columns_by_role": dict(date_columns_by_role),
+            "cells": int(date_cells_detected),
+            "cells_by_role": dict(date_cells_by_role),
+            "precision": dict(date_precision_counts),
+        }
+    if blank_cfg.enabled:
+        export_stats["blank_skip"] = {
+            "skipped": int(blank_skipped),
+            "ratio": float(blank_skipped / float(max(1, total_cells))),
+            "dark_threshold": int(blank_cfg.dark_threshold),
+            "min_dark_ratio": float(blank_cfg.min_dark_ratio),
+            "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        }
+    if guard_ms > 0:
+        export_stats["guard"] = {
+            "timeout_ms": int(guard_ms),
+            "timeouts": int(guard_timeouts),
+        }
+    if schema_tables:
+        export_stats["schema_alignment"] = {
+            "tables": int(schema_tables),
+            "noise_columns": int(schema_noise_columns),
+            "rows_adjusted": int(schema_rows_adjusted),
+            "cells_salvaged": int(schema_cells_salvaged),
+            "cells_cleared": int(schema_cells_cleared),
+        }
+    if total_rows_seen:
+        export_stats["total_rows"] = {
+            "rows": int(total_rows_seen),
+            "reflowed": int(total_rows_reflowed),
+            "ocr_attempts": int(total_rows_ocr_attempts),
+            "ocr_success": int(total_rows_ocr_success),
+        }
+    if motion_cfg.enabled:
+        export_stats["motion_prior"] = {
+            "sigma_px": float(motion_cfg.sigma_px),
+            "cutoff_sigma": float(motion_cfg.cutoff_sigma),
+            "accept_ratio": float(motion_cfg.accept_ratio),
+            "applied": int(motion_applied),
+            "rejected": int(motion_rejected),
+        }
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
     return count
@@ -5015,7 +6267,30 @@ DOMAIN_KW = {
     "delivery_jp": [("納品書",1.0),("数量",0.85),("品番",0.6),("受領",0.5),("出荷",0.4)],
     "delivery_en": [("delivery",1.0),("ship",0.85),("carrier",0.7),("qty",0.6),("item",0.5)],
     "estimate": [("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
-    "estimate_jp": [("見積書",1.0),("見積金額",0.85),("有効期限",0.6),("数量",0.5)],
+    "estimate_jp": [
+        ("見積書", 4.0),
+        ("御見積書", 3.6),
+        ("見積日", 2.3),
+        ("見積金額", 3.0),
+        ("御見積金額", 3.0),
+        ("御見積合計", 2.7),
+        ("合計金額", 2.4),
+        ("合計", 2.0),
+        ("総計", 1.8),
+        ("総額", 1.8),
+        ("計", 1.5),
+        ("小計", 1.6),
+        ("数量", 1.2),
+        ("単価", 1.2),
+        ("金額", 1.2),
+        ("有効期限", 2.5),
+        ("お見積有効期限", 2.3),
+        ("見積有効期限", 2.3),
+        ("納期", 1.4),
+        ("消費税", 1.5),
+        ("税込", 1.2),
+        ("税抜", 1.0),
+    ],
     "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
     "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
     "receipt_jp": [("領収書",1.0),("税込",0.8),("受領",0.6),("発行日",0.4)],
@@ -5147,6 +6422,15 @@ _DOMAIN_HEADER_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
         ("tva", 0.75),
         ("sous-total", 0.6),
     ],
+    "estimate_jp": [
+        ("見積金額", 0.9),
+        ("御見積金額", 0.9),
+        ("数量", 0.7),
+        ("単価", 0.7),
+        ("金額", 0.6),
+        ("有効期限", 0.65),
+        ("納期", 0.55),
+    ],
 }
 
 _HEADER_CONCEPT_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
@@ -5182,7 +6466,7 @@ DOMAIN_SUGGESTED_QUERIES = {
     "contract_jp_v2": ["契約期間", "甲", "乙", "締結日"],
     "contract_en": ["effective date", "party", "term", "signature"],
     "delivery_jp": ["納品日", "数量", "品番", "受領印"],
-    "estimate_jp": ["見積金額", "有効期限", "数量", "単価"],
+    "estimate_jp": ["御見積金額", "見積金額", "有効期限", "納期"],
     "receipt_jp": ["領収金額", "発行日", "支払方法", "住所"],
     "bank_statement_en": ["ending balance", "transaction", "deposit", "withdrawal"],
     "bank_statement_jp": ["残高", "入金", "出金", "取引日"],
@@ -5206,6 +6490,24 @@ DOMAIN_SUGGESTED_QUERIES = {
     "grant_application_en": ["project title", "requested amount", "milestone", "deliverable"],
     "boarding_pass_en": ["flight number", "seat", "gate", "boarding time"],
     "default": ["total amount", "date", "company", "reference number"]
+}
+
+DOMAIN_MONITOR_QUERIES = {
+    "default": {
+        "q_amount": "合計 金額 消費税 円 2023 2024 2025",
+        "q_date": "請求日 発行日 2023 2024 2025",
+        "q_due": "支払期日 支払期限 期日 支払日",
+    },
+    "contract_jp_v2": {
+        "q_amount": "契約金額 代金 支払",
+        "q_date": "契約日 締結日 開始日 終了日",
+        "q_due": "契約期間 支払期日 締結日",
+    },
+    "estimate_jp": {
+        "q_amount": "見積金額 御見積金額 御見積総額 合計 合計金額 総計 計 金額 税込 税抜 円",
+        "q_date": "見積日 発行日 作成日 提出日 2023 2024 2025",
+        "q_due": "有効期限 お見積有効期限 見積有効期限 納期 納入期限 2023 2024 2025",
+    },
 }
 
 
@@ -6452,7 +7754,7 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
         "delivery_jp":   ["納品", "数量", "品番", "伝票", "受領"],
         "delivery_en":   ["delivery", "tracking", "carrier", "qty", "item"],
         "estimate":      ["見積", "単価", "小計", "有効期限"],
-        "estimate_jp":   ["見積金額", "小計", "数量", "有効期限"],
+        "estimate_jp":   ["御見積金額", "見積金額", "有効期限", "納期"],
         "estimate_en":   ["estimate", "quote", "valid", "subtotal", "project"],
         "receipt":       ["領収", "合計", "発行日", "住所", "税込"],
         "receipt_jp":    ["領収書", "税込", "受領", "発行日", "現金"],
@@ -6813,13 +8115,17 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                     good += 1
         trust = good / len(res) if res else None
         return hit, trust
-    q_amount="合計 金額 消費税 円 2023 2024 2025"
-    q_date="請求日 発行日 2023 2024 2025"
-    q_due="支払期日 支払期限 期日 支払日"
-    if domain=="contract_jp_v2":
-        q_amount="契約金額 代金 支払"
-        q_date="契約日 締結日 開始日 終了日"
-        q_due="契約期間 支払期日 締結日"
+    domain_key = domain or "default"
+    resolved_monitor_key = _DOMAIN_ALIAS.get(domain_key, domain_key)
+    monitor_cfg = (
+        DOMAIN_MONITOR_QUERIES.get(resolved_monitor_key)
+        or DOMAIN_MONITOR_QUERIES.get(domain_key)
+        or DOMAIN_MONITOR_QUERIES["default"]
+    )
+    defaults_monitor = DOMAIN_MONITOR_QUERIES["default"]
+    q_amount = monitor_cfg.get("q_amount") or defaults_monitor["q_amount"]
+    q_date = monitor_cfg.get("q_date") or defaults_monitor["q_date"]
+    q_due = monitor_cfg.get("q_due") or defaults_monitor["q_due"]
     hit_amount, trust_amount = _score("amount", q_amount)
     hit_date, trust_date = _score("date", q_date)
     hit_due, trust_due = _score("due", q_due)
@@ -8060,6 +9366,68 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
         insights.append(msg)
 
     return insights
+
+
+def _dedupe_insights_and_queries(summary: Dict[str, Any]) -> None:
+    insights = summary.get("insights")
+    queries = summary.get("rag_suggested_queries")
+    if not insights or not queries:
+        return
+
+    def _canon(val: Any) -> Optional[str]:
+        if not isinstance(val, str):
+            return None
+        return " ".join(val.split()).strip().lower()
+
+    insight_keys = {c for c in (_canon(v) for v in insights) if c}
+    if not insight_keys:
+        return
+
+    filtered: List[Any] = []
+    for q in queries:
+        canon = _canon(q)
+        if canon and canon in insight_keys:
+            continue
+        filtered.append(q)
+    summary["rag_suggested_queries"] = filtered
+
+
+def _derive_rag_bundle_status(
+    cell_count: Optional[int],
+    table_count: Optional[int],
+    page_count: Optional[int],
+    doc_ids: Optional[List[str]] = None,
+    languages: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    def _is_positive(val: Optional[int]) -> bool:
+        try:
+            return int(val) > 0
+        except (TypeError, ValueError):
+            return False
+
+    has_cells = _is_positive(cell_count)
+    has_tables = _is_positive(table_count)
+    has_pages = _is_positive(page_count)
+    issues: List[str] = []
+    if not has_cells:
+        issues.append("no_cells")
+    if has_cells and not has_tables:
+        issues.append("no_tables")
+    if has_cells and not has_pages:
+        issues.append("no_pages")
+
+    status: Dict[str, Any] = {
+        "has_cells": has_cells,
+        "has_tables": has_tables,
+        "has_pages": has_pages,
+    }
+    if doc_ids:
+        status["doc_ids"] = doc_ids
+    if languages:
+        status["languages"] = languages
+    if issues:
+        status["issues"] = issues
+    return status
 
 def _generate_report(
     outdir: str,
@@ -10073,7 +11441,48 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
     rag_feedback: Optional[str] = None,
+    motion_prior: bool = False,
+    motion_sigma_px: Optional[float] = None,
+    motion_cutoff_sigma: Optional[float] = None,
+    motion_accept_ratio: Optional[float] = None,
+    export_guard_ms: Optional[int] = None,
+    sweeps_fixed: Optional[int] = None,
+    blank_skip: Optional[bool] = None,
+    blank_threshold: Optional[int] = None,
+    blank_min_pixels: Optional[int] = None,
+    blank_min_ratio: Optional[float] = None,
+    blank_min_area: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if sweeps_fixed is not None and sweeps_fixed > 0:
+        toy_sweeps = int(sweeps_fixed)
+        os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
+        os.environ["ZOCR_TOY_SWEEP_LIMIT"] = str(toy_sweeps)
+    if motion_prior:
+        os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1"
+    if motion_prior and motion_sigma_px is None:
+        motion_sigma_px = 10.0
+    if motion_prior and motion_cutoff_sigma is None:
+        motion_cutoff_sigma = 2.5
+    if motion_prior and motion_accept_ratio is None:
+        motion_accept_ratio = 0.6
+    if motion_sigma_px is not None:
+        os.environ["ZOCR_EXPORT_MOTION_SIGMA"] = str(motion_sigma_px)
+    if motion_cutoff_sigma is not None:
+        os.environ["ZOCR_EXPORT_MOTION_CUTOFF"] = str(motion_cutoff_sigma)
+    if motion_accept_ratio is not None:
+        os.environ["ZOCR_EXPORT_MOTION_ACCEPT"] = str(motion_accept_ratio)
+    if export_guard_ms is not None:
+        os.environ["ZOCR_EXPORT_GUARD_MS"] = str(max(0, int(export_guard_ms)))
+    if blank_skip is not None:
+        os.environ["ZOCR_EXPORT_SKIP_BLANK"] = "1" if blank_skip else "0"
+    if blank_threshold is not None:
+        os.environ["ZOCR_EXPORT_BLANK_THRESHOLD"] = str(int(blank_threshold))
+    if blank_min_pixels is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_PIXELS"] = str(int(blank_min_pixels))
+    if blank_min_ratio is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_RATIO"] = str(float(blank_min_ratio))
+    if blank_min_area is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_AREA"] = str(int(blank_min_area))
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -10387,6 +11796,10 @@ def _patched_run_full_pipeline(
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
+        os.environ.setdefault("ZOCR_EXPORT_EXT_VARIANTS", "0")
+        os.environ.setdefault("ZOCR_EXPORT_PROGRESS", "1")
+        os.environ.setdefault("ZOCR_EXPORT_LOG_EVERY", "100")
+        os.environ.setdefault("ZOCR_EXPORT_SKIP_BLANK", "1")
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
@@ -10931,9 +12344,6 @@ def _patched_run_full_pipeline(
                     json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)
             except Exception as exc:
                 print("Profile save skipped (gate streak):", exc)
-    if safety_flags:
-        summary["safety_flags"] = safety_flags
-
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
                                                      prefix=(prof.get("domain") or "invoice"))
@@ -10957,13 +12367,37 @@ def _patched_run_full_pipeline(
         summary["rag_sections"] = rag_manifest.get("sections")
         summary["rag_tables_json"] = rag_manifest.get("tables_json")
         summary["rag_markdown"] = rag_manifest.get("markdown")
+        summary["rag_cell_count"] = rag_manifest.get("cell_count")
+        summary["rag_table_count"] = rag_manifest.get("table_sections")
+        summary["rag_page_count"] = rag_manifest.get("page_sections")
+        summary["rag_languages"] = rag_manifest.get("languages")
+        summary["rag_doc_ids"] = rag_manifest.get("doc_ids")
+        summary["rag_bundle_metrics"] = {
+            "cells": rag_manifest.get("cell_count"),
+            "tables": rag_manifest.get("table_sections"),
+            "pages": rag_manifest.get("page_sections"),
+        }
+        summary["rag_bundle_status"] = _derive_rag_bundle_status(
+            rag_manifest.get("cell_count"),
+            rag_manifest.get("table_sections"),
+            rag_manifest.get("page_sections"),
+            doc_ids=rag_manifest.get("doc_ids"),
+            languages=rag_manifest.get("languages"),
+        )
         summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
         summary["rag_trace_schema"] = rag_manifest.get("trace_schema")
         summary["rag_fact_tag_example"] = rag_manifest.get("fact_tag_example")
+        _dedupe_insights_and_queries(summary)
     except Exception as e:
         print("RAG bundle export skipped:", e)
         summary["rag_trace_schema"] = summary.get("rag_trace_schema") or None
         summary["rag_fact_tag_example"] = summary.get("rag_fact_tag_example") or None
+        summary["rag_bundle_status"] = {"issues": ["export_skipped"]}
+    rag_status = summary.get("rag_bundle_status")
+    if isinstance(rag_status, dict) and rag_status.get("issues"):
+        safety_flags.setdefault("rag_bundle", rag_status)
+    if safety_flags:
+        summary["safety_flags"] = safety_flags
     _call(
         "post_rag",
         manifest=summary.get("rag_manifest"),
@@ -11262,6 +12696,78 @@ def main():
         help="Normalize numeric columns according to header heuristics",
     )
     ap.add_argument(
+        "--motion-prior",
+        action="store_true",
+        help="Enable motion prior seeding between export sweeps",
+    )
+    ap.add_argument(
+        "--motion-sigma-px",
+        type=float,
+        default=None,
+        help="Motion prior std-dev in pixels (default: 10 when enabled)",
+    )
+    ap.add_argument(
+        "--motion-cutoff-sigma",
+        type=float,
+        default=None,
+        help="Reject motion priors when deviation exceeds this multiple of sigma",
+    )
+    ap.add_argument(
+        "--motion-accept-ratio",
+        type=float,
+        default=None,
+        help="Minimum inlier ratio required to accept motion prior reseeding",
+    )
+    ap.add_argument(
+        "--export-guard-ms",
+        type=int,
+        default=15000,
+        help="Abort per-table export loops after this many milliseconds",
+    )
+    ap.add_argument(
+        "--sweeps-fixed",
+        type=int,
+        default=None,
+        help="Force toy OCR threshold sweeps to a fixed count",
+    )
+    ap.add_argument(
+        "--blank-skip",
+        dest="blank_skip",
+        action="store_true",
+        default=None,
+        help="Enable blank-cell skip heuristic during export",
+    )
+    ap.add_argument(
+        "--no-blank-skip",
+        dest="blank_skip",
+        action="store_false",
+        help="Disable blank-cell skipping",
+    )
+    ap.add_argument(
+        "--blank-threshold",
+        type=int,
+        default=None,
+        help="Grayscale threshold (0-255) for blank detection",
+    )
+    ap.add_argument(
+        "--blank-min-pixels",
+        type=int,
+        default=None,
+        help="Minimum dark pixel count required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-ratio",
+        type=float,
+        default=None,
+        help="Minimum dark pixel ratio required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-area",
+        type=int,
+        default=None,
+        help="Minimum crop area required before blank skip applies",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -11316,6 +12822,17 @@ def main():
             advisor_response=args.advisor_response,
             print_stage_trace=args.print_stage_trace,
             rag_feedback=args.rag_feedback,
+            motion_prior=args.motion_prior,
+            motion_sigma_px=args.motion_sigma_px,
+            motion_cutoff_sigma=args.motion_cutoff_sigma,
+            motion_accept_ratio=args.motion_accept_ratio,
+            export_guard_ms=args.export_guard_ms,
+            sweeps_fixed=args.sweeps_fixed,
+            blank_skip=args.blank_skip,
+            blank_threshold=args.blank_threshold,
+            blank_min_pixels=args.blank_min_pixels,
+            blank_min_ratio=args.blank_min_ratio,
+            blank_min_area=args.blank_min_area,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
