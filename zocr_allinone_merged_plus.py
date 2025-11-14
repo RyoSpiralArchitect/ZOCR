@@ -8894,6 +8894,44 @@ def _dedupe_insights_and_queries(summary: Dict[str, Any]) -> None:
         filtered.append(q)
     summary["rag_suggested_queries"] = filtered
 
+
+def _derive_rag_bundle_status(
+    cell_count: Optional[int],
+    table_count: Optional[int],
+    page_count: Optional[int],
+    doc_ids: Optional[List[str]] = None,
+    languages: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    def _is_positive(val: Optional[int]) -> bool:
+        try:
+            return int(val) > 0
+        except (TypeError, ValueError):
+            return False
+
+    has_cells = _is_positive(cell_count)
+    has_tables = _is_positive(table_count)
+    has_pages = _is_positive(page_count)
+    issues: List[str] = []
+    if not has_cells:
+        issues.append("no_cells")
+    if has_cells and not has_tables:
+        issues.append("no_tables")
+    if has_cells and not has_pages:
+        issues.append("no_pages")
+
+    status: Dict[str, Any] = {
+        "has_cells": has_cells,
+        "has_tables": has_tables,
+        "has_pages": has_pages,
+    }
+    if doc_ids:
+        status["doc_ids"] = doc_ids
+    if languages:
+        status["languages"] = languages
+    if issues:
+        status["issues"] = issues
+    return status
+
 def _generate_report(
     outdir: str,
     dest: Optional[str] = None,
@@ -11809,9 +11847,6 @@ def _patched_run_full_pipeline(
                     json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)
             except Exception as exc:
                 print("Profile save skipped (gate streak):", exc)
-    if safety_flags:
-        summary["safety_flags"] = safety_flags
-
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
                                                      prefix=(prof.get("domain") or "invoice"))
@@ -11845,6 +11880,13 @@ def _patched_run_full_pipeline(
             "tables": rag_manifest.get("table_sections"),
             "pages": rag_manifest.get("page_sections"),
         }
+        summary["rag_bundle_status"] = _derive_rag_bundle_status(
+            rag_manifest.get("cell_count"),
+            rag_manifest.get("table_sections"),
+            rag_manifest.get("page_sections"),
+            doc_ids=rag_manifest.get("doc_ids"),
+            languages=rag_manifest.get("languages"),
+        )
         summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
         summary["rag_trace_schema"] = rag_manifest.get("trace_schema")
         summary["rag_fact_tag_example"] = rag_manifest.get("fact_tag_example")
@@ -11853,6 +11895,12 @@ def _patched_run_full_pipeline(
         print("RAG bundle export skipped:", e)
         summary["rag_trace_schema"] = summary.get("rag_trace_schema") or None
         summary["rag_fact_tag_example"] = summary.get("rag_fact_tag_example") or None
+        summary["rag_bundle_status"] = {"issues": ["export_skipped"]}
+    rag_status = summary.get("rag_bundle_status")
+    if isinstance(rag_status, dict) and rag_status.get("issues"):
+        safety_flags.setdefault("rag_bundle", rag_status)
+    if safety_flags:
+        summary["safety_flags"] = safety_flags
     _call(
         "post_rag",
         manifest=summary.get("rag_manifest"),
