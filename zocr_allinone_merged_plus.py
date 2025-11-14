@@ -88,7 +88,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit, difflib
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -1603,6 +1603,9 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["template_cache_saved"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_saved", 0))
     result["template_cache_loaded"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_loaded", 0))
     result["template_cache_errors"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_errors", 0))
+    result["template_override_conf"] = int(_GLYPH_RUNTIME_STATS.get("template_override_conf", 0))
+    result["template_override_quality"] = int(_GLYPH_RUNTIME_STATS.get("template_override_quality", 0))
+    result["template_override_missing"] = int(_GLYPH_RUNTIME_STATS.get("template_override_missing", 0))
     if reset:
         reset_toy_recognition_stats()
     return result
@@ -3914,6 +3917,60 @@ def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
     _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
     return best_token, conf
 
+
+def _normalized_string_distance(a: str, b: str) -> float:
+    if not a and not b:
+        return 0.0
+    if not a or not b:
+        return 1.0
+    try:
+        matcher = difflib.SequenceMatcher(a=a, b=b)
+        ratio = matcher.ratio()
+    except Exception:
+        return 1.0 if a != b else 0.0
+    return float(max(0.0, min(1.0, 1.0 - ratio)))
+
+
+def _template_override_thresholds() -> Tuple[float, float, float, float]:
+    def _get(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    strict_delta = _get("ZOCR_TEMPLATE_OVERRIDE_DELTA", 0.05)
+    min_quality = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_QUALITY", 0.6)
+    flex_delta = _get("ZOCR_TEMPLATE_OVERRIDE_FLEX", 0.02)
+    min_diff = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_DIFF", 0.3)
+    return float(strict_delta), float(min_quality), float(flex_delta), float(min_diff)
+
+
+def _decide_template_override(
+    final_text: str,
+    final_effective_conf: float,
+    final_quality: float,
+    template_text: str,
+    template_conf: float,
+) -> str:
+    if not template_text:
+        return ""
+    strict_delta, min_quality, flex_delta, min_diff = _template_override_thresholds()
+    lexical = float(final_quality)
+    if (not lexical) and final_text:
+        lexical = _toy_text_quality(final_text)[0]
+    if not final_text:
+        return "missing"
+    if template_conf >= final_effective_conf + strict_delta:
+        return "conf"
+    if lexical < min_quality and template_conf + flex_delta >= final_effective_conf:
+        distance = _normalized_string_distance(final_text, template_text)
+        if distance >= min_diff:
+            return "quality"
+    return ""
+
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     if dx == 0 and dy == 0:
         return arr
@@ -4281,12 +4338,16 @@ def toy_ocr_text_from_cell(
     template_text, template_conf = ("", 0.0)
     if ref_bitmap is not None:
         template_text, template_conf = _match_token_template_from_cache(ref_bitmap)
-    if template_text and (template_conf > final_effective_conf + 1e-3 or not final_text):
+    override_reason = _decide_template_override(
+        final_text, final_effective_conf, final_quality, template_text, template_conf
+    )
+    if override_reason:
         final_text = template_text
         final_conf = max(final_conf, template_conf)
         final_effective_conf = max(final_effective_conf, template_conf)
         final_quality = max(final_quality, 0.95)
         _GLYPH_RUNTIME_STATS["template_matches"] += 1.0
+        _GLYPH_RUNTIME_STATS[f"template_override_{override_reason}"] += 1.0
 
     if final_text:
         coherence = _ngram_coherence(final_text)
