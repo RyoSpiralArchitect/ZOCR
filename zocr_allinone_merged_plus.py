@@ -1451,6 +1451,8 @@ def _blank_recognition_stats() -> Dict[str, Any]:
         "surprisal_sum": 0.0,
         "low_conf_cells": 0,
         "high_surprisal_cells": 0,
+        "lexical_quality_sum": 0.0,
+        "garbled_cells": 0,
         "examples": [],
     }
 
@@ -1468,13 +1470,22 @@ def reset_toy_recognition_stats() -> None:
     _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
 
 
-def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal: float) -> None:
+def _record_toy_recognition(
+    text: str,
+    conf: float,
+    coherence: float,
+    surprisal: float,
+    lexical_quality: float = 0.0,
+) -> None:
     stats = _TOY_RECOGNITION_STATS
     stats["cells"] = int(stats.get("cells", 0) + 1)
     stats["characters"] = int(stats.get("characters", 0) + len(text))
     stats["conf_sum"] = float(stats.get("conf_sum", 0.0) + float(conf))
     stats["coherence_sum"] = float(stats.get("coherence_sum", 0.0) + float(coherence))
     stats["surprisal_sum"] = float(stats.get("surprisal_sum", 0.0) + float(surprisal))
+    stats["lexical_quality_sum"] = float(
+        stats.get("lexical_quality_sum", 0.0) + float(max(0.0, min(1.5, lexical_quality)))
+    )
     if conf < 0.6:
         stats["low_conf_cells"] = int(stats.get("low_conf_cells", 0) + 1)
     if surprisal > 1.6:
@@ -1488,6 +1499,8 @@ def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal:
                 "surprisal": float(surprisal),
                 "length": len(text),
             })
+    if lexical_quality and lexical_quality < 0.55:
+        stats["garbled_cells"] = int(stats.get("garbled_cells", 0) + 1)
 
 
 def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
@@ -1501,8 +1514,10 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
         "avg_confidence": float(stats.get("conf_sum", 0.0) / cells) if cells else 0.0,
         "avg_coherence": float(stats.get("coherence_sum", 0.0) / cells) if cells else 0.0,
         "avg_surprisal": float(stats.get("surprisal_sum", 0.0) / cells) if cells else 0.0,
+        "avg_lexical_quality": float(stats.get("lexical_quality_sum", 0.0) / cells) if cells else 0.0,
         "low_conf_cells": int(stats.get("low_conf_cells", 0)),
         "high_surprisal_cells": int(stats.get("high_surprisal_cells", 0)),
+        "garbled_cells": int(stats.get("garbled_cells", 0)),
         "examples": [
             {
                 "text": ex.get("text"),
@@ -1521,6 +1536,7 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["runtime_replay_attempts"] = int(_GLYPH_RUNTIME_STATS.get("replay_attempts", 0))
     result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
     result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
+    result["lexical_penalties"] = int(_GLYPH_RUNTIME_STATS.get("lexical_penalty", 0))
     if reset:
         reset_toy_recognition_stats()
     return result
@@ -1978,6 +1994,85 @@ def _looks_like_numeric_token(text: str) -> bool:
 
 def _looks_like_upper_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
+
+
+_TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
+_TOY_NOISE_CHARS = set("?`~^|'\"¤")
+_TOY_GARBLED_PATTERN = re.compile(r"[?]{2,}|[|\\/_]{3,}|={2,}|\bfax\b", re.IGNORECASE)
+_TOY_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?(?:[¥$]\s*)?[0-9][0-9,]*(?:\.[0-9]+)?%?$")
+_TOY_CANONICAL_TOKEN_HINTS: Dict[str, float] = {
+    "item": 0.35,
+    "items": 0.28,
+    "qty": 0.30,
+    "quantity": 0.28,
+    "unitprice": 0.32,
+    "price": 0.22,
+    "amount": 0.35,
+    "total": 0.30,
+    "subtotal": 0.22,
+    "tax": 0.18,
+    "taxtotal": 0.2,
+    "estimate": 0.2,
+    "invoice": 0.18,
+    "description": 0.2,
+    "unit": 0.15,
+    "remarks": 0.18,
+    "date": 0.18,
+    "duedate": 0.24,
+    "servicedate": 0.24,
+    "shipdate": 0.18,
+    "payment": 0.2,
+    "discount": 0.2,
+    "project": 0.18,
+    "code": 0.15,
+    "client": 0.2,
+}
+
+
+def _canonicalize_toy_token(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", (text or "").lower())
+
+
+def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return 0.0, {"reason": "empty"}
+    length = len(normalized)
+    allowed = 0
+    ascii_like = 0
+    weird = 0
+    for ch in normalized:
+        if ord(ch) < 128:
+            ascii_like += 1
+        if ch.isalnum() or ch in _TOY_ALLOWED_SYMBOLS:
+            allowed += 1
+        elif ch in _TOY_NOISE_CHARS or ord(ch) >= 0x2500:
+            weird += 1
+    allowed_ratio = float(allowed) / float(length or 1)
+    weird_ratio = float(weird) / float(length or 1)
+    base = 0.4 + 0.6 * allowed_ratio
+    if ascii_like < max(1, length - 1) and not _TOY_NUMERIC_TOKEN_RE.match(normalized):
+        base *= 0.9
+    if weird_ratio > 0:
+        base *= max(0.35, 1.0 - 0.45 * weird_ratio)
+    canonical = _canonicalize_toy_token(normalized)
+    lex_boost = 1.0
+    if canonical:
+        lex_boost += _TOY_CANONICAL_TOKEN_HINTS.get(canonical, 0.0)
+    if _TOY_NUMERIC_TOKEN_RE.match(normalized):
+        lex_boost = max(lex_boost, 1.05)
+    elif len(canonical) <= 1 and canonical not in {"x", "y", "z", "a"}:
+        base *= 0.9
+    if _TOY_GARBLED_PATTERN.search(normalized):
+        base *= 0.6
+    quality = float(max(0.2, min(1.6, base * lex_boost)))
+    diag = {
+        "canonical": canonical,
+        "allowed_ratio": allowed_ratio,
+        "weird_ratio": weird_ratio,
+        "lex_boost": lex_boost,
+    }
+    return quality, diag
 
 def _ngram_probability(prev: str, ch: str) -> float:
     counts = _NGRAM_COUNTS.get(prev)
@@ -3618,22 +3713,36 @@ def toy_ocr_text_from_cell(
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
 
     candidate_scores: Dict[str, float] = {}
+    candidate_actual_conf: Dict[str, float] = {}
+    candidate_quality: Dict[str, float] = {}
     best_text, best_conf = "", 0.0
     best_meta: Optional[Dict[str, Any]] = None
     best_bw: Optional[np.ndarray] = None
+    best_effective_conf = 0.0
 
     def _evaluate_from(idx: int) -> int:
-        nonlocal best_text, best_conf, best_meta, best_bw
+        nonlocal best_text, best_conf, best_meta, best_bw, best_effective_conf
         total = len(candidates)
         for i in range(idx, total):
             bw, meta = candidates[i]
             text, conf = _text_from_binary(bw, allowed_chars=allowed_chars)
             if text:
+                lexical_quality, _ = _toy_text_quality(text)
+                candidate_quality[text] = max(candidate_quality.get(text, 0.0), float(lexical_quality))
+                candidate_actual_conf[text] = max(candidate_actual_conf.get(text, 0.0), float(conf))
+                effective_conf = float(conf) * float(lexical_quality or 1.0)
+                effective_conf = float(max(0.0, min(1.5, effective_conf)))
                 prev = candidate_scores.get(text)
-                if prev is None or conf > prev:
-                    candidate_scores[text] = conf
-            if text and conf > best_conf:
-                best_text, best_conf, best_meta, best_bw = text, conf, meta, bw
+                if prev is None or effective_conf > prev:
+                    candidate_scores[text] = effective_conf
+                if lexical_quality < 0.6:
+                    _GLYPH_RUNTIME_STATS["lexical_penalty"] += 1.0
+            else:
+                lexical_quality = 0.0
+                effective_conf = float(conf)
+            if text and effective_conf > best_effective_conf:
+                best_text, best_conf, best_meta, best_bw = text, float(conf), meta, bw
+                best_effective_conf = effective_conf
         return total
 
     _evaluate_from(0)
@@ -3655,21 +3764,47 @@ def toy_ocr_text_from_cell(
         _threshold_memory_store(key, int(best_meta["thr"]))
 
     final_text, final_conf = best_text, best_conf
+    final_effective_conf = best_effective_conf
+    final_quality = candidate_quality.get(final_text, 0.0)
     if candidate_scores:
         reranked_text, reranked_conf = _contextual_rerank_candidates(candidate_scores)
         if reranked_text:
-            if reranked_conf >= final_conf - 1e-6:
+            reranked_actual = candidate_actual_conf.get(reranked_text, reranked_conf)
+            reranked_quality = candidate_quality.get(reranked_text, 0.0)
+            if reranked_quality <= 0.0 and reranked_text:
+                reranked_quality, _ = _toy_text_quality(reranked_text)
+            if (
+                reranked_conf > final_effective_conf + 1e-6
+                or (
+                    abs(reranked_conf - final_effective_conf) <= 1e-6
+                    and reranked_actual > final_conf
+                )
+            ):
                 final_text = reranked_text
-                final_conf = max(final_conf, reranked_conf)
+                final_conf = float(reranked_actual)
+                final_quality = reranked_quality
+                final_effective_conf = reranked_conf
             elif not final_text:
-                final_text, final_conf = reranked_text, reranked_conf
+                final_text = reranked_text
+                final_conf = float(reranked_actual)
+                final_quality = reranked_quality
+                final_effective_conf = reranked_conf
 
     if final_text:
         coherence = _ngram_coherence(final_text)
         surprisal = _ngram_surprisal(final_text)
-        _record_toy_recognition(final_text, float(final_conf), coherence, surprisal)
+        if final_quality <= 0.0:
+            final_quality, _ = _toy_text_quality(final_text)
+        bounded_conf = float(max(0.0, min(1.0, final_conf)))
+        _record_toy_recognition(
+            final_text,
+            bounded_conf,
+            coherence,
+            surprisal,
+            lexical_quality=float(max(0.0, min(1.6, final_quality))),
+        )
         _update_ngram_model(final_text)
-        return final_text, float(max(0.0, min(1.0, final_conf)))
+        return final_text, bounded_conf
     return "", 0.0
 
 
