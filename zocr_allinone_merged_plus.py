@@ -11835,6 +11835,16 @@ def _patched_run_full_pipeline(
         summary["rag_sections"] = rag_manifest.get("sections")
         summary["rag_tables_json"] = rag_manifest.get("tables_json")
         summary["rag_markdown"] = rag_manifest.get("markdown")
+        summary["rag_cell_count"] = rag_manifest.get("cell_count")
+        summary["rag_table_count"] = rag_manifest.get("table_sections")
+        summary["rag_page_count"] = rag_manifest.get("page_sections")
+        summary["rag_languages"] = rag_manifest.get("languages")
+        summary["rag_doc_ids"] = rag_manifest.get("doc_ids")
+        summary["rag_bundle_metrics"] = {
+            "cells": rag_manifest.get("cell_count"),
+            "tables": rag_manifest.get("table_sections"),
+            "pages": rag_manifest.get("page_sections"),
+        }
         summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
         summary["rag_trace_schema"] = rag_manifest.get("trace_schema")
         summary["rag_fact_tag_example"] = rag_manifest.get("fact_tag_example")
