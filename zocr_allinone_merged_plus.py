@@ -3944,6 +3944,596 @@ def _rectify_item_qty_amount_schema(
     return new_text, new_conf, new_bounds, stats
 
 
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    strategy = "header"
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
+    }
+    return new_text, new_conf, new_bounds, stats
+
+
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    strategy = "header"
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
+    }
+    return new_text, new_conf, new_bounds, stats
+
+
 def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
     if not headers or not _FORCE_NUMERIC:
         return []
@@ -4637,6 +5227,21 @@ def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
     _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
     return best_token, conf
 
+def _observe_token_template(token: str, arr: Any) -> None:
+    if not token:
+        return
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[token] = dq
+    dq.append(norm)
+    _TEMPLATE_CACHE_STATE["dirty"] = True
+    _update_template_variant_stats()
 
 def _normalized_string_distance(a: str, b: str) -> float:
     if not a and not b:
