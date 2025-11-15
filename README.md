@@ -11,11 +11,28 @@ zocr/
   consensus/zocr_consensus.py    # OCR + table reconstruction helpers
   core/zocr_core.py              # augmentation, BM25, monitoring, SQL & RAG export
   orchestrator/zocr_pipeline.py  # CLI pipeline orchestrator + resume/watchdog/reporting
+  diff/                          # semantic diff engine (see zocr/diff/README.md)
 samples/
   demo_inputs/                   # place your PDFs/PNGs here for quick demos
 README.md
 zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```
+
+### Semantic diff overview / セマンティック差分概要 / Aperçu du diff sémantique
+- **[JA]** `zocr.diff` は `cells.jsonl` / `sections.jsonl` を比較してイベントJSON・.diff・HTMLを生成します。`python -m zocr.diff --a out/A --b out/B` のように実行ディレクトリを渡せます。構成や詳細は [`zocr/diff/README.md`](zocr/diff/README.md) を参照してください。
+- **[EN]** `zocr.diff` compares `cells.jsonl` / `sections.jsonl` to emit JSON events plus unified-text and HTML reports. You can point it at run directories via `python -m zocr.diff --a out/A --b out/B`; see [`zocr/diff/README.md`](zocr/diff/README.md) for layout and CLI details.
+- **[FR]** `zocr.diff` compare `cells.jsonl` / `sections.jsonl` afin de produire des événements JSON, un diff texte et un rapport HTML. Il suffit de cibler les dossiers d’exécution avec `python -m zocr.diff --a out/A --b out/B`. L’architecture et l’exemple complet figurent dans [`zocr/diff/README.md`](zocr/diff/README.md).
+- **[JA]** `--out_plan` / orchestrator の `run_diff` は `assist_plan.json` を併せて吐き出し、差分イベントを再解析キュー・RAG 補助・プロファイル調整に分割します（`intent.action="reanalyze_cells"` の自動発火にも利用可）。
+- **[EN]** The CLI and `run_diff` helper can also emit `assist_plan.json` via `--out_plan`, splitting events into reanalysis queues, downstream RAG follow-ups, and profile tweaks so the pipeline can fire `intent.action="reanalyze_cells"` without hand wiring.
+- **[FR]** La CLI et `run_diff` exportent en option `assist_plan.json` (`--out_plan`), qui ventile les événements entre file de réanalyse, suivi RAG et ajustements de profil pour déclencher automatiquement `intent.action="reanalyze_cells"`.
+- **[JA]** `assist_plan.json` には `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` が入っており、請求書・契約・物流に加えて医療・保険・製造・コンプラなどのハンドオフ文章を diff 専用テンプレで LLM に渡せます。
+- **[EN]** Each assist plan entry now carries `domain_tags`, an LLM-friendly `llm_directive`, aggregated `domain_briefings`, and batched `handoff_packets`, so invoice/contract/logistics plus healthcare/insurance/manufacturing/compliance helpers receive diff-specific prompts instantly.
+- **[FR]** Chaque plan d’assistance expose désormais `domain_tags`, `llm_directive`, `domain_briefings` et `handoff_packets`, offrant des consignes prêtes à l’emploi aux assistants facture/contrat/logistique ainsi qu’aux équipes santé/assurance/fabrication/conformité.
+
+#### Frontier & identity / フロンティアと技術的アイデンティティ / Frontière et identité
+- **[JA]** AI 市場にはまだ「請求書や法務文書を意味構造ごと差分化する」製品が存在せず、`zocr.diff` のように表×節×filters を束ねて比較できる基盤は希少です。ここを押さえることで Z-OCR 全体の技術的アイデンティティを形成でき、請求書ドメイン等で運用済みの下流 RAG／再解析ループへも即接続できます。
+- **[EN]** The AI market still lacks semantic diff tooling that understands invoices, legal decks, CAD-like tables, and business specs at the structural level. Owning this frontier with `zocr.diff` turns the pipeline into a recognizable identity play while letting us reuse the existing invoice-domain RAG + reanalysis feedback loops for downstream support agents.
+- **[FR]** Le marché IA ne dispose toujours pas d’un diff sémantique capable de traiter factures, documents juridiques, tableaux CAD ou spécifications métier au niveau structurel. En maîtrisant cette frontière via `zocr.diff`, la suite forge une identité technique claire et réutilise les boucles RAG/réanalyse déjà éprouvées sur les domaines facturation pour épauler les agents en aval.
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash
