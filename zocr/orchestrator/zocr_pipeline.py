@@ -3545,6 +3545,48 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
