@@ -3217,10 +3217,19 @@ _ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
 
 
 def _schema_normalize_header_token(text: Optional[str]) -> str:
-    if not text:
+    if text is None:
         return ""
-    body = re.sub(r"[^a-z0-9]+", "", str(text).lower())
-    return body
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
 
 
 def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
@@ -4830,6 +4839,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         return max(minimum, value)
 
     log_every = max(1, _parse_env_int("ZOCR_EXPORT_LOG_EVERY", 200, 1))
+    flush_every = max(0, _parse_env_int("ZOCR_EXPORT_FLUSH_EVERY", 200, 0))
     max_cells = _parse_env_int("ZOCR_EXPORT_MAX_CELLS", 0, 0)
     cells_done = 0
     t0 = time.time()
@@ -4940,6 +4950,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         print(f"[Export] engine={ocr_engine} pages={len(pages)} ~cells={est_cells}", flush=True)
 
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
+        records_written = 0
         for enum_idx, p in enumerate(pages):
             if stop_due_to_limit:
                 break
@@ -5300,6 +5311,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if note:
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        records_written += 1
+                        if flush_every and (records_written % flush_every == 0):
+                            fw.flush()
                         count += 1
                 if log_progress:
                     fw.flush()
@@ -5359,6 +5373,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "numeric": numeric_stats,
         "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
+        "flush_every": int(flush_every),
     }
     if date_cells_detected or date_columns_total:
         export_stats["date_fields"] = {
