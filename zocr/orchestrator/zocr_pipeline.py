@@ -3519,65 +3519,71 @@ def _patched_run_full_pipeline(
     autotune_count = _positive_cli_value(autotune_trials)
 
     if autocalib_count:
-        auto_calib_fn = getattr(zocr_onefile_consensus, "auto_calibrate_params", None)
-        if callable(auto_calib_fn):
+        def _run_autocalib_stage() -> Dict[str, Any]:
+            status: Dict[str, Any] = {"samples": int(autocalib_count)}
+            updates: Dict[str, Any] = {}
+            auto_calib_fn = getattr(zocr_onefile_consensus, "auto_calibrate_params", None)
+            if not callable(auto_calib_fn):
+                status["status"] = "unavailable"
+                return {"status": status, "updates": updates}
             try:
                 calib_cfg = auto_calib_fn(pages, autocalib_count) or {}
-                if isinstance(calib_cfg, dict) and calib_cfg:
-                    table_params.update(calib_cfg)
-                    table_autocalib_status = {
-                        "status": "applied",
-                        "samples": int(autocalib_count),
-                        "keys": sorted(calib_cfg.keys()),
-                    }
-                else:
-                    table_autocalib_status = {
-                        "status": "no_change",
-                        "samples": int(autocalib_count),
-                    }
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover - defensive log path
                 print(f"[WARN] Auto-calibration failed: {exc}")
-                table_autocalib_status = {
-                    "status": "error",
-                    "samples": int(autocalib_count),
-                    "error": str(exc),
-                }
-        else:
-            table_autocalib_status = {
-                "status": "unavailable",
-                "samples": int(autocalib_count),
-            }
+                status["status"] = "error"
+                status["error"] = str(exc)
+                return {"status": status, "updates": updates}
+            if isinstance(calib_cfg, dict) and calib_cfg:
+                updates = calib_cfg
+                status["status"] = "applied"
+                status["keys"] = sorted(calib_cfg.keys())
+            else:
+                status["status"] = "no_change"
+            return {"status": status, "updates": updates}
+
+        calib_stage = _safe_step(f"AutoCalib ({autocalib_count})", _run_autocalib_stage)
+        payload = calib_stage.get("out") if isinstance(calib_stage, dict) else None
+        if isinstance(payload, dict):
+            status = payload.get("status")
+            updates = payload.get("updates")
+            if isinstance(status, dict):
+                table_autocalib_status = status
+            if isinstance(updates, dict) and updates:
+                table_params.update(updates)
 
     if autotune_count:
-        autotune_fn = getattr(zocr_onefile_consensus, "autotune_params", None)
-        if callable(autotune_fn):
+        def _run_autotune_stage() -> Dict[str, Any]:
+            status: Dict[str, Any] = {"trials": int(autotune_count)}
+            updates: Dict[str, Any] = {}
+            autotune_fn = getattr(zocr_onefile_consensus, "autotune_params", None)
+            if not callable(autotune_fn):
+                status["status"] = "unavailable"
+                return {"status": status, "updates": updates}
             try:
                 base_for_tune = table_params.copy()
                 tuned_cfg = autotune_fn(pages, base_for_tune, trials=autotune_count) or {}
-                if isinstance(tuned_cfg, dict) and tuned_cfg:
-                    table_params.update(tuned_cfg)
-                    table_autotune_status = {
-                        "status": "applied",
-                        "trials": int(autotune_count),
-                        "keys": sorted(tuned_cfg.keys()),
-                    }
-                else:
-                    table_autotune_status = {
-                        "status": "no_change",
-                        "trials": int(autotune_count),
-                    }
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover - defensive log path
                 print(f"[WARN] Autotune failed: {exc}")
-                table_autotune_status = {
-                    "status": "error",
-                    "trials": int(autotune_count),
-                    "error": str(exc),
-                }
-        else:
-            table_autotune_status = {
-                "status": "unavailable",
-                "trials": int(autotune_count),
-            }
+                status["status"] = "error"
+                status["error"] = str(exc)
+                return {"status": status, "updates": updates}
+            if isinstance(tuned_cfg, dict) and tuned_cfg:
+                updates = tuned_cfg
+                status["status"] = "applied"
+                status["keys"] = sorted(tuned_cfg.keys())
+            else:
+                status["status"] = "no_change"
+            return {"status": status, "updates": updates}
+
+        tune_stage = _safe_step(f"AutoTune ({autotune_count})", _run_autotune_stage)
+        payload = tune_stage.get("out") if isinstance(tune_stage, dict) else None
+        if isinstance(payload, dict):
+            status = payload.get("status")
+            updates = payload.get("updates")
+            if isinstance(status, dict):
+                table_autotune_status = status
+            if isinstance(updates, dict) and updates:
+                table_params.update(updates)
 
     pipe_cfg = {"table": table_params, "bench_iterations": 1, "eval": False}
     pipe = zocr_onefile_consensus.Pipeline(pipe_cfg)
@@ -3965,6 +3971,38 @@ def _patched_run_full_pipeline(
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
     bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
