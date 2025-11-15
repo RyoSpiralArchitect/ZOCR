@@ -93,6 +93,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Ma
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
 
+try:  # pragma: no cover - optional built-in tesslite bundle
+    from zocr.resources import tesslite_defaults as _tesslite_defaults  # type: ignore
+except Exception:  # pragma: no cover - when the package resources are missing
+    _tesslite_defaults = None  # type: ignore
+
 try:
     import numpy as np
 except Exception:
@@ -2083,6 +2088,13 @@ class _TessLiteModel:
 
 _TESSLITE_MODEL: Optional[_TessLiteModel] = None
 _TESSLITE_MODEL_SIG: Optional[str] = None
+_TESSLITE_LAST_SOURCE: str = "none"
+
+_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v1"
+if _tesslite_defaults is not None:
+    _TESSLITE_BUILTIN_SIGNATURE = str(
+        getattr(_tesslite_defaults, "DEFAULT_SIGNATURE", _TESSLITE_BUILTIN_SIGNATURE)
+    )
 
 
 def _tesslite_env_signature() -> str:
@@ -2102,6 +2114,59 @@ def _tesslite_env_signature() -> str:
         except Exception:
             stats.append(f"{path}:missing")
     return "|".join(stats)
+
+
+def _tesslite_builtin_available() -> bool:
+    disable = os.environ.get("ZOCR_TESSLITE_DISABLE_BUILTIN", "").strip().lower()
+    if disable in {"1", "true", "yes", "on"}:
+        return False
+    return bool(
+        _tesslite_defaults
+        and getattr(_tesslite_defaults, "DEFAULT_GLYPHS", None)
+        and len(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", [])) > 0
+    )
+
+
+def _tesslite_builtin_payload() -> Tuple[
+    Set[str],
+    Dict[str, Set[str]],
+    Dict[str, str],
+    Set[str],
+    Dict[str, Dict[str, float]],
+]:
+    glyphs: Set[str] = set()
+    ambiguous: Dict[str, Set[str]] = defaultdict(set)
+    categories: Dict[str, str] = {}
+    dictionary: Set[str] = set()
+    bigrams: Dict[str, Dict[str, float]] = {}
+    if not _tesslite_builtin_available():
+        return glyphs, ambiguous, categories, dictionary, bigrams
+    glyphs.update(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", []))
+    for src, targets in getattr(_tesslite_defaults, "DEFAULT_AMBIGUOUS", {}).items():
+        if not targets:
+            continue
+        ambiguous[src].update(targets)
+    categories.update(getattr(_tesslite_defaults, "DEFAULT_CHAR_CATEGORIES", {}))
+    dictionary.update(getattr(_tesslite_defaults, "DEFAULT_DICTIONARY", []))
+    raw_bigrams = getattr(_tesslite_defaults, "DEFAULT_BIGRAMS", {})
+    if isinstance(raw_bigrams, dict):
+        for prev, mapping in raw_bigrams.items():
+            if not isinstance(mapping, dict):
+                continue
+            bigrams[prev] = {str(ch): float(val) for ch, val in mapping.items() if isinstance(val, (int, float))}
+    return glyphs, ambiguous, categories, dictionary, bigrams
+
+
+def _tesslite_effective_source() -> Tuple[bool, str, bool]:
+    unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
+    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
+    env_supplied = any([unichar, wordlist, bigram])
+    if env_supplied:
+        return True, _tesslite_env_signature(), False
+    if _tesslite_builtin_available():
+        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}", True
+    return False, "", False
 
 
 def _decode_unichar_token(token: str) -> str:
@@ -2209,20 +2274,24 @@ def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
 
 
 def _get_tesslite_model() -> Optional[_TessLiteModel]:
-    global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG
-    signature = _tesslite_env_signature()
-    if not signature.strip("|-"):
+    global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG, _TESSLITE_LAST_SOURCE
+    enabled, signature, use_builtin = _tesslite_effective_source()
+    if not enabled:
         _TESSLITE_MODEL = None
         _TESSLITE_MODEL_SIG = None
+        _TESSLITE_LAST_SOURCE = "none"
         return None
     if _TESSLITE_MODEL is not None and signature == _TESSLITE_MODEL_SIG:
         return _TESSLITE_MODEL
-    unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
-    word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
-    bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
-    glyphs, ambiguous, categories = _load_unicharset(unichar_path)
-    dictionary = _load_wordlist(word_path)
-    bigrams = _load_bigram_json(bigram_path)
+    if use_builtin:
+        glyphs, ambiguous, categories, dictionary, bigrams = _tesslite_builtin_payload()
+    else:
+        unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+        word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
+        bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
+        glyphs, ambiguous, categories = _load_unicharset(unichar_path)
+        dictionary = _load_wordlist(word_path)
+        bigrams = _load_bigram_json(bigram_path)
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
@@ -2235,7 +2304,24 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
     )
     _TESSLITE_MODEL = model
     _TESSLITE_MODEL_SIG = signature
+    _TESSLITE_LAST_SOURCE = "builtin" if use_builtin else "env"
     return model
+
+
+def get_tesslite_status() -> Dict[str, Any]:
+    enabled, signature, use_builtin = _tesslite_effective_source()
+    unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
+    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
+    source = "builtin" if use_builtin else ("env" if enabled else "none")
+    return {
+        "enabled": bool(enabled),
+        "signature": signature or None,
+        "source": source,
+        "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
+        "wordlist": wordlist if wordlist else ("builtin" if use_builtin else None),
+        "bigram_json": bigram if bigram else ("builtin" if use_builtin else None),
+    }
 
 
 def _tesslite_unknown_ratio(model: _TessLiteModel, text: str) -> float:
@@ -2939,7 +3025,7 @@ _EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
 
 
 def _motion_prior_cfg_from_env() -> MotionPriorCfg:
-    cfg = MotionPriorCfg(enabled=_env_flag("ZOCR_EXPORT_MOTION_PRIOR", False))
+    cfg = MotionPriorCfg(enabled=_env_flag("ZOCR_EXPORT_MOTION_PRIOR", True))
     if cfg.enabled:
         sigma = _env_float("ZOCR_EXPORT_MOTION_SIGMA", cfg.sigma_px)
         cutoff = _env_float("ZOCR_EXPORT_MOTION_CUTOFF", cfg.cutoff_sigma)
@@ -4534,6 +4620,301 @@ def _rectify_item_qty_amount_schema(
     return new_text, new_conf, new_bounds, stats
 
 
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    strategy = "header"
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
+    }
+    return new_text, new_conf, new_bounds, stats
+
+
 def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
     if not headers or not _FORCE_NUMERIC:
         return []
@@ -5227,6 +5608,19 @@ def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
     _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
     return best_token, conf
 
+
+def _normalized_string_distance(a: str, b: str) -> float:
+    if not a and not b:
+        return 0.0
+    if not a or not b:
+        return 1.0
+    try:
+        matcher = difflib.SequenceMatcher(a=a, b=b)
+        ratio = matcher.ratio()
+    except Exception:
+        return 1.0 if a != b else 0.0
+    return float(max(0.0, min(1.0, 1.0 - ratio)))
+
 def _observe_token_template(token: str, arr: Any) -> None:
     if not token:
         return
@@ -5254,7 +5648,6 @@ def _normalized_string_distance(a: str, b: str) -> float:
     except Exception:
         return 1.0 if a != b else 0.0
     return float(max(0.0, min(1.0, 1.0 - ratio)))
-
 
 def _template_override_thresholds() -> Tuple[float, float, float, float]:
     def _get(name: str, default: float) -> float:
@@ -13238,7 +13631,7 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
     rag_feedback: Optional[str] = None,
-    motion_prior: bool = False,
+    motion_prior: Optional[bool] = None,
     motion_sigma_px: Optional[float] = None,
     motion_cutoff_sigma: Optional[float] = None,
     motion_accept_ratio: Optional[float] = None,
@@ -13258,8 +13651,9 @@ def _patched_run_full_pipeline(
         toy_sweeps = int(sweeps_fixed)
         os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
         os.environ["ZOCR_TOY_SWEEP_LIMIT"] = str(toy_sweeps)
-    if motion_prior:
-        os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1"
+    if motion_prior is None:
+        motion_prior = True
+    os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1" if motion_prior else "0"
     if motion_prior and motion_sigma_px is None:
         motion_sigma_px = 10.0
     if motion_prior and motion_cutoff_sigma is None:
@@ -13520,15 +13914,14 @@ def _patched_run_full_pipeline(
         "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
         "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
     }
-    if any(tesslite_cfg.values()):
-        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
-        signature = sig_fn() if callable(sig_fn) else None
-        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
-        tesslite_summary["signature"] = signature
-        tesslite_summary["enabled"] = True
-        summary["tesslite"] = tesslite_summary
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
     else:
-        summary["tesslite"] = {"enabled": False}
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
 
     episode_info = _begin_episode(outdir)
     if episode_info:
@@ -14538,8 +14931,16 @@ def main():
     )
     ap.add_argument(
         "--motion-prior",
+        dest="motion_prior",
         action="store_true",
-        help="Enable motion prior seeding between export sweeps",
+        default=None,
+        help="Force-enable motion prior seeding between export sweeps",
+    )
+    ap.add_argument(
+        "--no-motion-prior",
+        dest="motion_prior",
+        action="store_false",
+        help="Disable motion prior reseeding",
     )
     ap.add_argument(
         "--motion-sigma-px",

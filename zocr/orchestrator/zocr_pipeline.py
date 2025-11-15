@@ -3267,7 +3267,7 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
     rag_feedback: Optional[str] = None,
-    motion_prior: bool = False,
+    motion_prior: Optional[bool] = None,
     motion_sigma_px: Optional[float] = None,
     motion_cutoff_sigma: Optional[float] = None,
     motion_accept_ratio: Optional[float] = None,
@@ -3287,8 +3287,9 @@ def _patched_run_full_pipeline(
         toy_sweeps = int(sweeps_fixed)
         os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
         os.environ["ZOCR_TOY_SWEEP_LIMIT"] = str(toy_sweeps)
-    if motion_prior:
-        os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1"
+    if motion_prior is None:
+        motion_prior = True
+    os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1" if motion_prior else "0"
     if motion_prior and motion_sigma_px is None:
         motion_sigma_px = 10.0
     if motion_prior and motion_cutoff_sigma is None:
@@ -3582,6 +3583,24 @@ def _patched_run_full_pipeline(
         summary["tesslite"] = tesslite_summary
     else:
         summary["tesslite"] = {"enabled": False}
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
     bandit: Optional[PriorBandit] = None
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
@@ -4614,8 +4633,16 @@ def main():
     )
     ap.add_argument(
         "--motion-prior",
+        dest="motion_prior",
         action="store_true",
-        help="Enable motion prior seeding between export sweeps",
+        default=None,
+        help="Force-enable motion prior seeding between export sweeps",
+    )
+    ap.add_argument(
+        "--no-motion-prior",
+        dest="motion_prior",
+        action="store_false",
+        help="Disable motion prior reseeding",
     )
     ap.add_argument(
         "--motion-sigma-px",

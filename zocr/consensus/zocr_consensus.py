@@ -19,6 +19,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Ma
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
 
+try:  # pragma: no cover - optional built-in tesslite tables
+    from ..resources import tesslite_defaults as _tesslite_defaults  # type: ignore
+except Exception:  # pragma: no cover - fallback when package data is unavailable
+    _tesslite_defaults = None  # type: ignore
+
 try:
     import numpy as np
 except Exception:
@@ -1328,7 +1333,7 @@ _EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
 
 
 def _motion_prior_cfg_from_env() -> MotionPriorCfg:
-    enabled = _env_flag("ZOCR_EXPORT_MOTION_PRIOR", False) or _env_flag("ZOCR_USE_PRIOR", False)
+    enabled = _env_flag("ZOCR_EXPORT_MOTION_PRIOR", True) or _env_flag("ZOCR_USE_PRIOR", False)
     cfg = MotionPriorCfg(enabled=enabled)
     cfg.table_signature = os.environ.get("ZOCR_TABLE_SIGNATURE")
     cfg.cache_dir = os.environ.get("ZOCR_PRIOR_CACHE")
@@ -2437,6 +2442,54 @@ class _TessLiteModel:
 
 _TESSLITE_MODEL: Optional[_TessLiteModel] = None
 _TESSLITE_MODEL_SIG: Optional[str] = None
+_TESSLITE_LAST_SOURCE: str = "none"
+
+_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v1"
+if _tesslite_defaults is not None:
+    _TESSLITE_BUILTIN_SIGNATURE = str(
+        getattr(_tesslite_defaults, "DEFAULT_SIGNATURE", _TESSLITE_BUILTIN_SIGNATURE)
+    )
+
+
+def _tesslite_builtin_available() -> bool:
+    disable = os.environ.get("ZOCR_TESSLITE_DISABLE_BUILTIN", "").strip().lower()
+    if disable in {"1", "true", "yes", "on"}:
+        return False
+    return bool(
+        _tesslite_defaults
+        and getattr(_tesslite_defaults, "DEFAULT_GLYPHS", None)
+        and len(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", [])) > 0
+    )
+
+
+def _tesslite_builtin_payload() -> Tuple[
+    Set[str],
+    Dict[str, Set[str]],
+    Dict[str, str],
+    Set[str],
+    Dict[str, Dict[str, float]],
+]:
+    glyphs: Set[str] = set()
+    ambiguous: Dict[str, Set[str]] = defaultdict(set)
+    categories: Dict[str, str] = {}
+    dictionary: Set[str] = set()
+    bigrams: Dict[str, Dict[str, float]] = {}
+    if not _tesslite_builtin_available():
+        return glyphs, ambiguous, categories, dictionary, bigrams
+    glyphs.update(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", []))
+    for src, targets in getattr(_tesslite_defaults, "DEFAULT_AMBIGUOUS", {}).items():
+        if not targets:
+            continue
+        ambiguous[src].update(targets)
+    categories.update(getattr(_tesslite_defaults, "DEFAULT_CHAR_CATEGORIES", {}))
+    dictionary.update(getattr(_tesslite_defaults, "DEFAULT_DICTIONARY", []))
+    raw_bigrams = getattr(_tesslite_defaults, "DEFAULT_BIGRAMS", {})
+    if isinstance(raw_bigrams, dict):
+        for prev, mapping in raw_bigrams.items():
+            if not isinstance(mapping, dict):
+                continue
+            bigrams[prev] = {str(ch): float(val) for ch, val in mapping.items() if isinstance(val, (int, float))}
+    return glyphs, ambiguous, categories, dictionary, bigrams
 
 
 def _tesslite_env_signature() -> str:
@@ -2456,6 +2509,18 @@ def _tesslite_env_signature() -> str:
         except Exception:
             stats.append(f"{path}:missing")
     return "|".join(stats)
+
+
+def _tesslite_effective_source() -> Tuple[bool, str, bool]:
+    unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
+    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
+    env_supplied = any([unichar, wordlist, bigram])
+    if env_supplied:
+        return True, _tesslite_env_signature(), False
+    if _tesslite_builtin_available():
+        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}", True
+    return False, "", False
 
 
 def _decode_unichar_token(token: str) -> str:
@@ -2563,20 +2628,24 @@ def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
 
 
 def _get_tesslite_model() -> Optional[_TessLiteModel]:
-    global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG
-    signature = _tesslite_env_signature()
-    if not signature.strip("|-"):
+    global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG, _TESSLITE_LAST_SOURCE
+    enabled, signature, use_builtin = _tesslite_effective_source()
+    if not enabled:
         _TESSLITE_MODEL = None
         _TESSLITE_MODEL_SIG = None
+        _TESSLITE_LAST_SOURCE = "none"
         return None
     if _TESSLITE_MODEL is not None and signature == _TESSLITE_MODEL_SIG:
         return _TESSLITE_MODEL
-    unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
-    word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
-    bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
-    glyphs, ambiguous, categories = _load_unicharset(unichar_path)
-    dictionary = _load_wordlist(word_path)
-    bigrams = _load_bigram_json(bigram_path)
+    if use_builtin:
+        glyphs, ambiguous, categories, dictionary, bigrams = _tesslite_builtin_payload()
+    else:
+        unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+        word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
+        bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
+        glyphs, ambiguous, categories = _load_unicharset(unichar_path)
+        dictionary = _load_wordlist(word_path)
+        bigrams = _load_bigram_json(bigram_path)
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
@@ -2589,7 +2658,24 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
     )
     _TESSLITE_MODEL = model
     _TESSLITE_MODEL_SIG = signature
+    _TESSLITE_LAST_SOURCE = "builtin" if use_builtin else "env"
     return model
+
+
+def get_tesslite_status() -> Dict[str, Any]:
+    enabled, signature, use_builtin = _tesslite_effective_source()
+    unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
+    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
+    source = "builtin" if use_builtin else ("env" if enabled else "none")
+    return {
+        "enabled": bool(enabled),
+        "signature": signature or None,
+        "source": source,
+        "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
+        "wordlist": wordlist if wordlist else ("builtin" if use_builtin else None),
+        "bigram_json": bigram if bigram else ("builtin" if use_builtin else None),
+    }
 
 
 def _tesslite_unknown_ratio(model: _TessLiteModel, text: str) -> float:
