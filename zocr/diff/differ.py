@@ -75,6 +75,17 @@ def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
 
 
+def clip_preview(text: Optional[str], limit: int = 160) -> Optional[str]:
+    if not text:
+        return None
+    clean = norm_text(text)
+    if not clean:
+        return None
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1] + "…"
+
+
 # --------- データ抽出 ---------
 @dataclass
 class Cell:
@@ -119,6 +130,8 @@ class TableView:
     row_keys: List[str]
     row_meta: Dict[str, RowMeta]
     column_signatures: Dict[int, str]
+    page: int
+    table_index: int
 
 
 @dataclass
@@ -128,6 +141,30 @@ class SectionEntry:
     page: Optional[int]
     order: int
     trace_id: Optional[str]
+
+
+def table_context(table: TableView) -> Dict[str, Any]:
+    return {
+        "table_id": table.id_hint,
+        "table_page": table.page,
+        "table_index": table.table_index,
+        "table_rows": len(table.row_keys),
+        "table_columns": len(table.headers),
+    }
+
+
+def row_meta_fields(meta: Optional[RowMeta], prefix: str = "") -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    if not meta:
+        return data
+    preview = clip_preview(meta.signature)
+    if preview:
+        data[f"{prefix}row_preview"] = preview
+    if meta.ids:
+        data[f"{prefix}row_ids"] = meta.ids
+    if meta.dates:
+        data[f"{prefix}row_dates"] = meta.dates
+    return data
 
 
 def normalize_filter_value(value: Any) -> Optional[str]:
@@ -246,6 +283,8 @@ def build_tables(cells: List[Cell]) -> Dict[str, TableView]:
             row_keys=row_keys,
             row_meta=row_meta,
             column_signatures=column_signatures,
+            page=page,
+            table_index=t_idx,
         )
     return tables
 
@@ -503,6 +542,17 @@ class SemanticDiffer:
         events: List[dict] = []
         col_map = match_columns(a, b)
 
+        def add_row_event(table: TableView, row_key: str, event_type: str, row_side: str) -> None:
+            payload: Dict[str, Any] = {"type": event_type, **table_context(table)}
+            payload["row_key"] = row_key
+            if row_side.upper() == "A":
+                payload["row_key_a"] = row_key
+            else:
+                payload["row_key_b"] = row_key
+            payload["row_origin"] = row_side.upper()
+            payload.update(row_meta_fields(table.row_meta.get(row_key)))
+            events.append(payload)
+
         for ai, ah in enumerate(a.headers):
             if ai in col_map:
                 bi = col_map[ai]
@@ -532,9 +582,9 @@ class SemanticDiffer:
 
         row_pairs, row_added, row_removed = match_rows(a, b, col_map)
         for rk in row_added:
-            events.append({"type": "row_added", "table_id": a.id_hint, "row_key": rk})
+            add_row_event(b, rk, "row_added", row_side="B")
         for rk in row_removed:
-            events.append({"type": "row_removed", "table_id": a.id_hint, "row_key": rk})
+            add_row_event(a, rk, "row_removed", row_side="A")
 
         for ra, rb in row_pairs:
             a_row = a.rows.get(ra, {})
@@ -550,11 +600,15 @@ class SemanticDiffer:
                 diff = self.compare_cells(a_cell, b_cell)
                 if diff:
                     diff.update({
-                        "table_id": a.id_hint,
+                        **table_context(a),
                         "row_key": ra,
+                        "row_key_a": ra,
+                        "row_key_b": rb,
                         "a_col": ai,
                         "b_col": bi,
                     })
+                    diff.update(row_meta_fields(a.row_meta.get(ra), prefix="a_"))
+                    diff.update(row_meta_fields(b.row_meta.get(rb), prefix="b_"))
                     events.append(diff)
 
             # handle B-only columns that were not mapped
@@ -562,11 +616,15 @@ class SemanticDiffer:
                 diff = self.compare_cells(None, b_row.get(bi))
                 if diff:
                     diff.update({
-                        "table_id": a.id_hint,
+                        **table_context(a),
                         "row_key": ra,
+                        "row_key_a": ra,
+                        "row_key_b": rb,
                         "a_col": None,
                         "b_col": bi,
                     })
+                    diff.update(row_meta_fields(a.row_meta.get(ra), prefix="a_"))
+                    diff.update(row_meta_fields(b.row_meta.get(rb), prefix="b_"))
                     events.append(diff)
         return events
 
@@ -665,9 +723,9 @@ class SemanticDiffer:
 
         events: List[dict] = []
         for b_id in added:
-            events.append({"type": "table_added", "table_id": b_id})
+            events.append({"type": "table_added", **table_context(tables_b[b_id])})
         for a_id in removed:
-            events.append({"type": "table_removed", "table_id": a_id})
+            events.append({"type": "table_removed", **table_context(tables_a[a_id])})
 
         for a_id, b_id in pairs:
             ev = self.compare_tables(tables_a[a_id], tables_b[b_id])
