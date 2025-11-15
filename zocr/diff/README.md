@@ -54,9 +54,9 @@ python -m zocr.diff \
 - **[JA]** `assist_plan.json` は `reanalyze_queue` / `rag_followups` / `profile_actions` を含み、各エントリに行プレビューや `trace_id` を付与するため、Slack/Teams 通知や `intent.action="reanalyze_cells"` トリガにそのまま使えます。
 - **[EN]** `assist_plan.json` groups recommendations into `reanalyze_queue`, `rag_followups`, and `profile_actions` while preserving row previews plus `trace_id`s so it can feed Slack/Teams digests or fire `intent.action="reanalyze_cells"` automatically.
 - **[FR]** `assist_plan.json` regroupe les recommandations (`reanalyze_queue`, `rag_followups`, `profile_actions`) avec aperçus de lignes et `trace_id`, prêt à déclencher `intent.action="reanalyze_cells"` ou à nourrir des notifications Slack/Teams.
-- **[JA]** さらに `domain_tags` / `llm_directive` / `domain_briefings` により、請求書・契約・物流など各ドメイン向けのハンドオフ文章を LLM に直接渡せます。
-- **[EN]** Each entry also exposes `domain_tags`, an LLM-oriented `llm_directive`, and top-level `domain_briefings`, so invoice, contract, or logistics assistants get tailored instructions straight from the diff output.
-- **[FR]** Chaque entrée inclut désormais `domain_tags`, une `llm_directive` pour les LLM ainsi que des `domain_briefings`, afin que les assistants factures/contrats/logistique disposent d’instructions adaptées dès la sortie du diff.
+- **[JA]** さらに `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` があり、請求書・契約・物流だけでなく医療・保険・製造・エネルギー・コンプラなど各ドメイン専用のハンドオフを diff テンプレ付きで生成します。
+- **[EN]** Each entry also exposes `domain_tags`, an LLM-oriented `llm_directive`, aggregated `domain_briefings`, and consolidated `handoff_packets`, so invoice/contract/logistics plus healthcare/insurance/manufacturing/energy/compliance assistants receive bespoke prompts from the diff feed.
+- **[FR]** Chaque entrée inclut désormais `domain_tags`, une `llm_directive`, des `domain_briefings` et des `handoff_packets`, livrant des consignes spécialisées pour les domaines facture/contrat/logistique mais aussi santé/assurance/fabrication/énergie/conformité directement depuis le diff.
 
 ## なぜ小さく保てるか / Why the implementation stays small / Pourquoi si peu de code suffit
 1. **構造化セル情報 / Structured cell context / Contexte cellulaire structuré** – 各レコードにページ・表・行列・テキスト・filters・`trace_id` が揃っているため、再OCRではなく構造合わせに集中できます。

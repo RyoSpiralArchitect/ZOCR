@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import count
 from typing import Any, Dict, List, Optional, Tuple
 
 DOMAIN_PATTERNS: Dict[str, List[str]] = {
@@ -92,6 +93,69 @@ DOMAIN_PATTERNS: Dict[str, List[str]] = {
         "benefit",
         "compensation",
     ],
+    "insurance": [
+        "policy",
+        "claim",
+        "premium",
+        "coverage",
+        "insurer",
+        "insured",
+        "deductible",
+        "損害",
+        "保険",
+        "保険金",
+        "保障",
+    ],
+    "healthcare": [
+        "patient",
+        "medical",
+        "clinical",
+        "診療",
+        "薬価",
+        "treatment",
+        "provider",
+        "hospital",
+        "icd",
+        "cpt",
+    ],
+    "manufacturing": [
+        "bom",
+        "bill of materials",
+        "assembly",
+        "sku",
+        "part",
+        "lot",
+        "製造",
+        "工程",
+        "工番",
+        "line",
+    ],
+    "energy": [
+        "power",
+        "utility",
+        "generation",
+        "grid",
+        "kwh",
+        "mw",
+        "pipeline",
+        "oil",
+        "gas",
+        "emission",
+        "carbon",
+    ],
+    "compliance": [
+        "audit",
+        "compliance",
+        "risk",
+        "control",
+        "penalty",
+        "violation",
+        "gdpr",
+        "sox",
+        "policy",
+        "規制",
+        "監査",
+    ],
 }
 
 DOMAIN_SUMMARY_NOTES: Dict[str, str] = {
@@ -102,6 +166,11 @@ DOMAIN_SUMMARY_NOTES: Dict[str, str] = {
     "finance": "Banking / statement update – enumerate transaction IDs and balance impacts.",
     "legal": "Legal memorandum shift – mention clause titles and compliance owners.",
     "hr": "HR / payroll change – reference employee identifiers and pay-period context.",
+    "insurance": "Insurance policy or claim drift – call out policy numbers, coverage caps, and payout amounts.",
+    "healthcare": "Healthcare/clinical diff – cite patient IDs, treatment codes, and physician sign-offs.",
+    "manufacturing": "Manufacturing/BOM change – list affected part numbers, assembly steps, and lot IDs.",
+    "energy": "Energy/utility adjustment – highlight meter IDs, generation totals, and emission factors.",
+    "compliance": "Compliance/audit variance – mention control IDs, audit steps, and deadlines.",
     "general": "General structured document – keep row/table context and cite trace IDs for quick reopening.",
 }
 
@@ -113,6 +182,11 @@ DOMAIN_DIRECTIVES: Dict[str, str] = {
     "finance": "List affected transaction IDs and the before/after balances.",
     "legal": "Cite the article/title that moved and whether its level changed.",
     "hr": "Mention employee identifiers and pay-period spans for HR reruns.",
+    "insurance": "Reference policy numbers, claim IDs, coverage limits, and payout figures.",
+    "healthcare": "Point to patient IDs, encounter dates, and treatment/procedure codes.",
+    "manufacturing": "Surface BOM lines, part numbers, quantities, and assembly stage changes.",
+    "energy": "List meter IDs, generation/consumption deltas, and emission metrics.",
+    "compliance": "Tie the change back to control IDs, regulatory clauses, and due dates.",
     "general": "Stick to the table context and include trace IDs so downstream LLMs can reopen the snippet.",
 }
 
@@ -154,11 +228,16 @@ class DiffAssistPlanner:
         rag = _Bucket("rag_followups", [])
         profile = _Bucket("profile_actions", [])
         domain_counter: Dict[str, int] = defaultdict(int)
+        seq = count(1)
 
         def _bump(tags: List[str]) -> None:
             if not tags:
                 return
             domain_counter[tags[0]] += 1
+
+        def _assign(entry: Dict[str, Any]) -> Dict[str, Any]:
+            entry["entry_id"] = f"entry_{next(seq)}"
+            return entry
 
         for event in events:
             etype = event.get("type")
@@ -169,19 +248,19 @@ class DiffAssistPlanner:
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=severity)
                 _bump(tags)
                 if severity == "high":
-                    reanalyze.add(entry, self.max_items_per_bucket)
+                    reanalyze.add(_assign(entry), self.max_items_per_bucket)
                 else:
-                    rag.add(entry, self.max_items_per_bucket)
+                    rag.add(_assign(entry), self.max_items_per_bucket)
             elif etype in {"row_added", "row_removed", "table_added", "table_removed", "section_added", "section_removed"}:
                 entry = self._basic_entry(event, action="rag_followup", reason=self._row_or_table_reason(event))
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=None)
                 _bump(tags)
-                rag.add(entry, self.max_items_per_bucket)
+                rag.add(_assign(entry), self.max_items_per_bucket)
             elif etype in {"header_renamed", "col_moved", "section_title_changed", "section_level_changed"}:
                 entry = self._basic_entry(event, action="profile_update", reason=self._profile_reason(event))
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=None)
                 _bump(tags)
-                profile.add(entry, self.max_items_per_bucket)
+                profile.add(_assign(entry), self.max_items_per_bucket)
 
         summary = {
             "events": len(events),
@@ -194,12 +273,14 @@ class DiffAssistPlanner:
             summary["primary_domain"] = domain_briefings[0]["domain"]
         elif domain_counter:
             summary["primary_domain"] = max(domain_counter.items(), key=lambda kv: kv[1])[0]
+        packets = self._build_handoff_packets([reanalyze, rag, profile])
         return {
             "summary": summary,
             "reanalyze_queue": reanalyze.entries,
             "rag_followups": rag.entries,
             "profile_actions": profile.entries,
             "domain_briefings": domain_briefings,
+            "handoff_packets": packets,
         }
 
     # ------------------------------------------------------------------
@@ -485,3 +566,81 @@ class DiffAssistPlanner:
                 }
             )
         return briefings[:5]
+
+    def _build_handoff_packets(self, buckets: List[_Bucket]) -> List[Dict[str, Any]]:
+        groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+        for bucket in buckets:
+            for entry in bucket.entries:
+                domain = (entry.get("domain_tags") or ["general"])[0]
+                groups[(domain, entry.get("action", "rag_followup"))].append(entry)
+
+        packets: List[Dict[str, Any]] = []
+        for (domain, action), entries in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1])):
+            summary_note = DOMAIN_SUMMARY_NOTES.get(domain, DOMAIN_SUMMARY_NOTES["general"])
+            action_hint = LLM_ACTION_GUIDANCE.get(action, "")
+            sample_refs = self._sample_entry_refs(entries)
+            llm_prompt = self._packet_prompt(domain, action, entries, summary_note, action_hint, sample_refs)
+            packets.append(
+                {
+                    "domain": domain,
+                    "action": action,
+                    "count": len(entries),
+                    "summary": summary_note,
+                    "action_hint": action_hint,
+                    "sample_refs": sample_refs,
+                    "llm_prompt": llm_prompt,
+                    "entry_ids": [entry.get("entry_id") for entry in entries],
+                }
+            )
+        return packets[:20]
+
+    def _sample_entry_refs(self, entries: List[Dict[str, Any]], limit: int = 8) -> List[str]:
+        refs: List[str] = []
+        for entry in entries:
+            ref = (
+                entry.get("row_key")
+                or entry.get("row_key_b")
+                or entry.get("row_key_a")
+                or entry.get("title")
+                or entry.get("table_header_preview")
+                or entry.get("reason")
+            )
+            if ref:
+                refs.append(str(ref))
+            if len(refs) >= limit:
+                break
+        return refs
+
+    def _packet_prompt(
+        self,
+        domain: str,
+        action: str,
+        entries: List[Dict[str, Any]],
+        summary_note: str,
+        action_hint: str,
+        sample_refs: List[str],
+    ) -> str:
+        bullet_lines: List[str] = []
+        for entry in entries[: min(5, len(entries))]:
+            ref = entry.get("row_key") or entry.get("row_key_b") or entry.get("title") or entry.get("reason")
+            delta = []
+            if entry.get("numeric_delta") is not None:
+                delta.append(f"Δ={entry['numeric_delta']:+g}")
+            if entry.get("relative_delta") is not None:
+                try:
+                    delta.append(f"rΔ={float(entry['relative_delta']):+.2%}")
+                except (TypeError, ValueError):
+                    pass
+            if entry.get("reason"):
+                delta.append(entry["reason"])
+            delta_text = ", ".join(delta)
+            bullet_lines.append(f"- {ref or entry.get('event_type')} {delta_text}".strip())
+        sample_blob = "; ".join(sample_refs) if sample_refs else ""
+        parts = [
+            f"Domain: {domain} ({summary_note})",
+            f"Action: {action}.",
+            action_hint,
+            "Focus rows/sections: " + sample_blob if sample_blob else "",
+            "Key deltas:\n" + "\n".join(bullet_lines) if bullet_lines else "",
+        ]
+        return "\n".join(part for part in parts if part).strip()
