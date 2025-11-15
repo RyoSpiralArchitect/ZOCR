@@ -624,21 +624,27 @@ def _align_row_band_centers(row_bands: List[Tuple[int, int]], height: int, med_h
 
 def _refine_row_bands_by_projection(
     row_bands: List[Tuple[int, int]], binary: "np.ndarray", med_h: float, height: int
-) -> List[Tuple[int, int]]:
+) -> Tuple[List[Tuple[int, int]], Dict[str, int]]:
+    stats = {
+        "segments": 0,
+        "valley_splits": 0,
+        "merged": 0,
+    }
     if not row_bands:
-        return row_bands
+        return row_bands, stats
     try:
         proj = (np.asarray(binary, dtype=np.uint8) > 0).sum(axis=1).astype(np.float64)
     except Exception:
-        return row_bands
+        return row_bands, stats
     if proj.size == 0:
-        return row_bands
+        return row_bands, stats
     kernel = np.ones(5, dtype=np.float64)
     kernel /= float(kernel.sum() or 1.0)
     smooth = np.convolve(proj, kernel, mode="same")
     refined: List[Tuple[int, int]] = []
     min_gap = int(max(2, med_h * 0.35))
     for y0, y1 in row_bands:
+        stats["segments"] += 1
         if y1 - y0 <= 0:
             continue
         segment = smooth[y0:y1]
@@ -646,6 +652,7 @@ def _refine_row_bands_by_projection(
             thr = float(min(np.percentile(segment, 40), np.mean(segment) * 0.7))
             valleys = _find_projection_valleys(segment, thr, min_gap)
             if valleys:
+                stats["valley_splits"] += len(valleys)
                 points = [y0] + [y0 + v for v in valleys] + [y1]
                 for a, b in zip(points, points[1:]):
                     if b - a >= max(2, int(med_h * 0.45)):
@@ -658,9 +665,12 @@ def _refine_row_bands_by_projection(
             prev = merged[-1]
             if band[0] - prev[1] <= med_h * 0.25:
                 merged[-1] = (prev[0], max(prev[1], band[1]))
+                stats["merged"] += 1
                 continue
         merged.append(band)
-    return _align_row_band_centers(merged, height, med_h)
+    aligned = _align_row_band_centers(merged, height, med_h)
+    stats["refined"] = len(aligned)
+    return aligned, stats
 
 # ----------------- Column smoothing (D²-like + λ scheduling) -----------------
 def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
@@ -1001,7 +1011,8 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 row_bands.append((max(0, int(start-1)), H))
     if not row_bands:
         row_bands.append((0, H))
-    row_bands = _refine_row_bands_by_projection(row_bands, bin_img, med_h, H)
+    row_bands_raw = list(row_bands)
+    row_bands, row_proj_stats = _refine_row_bands_by_projection(row_bands, bin_img, med_h, H)
     # per-row chunks & counts
     chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
     row_counts=[len(row) for row in chunks_by_row]
@@ -1037,6 +1048,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 gap=row[i+1][0]-row[i][2]
                 if gap>1.6*mw: mids.append(int((row[i][2]+row[i+1][0])/2.0))
         candidates_by_row.append(mids)
+    candidates_initial = [list(row) for row in candidates_by_row]
     global_mid_seeds: List[int] = []
     if len(btree_seed) >= 2:
         global_mid_seeds.extend(int((btree_seed[i]+btree_seed[i+1])/2.0) for i in range(len(btree_seed)-1))
@@ -1057,6 +1069,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         candidates_by_row = merged_rows
     continuity_tol = int(max(3, med_w * 0.35))
     candidates_by_row = _apply_column_continuity_prior(candidates_by_row, tolerance=continuity_tol)
+    candidates_after = [list(row) for row in candidates_by_row]
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
     col_bounds = _refine_column_bounds_alignment(col_bounds)
@@ -1168,16 +1181,38 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
             crop = imc.crop((xl,yt,xr,yb))
             name = f"cell_r{r0}_c{c0}_s{st}"
             views_cells[name] = _make_views(crop, vdir, name)
+    row_diag = {
+        "initial_bands": int(len(row_bands_raw)),
+        "refined_bands": int(len(row_bands)),
+        "projection_splits": int(row_proj_stats.get("valley_splits", 0)) if isinstance(row_proj_stats, dict) else 0,
+        "segments": int(row_proj_stats.get("segments", 0)) if isinstance(row_proj_stats, dict) else 0,
+        "merged": int(row_proj_stats.get("merged", 0)) if isinstance(row_proj_stats, dict) else 0,
+    }
     row_bands_rel = [
         (int(max(0, min(H, yt))), int(max(0, min(H, yb))))
         for (yt, yb) in row_bands
     ]
+    column_diag = {
+        "btree_seed": len(btree_seed),
+        "dp_centers": len(centers),
+        "vertical_votes": len(vertical_votes),
+        "global_mid_seeds": len({int(v) for v in global_mid_seeds}) if global_mid_seeds else 0,
+        "continuity_tol": continuity_tol,
+        "candidates_initial": sum(len(r) for r in candidates_initial),
+        "candidates_final": sum(len(r) for r in candidates_after),
+        "rows_with_candidates": sum(1 for r in candidates_after if r),
+    }
+    segmentation_stats = {
+        "row": row_diag,
+        "column": column_diag,
+    }
     dbg = {
         "rows":R,"cols":C,"row_counts": row_counts,
         "col_bounds":col_bounds,"smear_wx": wx, "smear_wy": wy,
         "med_h": med_h, "col_jitter": col_jitter,
         "baselines_segs": baselines,
         "row_bands_rel": row_bands_rel,
+        "segmentation_stats": segmentation_stats,
         "lambda": {"lambda_base": lam_base, "lambda_eff": lam_eff,
                    "k_pred0": K_pred0, "k_mode": K_mode, "k_pred": len(centers)},
         "iou_prob_events": iou_events[:200],
@@ -5940,6 +5975,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
             return default
         return max(minimum, value)
 
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
     log_every = max(1, _parse_env_int("ZOCR_EXPORT_LOG_EVERY", 200, 1))
     flush_every = max(0, _parse_env_int("ZOCR_EXPORT_FLUSH_EVERY", 200, 0))
     max_cells = _parse_env_int("ZOCR_EXPORT_MAX_CELLS", 0, 0)
@@ -5969,6 +6010,18 @@ def export_jsonl_with_ocr(doc_json_path: str,
     total_rows_reflowed = 0
     total_rows_ocr_attempts = 0
     total_rows_ocr_success = 0
+    seg_tables = 0
+    seg_row_initial = 0
+    seg_row_final = 0
+    seg_row_splits = 0
+    seg_row_merged = 0
+    seg_col_btree = 0
+    seg_col_dp = 0
+    seg_col_votes = 0
+    seg_col_mid = 0
+    seg_col_candidates_initial = 0
+    seg_col_candidates_final = 0
+    seg_rows_with_candidates = 0
 
     doc_identifier = str(
         doc.get("doc_id")
@@ -5980,6 +6033,33 @@ def export_jsonl_with_ocr(doc_json_path: str,
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
         pages = []
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        for table in page.get("tables", []) or []:
+            if not isinstance(table, dict):
+                continue
+            dbg = table.get("dbg")
+            if not isinstance(dbg, dict):
+                continue
+            seg_dbg = dbg.get("segmentation_stats")
+            if not isinstance(seg_dbg, dict):
+                continue
+            seg_tables += 1
+            row_diag = seg_dbg.get("row") or {}
+            col_diag = seg_dbg.get("column") or {}
+            seg_row_initial += _safe_int(row_diag.get("initial_bands"))
+            seg_row_final += _safe_int(row_diag.get("refined_bands"))
+            seg_row_splits += _safe_int(row_diag.get("projection_splits"))
+            seg_row_merged += _safe_int(row_diag.get("merged"))
+            seg_col_btree += _safe_int(col_diag.get("btree_seed"))
+            seg_col_dp += _safe_int(col_diag.get("dp_centers"))
+            seg_col_votes += _safe_int(col_diag.get("vertical_votes"))
+            seg_col_mid += _safe_int(col_diag.get("global_mid_seeds"))
+            seg_col_candidates_initial += _safe_int(col_diag.get("candidates_initial"))
+            seg_col_candidates_final += _safe_int(col_diag.get("candidates_final"))
+            seg_rows_with_candidates += _safe_int(col_diag.get("rows_with_candidates"))
 
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
@@ -6538,6 +6618,22 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "reflowed": int(total_rows_reflowed),
             "ocr_attempts": int(total_rows_ocr_attempts),
             "ocr_success": int(total_rows_ocr_success),
+        }
+    if seg_tables:
+        inv_tables = 1.0 / float(max(1, seg_tables))
+        export_stats["segmentation"] = {
+            "tables": int(seg_tables),
+            "row_initial_mean": round(seg_row_initial * inv_tables, 3),
+            "row_final_mean": round(seg_row_final * inv_tables, 3),
+            "row_projection_splits_mean": round(seg_row_splits * inv_tables, 3),
+            "row_merged_mean": round(seg_row_merged * inv_tables, 3),
+            "column_btree_mean": round(seg_col_btree * inv_tables, 3),
+            "column_dp_mean": round(seg_col_dp * inv_tables, 3),
+            "column_vertical_votes_mean": round(seg_col_votes * inv_tables, 3),
+            "column_mid_seed_mean": round(seg_col_mid * inv_tables, 3),
+            "column_candidates_initial_mean": round(seg_col_candidates_initial * inv_tables, 3),
+            "column_candidates_final_mean": round(seg_col_candidates_final * inv_tables, 3),
+            "rows_with_candidates_mean": round(seg_rows_with_candidates * inv_tables, 3),
         }
     if motion_cfg.enabled:
         export_stats["motion_prior"] = {
