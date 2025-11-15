@@ -121,6 +121,23 @@ def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
+def _json_ready(obj: Any):
+    """Best-effort conversion of numpy/complex objects into JSON-safe values."""
+
+    if isinstance(obj, dict):
+        return {k: _json_ready(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(v) for v in obj]
+    if isinstance(obj, set):
+        return [_json_ready(v) for v in obj]
+    if np is not None:
+        if isinstance(obj, np.generic):  # type: ignore[attr-defined]
+            return obj.item()
+        if isinstance(obj, np.ndarray):  # type: ignore[attr-defined]
+            return obj.tolist()
+    return obj
+
+
 def _toy_memory_series_paths(path: str) -> Tuple[str, str]:
     base_dir = os.environ.get("ZOCR_TOY_MEMORY_SERIES")
     if base_dir:
