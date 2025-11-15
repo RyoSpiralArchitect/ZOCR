@@ -2097,9 +2097,132 @@ _TOY_CANONICAL_TOKEN_HINTS: Dict[str, float] = {
     "client": 0.2,
 }
 
+_JP_TOKEN_STRIP_RE = re.compile(r"[\s\u3000・／/\\\-＿ー－〜~、。\.\[\](){}<>：:；;]+")
+_JP_HONORIFIC_PREFIXES = ("御", "お", "ご")
+_JP_JIS_MARKERS = set("様殿各位行宛先｣『』【】")
+_JP_TOKEN_SUFFIX_HINTS: Dict[str, float] = {
+    "金額": 0.22,
+    "見積金額": 0.3,
+    "御見積金額": 0.3,
+    "御見積書": 0.32,
+    "見積書": 0.32,
+    "合計": 0.26,
+    "小計": 0.22,
+    "数量": 0.22,
+    "単価": 0.22,
+    "金額(税込)": 0.25,
+    "金額(税抜)": 0.24,
+    "税抜金額": 0.24,
+    "税込金額": 0.25,
+    "税額": 0.22,
+    "消費税": 0.24,
+    "納期": 0.2,
+    "有効期限": 0.22,
+    "見積日": 0.22,
+    "発行日": 0.2,
+    "支払期日": 0.22,
+}
+_TOY_JP_TOKEN_HINTS: Dict[str, float] = {
+    "見積書": 0.35,
+    "御見積書": 0.35,
+    "見積金額": 0.34,
+    "御見積金額": 0.34,
+    "金額": 0.26,
+    "合計": 0.3,
+    "総計": 0.28,
+    "小計": 0.25,
+    "消費税": 0.25,
+    "税込": 0.2,
+    "税抜": 0.2,
+    "税率": 0.18,
+    "数量": 0.25,
+    "品名": 0.22,
+    "単価": 0.25,
+    "金額(税込)": 0.28,
+    "金額(税抜)": 0.28,
+    "単価(税込)": 0.23,
+    "単価(税抜)": 0.23,
+    "摘要": 0.22,
+    "備考": 0.18,
+    "見積日": 0.23,
+    "有効期限": 0.24,
+    "納期": 0.23,
+    "発行日": 0.2,
+    "支払期日": 0.23,
+    "請求日": 0.2,
+    "お支払期限": 0.24,
+}
+
 
 def _canonicalize_toy_token(text: str) -> str:
     return re.sub(r"[^0-9a-z]", "", (text or "").lower())
+
+
+def _japanese_script_profile(text: str) -> Dict[str, float]:
+    counts = {
+        "kanji": 0,
+        "hiragana": 0,
+        "katakana": 0,
+        "latin": 0,
+        "digit": 0,
+        "other": 0,
+    }
+    total = len(text or "")
+    for ch in text or "":
+        code = ord(ch)
+        if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+            counts["kanji"] += 1
+        elif 0x3040 <= code <= 0x309F:
+            counts["hiragana"] += 1
+        elif 0x30A0 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
+            counts["katakana"] += 1
+        elif 0x0030 <= code <= 0x0039 or 0xFF10 <= code <= 0xFF19:
+            counts["digit"] += 1
+        elif 0x0041 <= code <= 0x005A or 0x0061 <= code <= 0x007A or 0xFF21 <= code <= 0xFF3A or 0xFF41 <= code <= 0xFF5A:
+            counts["latin"] += 1
+        else:
+            counts["other"] += 1
+    jp_chars = counts["kanji"] + counts["hiragana"] + counts["katakana"]
+    profile: Dict[str, float] = {k: float(v) for k, v in counts.items()}
+    profile["jp_chars"] = float(jp_chars)
+    profile["total_chars"] = float(total)
+    profile["jp_ratio"] = float(jp_chars) / float(total or 1)
+    profile["kanji_ratio"] = float(counts["kanji"]) / float(total or 1)
+    profile["kana_ratio"] = float(counts["hiragana"] + counts["katakana"]) / float(total or 1)
+    profile["latin_ratio"] = float(counts["latin"]) / float(total or 1)
+    return profile
+
+
+def _normalize_japanese_token(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = _JP_TOKEN_STRIP_RE.sub("", normalized)
+    for prefix in _JP_HONORIFIC_PREFIXES:
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            normalized = normalized[len(prefix) :]
+    if normalized and normalized[0] in _JP_JIS_MARKERS:
+        normalized = normalized[1:]
+    return normalized
+
+
+def _japanese_token_hint(text: str, profile: Dict[str, float]) -> Tuple[float, str]:
+    normalized = _normalize_japanese_token(text)
+    if not normalized:
+        return 0.0, ""
+    boost = _TOY_JP_TOKEN_HINTS.get(normalized, 0.0)
+    reason = "dict" if boost else ""
+    if not boost:
+        for suffix, bonus in _JP_TOKEN_SUFFIX_HINTS.items():
+            if normalized.endswith(suffix) and len(normalized) >= len(suffix) + 1:
+                boost = max(boost, bonus)
+                reason = f"suffix:{suffix}"
+                break
+    if not boost and profile.get("kana_ratio", 0.0) > 0.6 and profile.get("kanji_ratio", 0.0) < 0.1:
+        boost = 0.05
+        reason = "kana_balance"
+    elif not boost and profile.get("kanji_ratio", 0.0) >= 0.45:
+        boost = 0.05
+        reason = "kanji_balance"
+    return float(min(0.5, boost)), reason
 
 
 def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
@@ -2110,6 +2233,7 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
     allowed = 0
     ascii_like = 0
     weird = 0
+    jp_profile = _japanese_script_profile(normalized)
     for ch in normalized:
         if ord(ch) < 128:
             ascii_like += 1
@@ -2120,7 +2244,10 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
     allowed_ratio = float(allowed) / float(length or 1)
     weird_ratio = float(weird) / float(length or 1)
     base = 0.4 + 0.6 * allowed_ratio
-    if ascii_like < max(1, length - 1) and not _TOY_NUMERIC_TOKEN_RE.match(normalized):
+    ascii_penalty = ascii_like < max(1, length - 1) and not _TOY_NUMERIC_TOKEN_RE.match(normalized)
+    if ascii_penalty and jp_profile.get("jp_ratio", 0.0) > 0.35:
+        ascii_penalty = False
+    if ascii_penalty:
         base *= 0.9
     if weird_ratio > 0:
         base *= max(0.35, 1.0 - 0.45 * weird_ratio)
@@ -2132,6 +2259,9 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
         lex_boost = max(lex_boost, 1.05)
     elif len(canonical) <= 1 and canonical not in {"x", "y", "z", "a"}:
         base *= 0.9
+    jp_boost, jp_reason = _japanese_token_hint(normalized, jp_profile)
+    if jp_boost:
+        lex_boost += jp_boost
     if _TOY_GARBLED_PATTERN.search(normalized):
         base *= 0.6
     quality = float(max(0.2, min(1.6, base * lex_boost)))
@@ -2140,6 +2270,9 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
         "allowed_ratio": allowed_ratio,
         "weird_ratio": weird_ratio,
         "lex_boost": lex_boost,
+        "jp_ratio": jp_profile.get("jp_ratio", 0.0),
+        "jp_hint": jp_boost,
+        "jp_hint_reason": jp_reason,
     }
     return quality, diag
 
