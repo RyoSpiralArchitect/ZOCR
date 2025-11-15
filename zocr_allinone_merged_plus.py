@@ -2097,6 +2097,37 @@ _TOY_CANONICAL_TOKEN_HINTS: Dict[str, float] = {
     "client": 0.2,
 }
 
+_LEXICAL_CONF_CANONICAL_HINTS: Dict[str, str] = {
+    "item": "item",
+    "items": "item",
+    "description": "item",
+    "qty": "qty",
+    "quantity": "qty",
+    "unit": "qty",
+    "unitprice": "unit_price",
+    "price": "unit_price",
+    "amount": "amount",
+    "subtotal": "subtotal",
+    "total": "total",
+    "taxtotal": "tax",
+    "tax": "tax",
+}
+
+_LEXICAL_CONF_JP_HINTS: Dict[str, str] = {
+    "見積金額": "amount",
+    "御見積金額": "amount",
+    "数量": "qty",
+    "数量合計": "qty",
+    "単価": "unit_price",
+    "金額": "amount",
+    "小計": "subtotal",
+    "合計": "total",
+    "総計": "total",
+    "消費税": "tax",
+    "税込": "total",
+    "税抜": "subtotal",
+}
+
 _JP_TOKEN_STRIP_RE = re.compile(r"[\s\u3000・／/\\\-＿ー－〜~、。\.\[\](){}<>：:；;]+")
 _JP_HONORIFIC_PREFIXES = ("御", "お", "ご")
 _JP_JIS_MARKERS = set("様殿各位行宛先｣『』【】")
@@ -2574,6 +2605,11 @@ class _ConfidenceBoostConfig:
 
 
 @dataclass
+class _LexicalBoostConfig(_ConfidenceBoostConfig):
+    min_quality: float = 0.85
+
+
+@dataclass
 class _ExportSweepTracker:
     prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
 
@@ -2632,6 +2668,19 @@ def _confidence_boost_cfg_from_env() -> _ConfidenceBoostConfig:
     return cfg
 
 
+def _lexical_boost_cfg_from_env() -> _LexicalBoostConfig:
+    cfg = _LexicalBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_LEXICAL", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_LEXICAL_TARGET", cfg.target))))
+    cfg.min_input = float(
+        max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_INPUT", cfg.min_input)))
+    )
+    cfg.min_quality = float(
+        max(0.0, min(1.5, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_QUALITY", cfg.min_quality)))
+    )
+    return cfg
+
+
 def _apply_confidence_boost(
     conf: Optional[float], cfg: _ConfidenceBoostConfig
 ) -> Tuple[Optional[float], float]:
@@ -2650,6 +2699,30 @@ def _confidence_boost_reason(payload: Optional[Dict[str, Any]]) -> str:
     for key in ("amount", "subtotal", "tax_amount", "unit_price", "qty", "tax_rate"):
         if key in payload:
             return key
+    return ""
+
+
+def _lexical_confidence_reason(
+    text: Optional[str],
+    lexical_diag: Dict[str, Any],
+    min_quality: float,
+    quality: float,
+) -> str:
+    if not text or quality < min_quality:
+        return ""
+    canonical = (lexical_diag.get("canonical") or "").strip()
+    if canonical:
+        hint = _LEXICAL_CONF_CANONICAL_HINTS.get(canonical)
+        if hint:
+            return f"lexical:{hint}"
+    normalized_jp = _normalize_japanese_token(text)
+    if normalized_jp:
+        hint = _LEXICAL_CONF_JP_HINTS.get(normalized_jp)
+        if hint:
+            return f"lexical:{hint}"
+    jp_reason = lexical_diag.get("jp_hint_reason")
+    if lexical_diag.get("jp_hint") and jp_reason:
+        return f"lexical:jp_{jp_reason}"
     return ""
 
 
@@ -5021,9 +5094,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
     blank_cfg = _blank_skip_cfg_from_env()
     blank_skipped = 0
     confidence_boost_cfg = _confidence_boost_cfg_from_env()
+    lexical_boost_cfg = _lexical_boost_cfg_from_env()
     confidence_boost_applied = 0
     confidence_boost_delta = 0.0
     confidence_boost_reasons: Dict[str, int] = defaultdict(int)
+    lexical_boost_applied = 0
+    lexical_boost_delta = 0.0
+    lexical_boost_reasons: Dict[str, int] = defaultdict(int)
+    lexical_quality_sum = 0.0
+    lexical_quality_samples = 0
     schema_tables = 0
     schema_noise_columns = 0
     schema_rows_adjusted = 0
@@ -5333,6 +5412,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 grid_text[r][c] = coerced_txt
                             elif coerced_txt:
                                 txt = coerced_txt
+                        lexical_quality, lexical_diag = _toy_text_quality(txt)
+                        lexical_quality_sum += float(lexical_quality)
+                        lexical_quality_samples += 1
                         boost_reason = _confidence_boost_reason(forced_filters)
                         if boost_reason and conf is not None:
                             boosted_conf, delta = _apply_confidence_boost(conf, confidence_boost_cfg)
@@ -5343,6 +5425,20 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 confidence_boost_delta += float(delta)
                                 confidence_boost_reasons[boost_reason] += 1
                                 boost_marker = boost_reason
+                        lexical_reason = _lexical_confidence_reason(
+                            txt, lexical_diag, lexical_boost_cfg.min_quality, lexical_quality
+                        )
+                        if lexical_reason and conf is not None:
+                            boosted_conf, delta = _apply_confidence_boost(conf, lexical_boost_cfg)
+                            if boosted_conf is not None and delta > 0.0:
+                                conf = float(boosted_conf)
+                                grid_conf[r][c] = float(boosted_conf)
+                                lexical_boost_applied += 1
+                                lexical_boost_delta += float(delta)
+                                lexical_boost_reasons[lexical_reason] += 1
+                                boost_marker = (
+                                    f"{boost_marker},{lexical_reason}" if boost_marker else lexical_reason
+                                )
                         # build search/synthesis
                         row_texts = grid_text[r]
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
@@ -5415,12 +5511,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "low_conf": bool(low_conf),
                                 "ngram_coherence": float(coherence),
                                 "ngram_surprisal": float(surprisal),
+                                "lexical_quality": float(lexical_quality),
                                 "trace": trace_id,
                                 "filters": filters
                             }
                         }
                         if boost_marker:
                             rec["meta"]["confidence_boost"] = boost_marker
+                        if lexical_reason:
+                            rec["meta"]["lexical_reason"] = lexical_reason
                         if concepts:
                             rec["meta"]["concepts"] = concepts
                         if hypotheses:
@@ -5548,6 +5647,20 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "reasons": dict(confidence_boost_reasons),
             "target": float(confidence_boost_cfg.target),
             "min_input": float(confidence_boost_cfg.min_input),
+        }
+    if lexical_boost_applied:
+        export_stats["lexical_boost"] = {
+            "cells": int(lexical_boost_applied),
+            "delta_sum": round(lexical_boost_delta, 4),
+            "reasons": dict(lexical_boost_reasons),
+            "target": float(lexical_boost_cfg.target),
+            "min_input": float(lexical_boost_cfg.min_input),
+            "min_quality": float(lexical_boost_cfg.min_quality),
+        }
+    if lexical_quality_samples:
+        export_stats["lexical_quality"] = {
+            "samples": int(lexical_quality_samples),
+            "mean": round(lexical_quality_sum / float(max(1, lexical_quality_samples)), 4),
         }
     if guard_ms > 0:
         export_stats["guard"] = {
