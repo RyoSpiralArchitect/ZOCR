@@ -3227,6 +3227,24 @@ def _simulate_param_shift(
         )
     return simulations
 
+def _normalize_optional_path(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    trimmed = str(path).strip()
+    if not trimmed:
+        return None
+    return os.path.abspath(os.path.expanduser(trimmed))
+
+
+def _validate_file_if_supplied(path: Optional[str], label: str) -> Optional[str]:
+    resolved = _normalize_optional_path(path)
+    if not resolved:
+        return None
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"{label} path does not exist: {resolved}")
+    return resolved
+
+
 def _patched_run_full_pipeline(
     inputs: List[str],
     outdir: str,
@@ -3301,21 +3319,21 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
     else:
         os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
+    tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
+    tess_wordlist = _validate_file_if_supplied(tess_wordlist, "--tess-wordlist")
+    tess_bigram_json = _validate_file_if_supplied(tess_bigram_json, "--tess-bigram-json")
     if tess_unicharset is not None:
-        if tess_unicharset:
-            os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
-        else:
-            os.environ.pop("ZOCR_TESS_UNICHARSET", None)
+        os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
+    else:
+        os.environ.pop("ZOCR_TESS_UNICHARSET", None)
     if tess_wordlist is not None:
-        if tess_wordlist:
-            os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
-        else:
-            os.environ.pop("ZOCR_TESS_WORDLIST", None)
+        os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
+    else:
+        os.environ.pop("ZOCR_TESS_WORDLIST", None)
     if tess_bigram_json is not None:
-        if tess_bigram_json:
-            os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
-        else:
-            os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
+        os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
+    else:
+        os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
 
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
@@ -3526,6 +3544,25 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
     bandit: Optional[PriorBandit] = None
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
