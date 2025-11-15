@@ -3526,6 +3526,10 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
