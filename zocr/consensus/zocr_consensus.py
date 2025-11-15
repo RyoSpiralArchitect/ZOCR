@@ -13,17 +13,23 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib
+from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
+
+try:  # pragma: no cover - optional built-in tesslite tables
+    from ..resources import tesslite_defaults as _tesslite_defaults  # type: ignore
+except Exception:  # pragma: no cover - fallback when package data is unavailable
+    _tesslite_defaults = None  # type: ignore
 
 try:
     import numpy as np
 except Exception:
     np = None
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
@@ -271,6 +277,84 @@ def _box_mean(gray, k):
 def _binarize_pure(gray, k=31, c=10):
     m=_box_mean(gray,k); return (gray<(m-c)).astype(np.uint8)*255
 
+
+def _estimate_slant_slope(binary: "np.ndarray") -> float:
+    if np is None:
+        return 0.0
+    try:
+        coords = np.argwhere(np.asarray(binary, dtype=np.uint8) > 0)
+    except Exception:
+        return 0.0
+    if coords.size == 0:
+        return 0.0
+    y = coords[:, 0].astype(np.float64)
+    x = coords[:, 1].astype(np.float64)
+    if y.size < 128:
+        return 0.0
+    y_centered = y - float(np.mean(y))
+    x_centered = x - float(np.mean(x))
+    denom = float(np.dot(y_centered, y_centered))
+    if denom <= 1e-6:
+        return 0.0
+    slope = float(np.dot(x_centered, y_centered) / denom)
+    return float(max(-0.5, min(0.5, slope)))
+
+
+def _shear_rows_binary(binary01: "np.ndarray", slope: float) -> "np.ndarray":
+    arr = (np.asarray(binary01, dtype=np.uint8) > 0).astype(np.uint8)
+    H, W = arr.shape
+    out = np.zeros_like(arr)
+    center = H / 2.0
+    max_shift = int(min(W * 0.25, abs(slope) * H * 1.2 + 2))
+    for y in range(H):
+        shift = int(round((y - center) * slope))
+        shift = max(-max_shift, min(max_shift, shift))
+        row = arr[y]
+        if shift > 0:
+            out[y, shift:] = np.maximum(out[y, shift:], row[: W - shift])
+        elif shift < 0:
+            out[y, : W + shift] = np.maximum(out[y, : W + shift], row[-shift:])
+        else:
+            out[y] = np.maximum(out[y], row)
+    return out
+
+
+def _suppress_diagonal_bridges(binary01: "np.ndarray") -> "np.ndarray":
+    arr = (np.asarray(binary01, dtype=np.uint8) > 0).astype(np.uint8)
+    if arr.size == 0:
+        return arr
+    padded = np.pad(arr, 1, mode="constant")
+    left = padded[1:-1, :-2] > 0
+    right = padded[1:-1, 2:] > 0
+    up = padded[:-2, 1:-1] > 0
+    down = padded[2:, 1:-1] > 0
+    diag = (
+        padded[:-2, :-2]
+        | padded[:-2, 2:]
+        | padded[2:, :-2]
+        | padded[2:, 2:]
+    ) > 0
+    horiz = left | right
+    vert = up | down
+    mask = (diag & (~horiz) & (~vert))
+    trimmed = arr.copy()
+    trimmed[mask] = 0
+    return trimmed
+
+
+def _apply_italic_guard(binary: "np.ndarray") -> "np.ndarray":
+    if np is None:
+        return binary
+    arr = (np.asarray(binary, dtype=np.uint8) > 0).astype(np.uint8)
+    arr = _suppress_diagonal_bridges(arr)
+    slope = _estimate_slant_slope(arr)
+    if abs(slope) < 0.08:
+        return (arr * 255).astype(np.uint8)
+    deskewed = _shear_rows_binary(arr, -slope)
+    combined = np.maximum(arr, deskewed)
+    combined = _suppress_diagonal_bridges(combined)
+    return (combined * 255).astype(np.uint8)
+
 # ----------------- Separable dilation via prefix sums -----------------
 def _dilate_binary_rect(bw: "np.ndarray", wx: int, wy: int) -> "np.ndarray":
     H,W = bw.shape
@@ -392,6 +476,253 @@ def _dp_means_1d(points, lam, iters=3):
         for i,xs in buckets.items():
             if xs: centers[i]=sum(xs)/len(xs)
     return sorted(centers)
+
+
+def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -> List[List[float]]:
+    """Recursively partition column centers using a B-tree like split rule."""
+
+    ordered = sorted(float(v) for v in values if math.isfinite(v))
+    if not ordered:
+        return []
+
+    buckets: List[List[float]] = []
+
+    def _split(bucket: List[float], depth: int) -> None:
+        if len(bucket) <= max(1, min_bucket) or depth >= max_depth:
+            buckets.append(bucket)
+            return
+        mid_idx = len(bucket) // 2
+        pivot = bucket[mid_idx]
+        left = [v for v in bucket if v <= pivot]
+        right = [v for v in bucket if v > pivot]
+        if not left or not right:
+            buckets.append(bucket)
+            return
+        _split(left, depth + 1)
+        _split(right, depth + 1)
+
+    _split(ordered, 0)
+    return buckets
+
+
+def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_depth: int = 5) -> List[float]:
+    """Return stable column centers derived from a B-tree style recursive sort."""
+
+    buckets = _btree_partition(points, min_bucket=max(1, min_bucket), max_depth=max(1, max_depth))
+    centers: List[float] = []
+    for bucket in buckets:
+        if not bucket:
+            continue
+        centers.append(float(median(bucket)))
+    centers.sort()
+    deduped: List[float] = []
+    for value in centers:
+        if not deduped or abs(value - deduped[-1]) > 1.0:
+            deduped.append(value)
+        else:
+            deduped[-1] = (deduped[-1] + value) * 0.5
+    return deduped
+
+
+def _vertical_vote_boundaries(
+    binary: "np.ndarray", max_candidates: int = 16, min_gap: int = 6
+) -> List[int]:
+    """Return low-ink column boundaries via a lightweight vertical voting pass."""
+
+    try:
+        arr = np.asarray(binary, dtype=np.uint8)
+    except Exception:
+        return []
+    if arr.ndim != 2 or arr.size == 0:
+        return []
+    ink = arr.sum(axis=0).astype(np.float32)
+    if ink.size == 0:
+        return []
+    norm = ink / float(max(1.0, ink.max()))
+    blank_score = 1.0 - norm
+    window = max(3, min_gap // 2 * 2 + 1)
+    kernel = np.ones(window, dtype=np.float32)
+    kernel /= float(kernel.sum() or 1.0)
+    smoothed = np.convolve(blank_score, kernel, mode="same")
+    if smoothed.size == 0:
+        return []
+    threshold = float(max(0.2, min(0.85, np.percentile(smoothed, 75))))
+    picks: List[int] = []
+    for idx in range(1, len(smoothed) - 1):
+        if smoothed[idx] < threshold:
+            continue
+        if smoothed[idx] < smoothed[idx - 1] or smoothed[idx] < smoothed[idx + 1]:
+            continue
+        if picks and idx - picks[-1] < min_gap:
+            if smoothed[idx] > smoothed[picks[-1]]:
+                picks[-1] = idx
+            continue
+        picks.append(idx)
+        if len(picks) >= max_candidates:
+            break
+    return [int(val) for val in picks]
+
+
+def _apply_column_continuity_prior(
+    candidates_by_row: List[List[int]], tolerance: int = 5
+) -> List[List[int]]:
+    if not candidates_by_row:
+        return candidates_by_row
+    refined: List[List[int]] = []
+    prev: Optional[List[int]] = None
+    tol = max(1, int(tolerance))
+    for row in candidates_by_row:
+        base = sorted({int(v) for v in row})
+        if prev:
+            augmented = list(base)
+            for anchor in prev:
+                if all(abs(anchor - cur) > tol for cur in base):
+                    augmented.append(int(anchor))
+            base = sorted({int(v) for v in augmented})
+        refined.append(base)
+        prev = base
+    return refined
+
+
+def _refine_column_bounds_alignment(
+    col_bounds: List[int], smooth_strength: float = 0.25
+) -> List[int]:
+    if len(col_bounds) <= 2:
+        return col_bounds
+    widths = [col_bounds[i + 1] - col_bounds[i] for i in range(len(col_bounds) - 1)]
+    target = float(max(1.0, median([abs(w) for w in widths]) if widths else 1.0))
+    new_bounds = [int(col_bounds[0])]
+    for width in widths:
+        deviation = float(width) - target
+        adjusted = float(width) - deviation * smooth_strength
+        adjusted = max(2.0, adjusted)
+        new_bounds.append(int(round(new_bounds[-1] + adjusted)))
+    span_orig = float(col_bounds[-1] - col_bounds[0]) or 1.0
+    span_new = float(new_bounds[-1] - new_bounds[0]) or 1.0
+    scale = span_orig / span_new
+    scaled = [int(round(col_bounds[0] + (val - new_bounds[0]) * scale)) for val in new_bounds]
+    scaled[0] = col_bounds[0]
+    scaled[-1] = col_bounds[-1]
+    return scaled
+
+
+def _column_blank_ratios(binary: "np.ndarray", col_bounds: Sequence[int]) -> List[float]:
+    count = max(0, len(col_bounds) - 1)
+    if count <= 0:
+        return []
+    try:
+        arr = (np.asarray(binary, dtype=np.uint8) > 0).astype(np.uint8)
+    except Exception:
+        return [0.0] * count
+    H, W = arr.shape
+    ratios: List[float] = []
+    for idx in range(count):
+        x0 = int(max(0, min(W, col_bounds[idx])))
+        x1 = int(max(0, min(W, col_bounds[idx + 1])))
+        if x1 <= x0:
+            ratios.append(1.0)
+            continue
+        slice_arr = arr[:, x0:x1]
+        total = float(max(1, slice_arr.size))
+        ink = float(slice_arr.sum())
+        ratios.append(max(0.0, min(1.0, 1.0 - ink / total)))
+    return ratios
+
+
+def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: int) -> List[int]:
+    if values.size <= 2:
+        return []
+    valleys: List[int] = []
+    for idx in range(1, values.size - 1):
+        if values[idx] > threshold:
+            continue
+        if values[idx] > values[idx - 1] or values[idx] >= values[idx + 1]:
+            continue
+        if valleys and idx - valleys[-1] < min_gap:
+            if values[idx] < values[valleys[-1]]:
+                valleys[-1] = idx
+            continue
+        valleys.append(idx)
+    return valleys
+
+
+def _align_row_band_centers(
+    row_bands: List[Tuple[int, int]], height: int, med_h: float
+) -> List[Tuple[int, int]]:
+    if len(row_bands) <= 1:
+        return row_bands
+    centers = [0.5 * (y0 + y1) for (y0, y1) in row_bands]
+    diffs = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+    target_gap = float(max(2.0, median([abs(d) for d in diffs]) if diffs else med_h))
+    aligned = [centers[0]]
+    clamp_delta = med_h * 0.6
+    for idx in range(1, len(centers)):
+        expected = aligned[-1] + target_gap
+        delta = clamp(centers[idx] - expected, -clamp_delta, clamp_delta)
+        aligned.append(expected + delta * 0.35)
+    refined: List[Tuple[int, int]] = []
+    for idx, center in enumerate(aligned):
+        span = max(2.0, row_bands[idx][1] - row_bands[idx][0])
+        start = int(round(center - span / 2.0))
+        end = int(round(center + span / 2.0))
+        start = max(0, start)
+        end = min(height, max(start + 2, end))
+        refined.append((start, end))
+    return refined
+
+
+def _refine_row_bands_by_projection(
+    row_bands: List[Tuple[int, int]],
+    binary: "np.ndarray",
+    med_h: float,
+    height: int,
+) -> Tuple[List[Tuple[int, int]], Dict[str, int]]:
+    stats = {
+        "segments": 0,
+        "valley_splits": 0,
+        "merged": 0,
+    }
+    if not row_bands:
+        return row_bands, stats
+    try:
+        proj = (np.asarray(binary, dtype=np.uint8) > 0).sum(axis=1).astype(np.float64)
+    except Exception:
+        return row_bands, stats
+    if proj.size == 0:
+        return row_bands, stats
+    kernel = np.ones(5, dtype=np.float64)
+    kernel /= float(kernel.sum() or 1.0)
+    smooth = np.convolve(proj, kernel, mode="same")
+    refined: List[Tuple[int, int]] = []
+    min_gap = int(max(2, med_h * 0.35))
+    for y0, y1 in row_bands:
+        stats["segments"] += 1
+        if y1 - y0 <= 0:
+            continue
+        segment = smooth[y0:y1]
+        if (y1 - y0) > med_h * 1.6 and segment.size > 4:
+            thr = float(min(np.percentile(segment, 40), np.mean(segment) * 0.7))
+            valleys = _find_projection_valleys(segment, thr, min_gap)
+            if valleys:
+                stats["valley_splits"] += len(valleys)
+                points = [y0] + [y0 + v for v in valleys] + [y1]
+                for a, b in zip(points, points[1:]):
+                    if b - a >= max(2, int(med_h * 0.45)):
+                        refined.append((int(a), int(b)))
+                continue
+        refined.append((int(y0), int(y1)))
+    merged: List[Tuple[int, int]] = []
+    for band in refined:
+        if merged and (band[1] - band[0]) < med_h * 0.45:
+            prev = merged[-1]
+            if band[0] - prev[1] <= med_h * 0.25:
+                merged[-1] = (prev[0], max(prev[1], band[1]))
+                stats["merged"] += 1
+                continue
+        merged.append(band)
+    aligned = _align_row_band_centers(merged, height, med_h)
+    stats["refined"] = len(aligned)
+    return aligned, stats
 
 # ----------------- Column smoothing (D²-like + λ scheduling) -----------------
 def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
@@ -691,6 +1022,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     # binarize
     k=int(params.get("k",31)); c=float(params.get("c",10.0))
     bin_img=_binarize_pure(g,k,c)
+    bin_img=_apply_italic_guard(bin_img)
     # smear
     wx = int(params.get("wx", max(3, W//120))); wy = int(params.get("wy", max(1, H//300)))
     b=_dilate_binary_rect((bin_img>0).astype(np.uint8), wx, wy)
@@ -732,6 +1064,8 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 row_bands.append((max(0, int(start-1)), H))
     if not row_bands:
         row_bands.append((0, H))
+    row_bands_raw = list(row_bands)
+    row_bands, row_proj_stats = _refine_row_bands_by_projection(row_bands, bin_img, med_h, H)
     # per-row chunks & counts
     chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
     row_counts=[len(row) for row in chunks_by_row]
@@ -740,15 +1074,23 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     # DP-means for columns with λ補正（列モード吸着）
     xcenters=[(ch[0]+ch[2])/2.0 for row in chunks_by_row for ch in row]
     med_w=float(np.median([(ch[2]-ch[0]) for row in chunks_by_row for ch in row])) if xcenters else 12.0
+    btree_seed=_btree_column_centers(
+        xcenters,
+        min_bucket=max(3, int(math.sqrt(len(xcenters) + 1))) if xcenters else 3,
+        max_depth=6,
+    )
     lam_base=float(params.get("dp_lambda_factor", 2.2))*max(6.0, med_w)
-    centers0=_dp_means_1d(sorted(xcenters), lam=lam_base, iters=3)
+    seed_points = btree_seed if len(btree_seed) >= 2 else xcenters
+    if not seed_points:
+        seed_points = [W * 0.5]
+    centers0=_dp_means_1d(sorted(seed_points), lam=lam_base, iters=3)
     K_pred0=len(centers0)
     K_mode=_robust_k_mode(row_counts) or max(2, K_pred0)
     alpha=float(params.get("lambda_alpha", 0.7))
     # clip the scaling to avoid extreme swings
     scale = ( (K_pred0 / float(max(1,K_mode))) ** alpha )
     lam_eff = clamp(lam_base * scale, 0.6*lam_base, 1.8*lam_base)
-    centers=_dp_means_1d(sorted(xcenters), lam=lam_eff, iters=3)
+    centers=_dp_means_1d(sorted(xcenters or seed_points), lam=lam_eff, iters=3)
     # candidates
     candidates_by_row=[]
     for row in chunks_by_row:
@@ -759,11 +1101,32 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 gap=row[i+1][0]-row[i][2]
                 if gap>1.6*mw: mids.append(int((row[i][2]+row[i+1][0])/2.0))
         candidates_by_row.append(mids)
+    candidates_initial = [list(row) for row in candidates_by_row]
+    global_mid_seeds: List[int] = []
+    if len(btree_seed) >= 2:
+        global_mid_seeds.extend(int((btree_seed[i]+btree_seed[i+1])/2.0) for i in range(len(btree_seed)-1))
     if len(centers)>=2:
-        mids_global=[int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1)]
-        candidates_by_row = [[*mids_global, *row] for row in candidates_by_row]
+        global_mid_seeds.extend(int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1))
+    vertical_votes = _vertical_vote_boundaries(
+        bin_img,
+        max_candidates=32,
+        min_gap=int(max(4, med_w * 0.5)),
+    )
+    if vertical_votes:
+        global_mid_seeds.extend(vertical_votes)
+    if global_mid_seeds:
+        mids_global = sorted({int(val) for val in global_mid_seeds})
+        merged_rows: List[List[int]] = []
+        for row in candidates_by_row:
+            merged_rows.append(sorted({*row, *mids_global}))
+        candidates_by_row = merged_rows
+    continuity_tol = int(max(3, med_w * 0.35))
+    candidates_by_row = _apply_column_continuity_prior(candidates_by_row, tolerance=continuity_tol)
+    candidates_after = [list(row) for row in candidates_by_row]
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
+    col_bounds = _refine_column_bounds_alignment(col_bounds)
+    column_blank_ratios = _column_blank_ratios(bin_img, col_bounds)
     R=len(row_bands); C=max(1,len(col_bounds)-1)
     used=set(); cells={}
     def which_cols(xl,xr):
@@ -790,6 +1153,9 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         yt = row_bands[r0][0]; yb = row_bands[min(R-1, r0+rs-1)][1]
         xl = col_bounds[c0]; xr = col_bounds[min(C, c0+cs)]
         return xl,yt,xr,yb
+    blank_thr = float(params.get("colspan_blank_threshold", 0.9))
+    blank_sigma = float(params.get("colspan_blank_sigma", 0.08))
+
     def try_expand_span(r,c,rs,cs,ch):
         step = 0
         while (r+rs) < R:
@@ -827,6 +1193,44 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 break
             rs += 1; step += 1
         return rs, cs
+
+    def try_expand_colspan(r: int, c: int, rs: int, cs: int, ch: List[int]) -> int:
+        step = 0
+        while (c + cs) < C:
+            blank_ratio = column_blank_ratios[c + cs] if (c + cs) < len(column_blank_ratios) else 0.0
+            if blank_ratio < blank_thr:
+                break
+            block = cell_block_bbox(r, rs, c, cs + 1)
+            coverage_rows: List[float] = []
+            for rr in range(r, min(R, r + rs)):
+                coverage_rows.append(_coverage_ratio(chunks_by_row[rr], *block))
+            cov = float(np.median(coverage_rows)) if coverage_rows else 0.0
+            p_iou = _sigmoid((cov - tau) / max(1e-6, sigma))
+            blank_boost = _sigmoid((blank_ratio - blank_thr) / max(1e-3, blank_sigma))
+            gap_block = (
+                col_bounds[c + cs],
+                row_bands[r][0],
+                col_bounds[c + cs + 1],
+                row_bands[min(R - 1, r + rs - 1)][1],
+            )
+            gap_hits = 0
+            for rr in range(r, min(R, r + rs)):
+                cov_gap = _coverage_ratio(
+                    chunks_by_row[rr],
+                    gap_block[0],
+                    row_bands[rr][0],
+                    gap_block[2],
+                    row_bands[rr][1],
+                )
+                if cov_gap < 0.05:
+                    gap_hits += 1
+            p_gap = _sigmoid(((gap_hits / float(max(1, rs))) - 0.5) / 0.2)
+            p_comb = p_iou * blank_boost * p_gap
+            if p_comb < p_cons_thr:
+                break
+            cs += 1
+            step += 1
+        return cs
     html="<table>"
     for r in range(R):
         tag="th" if r==0 else "td"
@@ -838,6 +1242,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
             if ent:
                 rs,cs,ch = ent
                 rs,cs = try_expand_span(r,c,rs,cs,ch)
+                cs = try_expand_colspan(r,c,rs,cs,ch)
                 for rr in range(r, min(R,r+rs)):
                     for cc in range(c, min(C,c+cs)):
                         if not (rr==r and cc==c): used.add((rr,cc))
@@ -872,16 +1277,40 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
             crop = imc.crop((xl,yt,xr,yb))
             name = f"cell_r{r0}_c{c0}_s{st}"
             views_cells[name] = _make_views(crop, vdir, name)
+    row_diag = {
+        "initial_bands": int(len(row_bands_raw)),
+        "refined_bands": int(len(row_bands)),
+        "projection_splits": int(row_proj_stats.get("valley_splits", 0)) if isinstance(row_proj_stats, dict) else 0,
+        "segments": int(row_proj_stats.get("segments", 0)) if isinstance(row_proj_stats, dict) else 0,
+        "merged": int(row_proj_stats.get("merged", 0)) if isinstance(row_proj_stats, dict) else 0,
+    }
     row_bands_rel = [
         (int(max(0, min(H, yt))), int(max(0, min(H, yb))))
         for (yt, yb) in row_bands
     ]
+    column_diag = {
+        "btree_seed": len(btree_seed),
+        "dp_centers": len(centers),
+        "vertical_votes": len(vertical_votes),
+        "global_mid_seeds": len({int(v) for v in global_mid_seeds}) if global_mid_seeds else 0,
+        "continuity_tol": continuity_tol,
+        "candidates_initial": sum(len(r) for r in candidates_initial),
+        "candidates_final": sum(len(r) for r in candidates_after),
+        "rows_with_candidates": sum(1 for r in candidates_after if r),
+        "blank_columns": sum(1 for ratio in column_blank_ratios if ratio >= blank_thr),
+        "blank_ratio_mean": round(float(sum(column_blank_ratios)) / float(len(column_blank_ratios) or 1), 4)
+        }
+    segmentation_stats = {
+        "row": row_diag,
+        "column": column_diag,
+    }
     dbg = {
         "rows":R,"cols":C,"row_counts": row_counts,
         "col_bounds":col_bounds,"smear_wx": wx, "smear_wy": wy,
         "med_h": med_h, "col_jitter": col_jitter,
         "baselines_segs": baselines,
         "row_bands_rel": row_bands_rel,
+        "segmentation_stats": segmentation_stats,
         "lambda": {"lambda_base": lam_base, "lambda_eff": lam_eff,
                    "k_pred0": K_pred0, "k_mode": K_mode, "k_pred": len(centers)},
         "iou_prob_events": iou_events[:200],
@@ -1188,6 +1617,407 @@ _INITIAL_TOY_SWEEP_LIMIT = _initial_toy_sweep_limit()
 _GLYPH_VARIANT_LIMIT = int(_INITIAL_TOY_SWEEP_LIMIT)
 
 
+@dataclass
+class MotionPriorCfg:
+    enabled: bool = False
+    sigma_px: float = 8.0
+    cutoff_sigma: float = 2.5
+    accept_ratio: float = 0.5
+    k_sigma_window: float = 2.5
+    auto_sigma: bool = False
+    sigma_min_ratio: float = 0.15
+    sigma_max_ratio: float = 1.5
+    table_signature: Optional[str] = None
+    cache_dir: Optional[str] = None
+    bandit_action: Optional[str] = None
+
+
+@dataclass
+class _BlankSkipConfig:
+    enabled: bool = False
+    dark_threshold: int = 210
+    min_dark_pixels: int = 8
+    min_dark_ratio: float = 0.002
+    min_area: int = 36
+
+
+@dataclass
+class _ConfidenceBoostConfig:
+    enabled: bool = True
+    target: float = 0.82
+    min_input: float = 0.35
+
+
+@dataclass
+class _LexicalBoostConfig(_ConfidenceBoostConfig):
+    min_quality: float = 0.85
+
+
+try:  # pragma: no cover - optional orchestrator helper
+    from ..orchestrator.prior import estimate_sigma_px as _estimate_sigma_px  # type: ignore
+except Exception:  # pragma: no cover - fallback when orchestrator is unavailable
+
+    def _estimate_sigma_px(
+        delta_y: Sequence[float],
+        median_row_h: float,
+        s_min_ratio: float = 0.15,
+        s_max_ratio: float = 1.5,
+    ) -> float:
+        if not delta_y:
+            return max(1.0, 0.5 * float(median_row_h or 1.0))
+        med = median(delta_y)
+        mad = median([abs(d - med) for d in delta_y])
+        sigma = 1.4826 * mad
+        sigma_min = s_min_ratio * max(1.0, median_row_h)
+        sigma_max = s_max_ratio * max(1.0, median_row_h)
+        return float(min(max(sigma, sigma_min), sigma_max))
+
+
+@dataclass
+class _ExportSweepTracker:
+    prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
+
+    def get(self, doc_id: str, page_index: int, table_index: int) -> Optional[List[float]]:
+        return self.prev_y.get((doc_id, page_index, table_index))
+
+    def put(
+        self,
+        doc_id: str,
+        page_index: int,
+        table_index: int,
+        y_keys: Sequence[float],
+    ) -> None:
+        self.prev_y[(doc_id, page_index, table_index)] = [float(y) for y in y_keys]
+
+
+_EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
+
+
+def _motion_prior_cfg_from_env() -> MotionPriorCfg:
+    enabled = _env_flag("ZOCR_EXPORT_MOTION_PRIOR", True) or _env_flag("ZOCR_USE_PRIOR", False)
+    cfg = MotionPriorCfg(enabled=enabled)
+    cfg.table_signature = os.environ.get("ZOCR_TABLE_SIGNATURE")
+    cfg.cache_dir = os.environ.get("ZOCR_PRIOR_CACHE")
+    cfg.bandit_action = os.environ.get("ZOCR_PRIOR_ACTION")
+    cfg.k_sigma_window = float(max(0.1, _env_float("ZOCR_K_SIGMA_WINDOW", cfg.k_sigma_window)))
+    cfg.sigma_min_ratio = float(max(0.01, _env_float("ZOCR_PRIOR_SIGMA_MIN_RATIO", cfg.sigma_min_ratio)))
+    cfg.sigma_max_ratio = float(max(cfg.sigma_min_ratio, _env_float("ZOCR_PRIOR_SIGMA_MAX_RATIO", cfg.sigma_max_ratio)))
+    sigma_raw = os.environ.get("ZOCR_PRIOR_SIGMA")
+    sigma_override: Optional[float] = None
+    if sigma_raw:
+        if sigma_raw.strip().lower() == "auto":
+            cfg.auto_sigma = True
+        else:
+            try:
+                sigma_override = float(sigma_raw)
+            except Exception:
+                sigma_override = None
+    elif cfg.enabled:
+        cfg.auto_sigma = True
+    if sigma_override is None:
+        sigma_env = os.environ.get("ZOCR_EXPORT_MOTION_SIGMA")
+        if sigma_env:
+            try:
+                sigma_override = float(sigma_env)
+            except Exception:
+                sigma_override = None
+    if sigma_override is not None:
+        cfg.sigma_px = max(0.5, float(sigma_override))
+        cfg.auto_sigma = False
+    cutoff_raw = os.environ.get("ZOCR_EXPORT_MOTION_CUTOFF")
+    if cutoff_raw:
+        try:
+            cfg.cutoff_sigma = max(0.1, float(cutoff_raw))
+        except Exception:
+            pass
+    accept_raw = os.environ.get("ZOCR_EXPORT_MOTION_ACCEPT")
+    if accept_raw:
+        try:
+            cfg.accept_ratio = float(max(0.0, min(1.0, float(accept_raw))))
+        except Exception:
+            pass
+    return cfg
+
+
+def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
+    cfg = _BlankSkipConfig(enabled=_env_flag("ZOCR_EXPORT_SKIP_BLANK", True))
+    if not cfg.enabled:
+        return cfg
+    thr = _env_int("ZOCR_EXPORT_BLANK_THRESHOLD", cfg.dark_threshold)
+    if thr is not None:
+        cfg.dark_threshold = int(max(1, min(255, thr)))
+    min_px = _env_int("ZOCR_EXPORT_BLANK_MIN_PIXELS", cfg.min_dark_pixels)
+    if min_px is not None:
+        cfg.min_dark_pixels = int(max(1, min_px))
+    min_ratio = _env_float("ZOCR_EXPORT_BLANK_MIN_RATIO", cfg.min_dark_ratio)
+    if isinstance(min_ratio, (int, float)):
+        cfg.min_dark_ratio = float(max(0.0, min(0.1, min_ratio)))
+    min_area = _env_int("ZOCR_EXPORT_BLANK_MIN_AREA", cfg.min_area)
+    if min_area is not None:
+        cfg.min_area = int(max(1, min_area))
+    return cfg
+
+
+def _confidence_boost_cfg_from_env() -> _ConfidenceBoostConfig:
+    cfg = _ConfidenceBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_NUMERIC", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_TARGET", cfg.target))))
+    cfg.min_input = float(max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_MIN_INPUT", cfg.min_input))))
+    return cfg
+
+
+def _lexical_boost_cfg_from_env() -> _LexicalBoostConfig:
+    cfg = _LexicalBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_LEXICAL", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_LEXICAL_TARGET", cfg.target))))
+    cfg.min_input = float(
+        max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_INPUT", cfg.min_input)))
+    )
+    cfg.min_quality = float(
+        max(0.0, min(1.5, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_QUALITY", cfg.min_quality)))
+    )
+    return cfg
+
+
+def _apply_confidence_boost(
+    conf: Optional[float], cfg: _ConfidenceBoostConfig
+) -> Tuple[Optional[float], float]:
+    if conf is None or not cfg.enabled:
+        return conf, 0.0
+    base = _normalize_confidence(conf)
+    if base >= cfg.target or base < cfg.min_input:
+        return base, 0.0
+    boosted = float(max(base, cfg.target))
+    return boosted, boosted - base
+
+
+def _confidence_boost_reason(payload: Optional[Dict[str, Any]]) -> str:
+    if not payload:
+        return ""
+    for key in ("amount", "subtotal", "tax_amount", "unit_price", "qty", "tax_rate"):
+        if key in payload:
+            return key
+    return ""
+
+
+def _lexical_confidence_reason(
+    text: Optional[str],
+    lexical_diag: Dict[str, Any],
+    min_quality: float,
+    quality: float,
+) -> str:
+    if not text or quality < min_quality:
+        return ""
+    canonical = (lexical_diag.get("canonical") or "").strip()
+    if canonical:
+        hint = _LEXICAL_CONF_CANONICAL_HINTS.get(canonical)
+        if hint:
+            return f"lexical:{hint}"
+    normalized_jp = _normalize_japanese_token(text)
+    if normalized_jp:
+        hint = _LEXICAL_CONF_JP_HINTS.get(normalized_jp)
+        if hint:
+            return f"lexical:{hint}"
+    jp_reason = lexical_diag.get("jp_hint_reason")
+    if lexical_diag.get("jp_hint") and jp_reason:
+        return f"lexical:jp_{jp_reason}"
+    return ""
+
+
+def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
+    if not cfg.enabled:
+        return False
+    try:
+        w, h = img.size
+    except Exception:
+        return False
+    area = max(1, int(w) * int(h))
+    if area < cfg.min_area:
+        return False
+    try:
+        gray = img.convert("L")
+        hist = gray.histogram()
+    except Exception:
+        return False
+    if not hist:
+        return False
+    thr = max(1, min(256, int(cfg.dark_threshold)))
+    dark = int(sum(hist[:thr]))
+    if dark < cfg.min_dark_pixels:
+        return True
+    ratio = dark / float(area)
+    if ratio <= cfg.min_dark_ratio:
+        return True
+    return False
+
+
+def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
+    mids: List[float] = []
+    for top, bottom in row_bands:
+        try:
+            mid = (float(top) + float(bottom)) * 0.5
+        except Exception:
+            continue
+        if math.isfinite(mid):
+            mids.append(mid)
+    return mids
+
+
+def _prior_cache_path(cache_dir: str, signature: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", signature.strip()) or "unknown"
+    return os.path.join(cache_dir, f"{safe}.ykeys.json")
+
+
+def _load_prior_cache_ykeys(signature: Optional[str], cache_dir: Optional[str]) -> Optional[List[float]]:
+    if not signature or not cache_dir:
+        return None
+    path = _prior_cache_path(cache_dir, signature)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    values = payload.get("y_keys") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return None
+    result: List[float] = []
+    for val in values:
+        try:
+            result.append(float(val))
+        except Exception:
+            continue
+    return result or None
+
+
+def _store_prior_cache_ykeys(
+    signature: Optional[str], cache_dir: Optional[str], y_keys: Sequence[float]
+) -> bool:
+    if not signature or not cache_dir or not y_keys:
+        return False
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        return False
+    path = _prior_cache_path(cache_dir, signature)
+    payload = {"y_keys": [float(y) for y in y_keys]}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _reseed_row_bands_with_prior(
+    prev_keys: Sequence[float],
+    row_bands: Sequence[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[float, float]]]:
+    if not prev_keys or not row_bands:
+        return list(row_bands), []
+    mids = _row_band_midpoints(row_bands)
+    if not mids:
+        return list(row_bands), []
+    ordered = sorted(((mid, idx) for idx, mid in enumerate(mids)), key=lambda item: item[0])
+    ordered_mids = [mid for mid, _ in ordered]
+    used = [False] * len(ordered)
+    matches: List[Tuple[float, float]] = []
+    reseed_indices: List[int] = []
+    for prev_val in prev_keys:
+        pos = bisect.bisect_left(ordered_mids, prev_val)
+        best_idx = None
+        best_dist = float("inf")
+        for offset in (pos - 1, pos, pos + 1):
+            if 0 <= offset < len(ordered) and not used[offset]:
+                cand_mid, cand_idx = ordered[offset]
+                dist = abs(cand_mid - prev_val)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = offset
+        if best_idx is None:
+            continue
+        used[best_idx] = True
+        cand_mid, cand_idx = ordered[best_idx]
+        matches.append((cand_mid, float(prev_val)))
+        reseed_indices.append(cand_idx)
+    for offset, (_, idx) in enumerate(ordered):
+        if not used[offset]:
+            reseed_indices.append(idx)
+    reseeded = [row_bands[idx] for idx in reseed_indices]
+    return reseeded, matches
+
+
+def _apply_motion_prior_to_bands(
+    prev_keys: Optional[Sequence[float]],
+    row_bands: List[Tuple[int, int]],
+    cfg: MotionPriorCfg,
+    row_heights: Optional[Sequence[int]] = None,
+) -> Tuple[List[Tuple[int, int]], bool, Dict[str, Any]]:
+    stats: Dict[str, Any] = {}
+    if not cfg.enabled or not prev_keys or not row_bands:
+        return row_bands, False, stats
+    reseeded, matches = _reseed_row_bands_with_prior(prev_keys, row_bands)
+    if not reseeded:
+        return row_bands, False, stats
+    heights = row_heights or [int(max(1, band[1] - band[0])) for band in row_bands]
+    med_height = float(median(heights)) if heights else max(1.0, abs(row_bands[0][1] - row_bands[0][0]))
+    deltas = [cand_mid - prev_val for cand_mid, prev_val in matches]
+    sigma_px = float(cfg.sigma_px)
+    auto_used = False
+    if cfg.auto_sigma:
+        sigma_px = _estimate_sigma_px(deltas, med_height, cfg.sigma_min_ratio, cfg.sigma_max_ratio)
+        auto_used = True
+    sigma_px = max(1e-3, float(sigma_px))
+    k_sigma = max(0.1, float(cfg.k_sigma_window))
+    window = k_sigma * sigma_px
+    cutoff = float(cfg.cutoff_sigma) * sigma_px
+    stats.update(
+        {
+            "sigma_px": float(sigma_px),
+            "window_px": float(window),
+            "auto_sigma": bool(auto_used),
+            "deltas": len(deltas),
+            "median_row_h": float(med_height),
+            "k_sigma_window": float(k_sigma),
+        }
+    )
+    limited: List[Tuple[int, int]] = []
+    trimmed = 0
+    if window > 0:
+        for idx, band in enumerate(reseeded):
+            top, bottom = band
+            mid = (float(top) + float(bottom)) * 0.5
+            target = float(prev_keys[idx]) if idx < len(prev_keys) else mid
+            if abs(mid - target) > window:
+                trimmed += 1
+                height = max(1.0, float(bottom - top))
+                center = target + max(-window, min(window, mid - target))
+                half = height * 0.5
+                new_top = int(round(center - half))
+                new_bottom = int(round(center + half))
+                limited.append((new_top, new_bottom))
+            else:
+                limited.append(band)
+    else:
+        limited = list(reseeded)
+    if trimmed:
+        stats["trimmed"] = int(trimmed)
+    reseeded = limited
+    inside = 0
+    total = len(matches)
+    for cand_mid, prev_val in matches:
+        if abs(cand_mid - prev_val) <= cutoff:
+            inside += 1
+    stats["inliers"] = int(inside)
+    stats["matches"] = int(total)
+    actual_ratio = inside / float(total or 1)
+    stats["accept_ratio"] = float(actual_ratio)
+    if actual_ratio >= cfg.accept_ratio:
+        return reseeded, True, stats
+    return row_bands, False, stats
+
+
 def _parse_threshold_limit(value: str, default: int) -> int:
     try:
         limit = int(str(value).strip())
@@ -1398,6 +2228,8 @@ def _blank_recognition_stats() -> Dict[str, Any]:
         "surprisal_sum": 0.0,
         "low_conf_cells": 0,
         "high_surprisal_cells": 0,
+        "lexical_quality_sum": 0.0,
+        "garbled_cells": 0,
         "examples": [],
     }
 
@@ -1415,13 +2247,22 @@ def reset_toy_recognition_stats() -> None:
     _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
 
 
-def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal: float) -> None:
+def _record_toy_recognition(
+    text: str,
+    conf: float,
+    coherence: float,
+    surprisal: float,
+    lexical_quality: float = 0.0,
+) -> None:
     stats = _TOY_RECOGNITION_STATS
     stats["cells"] = int(stats.get("cells", 0) + 1)
     stats["characters"] = int(stats.get("characters", 0) + len(text))
     stats["conf_sum"] = float(stats.get("conf_sum", 0.0) + float(conf))
     stats["coherence_sum"] = float(stats.get("coherence_sum", 0.0) + float(coherence))
     stats["surprisal_sum"] = float(stats.get("surprisal_sum", 0.0) + float(surprisal))
+    stats["lexical_quality_sum"] = float(
+        stats.get("lexical_quality_sum", 0.0) + float(max(0.0, min(1.5, lexical_quality)))
+    )
     if conf < 0.6:
         stats["low_conf_cells"] = int(stats.get("low_conf_cells", 0) + 1)
     if surprisal > 1.6:
@@ -1435,6 +2276,8 @@ def _record_toy_recognition(text: str, conf: float, coherence: float, surprisal:
                 "surprisal": float(surprisal),
                 "length": len(text),
             })
+    if lexical_quality and lexical_quality < 0.55:
+        stats["garbled_cells"] = int(stats.get("garbled_cells", 0) + 1)
 
 
 def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
@@ -1448,8 +2291,10 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
         "avg_confidence": float(stats.get("conf_sum", 0.0) / cells) if cells else 0.0,
         "avg_coherence": float(stats.get("coherence_sum", 0.0) / cells) if cells else 0.0,
         "avg_surprisal": float(stats.get("surprisal_sum", 0.0) / cells) if cells else 0.0,
+        "avg_lexical_quality": float(stats.get("lexical_quality_sum", 0.0) / cells) if cells else 0.0,
         "low_conf_cells": int(stats.get("low_conf_cells", 0)),
         "high_surprisal_cells": int(stats.get("high_surprisal_cells", 0)),
+        "garbled_cells": int(stats.get("garbled_cells", 0)),
         "examples": [
             {
                 "text": ex.get("text"),
@@ -1468,6 +2313,22 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["runtime_replay_attempts"] = int(_GLYPH_RUNTIME_STATS.get("replay_attempts", 0))
     result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
     result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
+    result["lexical_penalties"] = int(_GLYPH_RUNTIME_STATS.get("lexical_penalty", 0))
+    result["tess_dictionary_boosts"] = int(_GLYPH_RUNTIME_STATS.get("tess_dictionary_boosts", 0))
+    result["tess_unknown_hits"] = int(_GLYPH_RUNTIME_STATS.get("tess_unknown_hits", 0))
+    result["tess_bigram_penalties"] = int(_GLYPH_RUNTIME_STATS.get("tess_bigram_penalties", 0))
+    result["baseline_splits"] = int(_GLYPH_RUNTIME_STATS.get("baseline_splits", 0))
+    result["template_matches"] = int(_GLYPH_RUNTIME_STATS.get("template_matches", 0))
+    result["template_observed"] = int(_GLYPH_RUNTIME_STATS.get("template_observed", 0))
+    result["template_cache_hits"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_hits", 0))
+    result["template_cache_misses"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_misses", 0))
+    result["template_cache_variants"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_variants", 0))
+    result["template_cache_saved"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_saved", 0))
+    result["template_cache_loaded"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_loaded", 0))
+    result["template_cache_errors"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_errors", 0))
+    result["template_override_conf"] = int(_GLYPH_RUNTIME_STATS.get("template_override_conf", 0))
+    result["template_override_quality"] = int(_GLYPH_RUNTIME_STATS.get("template_override_quality", 0))
+    result["template_override_missing"] = int(_GLYPH_RUNTIME_STATS.get("template_override_missing", 0))
     if reset:
         reset_toy_recognition_stats()
     return result
@@ -1489,10 +2350,36 @@ _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "T": ("7",),
 }
 
+
+def _radial_signature(arr_f: "np.ndarray") -> Tuple[float, float]:
+    if arr_f.ndim != 2 or arr_f.size == 0:
+        return 0.0, 0.0
+    arr = np.asarray(arr_f, dtype=np.float32)
+    h, w = arr.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    radius = float(max(1.0, max(cy, cx)))
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / radius
+    inner_mask = dist <= 0.4
+    outer_mask = dist >= 0.8
+    inner_val = float(arr[inner_mask].mean()) if inner_mask.any() else 0.0
+    outer_val = float(arr[outer_mask].mean()) if outer_mask.any() else 0.0
+    return inner_val, outer_val
+
+
 def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
     arr_f = np.asarray(arr, dtype=np.float32)
     if arr_f.size == 0:
-        return {"aspect": 1.0, "density": 0.0, "symmetry": 0.0, "style_var": 0.0, "count": 0}
+        return {
+            "aspect": 1.0,
+            "density": 0.0,
+            "symmetry": 0.0,
+            "style_var": 0.0,
+            "radial_inner": 0.0,
+            "radial_outer": 0.0,
+            "count": 0,
+        }
     if arr_f.max() > 1.5:
         arr_f = arr_f / 255.0
     h, w = arr_f.shape
@@ -1506,7 +2393,19 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
         style_var = float(np.var(row_profile) + np.var(col_profile))
     else:
         style_var = 0.0
-    return {"aspect": aspect, "density": density, "symmetry": symmetry, "style_var": style_var, "count": 1}
+    inner_ring = 0.0
+    outer_ring = 0.0
+    if arr_f.ndim == 2 and arr_f.size:
+        inner_ring, outer_ring = _radial_signature(arr_f)
+    return {
+        "aspect": aspect,
+        "density": density,
+        "symmetry": symmetry,
+        "style_var": style_var,
+        "radial_inner": inner_ring,
+        "radial_outer": outer_ring,
+        "count": 1,
+    }
 
 def _render_glyphs(font=None, size=16):
     # PIL's default bitmap font via ImageFont.load_default() matches our demo
@@ -1926,6 +2825,717 @@ def _looks_like_numeric_token(text: str) -> bool:
 def _looks_like_upper_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
 
+
+_TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
+
+
+@dataclass
+class _TessLiteModel:
+    glyphs: Set[str]
+    dictionary: Set[str]
+    bigrams: Dict[str, Dict[str, float]]
+    ambiguous: Dict[str, Set[str]]
+    char_categories: Dict[str, str]
+    source_signature: str
+
+
+_TESSLITE_MODEL: Optional[_TessLiteModel] = None
+_TESSLITE_MODEL_SIG: Optional[str] = None
+_TESSLITE_LAST_SOURCE: str = "none"
+
+_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v1"
+if _tesslite_defaults is not None:
+    _TESSLITE_BUILTIN_SIGNATURE = str(
+        getattr(_tesslite_defaults, "DEFAULT_SIGNATURE", _TESSLITE_BUILTIN_SIGNATURE)
+    )
+
+
+def _tesslite_builtin_available() -> bool:
+    disable = os.environ.get("ZOCR_TESSLITE_DISABLE_BUILTIN", "").strip().lower()
+    if disable in {"1", "true", "yes", "on"}:
+        return False
+    return bool(
+        _tesslite_defaults
+        and getattr(_tesslite_defaults, "DEFAULT_GLYPHS", None)
+        and len(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", [])) > 0
+    )
+
+
+def _tesslite_builtin_payload() -> Tuple[
+    Set[str],
+    Dict[str, Set[str]],
+    Dict[str, str],
+    Set[str],
+    Dict[str, Dict[str, float]],
+]:
+    glyphs: Set[str] = set()
+    ambiguous: Dict[str, Set[str]] = defaultdict(set)
+    categories: Dict[str, str] = {}
+    dictionary: Set[str] = set()
+    bigrams: Dict[str, Dict[str, float]] = {}
+    if not _tesslite_builtin_available():
+        return glyphs, ambiguous, categories, dictionary, bigrams
+    glyphs.update(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", []))
+    for src, targets in getattr(_tesslite_defaults, "DEFAULT_AMBIGUOUS", {}).items():
+        if not targets:
+            continue
+        ambiguous[src].update(targets)
+    categories.update(getattr(_tesslite_defaults, "DEFAULT_CHAR_CATEGORIES", {}))
+    dictionary.update(getattr(_tesslite_defaults, "DEFAULT_DICTIONARY", []))
+    raw_bigrams = getattr(_tesslite_defaults, "DEFAULT_BIGRAMS", {})
+    if isinstance(raw_bigrams, dict):
+        for prev, mapping in raw_bigrams.items():
+            if not isinstance(mapping, dict):
+                continue
+            bigrams[prev] = {str(ch): float(val) for ch, val in mapping.items() if isinstance(val, (int, float))}
+    return glyphs, ambiguous, categories, dictionary, bigrams
+
+
+def _tesslite_env_signature() -> str:
+    paths = [
+        os.environ.get("ZOCR_TESS_UNICHARSET", ""),
+        os.environ.get("ZOCR_TESS_WORDLIST", ""),
+        os.environ.get("ZOCR_TESS_BIGRAM_JSON", ""),
+    ]
+    stats: List[str] = []
+    for path in paths:
+        if not path:
+            stats.append("-")
+            continue
+        try:
+            st = os.stat(path)
+            stats.append(f"{path}:{int(st.st_mtime)}:{st.st_size}")
+        except Exception:
+            stats.append(f"{path}:missing")
+    return "|".join(stats)
+
+
+def _tesslite_effective_source() -> Tuple[bool, str, bool]:
+    unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
+    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
+    env_supplied = any([unichar, wordlist, bigram])
+    if env_supplied:
+        return True, _tesslite_env_signature(), False
+    if _tesslite_builtin_available():
+        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}", True
+    return False, "", False
+
+
+def _decode_unichar_token(token: str) -> str:
+    tok = token.strip().strip('"')
+    if not tok:
+        return ""
+    if tok == "NULL":
+        return ""
+    if tok.startswith("\\"):
+        try:
+            return tok.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+    return tok
+
+
+def _load_unicharset(path: str) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str, str]]:
+    glyphs: Set[str] = set()
+    ambiguous: Dict[str, Set[str]] = defaultdict(set)
+    categories: Dict[str, str] = {}
+    if not path:
+        return glyphs, ambiguous, categories
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                parts = raw.split()
+                if not parts:
+                    continue
+                ch = _decode_unichar_token(parts[0])
+                if not ch:
+                    continue
+                glyphs.add(ch)
+                if len(parts) >= 2:
+                    categories[ch] = parts[1]
+                if len(parts) >= 4 and parts[3] not in {"0", "NULL"}:
+                    ambiguous[ch].add(parts[3])
+    except Exception:
+        return set(), defaultdict(set), {}
+    return glyphs, ambiguous, categories
+
+
+def _load_wordlist(path: str) -> Set[str]:
+    words: Set[str] = set()
+    if not path:
+        return words
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                token = line.strip()
+                if not token or token.startswith("#"):
+                    continue
+                words.add(token)
+    except Exception:
+        return set()
+    return words
+
+
+def _load_bigram_json(path: str) -> Dict[str, Dict[str, float]]:
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}
+    bigrams: Dict[str, Dict[str, float]] = {}
+    if isinstance(payload, dict):
+        for prev, mapping in payload.items():
+            if not isinstance(mapping, dict):
+                continue
+            table: Dict[str, float] = {}
+            for ch, weight in mapping.items():
+                try:
+                    table[str(ch)] = float(weight)
+                except Exception:
+                    continue
+            if table:
+                bigrams[str(prev)] = table
+    return bigrams
+
+
+def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
+    counts: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    totals: Dict[str, float] = defaultdict(float)
+    for word in words:
+        prev = "\0"
+        for ch in word:
+            counts[prev][ch] += 1.0
+            totals[prev] += 1.0
+            prev = ch
+        counts[prev]["\0"] += 1.0
+        totals[prev] += 1.0
+    table: Dict[str, Dict[str, float]] = {}
+    for prev, mapping in counts.items():
+        total = max(1.0, totals.get(prev, 1.0))
+        scale: Dict[str, float] = {}
+        for ch, cnt in mapping.items():
+            scale[ch] = float(cnt / total)
+        if scale:
+            table[prev] = scale
+    return table
+
+
+def _get_tesslite_model() -> Optional[_TessLiteModel]:
+    global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG, _TESSLITE_LAST_SOURCE
+    enabled, signature, use_builtin = _tesslite_effective_source()
+    if not enabled:
+        _TESSLITE_MODEL = None
+        _TESSLITE_MODEL_SIG = None
+        _TESSLITE_LAST_SOURCE = "none"
+        return None
+    if _TESSLITE_MODEL is not None and signature == _TESSLITE_MODEL_SIG:
+        return _TESSLITE_MODEL
+    if use_builtin:
+        glyphs, ambiguous, categories, dictionary, bigrams = _tesslite_builtin_payload()
+    else:
+        unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+        word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
+        bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
+        glyphs, ambiguous, categories = _load_unicharset(unichar_path)
+        dictionary = _load_wordlist(word_path)
+        bigrams = _load_bigram_json(bigram_path)
+    if not bigrams and dictionary:
+        bigrams = _build_bigrams_from_words(dictionary)
+    model = _TessLiteModel(
+        glyphs=glyphs,
+        dictionary=dictionary,
+        bigrams=bigrams,
+        ambiguous=ambiguous,
+        char_categories=categories,
+        source_signature=signature,
+    )
+    _TESSLITE_MODEL = model
+    _TESSLITE_MODEL_SIG = signature
+    _TESSLITE_LAST_SOURCE = "builtin" if use_builtin else "env"
+    return model
+
+
+def get_tesslite_status() -> Dict[str, Any]:
+    enabled, signature, use_builtin = _tesslite_effective_source()
+    unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
+    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
+    source = "builtin" if use_builtin else ("env" if enabled else "none")
+    return {
+        "enabled": bool(enabled),
+        "signature": signature or None,
+        "source": source,
+        "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
+        "wordlist": wordlist if wordlist else ("builtin" if use_builtin else None),
+        "bigram_json": bigram if bigram else ("builtin" if use_builtin else None),
+    }
+
+
+def _feature_source(*names: str) -> str:
+    for name in names:
+        if name and os.environ.get(name) is not None:
+            return "env"
+    return "default"
+
+
+def get_toy_feature_status() -> Dict[str, Any]:
+    """Return a snapshot of the active toy OCR feature knobs."""
+
+    status: Dict[str, Any] = {}
+
+    conf_cfg = _confidence_boost_cfg_from_env()
+    status["confidence_boost"] = {
+        "enabled": bool(conf_cfg.enabled),
+        "target": float(conf_cfg.target),
+        "min_input": float(conf_cfg.min_input),
+        "source": _feature_source("ZOCR_CONF_BOOST_NUMERIC"),
+    }
+
+    lex_cfg = _lexical_boost_cfg_from_env()
+    status["lexical_boost"] = {
+        "enabled": bool(lex_cfg.enabled),
+        "target": float(lex_cfg.target),
+        "min_input": float(lex_cfg.min_input),
+        "min_quality": float(lex_cfg.min_quality),
+        "source": _feature_source("ZOCR_CONF_BOOST_LEXICAL"),
+    }
+
+    alpha_raw = os.environ.get("ZOCR_NGRAM_EMA_ALPHA")
+    try:
+        alpha_val = float(alpha_raw) if alpha_raw is not None else 0.05
+    except Exception:
+        alpha_val = 0.05
+    status["ngram_ema"] = {
+        "alpha": float(max(0.0, alpha_val)),
+        "source": _feature_source("ZOCR_NGRAM_EMA_ALPHA"),
+    }
+
+    motion_cfg = _motion_prior_cfg_from_env()
+    status["motion_prior"] = {
+        "enabled": bool(motion_cfg.enabled),
+        "sigma_px": float(motion_cfg.sigma_px),
+        "auto_sigma": bool(getattr(motion_cfg, "auto_sigma", False)),
+        "k_sigma_window": float(motion_cfg.k_sigma_window),
+        "cutoff_sigma": float(motion_cfg.cutoff_sigma),
+        "accept_ratio": float(motion_cfg.accept_ratio),
+        "source": _feature_source("ZOCR_EXPORT_MOTION_PRIOR", "ZOCR_USE_PRIOR"),
+    }
+
+    blank_cfg = _blank_skip_cfg_from_env()
+    status["blank_skip"] = {
+        "enabled": bool(blank_cfg.enabled),
+        "dark_threshold": int(blank_cfg.dark_threshold),
+        "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        "min_dark_ratio": float(blank_cfg.min_dark_ratio),
+        "min_area": int(blank_cfg.min_area),
+        "source": _feature_source(
+            "ZOCR_EXPORT_SKIP_BLANK",
+            "ZOCR_EXPORT_BLANK_THRESHOLD",
+            "ZOCR_EXPORT_BLANK_MIN_PIXELS",
+            "ZOCR_EXPORT_BLANK_MIN_RATIO",
+            "ZOCR_EXPORT_BLANK_MIN_AREA",
+        ),
+    }
+
+    status["tesslite"] = get_tesslite_status()
+
+    status["pytesseract"] = {
+        "allowed": _pytesseract_allowed(),
+        "source": _feature_source("ZOCR_ALLOW_PYTESSERACT"),
+    }
+
+    flush_raw = os.environ.get("ZOCR_EXPORT_FLUSH_EVERY")
+    if flush_raw:
+        try:
+            flush_val = int(flush_raw)
+        except Exception:
+            flush_val = None
+        if flush_val is not None:
+            status["export_flush"] = {
+                "interval": max(1, flush_val),
+                "source": "env",
+            }
+
+    return status
+
+
+def _tesslite_unknown_ratio(model: _TessLiteModel, text: str) -> float:
+    if not model.glyphs:
+        return 0.0
+    total = 0
+    missing = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        total += 1
+        if ch not in model.glyphs:
+            missing += 1
+    if total == 0:
+        return 0.0
+    return float(missing) / float(total)
+
+
+def _tesslite_dictionary_boost(model: _TessLiteModel, text: str) -> float:
+    token = text.strip()
+    if not token:
+        return 0.0
+    if token in model.dictionary:
+        return 0.15
+    lower = token.lower()
+    if lower in model.dictionary:
+        return 0.1
+    return 0.0
+
+
+def _tesslite_bigram_gate(model: _TessLiteModel, text: str) -> float:
+    if not model.bigrams or len(text) < 2:
+        return 1.0
+    penalties = 0
+    transitions = 0
+    prev = "\0"
+    for ch in text:
+        table = model.bigrams.get(prev)
+        score = table.get(ch, 0.0) if table else 0.0
+        if table is not None:
+            transitions += 1
+            if score < 0.02:
+                penalties += 1
+        prev = ch
+    if transitions == 0:
+        return 1.0
+    ratio = penalties / float(transitions)
+    return float(max(0.4, 1.0 - 0.6 * ratio))
+
+_TOY_CHAR_CATEGORY_MAP = {
+    "digit": set("0123456789０１２３４５６７８９"),
+    "latin_upper": set("ABCDEFGHIJKLMNOPQRSTUVWXYZＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"),
+    "latin_lower": set("abcdefghijklmnopqrstuvwxyzａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"),
+    "kana": set(),
+    "symbol": _TOY_ALLOWED_SYMBOLS | set({'+', '−', 'ー', '―', '~'}),
+}
+_TOY_TRANSITION_PRIORS = {
+    "digit": {"digit": 1.0, "symbol": 0.95, "latin_upper": 0.7, "latin_lower": 0.7, "kana": 0.65, "kanji": 0.65},
+    "latin_upper": {"latin_upper": 1.0, "latin_lower": 0.95, "digit": 0.8, "symbol": 0.75, "kana": 0.55, "kanji": 0.55},
+    "latin_lower": {"latin_lower": 1.0, "latin_upper": 0.9, "digit": 0.7, "symbol": 0.75, "kana": 0.5, "kanji": 0.5},
+    "kanji": {"kanji": 1.0, "kana": 0.9, "digit": 0.65, "symbol": 0.7, "latin_upper": 0.55, "latin_lower": 0.55},
+    "kana": {"kana": 1.0, "kanji": 0.92, "digit": 0.68, "symbol": 0.72, "latin_upper": 0.58, "latin_lower": 0.58},
+}
+
+def _toy_char_category(ch: str) -> str:
+    if not ch:
+        return "other"
+    code = ord(ch)
+    if ch in _TOY_CHAR_CATEGORY_MAP["digit"] or 0xFF10 <= code <= 0xFF19:
+        return "digit"
+    if ch in _TOY_CHAR_CATEGORY_MAP["latin_upper"]:
+        return "latin_upper"
+    if ch in _TOY_CHAR_CATEGORY_MAP["latin_lower"]:
+        return "latin_lower"
+    if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
+        return "kana"
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+        return "kanji"
+    if ch in _TOY_CHAR_CATEGORY_MAP["symbol"]:
+        return "symbol"
+    if ch.isspace():
+        return "space"
+    return "other"
+
+def _toy_transition_gate(text: str) -> Tuple[float, str]:
+    prev_cat: Optional[str] = None
+    penalty = 0
+    transitions = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        cat = _toy_char_category(ch)
+        if prev_cat is None:
+            prev_cat = cat
+            continue
+        transitions += 1
+        priors = _TOY_TRANSITION_PRIORS.get(prev_cat)
+        score = priors.get(cat, 0.5) if priors else 0.5
+        if score < 0.6:
+            penalty += 1
+        prev_cat = cat
+    if transitions == 0:
+        return 1.0, ""
+    ratio = penalty / float(transitions)
+    gate = max(0.55, 1.0 - 0.45 * ratio)
+    reason = f"penalty:{penalty}/{transitions}"
+    return float(gate), reason
+_TOY_NOISE_CHARS = set("?`~^|'\"¤")
+_TOY_GARBLED_PATTERN = re.compile(r"[?]{2,}|[|\\/_]{3,}|={2,}|\bfax\b", re.IGNORECASE)
+_TOY_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?(?:[¥$]\s*)?[0-9][0-9,]*(?:\.[0-9]+)?%?$")
+_TOY_CANONICAL_TOKEN_HINTS: Dict[str, float] = {
+    "item": 0.35,
+    "items": 0.28,
+    "qty": 0.30,
+    "quantity": 0.28,
+    "unitprice": 0.32,
+    "price": 0.22,
+    "amount": 0.35,
+    "total": 0.30,
+    "subtotal": 0.22,
+    "tax": 0.18,
+    "taxtotal": 0.2,
+    "estimate": 0.2,
+    "invoice": 0.18,
+    "description": 0.2,
+    "unit": 0.15,
+    "remarks": 0.18,
+    "date": 0.18,
+    "duedate": 0.24,
+    "servicedate": 0.24,
+    "shipdate": 0.18,
+    "payment": 0.2,
+    "discount": 0.2,
+    "project": 0.18,
+    "code": 0.15,
+    "client": 0.2,
+}
+
+_LEXICAL_CONF_CANONICAL_HINTS: Dict[str, str] = {
+    "item": "item",
+    "items": "item",
+    "description": "item",
+    "qty": "qty",
+    "quantity": "qty",
+    "unit": "qty",
+    "unitprice": "unit_price",
+    "price": "unit_price",
+    "amount": "amount",
+    "subtotal": "subtotal",
+    "total": "total",
+    "taxtotal": "tax",
+    "tax": "tax",
+}
+
+_LEXICAL_CONF_JP_HINTS: Dict[str, str] = {
+    "見積金額": "amount",
+    "御見積金額": "amount",
+    "数量": "qty",
+    "数量合計": "qty",
+    "単価": "unit_price",
+    "金額": "amount",
+    "小計": "subtotal",
+    "合計": "total",
+    "総計": "total",
+    "消費税": "tax",
+    "税込": "total",
+    "税抜": "subtotal",
+}
+
+_JP_TOKEN_STRIP_RE = re.compile(r"[\s\u3000・／/\\\-＿ー－〜~、。\.\[\](){}<>：:；;]+")
+_JP_HONORIFIC_PREFIXES = ("御", "お", "ご")
+_JP_JIS_MARKERS = set("様殿各位行宛先｣『』【】")
+_JP_TOKEN_SUFFIX_HINTS: Dict[str, float] = {
+    "金額": 0.22,
+    "見積金額": 0.3,
+    "御見積金額": 0.3,
+    "御見積書": 0.32,
+    "見積書": 0.32,
+    "合計": 0.26,
+    "小計": 0.22,
+    "数量": 0.22,
+    "単価": 0.22,
+    "金額(税込)": 0.25,
+    "金額(税抜)": 0.24,
+    "税抜金額": 0.24,
+    "税込金額": 0.25,
+    "税額": 0.22,
+    "消費税": 0.24,
+    "納期": 0.2,
+    "有効期限": 0.22,
+    "見積日": 0.22,
+    "発行日": 0.2,
+    "支払期日": 0.22,
+}
+_TOY_JP_TOKEN_HINTS: Dict[str, float] = {
+    "見積書": 0.35,
+    "御見積書": 0.35,
+    "見積金額": 0.34,
+    "御見積金額": 0.34,
+    "金額": 0.26,
+    "合計": 0.3,
+    "総計": 0.28,
+    "小計": 0.25,
+    "消費税": 0.25,
+    "税込": 0.2,
+    "税抜": 0.2,
+    "税率": 0.18,
+    "数量": 0.25,
+    "品名": 0.22,
+    "単価": 0.25,
+    "金額(税込)": 0.28,
+    "金額(税抜)": 0.28,
+    "単価(税込)": 0.23,
+    "単価(税抜)": 0.23,
+    "摘要": 0.22,
+    "備考": 0.18,
+    "見積日": 0.23,
+    "有効期限": 0.24,
+    "納期": 0.23,
+    "発行日": 0.2,
+    "支払期日": 0.23,
+    "請求日": 0.2,
+    "お支払期限": 0.24,
+}
+
+
+def _canonicalize_toy_token(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", (text or "").lower())
+
+
+def _japanese_script_profile(text: str) -> Dict[str, float]:
+    counts = {
+        "kanji": 0,
+        "hiragana": 0,
+        "katakana": 0,
+        "latin": 0,
+        "digit": 0,
+        "other": 0,
+    }
+    total = len(text or "")
+    for ch in text or "":
+        code = ord(ch)
+        if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+            counts["kanji"] += 1
+        elif 0x3040 <= code <= 0x309F:
+            counts["hiragana"] += 1
+        elif 0x30A0 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
+            counts["katakana"] += 1
+        elif 0x0030 <= code <= 0x0039 or 0xFF10 <= code <= 0xFF19:
+            counts["digit"] += 1
+        elif 0x0041 <= code <= 0x005A or 0x0061 <= code <= 0x007A or 0xFF21 <= code <= 0xFF3A or 0xFF41 <= code <= 0xFF5A:
+            counts["latin"] += 1
+        else:
+            counts["other"] += 1
+    jp_chars = counts["kanji"] + counts["hiragana"] + counts["katakana"]
+    profile: Dict[str, float] = {k: float(v) for k, v in counts.items()}
+    profile["jp_chars"] = float(jp_chars)
+    profile["total_chars"] = float(total)
+    profile["jp_ratio"] = float(jp_chars) / float(total or 1)
+    profile["kanji_ratio"] = float(counts["kanji"]) / float(total or 1)
+    profile["kana_ratio"] = float(counts["hiragana"] + counts["katakana"]) / float(total or 1)
+    profile["latin_ratio"] = float(counts["latin"]) / float(total or 1)
+    return profile
+
+
+def _normalize_japanese_token(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = _JP_TOKEN_STRIP_RE.sub("", normalized)
+    for prefix in _JP_HONORIFIC_PREFIXES:
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            normalized = normalized[len(prefix) :]
+    if normalized and normalized[0] in _JP_JIS_MARKERS:
+        normalized = normalized[1:]
+    return normalized
+
+
+def _japanese_token_hint(text: str, profile: Dict[str, float]) -> Tuple[float, str]:
+    normalized = _normalize_japanese_token(text)
+    if not normalized:
+        return 0.0, ""
+    boost = _TOY_JP_TOKEN_HINTS.get(normalized, 0.0)
+    reason = "dict" if boost else ""
+    if not boost:
+        for suffix, bonus in _JP_TOKEN_SUFFIX_HINTS.items():
+            if normalized.endswith(suffix) and len(normalized) >= len(suffix) + 1:
+                boost = max(boost, bonus)
+                reason = f"suffix:{suffix}"
+                break
+    if not boost and profile.get("kana_ratio", 0.0) > 0.6 and profile.get("kanji_ratio", 0.0) < 0.1:
+        boost = 0.05
+        reason = "kana_balance"
+    elif not boost and profile.get("kanji_ratio", 0.0) >= 0.45:
+        boost = 0.05
+        reason = "kanji_balance"
+    return float(min(0.5, boost)), reason
+
+
+def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return 0.0, {"reason": "empty"}
+    length = len(normalized)
+    allowed = 0
+    ascii_like = 0
+    weird = 0
+    jp_profile = _japanese_script_profile(normalized)
+    for ch in normalized:
+        if ord(ch) < 128:
+            ascii_like += 1
+        if ch.isalnum() or ch in _TOY_ALLOWED_SYMBOLS:
+            allowed += 1
+        elif ch in _TOY_NOISE_CHARS or ord(ch) >= 0x2500:
+            weird += 1
+    allowed_ratio = float(allowed) / float(length or 1)
+    weird_ratio = float(weird) / float(length or 1)
+    base = 0.4 + 0.6 * allowed_ratio
+    ascii_penalty = ascii_like < max(1, length - 1) and not _TOY_NUMERIC_TOKEN_RE.match(normalized)
+    if ascii_penalty and jp_profile.get("jp_ratio", 0.0) > 0.35:
+        ascii_penalty = False
+    if ascii_penalty:
+        base *= 0.9
+    if weird_ratio > 0:
+        base *= max(0.35, 1.0 - 0.45 * weird_ratio)
+    canonical = _canonicalize_toy_token(normalized)
+    lex_boost = 1.0
+    if canonical:
+        lex_boost += _TOY_CANONICAL_TOKEN_HINTS.get(canonical, 0.0)
+    if _TOY_NUMERIC_TOKEN_RE.match(normalized):
+        lex_boost = max(lex_boost, 1.05)
+    elif len(canonical) <= 1 and canonical not in {"x", "y", "z", "a"}:
+        base *= 0.9
+    jp_boost, jp_reason = _japanese_token_hint(normalized, jp_profile)
+    if jp_boost:
+        lex_boost += jp_boost
+    transition_gate, transition_reason = _toy_transition_gate(normalized)
+    if transition_gate < 1.0:
+        base *= transition_gate
+    tess_model = _get_tesslite_model()
+    tess_unknown = 0.0
+    tess_gate = 1.0
+    tess_dict_boost = 0.0
+    if tess_model:
+        tess_unknown = _tesslite_unknown_ratio(tess_model, normalized)
+        if tess_unknown > 0:
+            base *= max(0.35, 1.0 - 0.55 * tess_unknown)
+            _GLYPH_RUNTIME_STATS["tess_unknown_hits"] += 1.0
+        tess_gate = _tesslite_bigram_gate(tess_model, normalized)
+        if tess_gate < 1.0:
+            base *= tess_gate
+            _GLYPH_RUNTIME_STATS["tess_bigram_penalties"] += 1.0
+        tess_dict_boost = _tesslite_dictionary_boost(tess_model, normalized)
+        if tess_dict_boost > 0:
+            lex_boost += tess_dict_boost
+            _GLYPH_RUNTIME_STATS["tess_dictionary_boosts"] += 1.0
+    if _TOY_GARBLED_PATTERN.search(normalized):
+        base *= 0.6
+    quality = float(max(0.2, min(1.6, base * lex_boost)))
+    diag = {
+        "canonical": canonical,
+        "allowed_ratio": allowed_ratio,
+        "weird_ratio": weird_ratio,
+        "lex_boost": lex_boost,
+        "jp_ratio": jp_profile.get("jp_ratio", 0.0),
+        "jp_hint": jp_boost,
+        "jp_hint_reason": jp_reason,
+        "transition_gate": transition_gate,
+        "transition_reason": transition_reason,
+        "tess_unknown_ratio": tess_unknown,
+        "tess_bigram_gate": tess_gate,
+        "tess_dict_boost": tess_dict_boost,
+    }
+    return quality, diag
+
 def _ngram_probability(prev: str, ch: str) -> float:
     counts = _NGRAM_COUNTS.get(prev)
     totals = _NGRAM_TOTALS.get(prev, 0)
@@ -2112,6 +3722,7 @@ _TOTAL_LABEL_HINTS = [
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?%?")
+_NUMERIC_HEADER_INFERRED_LAST = 0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -2157,6 +3768,13 @@ def _pytesseract_env_kwargs() -> Dict[str, Any]:
 _PYTESS_ENV_KWARGS = _pytesseract_env_kwargs()
 _PYTESS_ENV_SUPPORTED = True
 _PYTESS_TIMEOUT_WARNED = False
+
+
+def _pytesseract_allowed() -> bool:
+    raw = os.environ.get("ZOCR_ALLOW_PYTESSERACT")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _note_pytesseract_exception(label: str, exc: Exception) -> None:
@@ -2240,18 +3858,18 @@ def configure_toy_runtime(
             updates["force_numeric"] = new_flag
     return updates
 _NUMERIC_HEADER_KIND = [
-    ("qty", re.compile(r"(数量|数|個|qty|q'?ty|quantity)", re.I)),
+    ("qty", re.compile(r"(数量|数|個|台数|件数|口数|本数|点数|qty|q'?ty|quantity)", re.I)),
     ("unit_price", re.compile(r"(単価|unit\s*price|price|unit\s*cost)", re.I)),
     ("subtotal", re.compile(r"(小計|subtotal)", re.I)),
     (
         "amount",
         re.compile(
-            r"(金額|合計|総計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
+            r"(金額|見積金額|御見積金額|御見積合計|合計金額|合計|総計|計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
             re.I,
         ),
     ),
-    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount)", re.I)),
-    ("tax_rate", re.compile(r"(税率|消費税|tax(\s*rate)?|vat|gst)", re.I)),
+    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount|gst\s*amount)", re.I)),
+    ("tax_rate", re.compile(r"(税率|消費税率|税%|tax%|tax(\s*rate)?|vat|gst)", re.I)),
 ]
 
 _FULLWIDTH_NUMBERS = str.maketrans(
@@ -2338,25 +3956,138 @@ def _coerce_numeric_filters(kind: Optional[str], text: str) -> Tuple[str, Dict[s
     return result_text, payload
 
 
-def _numeric_header_kinds(headers: Sequence[str]) -> List[Optional[str]]:
-    kinds: List[Optional[str]] = []
-    if not headers or not _FORCE_NUMERIC:
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+def _header_variants_for_numeric(label: str) -> List[str]:
+    base = _canonicalize_header_label(label)
+    variants: List[str] = []
+    if not base:
+        return variants
+
+    def _add(val: str) -> None:
+        val = val.strip()
+        if val and val not in variants:
+            variants.append(val)
+
+    _add(base)
+    _add(base.replace(" ", ""))
+    honorific = base.lstrip("御お")
+    _add(honorific)
+    no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", base)
+    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+    _add(no_brackets)
+    simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", base)
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    _add(simplified)
+    _add(simplified.replace(" ", ""))
+    for token in re.split(r"[/｜\|・,、]", base):
+        token = token.strip()
+        if not token:
+            continue
+        _add(token)
+        _add(token.replace(" ", ""))
+    return variants
+
+
+def _infer_numeric_kinds_from_values(
+    grid_text: Sequence[Sequence[str]],
+    kinds: List[Optional[str]],
+) -> List[Optional[str]]:
+    global _NUMERIC_HEADER_INFERRED_LAST
+    inferred = 0
+    if not grid_text:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
         return kinds
-    for header in headers:
-        base = (header or "").strip().lower()
-        kind: Optional[str] = None
-        for candidate, rx in _NUMERIC_HEADER_KIND:
-            if rx.search(base):
-                kind = candidate
-                break
-        kinds.append(kind)
+    num_cols = max(len(row) for row in grid_text)
+    if len(kinds) < num_cols:
+        kinds.extend([None] * (num_cols - len(kinds)))
+    currency_rx = re.compile(r"[¥￥円＄$元]")
+    for c in range(num_cols):
+        if c < len(kinds) and kinds[c]:
+            continue
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimals = 0
+        values: List[float] = []
+        for r in range(1, len(grid_text)):
+            row = grid_text[r]
+            if c >= len(row):
+                continue
+            txt = str(row[c] or "").strip()
+            if not txt:
+                continue
+            total += 1
+            if currency_rx.search(txt):
+                currency_hits += 1
+            cleaned = txt.replace("，", ",").replace("．", ".")
+            cleaned = cleaned.replace(",", "")
+            match = re.search(r"[+\-]?\d+(?:\.\d+)?", cleaned)
+            if not match:
+                continue
+            numeric_hits += 1
+            token = match.group(0)
+            try:
+                val = float(token)
+            except ValueError:
+                continue
+            values.append(abs(val))
+            if "." in token:
+                decimals += 1
+        if total < 2:
+            continue
+        ratio = numeric_hits / float(total)
+        if ratio < 0.65:
+            continue
+        avg_val = sum(values) / float(len(values)) if values else 0.0
+        if currency_hits >= max(1, math.ceil(total * 0.4)) or avg_val >= 1000:
+            new_kind = "total" if c >= num_cols - 1 else "amount"
+        elif decimals > 0 and avg_val >= 1:
+            new_kind = "unit_price"
+        else:
+            new_kind = "qty"
+        kinds[c] = new_kind
+        inferred += 1
+    _NUMERIC_HEADER_INFERRED_LAST = inferred
+    return kinds
+
+
+def _numeric_header_kinds(
+    headers: Sequence[str],
+    grid_text: Optional[Sequence[Sequence[str]]] = None,
+) -> List[Optional[str]]:
+    global _NUMERIC_HEADER_INFERRED_LAST
+    kinds: List[Optional[str]] = []
+    if not _FORCE_NUMERIC:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
+        return kinds
+    if headers:
+        for header in headers:
+            kind: Optional[str] = None
+            for variant in _header_variants_for_numeric(header) or [""]:
+                for candidate, rx in _NUMERIC_HEADER_KIND:
+                    if variant and rx.search(variant):
+                        kind = candidate
+                        break
+                if kind:
+                    break
+            kinds.append(kind)
+    if grid_text:
+        kinds = _infer_numeric_kinds_from_values(grid_text, kinds)
+    else:
+        _NUMERIC_HEADER_INFERRED_LAST = 0
     return kinds
 
 
 def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequence[str]]) -> None:
-    if not headers or not _FORCE_NUMERIC:
+    if not _FORCE_NUMERIC:
         return
-    kinds = _numeric_header_kinds(headers)
+    kinds = _numeric_header_kinds(headers, grid_text)
     if not kinds:
         return
     for r in range(1, len(grid_text)):
@@ -2373,6 +4104,206 @@ def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequ
             grid_text[r][:] = row
 
 
+_DATE_ROLE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
+    (
+        "due",
+        (
+            "due date",
+            "payment due",
+            "due on",
+            "due",
+            "支払期限",
+            "支払期日",
+            "支払日",
+            "期日",
+            "納期",
+        ),
+    ),
+    (
+        "issue",
+        (
+            "invoice date",
+            "issue date",
+            "billing date",
+            "請求日",
+            "発行日",
+            "作成日",
+            "交付日",
+            "売上日",
+        ),
+    ),
+    (
+        "service",
+        (
+            "service date",
+            "ship date",
+            "delivery date",
+            "利用日",
+            "作業日",
+            "搭乗日",
+            "乗車日",
+        ),
+    ),
+]
+
+_DATE_RX_SLASH = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})[./-](?P<month>0?[1-9]|1[0-2])(?:[./-](?P<day>0?[1-9]|[12]\d|3[01]))?"
+)
+_DATE_RX_KANJI = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_ERA = re.compile(
+    r"(?P<era>令和|平成|昭和)(?P<erayear>元|\d{1,2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_COMPACT = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})(?P<month>0?[1-9]|1[0-2])(?P<day>0?[1-9]|[12]\d|3[01])"
+)
+_JP_ERA_BASE = {"令和": 2018, "平成": 1988, "昭和": 1925}
+
+
+def _date_role_from_header(header: Optional[str]) -> Optional[str]:
+    if not header:
+        return None
+    base = header.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _date_header_roles(headers: Sequence[str]) -> List[Optional[str]]:
+    roles: List[Optional[str]] = []
+    if not headers:
+        return roles
+    for header in headers:
+        roles.append(_date_role_from_header(header))
+    return roles
+
+
+def _infer_date_role_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    base = text.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _normalize_japanese_era_year(era: str, era_year: str) -> Optional[int]:
+    base = _JP_ERA_BASE.get(era)
+    if base is None:
+        return None
+    token = era_year.strip()
+    if token == "元":
+        offset = 1
+    else:
+        try:
+            offset = int(token)
+        except Exception:
+            return None
+    if offset <= 0:
+        return None
+    return base + offset
+
+
+def _normalize_date_value(text: str) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    norm = str(text).strip()
+    if not norm:
+        return None
+    norm = norm.translate(_FULLWIDTH_NUMBERS)
+    compact = norm.replace(" ", "").replace("　", "")
+
+    def _format(year: int, month: int, day: Optional[int]) -> Optional[Tuple[str, str]]:
+        if year < 1900 or year > 2100:
+            return None
+        if not 1 <= month <= 12:
+            return None
+        precision = "ym"
+        value = f"{year:04d}-{month:02d}"
+        if day is not None:
+            if not 1 <= day <= 31:
+                return None
+            precision = "ymd"
+            value = f"{value}-{day:02d}"
+        return value, precision
+
+    for rx in (_DATE_RX_SLASH, _DATE_RX_KANJI):
+        m = rx.search(compact)
+        if not m:
+            continue
+        try:
+            year = int(m.group("year"))
+            month = int(m.group("month"))
+            day = int(m.group("day")) if m.group("day") else None
+        except Exception:
+            continue
+        formatted = _format(year, month, day)
+        if formatted:
+            return formatted
+
+    m_era = _DATE_RX_ERA.search(compact)
+    if m_era:
+        year = _normalize_japanese_era_year(m_era.group("era"), m_era.group("erayear"))
+        try:
+            month = int(m_era.group("month"))
+            day = int(m_era.group("day")) if m_era.group("day") else None
+        except Exception:
+            month = None
+            day = None
+        if year and month:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+
+    m_compact = _DATE_RX_COMPACT.search(compact)
+    if m_compact:
+        try:
+            year = int(m_compact.group("year"))
+            month = int(m_compact.group("month"))
+            day = int(m_compact.group("day"))
+        except Exception:
+            year = month = day = None
+        if year and month and day:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+    return None
+
+
+def _extract_date_filters(text: str, header_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_date_value(text)
+    if not normalized:
+        return None
+    value, precision = normalized
+    role = header_role or _infer_date_role_from_text(text)
+    payload: Dict[str, Any] = {
+        "date": value,
+        "date_precision": precision,
+    }
+    if role == "due":
+        payload["due_date"] = value
+    elif role == "issue":
+        payload["issue_date"] = value
+    elif role == "service":
+        payload["service_date"] = value
+    if role:
+        payload["date_role"] = role
+    return payload
+
+
 _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
     "qty": "0123456789",
     "unit_price": "0123456789.-",
@@ -2381,6 +4312,603 @@ _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
     "tax_amount": "0123456789.-",
     "tax_rate": "0123456789.%",
 }
+
+_ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
+    {
+        "key": "item",
+        "pattern": re.compile(r"(item|品名|品目|摘要|description|desc|details)", re.I),
+        "title": "Item",
+        "normalizer": None,
+    },
+    {
+        "key": "qty",
+        "pattern": re.compile(r"(qty|数量|quantity|q'?ty|pcs?|units?|個数|台数)", re.I),
+        "title": "Qty",
+        "normalizer": "qty",
+    },
+    {
+        "key": "unit_price",
+        "pattern": re.compile(r"(unit\s*(price|cost)|単価|単価金額)", re.I),
+        "title": "Unit Price",
+        "normalizer": "currency",
+    },
+    {
+        "key": "amount",
+        "pattern": re.compile(r"(amount|line\s*total|line\s*amount|金額|total|合計|総計|見積金額)", re.I),
+        "title": "Amount",
+        "normalizer": "currency",
+    },
+]
+
+_SCHEMA_SEMANTIC_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "item": (
+        "item",
+        "品名",
+        "品目",
+        "摘要",
+        "内容",
+        "名称",
+        "品番",
+        "項目",
+        "description",
+        "desc",
+        "details",
+        "備考",
+        "仕様",
+    ),
+    "qty": (
+        "qty",
+        "quantity",
+        "数量",
+        "個数",
+        "台数",
+        "数",
+        "pcs",
+        "unit",
+    ),
+    "unit_price": (
+        "unitprice",
+        "unitcost",
+        "単価",
+        "単価金額",
+        "単価(税込)",
+        "単価(税抜)",
+    ),
+    "amount": (
+        "amount",
+        "total",
+        "lineamount",
+        "lineTotal",
+        "金額",
+        "合計",
+        "総計",
+        "見積金額",
+        "御見積金額",
+        "計",
+        "税込金額",
+    ),
+}
+
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def _build_schema_synonym_map() -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for key, tokens in _SCHEMA_SEMANTIC_SYNONYMS.items():
+        for token in tokens:
+            norm = _schema_normalize_header_token(token)
+            if not norm:
+                continue
+            mapping.setdefault(norm, key)
+    return mapping
+
+
+_SCHEMA_SYNONYM_MAP = _build_schema_synonym_map()
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                mapped = _SCHEMA_SYNONYM_MAP.get(token)
+                if mapped == column.get("key"):
+                    best_idx = idx
+                    break
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _schema_token_role(text: Optional[str]) -> Optional[str]:
+    token = _schema_normalize_header_token(text)
+    if not token:
+        return None
+    mapped = _SCHEMA_SYNONYM_MAP.get(token)
+    if mapped:
+        return mapped
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        if pattern and pattern.search(token):
+            return column.get("key")
+    return None
+
+
+def _collect_schema_token_bonuses(
+    grid_text: Sequence[Sequence[str]], num_cols: int
+) -> List[defaultdict]:  # type: ignore[type-arg]
+    bonuses: List[defaultdict] = [defaultdict(float) for _ in range(max(0, num_cols))]
+    if not grid_text or num_cols <= 0:
+        return bonuses
+    sample_rows: List[Sequence[str]] = []
+    sample_rows.extend(grid_text[:2])
+    sample_rows.extend(grid_text[-2:])
+    for ridx, row in enumerate(sample_rows):
+        weight = 1.2 if ridx == 0 else (1.0 if ridx <= 2 else 0.9)
+        for idx in range(num_cols):
+            token = row[idx] if idx < len(row) else None
+            role = _schema_token_role(token)
+            if not role:
+                continue
+            bonuses[idx][role] += weight
+    return bonuses
+
+
+def _semantic_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < num_cols:
+        return None
+    bonuses = _collect_schema_token_bonuses(grid_text, num_cols)
+
+    def _score(idx: int, key: str) -> float:
+        profile = profiles[idx] if idx < len(profiles) else {
+            "numeric_ratio": 0.0,
+            "currency_ratio": 0.0,
+            "decimal_ratio": 0.0,
+            "text_ratio": 0.0,
+        }
+        score = 0.0
+        if key == "item":
+            score = profile.get("text_ratio", 0.0) * 1.2 + (1.0 - profile.get("numeric_ratio", 0.0)) * 0.4
+        elif key == "qty":
+            score = profile.get("numeric_ratio", 0.0) * 1.1 + (1.0 - profile.get("currency_ratio", 0.0)) * 0.3
+            score -= profile.get("text_ratio", 0.0) * 0.2
+        elif key == "unit_price":
+            score = profile.get("decimal_ratio", 0.0) * 1.0 + profile.get("currency_ratio", 0.0) * 0.6
+            score += profile.get("numeric_ratio", 0.0) * 0.25
+        elif key == "amount":
+            score = profile.get("currency_ratio", 0.0) * 1.2 + profile.get("numeric_ratio", 0.0) * 0.6
+        score += bonuses[idx].get(key, 0.0)
+        # prefer columns closer to the right for amount but left for item
+        if key == "item":
+            score -= idx * 0.02
+        elif key == "amount":
+            score += idx * 0.01
+        return score
+
+    def _select_best(indices: Sequence[int], key: str) -> Optional[int]:
+        best_idx = None
+        best_score = -1e9
+        for idx in indices:
+            sc = _score(idx, key)
+            if sc > best_score:
+                best_score = sc
+                best_idx = idx
+        if best_idx is None or best_score < 0.1:
+            return None
+        return best_idx
+
+    all_indices = list(range(num_cols))
+    amount_idx = _select_best(all_indices, "amount")
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in all_indices if idx < amount_idx]
+    unit_price_idx = _select_best(unit_price_candidates, "unit_price")
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in all_indices if idx < unit_price_idx]
+    qty_idx = _select_best(qty_candidates, "qty")
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in all_indices if idx < qty_idx]
+    item_idx = _select_best(item_candidates, "item")
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _looks_like_numeric_token(text: Optional[str]) -> bool:
+    if text is None:
+        return False
+    body = str(text).strip()
+    if not body:
+        return False
+    compact = body.replace(",", "").replace("，", "").replace("．", ".")
+    if compact.endswith("%"):
+        compact = compact[:-1]
+    return bool(re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact))
+
+
+def _looks_like_item_context(text: Optional[str]) -> bool:
+    if text is None:
+        return False
+    body = str(text).strip()
+    if not body:
+        return False
+    if _looks_like_numeric_token(body):
+        return False
+    if any(ch.isalpha() for ch in body):
+        return True
+    for ch in body:
+        cat = unicodedata.category(ch)
+        if cat.startswith("L"):
+            return True
+    return len(body) >= 4
+
+
+def _looks_like_item_noise(text: Optional[str]) -> bool:
+    if text is None:
+        return True
+    body = str(text).strip()
+    if not body:
+        return True
+    if len(body) <= 2:
+        return True
+    if body.isupper() and len(body) <= 4 and body.isalpha():
+        return True
+    return False
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    strategy = "header"
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _semantic_item_qty_schema(grid_text)
+        if match:
+            strategy = "semantic"
+    if not match:
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    left_item_cols = [idx for idx in noise_cols if idx < match[0]] if match else []
+    right_amount_cols = [idx for idx in noise_cols if idx > match[-1]] if match else []
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+    item_aux_rows = 0
+    item_aux_cells = 0
+    item_aux_examples: List[str] = []
+    trailing_notes = 0
+    trailing_note_rows = 0
+    trailing_note_examples: List[str] = []
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            left_candidates: List[Tuple[str, float]] = []
+            trailing_candidates: List[str] = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+                if idx in left_item_cols and _looks_like_item_context(txt):
+                    cleaned = str(txt).strip()
+                    if cleaned:
+                        left_candidates.append((cleaned, cf))
+                elif idx in right_amount_cols:
+                    cleaned = str(txt).strip()
+                    if not cleaned or _looks_like_numeric_token(cleaned):
+                        continue
+                    trailing_candidates.append(cleaned)
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+            if left_candidates:
+                left_candidates.reverse()
+                base_val = new_row[0] or ""
+                base_clean = base_val.strip()
+                allow_merge = (not base_clean) or _looks_like_item_noise(base_clean) or len(base_clean) <= 3
+                if allow_merge:
+                    merged_tokens: List[str] = []
+                    for token, cf in left_candidates:
+                        token_clean = token.strip()
+                        if not token_clean:
+                            continue
+                        if token_clean in merged_tokens:
+                            continue
+                        merged_tokens.append(token_clean)
+                        item_aux_cells += 1
+                        if len(item_aux_examples) < 5:
+                            item_aux_examples.append(token_clean)
+                        new_conf_row[0] = max(new_conf_row[0], cf)
+                    keep_existing = bool(base_clean and not _looks_like_item_noise(base_clean))
+                    if keep_existing and base_clean:
+                        merged_tokens.append(base_clean)
+                    if merged_tokens:
+                        merged_value = "\n".join(merged_tokens)
+                        if merged_value != new_row[0]:
+                            new_row[0] = merged_value
+                            row_changed = True
+                            item_aux_rows += 1
+            if trailing_candidates:
+                trailing_notes += len(trailing_candidates)
+                trailing_note_rows += 1
+                for token in trailing_candidates:
+                    if len(trailing_note_examples) < 5 and token not in trailing_note_examples:
+                        trailing_note_examples.append(token)
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
+        "item_aux_rows": item_aux_rows,
+        "item_aux_cells": item_aux_cells,
+        "item_aux_examples": item_aux_examples[:5],
+        "trailing_notes": trailing_notes,
+        "trailing_note_rows": trailing_note_rows,
+        "trailing_note_examples": trailing_note_examples[:5],
+    }
+    return new_text, new_conf, new_bounds, stats
 
 
 def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
@@ -2433,7 +4961,7 @@ def _ambiguous_variants(text: Optional[str]) -> List[str]:
 
 
 def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
-    if pytesseract is None or _PYTESS_OUTPUT is None:
+    if not _pytesseract_allowed() or pytesseract is None or _PYTESS_OUTPUT is None:
         return []
     variants: List[Tuple[str, float, str]] = []
     config = "--psm 6"
@@ -2686,6 +5214,8 @@ def _synthetic_external_variants(img: "Image.Image") -> List[Tuple[str, float, s
 
 def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
     variants: List[Tuple[str, float, str]] = []
+    if not _pytesseract_allowed():
+        return _synthetic_external_variants(img)
     tess_variants = _pytesseract_variants(img)
     variants.extend(tess_variants)
     if pytesseract is not None and tess_variants:
@@ -2719,6 +5249,53 @@ def _is_total_row(cells: List[str]) -> bool:
             return True
     return False
 
+
+def _numeric_token_value(token: str) -> Optional[float]:
+    if not token:
+        return None
+    body = token.replace(",", "")
+    if body.endswith("%"):
+        return None
+    try:
+        return float(body)
+    except Exception:
+        return None
+
+
+def _relocate_total_amount(
+    row: List[str], conf_row: List[float], target_idx: int
+) -> bool:
+    if target_idx < 0 or target_idx >= len(row):
+        return False
+    existing = _NUMERIC_RX.search(row[target_idx] or "")
+    if existing and not (existing.group(0).endswith("%")):
+        return False
+    best_idx = None
+    best_token = None
+    best_score: Optional[Tuple[float, int]] = None
+    for idx, cell in enumerate(row):
+        if idx == target_idx:
+            continue
+        match = _NUMERIC_RX.search(cell or "")
+        if not match:
+            continue
+        token = match.group(0)
+        if token.endswith("%"):
+            continue
+        value = _numeric_token_value(token)
+        magnitude = abs(value) if value is not None else 0.0
+        score = (magnitude, idx)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = idx
+            best_token = token
+    if best_idx is None or best_token is None:
+        return False
+    row[target_idx] = best_token
+    if best_idx < len(conf_row):
+        conf_row[target_idx] = max(conf_row[target_idx], conf_row[best_idx])
+    return True
+
 def _resize_keep_ar(im, w, h):
     im = im.convert("L")
     iw, ih = im.size
@@ -2728,6 +5305,358 @@ def _resize_keep_ar(im, w, h):
     out = Image.new("L", (w,h), 0)
     out.paste(imr, ((w-tw)//2,(h-th)//2))
     return out
+
+
+_TOKEN_TEMPLATE_SIZE = (96, 28)
+_TOKEN_TEMPLATE_MAX_VARIANTS = 8
+_TOKEN_TEMPLATE_PRESETS = [
+    "item",
+    "qty",
+    "unit price",
+    "amount",
+    "total",
+    "subtotal",
+    "tax",
+    "due",
+    "date",
+    "見積金額",
+    "御見積金額",
+    "数量",
+    "単価",
+    "金額",
+    "小計",
+    "合計",
+]
+
+
+def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+_TOKEN_TEMPLATE_FONT = _load_template_font()
+
+
+def _render_template_bitmap(token: str) -> Optional["Image.Image"]:
+    text = (token or "").strip()
+    if not text:
+        return None
+    font = _TOKEN_TEMPLATE_FONT
+    try:
+        bbox = font.getbbox(text)
+    except Exception:
+        bbox = None
+    if bbox:
+        width = max(12, bbox[2] - bbox[0] + 6)
+        height = max(12, bbox[3] - bbox[1] + 6)
+    else:
+        width = max(12, len(text) * 8)
+        height = 24
+    img = Image.new("L", (width, height), 0)
+    dr = ImageDraw.Draw(img)
+    try:
+        dr.text((3, 2), text, fill=255, font=font)
+    except Exception:
+        return None
+    if not img.getbbox():
+        return None
+    return img
+
+
+def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
+    import numpy as _np
+
+    try:
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+    except Exception:
+        return None
+    resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
+    arr_f = _np.asarray(resized, dtype=_np.float32)
+    if arr_f.size == 0:
+        return None
+    std = float(arr_f.std())
+    if std < 1e-3:
+        return None
+    normed = (arr_f - float(arr_f.mean())) / (std + 1e-3)
+    return normed
+
+
+def _init_token_template_library() -> Dict[str, deque]:
+    library: Dict[str, deque] = {}
+    for token in _TOKEN_TEMPLATE_PRESETS:
+        bmp = _render_template_bitmap(token)
+        if bmp is None:
+            continue
+        norm = _normalize_template_bitmap(bmp)
+        if norm is None:
+            continue
+        dq = library.setdefault(token, deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS))
+        dq.append(norm)
+    return library
+
+
+_TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+
+_TEMPLATE_CACHE_STATE: Dict[str, Any] = {
+    "loaded_path": None,
+    "loaded": False,
+    "autosave": False,
+    "dirty": False,
+}
+
+
+def _template_cache_path() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TEMPLATE_CACHE")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "false", "none"}:
+        return None
+    return os.path.abspath(raw)
+
+
+def _update_template_variant_stats() -> None:
+    total = 0
+    for dq in _TOKEN_TEMPLATE_LIBRARY.values():
+        if dq:
+            total += len(dq)
+    _GLYPH_RUNTIME_STATS["template_cache_variants"] = float(total)
+
+
+def _ensure_template_cache_autosave() -> None:
+    if _TEMPLATE_CACHE_STATE.get("autosave"):
+        return
+    if not _template_cache_path():
+        return
+    atexit.register(_autosave_template_cache)
+    _TEMPLATE_CACHE_STATE["autosave"] = True
+
+
+def _ensure_template_cache_loaded() -> None:
+    path = _template_cache_path()
+    if not path:
+        return
+    state_path = _TEMPLATE_CACHE_STATE.get("loaded_path")
+    if _TEMPLATE_CACHE_STATE.get("loaded") and state_path == path:
+        return
+    _load_token_template_cache(path)
+
+
+def _load_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except FileNotFoundError:
+        _TEMPLATE_CACHE_STATE["loaded_path"] = path
+        _TEMPLATE_CACHE_STATE["loaded"] = True
+        _TEMPLATE_CACHE_STATE["dirty"] = False
+        _ensure_template_cache_autosave()
+        return
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    restored = 0
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if isinstance(tokens, dict):
+        for token, entry in tokens.items():
+            variants = []
+            if isinstance(entry, dict):
+                seq = entry.get("variants")
+                if isinstance(seq, list):
+                    variants = seq
+            elif isinstance(entry, list):
+                variants = entry
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                shape = variant.get("shape")
+                data = variant.get("data")
+                if not shape or not data:
+                    continue
+                try:
+                    arr = np.asarray(data, dtype=np.float32)
+                    dims = tuple(int(v) for v in shape)
+                    if len(dims) != 2 or arr.size != (dims[0] * dims[1]):
+                        continue
+                    arr = arr.reshape(dims)
+                except Exception:
+                    continue
+                dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+                if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+                    dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+                    _TOKEN_TEMPLATE_LIBRARY[token] = dq
+                dq.append(arr)
+                restored += 1
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _ensure_template_cache_autosave()
+    _update_template_variant_stats()
+    _GLYPH_RUNTIME_STATS["template_cache_loaded"] = float(restored)
+
+
+def _serialize_template_variants(dq: "deque[Any]") -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for tpl in dq:
+        try:
+            arr = np.asarray(tpl, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        payload = {
+            "shape": [int(dim) for dim in arr.shape],
+            "data": [round(float(val), 4) for val in arr.flatten().tolist()],
+        }
+        serialized.append(payload)
+    return serialized
+
+
+def _save_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    tokens: Dict[str, Any] = {}
+    total = 0
+    for token, dq in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not dq:
+            continue
+        variants = _serialize_template_variants(dq)
+        if not variants:
+            continue
+        tokens[token] = {"variants": variants}
+        total += len(variants)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {"version": 1, "tokens": tokens, "updated_at": time.time()}
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _GLYPH_RUNTIME_STATS["template_cache_saved"] = float(total)
+    _update_template_variant_stats()
+
+
+def _autosave_template_cache() -> None:
+    if not _TEMPLATE_CACHE_STATE.get("dirty"):
+        return
+    path = _template_cache_path()
+    if not path:
+        return
+    _save_token_template_cache(path)
+
+
+def _observe_token_template(token: str, arr: Any) -> None:
+    if not token:
+        return
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[token] = dq
+    dq.append(norm)
+    _TEMPLATE_CACHE_STATE["dirty"] = True
+    _update_template_variant_stats()
+
+
+def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
+    import numpy as _np
+
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return "", 0.0
+    best_token = ""
+    best_score = -1.0
+    _GLYPH_RUNTIME_STATS["template_cache_checks"] += 1.0
+    for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not variants:
+            continue
+        for tpl in variants:
+            if tpl.shape != norm.shape:
+                continue
+            score = float((norm * tpl).mean())
+            if score > best_score:
+                best_score = score
+                best_token = token
+    if best_score < 0.35:
+        _GLYPH_RUNTIME_STATS["template_cache_misses"] += 1.0
+        return "", 0.0
+    conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
+    _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
+    return best_token, conf
+
+
+def _normalized_string_distance(a: str, b: str) -> float:
+    if not a and not b:
+        return 0.0
+    if not a or not b:
+        return 1.0
+    try:
+        matcher = difflib.SequenceMatcher(a=a, b=b)
+        ratio = matcher.ratio()
+    except Exception:
+        return 1.0 if a != b else 0.0
+    return float(max(0.0, min(1.0, 1.0 - ratio)))
+
+
+def _template_override_thresholds() -> Tuple[float, float, float, float]:
+    def _get(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    strict_delta = _get("ZOCR_TEMPLATE_OVERRIDE_DELTA", 0.05)
+    min_quality = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_QUALITY", 0.6)
+    flex_delta = _get("ZOCR_TEMPLATE_OVERRIDE_FLEX", 0.02)
+    min_diff = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_DIFF", 0.3)
+    return float(strict_delta), float(min_quality), float(flex_delta), float(min_diff)
+
+
+def _decide_template_override(
+    final_text: str,
+    final_effective_conf: float,
+    final_quality: float,
+    template_text: str,
+    template_conf: float,
+) -> str:
+    if not template_text:
+        return ""
+    strict_delta, min_quality, flex_delta, min_diff = _template_override_thresholds()
+    lexical = float(final_quality)
+    if (not lexical) and final_text:
+        lexical = _toy_text_quality(final_text)[0]
+    if not final_text:
+        return "missing"
+    if template_conf >= final_effective_conf + strict_delta:
+        return "conf"
+    if lexical < min_quality and template_conf + flex_delta >= final_effective_conf:
+        distance = _normalized_string_distance(final_text, template_text)
+        if distance >= min_diff:
+            return "quality"
+    return ""
 
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     if dx == 0 and dy == 0:
@@ -2754,10 +5683,13 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
     cell_density = float((cell_arr > 0).mean())
     cell_aspect = float(cw) / float(ch or 1)
     cell_scaled = cell_arr / 255.0 if cell_arr.max() > 1.5 else cell_arr
+    cell_inner = 0.0
+    cell_outer = 0.0
     if cell_scaled.ndim == 2 and cell_scaled.size:
         row_profile = cell_scaled.mean(axis=1)
         col_profile = cell_scaled.mean(axis=0)
         cell_style = float(_np.var(row_profile) + _np.var(col_profile))
+        cell_inner, cell_outer = _radial_signature(cell_scaled)
     else:
         cell_style = 0.0
     allowed: Optional[Set[str]] = None
@@ -2791,6 +5723,8 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         glyph_density = feats.get("density", 0.5)
         glyph_sym = feats.get("symmetry", 0.0)
         glyph_style = feats.get("style_var", 0.0)
+        glyph_inner = feats.get("radial_inner", cell_inner)
+        glyph_outer = feats.get("radial_outer", cell_outer)
         aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
         density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
         if glyph_sym > 0.5:
@@ -2799,7 +5733,14 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         else:
             symmetry_penalty = 1.0
         style_penalty = 1.0 - min(0.35, abs(cell_style - glyph_style) * 0.8)
-        variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty * max(0.45, style_penalty)
+        radial_penalty = 1.0 - min(0.3, abs(cell_inner - glyph_inner) * 1.2 + abs(cell_outer - glyph_outer) * 0.9)
+        variant_best *= (
+            aspect_penalty
+            * max(0.4, density_penalty)
+            * symmetry_penalty
+            * max(0.45, style_penalty)
+            * max(0.5, radial_penalty)
+        )
         if variant_best > best_score:
             best_score = variant_best
             best_ch = ch_key
@@ -2833,38 +5774,163 @@ def _otsu_threshold_toy(arr):
             threshold = i
     return int(threshold)
 
+
+def _component_projection_splits(arr: "np.ndarray", axis: int, gap_ratio: float, min_span_ratio: float) -> List[Tuple[int, int, int, int]]:
+    if arr.size == 0:
+        return []
+    work = (arr > 0).astype(np.uint8)
+    height, width = work.shape[:2]
+    if axis == 1:
+        density = work.sum(axis=0)
+        span = width
+        orth = height
+    else:
+        density = work.sum(axis=1)
+        span = height
+        orth = width
+    gap_thr = max(1, int(round(gap_ratio * max(1, orth))))
+    min_span = max(1, int(round(min_span_ratio * max(1, span))))
+    segments: List[Tuple[int, int, int, int]] = []
+    idx = 0
+    while idx < span:
+        while idx < span and density[idx] <= gap_thr:
+            idx += 1
+        if idx >= span:
+            break
+        start = idx
+        while idx < span and density[idx] > gap_thr:
+            idx += 1
+        if idx - start >= min_span:
+            if axis == 1:
+                segments.append((start, 0, idx, height))
+            else:
+                segments.append((0, start, width, idx))
+    return segments
+
+@dataclass
+class _BaselineStats:
+    baseline: float
+    xheight: float
+    ascender: float
+    descender: float
+    avg_width: float = 0.0
+    avg_height: float = 0.0
+    stroke_density: float = 0.0
+    aspect_median: float = 1.0
+
+
+def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) -> Optional[_BaselineStats]:
+    if not boxes:
+        return None
+    bottoms: List[float] = []
+    heights: List[float] = []
+    widths: List[float] = []
+    densities: List[float] = []
+    ascenders: List[float] = []
+    descenders: List[float] = []
+    for x1, y1, x2, y2, area in boxes:
+        h = float(max(1, y2 - y1))
+        w = float(max(1, x2 - x1))
+        heights.append(h)
+        widths.append(w)
+        bottoms.append(float(y2))
+        box_area = float(max(1.0, (x2 - x1) * (y2 - y1)))
+        densities.append(float(max(0.0, area)) / box_area)
+    if not heights or not bottoms:
+        return None
+    baseline = float(median(bottoms))
+    xheight = float(max(4.0, median(heights)))
+    for _, y1, _, y2, _ in boxes:
+        bottom = float(y2)
+        top = float(y1)
+        ascenders.append(max(0.0, baseline - top))
+        descenders.append(max(0.0, bottom - baseline))
+    asc = float(max(3.0, median(ascenders) if ascenders else xheight))
+    desc = float(max(1.0, median(descenders) if descenders else xheight * 0.2))
+    avg_w = float(median(widths)) if widths else xheight
+    density = float(median(densities)) if densities else 0.5
+    aspect = float(max(0.25, min(4.0, avg_w / max(1.0, xheight))))
+    return _BaselineStats(
+        baseline=baseline,
+        xheight=xheight,
+        ascender=asc,
+        descender=desc,
+        avg_width=avg_w,
+        avg_height=float(median(heights) if heights else xheight),
+        stroke_density=density,
+        aspect_median=aspect,
+    )
+
+
+def _segment_component_bbox(
+    bw: "np.ndarray", bbox: Tuple[int, int, int, int, float], baseline: Optional[_BaselineStats] = None
+) -> List[Tuple[int, int, int, int, float]]:
+    x1, y1, x2, y2, _ = bbox
+    sub = bw[y1:y2, x1:x2]
+    if sub.size == 0:
+        return []
+    try:
+        arr = np.asarray(sub, dtype=np.uint8)
+    except Exception:
+        arr = sub
+    height = max(1, arr.shape[0])
+    width = max(1, arr.shape[1])
+    segments: List[Tuple[int, int, int, int]] = []
+    wide_ratio = 1.4
+    tall_ratio = 1.8
+    gap_ratio = 0.08
+    density_hint = 0.0
+    if baseline:
+        density_hint = baseline.stroke_density or 0.0
+        aspect_hint = baseline.aspect_median or 1.0
+        wide_ratio = max(1.1, min(1.8, 1.0 + aspect_hint * 0.35))
+        tall_ratio = max(1.2, min(2.2, (baseline.avg_height or baseline.xheight) / max(1.0, baseline.avg_width or baseline.xheight)))
+        gap_ratio = 0.06 * (0.85 if density_hint > 0.45 else 1.1)
+    if width > height * wide_ratio:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio, min_span_ratio=0.22)
+    if not segments and baseline and width > max(1.0, baseline.avg_width) * 1.75:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio * 0.8, min_span_ratio=0.2)
+    if not segments:
+        tall_gate = height > width * tall_ratio
+        if baseline:
+            tall_gate = height > baseline.xheight * 1.65
+        if tall_gate:
+            segments = _component_projection_splits(arr, axis=0, gap_ratio=gap_ratio, min_span_ratio=0.28)
+    boxes: List[Tuple[int, int, int, int, float]] = []
+    if segments:
+        for sx1, sy1, sx2, sy2 in segments:
+            gx1, gy1 = x1 + sx1, y1 + sy1
+            gx2, gy2 = x1 + sx2, y1 + sy2
+            area = float(max(1, (gx2 - gx1) * (gy2 - gy1)))
+            boxes.append((gx1, gy1, gx2, gy2, area))
+        _GLYPH_RUNTIME_STATS["baseline_splits"] += float(len(segments))
+    return boxes
+
+def _refine_component_segments(
+    bw: "np.ndarray", bbox: Tuple[int, int, int, int, float], baseline: Optional[_BaselineStats] = None
+) -> List[Tuple[int, int, int, int, float]]:
+    queue = [bbox]
+    output: List[Tuple[int, int, int, int, float]] = []
+    steps = 0
+    while queue and steps < 32:
+        current = queue.pop()
+        children = _segment_component_bbox(bw, current, baseline=baseline)
+        if children:
+            queue.extend(children)
+        else:
+            output.append(current)
+        steps += 1
+    return output
+
 def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = _cc_label_rle(bw)
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
         return "", 0.0
-    refined: List[Tuple[int,int,int,int,float]] = []
-    for (x1, y1, x2, y2, area) in cc:
-        sub = bw[y1:y2, x1:x2]
-        if sub.size == 0:
-            continue
-        if (x2 - x1) > max(2, int(1.8 * (y2 - y1))):
-            col_density = (sub > 0).sum(axis=0)
-            gap_thr = max(1, int(0.12 * sub.shape[0]))
-            mask = col_density <= gap_thr
-            segments = []
-            idx = 0
-            L = mask.shape[0]
-            while idx < L:
-                while idx < L and mask[idx]:
-                    idx += 1
-                if idx >= L:
-                    break
-                j = idx
-                while j < L and not mask[j]:
-                    j += 1
-                if j - idx >= max(2, int(0.4 * (y2 - y1))):
-                    segments.append((x1 + idx, y1, x1 + j, y2))
-                idx = j
-            if segments:
-                refined.extend([(sx1, sy1, sx2, sy2, (sx2 - sx1) * (sy2 - sy1)) for (sx1, sy1, sx2, sy2) in segments])
-                continue
-        refined.append((x1, y1, x2, y2, area))
+    baseline_stats = _estimate_baseline_stats(cc)
+    refined: List[Tuple[int, int, int, int, float]] = []
+    for bbox in cc:
+        refined.extend(_refine_component_segments(bw, bbox, baseline=baseline_stats))
     if not refined:
         refined = cc
     refined.sort(key=lambda b: b[0])
@@ -2910,6 +5976,26 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     adj = (mean - 0.55) / (0.12 + spread * 0.5)
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
+
+
+def _shadow_correct_array(arr: "np.ndarray") -> "np.ndarray":
+    if arr.size == 0:
+        return arr
+    try:
+        img = Image.fromarray(arr, mode="L")
+    except Exception:
+        img = Image.fromarray(arr)
+    try:
+        blur = img.filter(ImageFilter.GaussianBlur(radius=3))
+    except Exception:
+        blur = img.filter(ImageFilter.BoxBlur(2))
+    low = np.asarray(blur, dtype=np.float32)
+    src = arr.astype(np.float32)
+    normalized = src - low + 128.0
+    normalized -= normalized.min()
+    peak = normalized.max() or 1.0
+    normalized = (normalized / peak) * 255.0
+    return normalized.astype(np.uint8)
 
 def toy_ocr_text_from_cell(
     crop_img: "Image.Image", bin_k: int = 15, allowed_chars: Optional[Sequence[str]] = None
@@ -3012,23 +6098,45 @@ def toy_ocr_text_from_cell(
         thr_val = int(_np.clip(thr_med + delta, 16, 240))
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
 
+    try:
+        shadow = _shadow_correct_array(arr)
+        thr_shadow = _otsu_threshold_toy(shadow)
+        _add_candidate((shadow < thr_shadow).astype(_np.uint8) * 255, {"type": "shadow_dark", "thr": thr_shadow})
+        _add_candidate((shadow > thr_shadow).astype(_np.uint8) * 255, {"type": "shadow_light", "thr": thr_shadow})
+    except Exception:
+        pass
+
     candidate_scores: Dict[str, float] = {}
+    candidate_actual_conf: Dict[str, float] = {}
+    candidate_quality: Dict[str, float] = {}
     best_text, best_conf = "", 0.0
     best_meta: Optional[Dict[str, Any]] = None
     best_bw: Optional[np.ndarray] = None
+    best_effective_conf = 0.0
 
     def _evaluate_from(idx: int) -> int:
-        nonlocal best_text, best_conf, best_meta, best_bw
+        nonlocal best_text, best_conf, best_meta, best_bw, best_effective_conf
         total = len(candidates)
         for i in range(idx, total):
             bw, meta = candidates[i]
             text, conf = _text_from_binary(bw, allowed_chars=allowed_chars)
             if text:
+                lexical_quality, _ = _toy_text_quality(text)
+                candidate_quality[text] = max(candidate_quality.get(text, 0.0), float(lexical_quality))
+                candidate_actual_conf[text] = max(candidate_actual_conf.get(text, 0.0), float(conf))
+                effective_conf = float(conf) * float(lexical_quality or 1.0)
+                effective_conf = float(max(0.0, min(1.5, effective_conf)))
                 prev = candidate_scores.get(text)
-                if prev is None or conf > prev:
-                    candidate_scores[text] = conf
-            if text and conf > best_conf:
-                best_text, best_conf, best_meta, best_bw = text, conf, meta, bw
+                if prev is None or effective_conf > prev:
+                    candidate_scores[text] = effective_conf
+                if lexical_quality < 0.6:
+                    _GLYPH_RUNTIME_STATS["lexical_penalty"] += 1.0
+            else:
+                lexical_quality = 0.0
+                effective_conf = float(conf)
+            if text and effective_conf > best_effective_conf:
+                best_text, best_conf, best_meta, best_bw = text, float(conf), meta, bw
+                best_effective_conf = effective_conf
         return total
 
     _evaluate_from(0)
@@ -3050,21 +6158,67 @@ def toy_ocr_text_from_cell(
         _threshold_memory_store(key, int(best_meta["thr"]))
 
     final_text, final_conf = best_text, best_conf
+    final_effective_conf = best_effective_conf
+    final_quality = candidate_quality.get(final_text, 0.0)
     if candidate_scores:
         reranked_text, reranked_conf = _contextual_rerank_candidates(candidate_scores)
         if reranked_text:
-            if reranked_conf >= final_conf - 1e-6:
+            reranked_actual = candidate_actual_conf.get(reranked_text, reranked_conf)
+            reranked_quality = candidate_quality.get(reranked_text, 0.0)
+            if reranked_quality <= 0.0 and reranked_text:
+                reranked_quality, _ = _toy_text_quality(reranked_text)
+            if (
+                reranked_conf > final_effective_conf + 1e-6
+                or (
+                    abs(reranked_conf - final_effective_conf) <= 1e-6
+                    and reranked_actual > final_conf
+                )
+            ):
                 final_text = reranked_text
-                final_conf = max(final_conf, reranked_conf)
+                final_conf = float(reranked_actual)
+                final_quality = reranked_quality
+                final_effective_conf = reranked_conf
             elif not final_text:
-                final_text, final_conf = reranked_text, reranked_conf
+                final_text = reranked_text
+                final_conf = float(reranked_actual)
+                final_quality = reranked_quality
+                final_effective_conf = reranked_conf
+
+    ref_bitmap = best_bw
+    if ref_bitmap is None and candidates:
+        ref_bitmap = candidates[0][0]
+    template_text, template_conf = ("", 0.0)
+    if ref_bitmap is not None:
+        template_text, template_conf = _match_token_template_from_cache(ref_bitmap)
+    override_reason = _decide_template_override(
+        final_text, final_effective_conf, final_quality, template_text, template_conf
+    )
+    if override_reason:
+        final_text = template_text
+        final_conf = max(final_conf, template_conf)
+        final_effective_conf = max(final_effective_conf, template_conf)
+        final_quality = max(final_quality, 0.95)
+        _GLYPH_RUNTIME_STATS["template_matches"] += 1.0
+        _GLYPH_RUNTIME_STATS[f"template_override_{override_reason}"] += 1.0
 
     if final_text:
         coherence = _ngram_coherence(final_text)
         surprisal = _ngram_surprisal(final_text)
-        _record_toy_recognition(final_text, float(final_conf), coherence, surprisal)
+        if final_quality <= 0.0:
+            final_quality, _ = _toy_text_quality(final_text)
+        bounded_conf = float(max(0.0, min(1.0, final_conf)))
+        _record_toy_recognition(
+            final_text,
+            bounded_conf,
+            coherence,
+            surprisal,
+            lexical_quality=float(max(0.0, min(1.6, final_quality))),
+        )
         _update_ngram_model(final_text)
-        return final_text, float(max(0.0, min(1.0, final_conf)))
+        if ref_bitmap is not None:
+            _observe_token_template(final_text, ref_bitmap)
+            _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
+        return final_text, bounded_conf
     return "", 0.0
 
 
@@ -3100,7 +6254,12 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
     elif engine_key in ("toy", "mock", "demo"):
         runner = toy_ocr_text_from_cell
     elif engine_key.startswith("tess"):
-        if pytesseract is None or _PYTESS_OUTPUT is None:
+        if not _pytesseract_allowed():
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract disabled by ZOCR_ALLOW_PYTESSERACT=0; using toy OCR", flush=True)
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        elif pytesseract is None or _PYTESS_OUTPUT is None:
             if cache_key not in _OCR_BACKEND_WARNED:
                 print("[WARN] pytesseract not available; falling back to toy OCR")
                 _OCR_BACKEND_WARNED.add(cache_key)
@@ -3367,15 +6526,112 @@ def export_jsonl_with_ocr(doc_json_path: str,
             return default
         return max(minimum, value)
 
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
     log_every = max(1, _parse_env_int("ZOCR_EXPORT_LOG_EVERY", 200, 1))
+    flush_every = max(0, _parse_env_int("ZOCR_EXPORT_FLUSH_EVERY", 200, 0))
     max_cells = _parse_env_int("ZOCR_EXPORT_MAX_CELLS", 0, 0)
     cells_done = 0
     t0 = time.time()
     stop_due_to_limit = False
+    motion_cfg = _motion_prior_cfg_from_env()
+    sweep_tracker = _EXPORT_SWEEP_TRACKER
+    motion_applied = 0
+    motion_rejected = 0
+    motion_sigma_samples: List[float] = []
+    motion_window_samples: List[float] = []
+    motion_auto_estimated = 0
+    motion_prior_attempts: List[Dict[str, Any]] = []
+    guard_ms = _parse_env_int("ZOCR_EXPORT_GUARD_MS", 0, 0)
+    guard_timeouts = 0
+    doc_identifier = str(
+        doc.get("doc_id")
+        or doc.get("document_id")
+        or doc.get("id")
+        or os.path.splitext(os.path.basename(doc_json_path))[0]
+    )
+    blank_cfg = _blank_skip_cfg_from_env()
+    blank_skipped = 0
+    confidence_boost_cfg = _confidence_boost_cfg_from_env()
+    lexical_boost_cfg = _lexical_boost_cfg_from_env()
+    confidence_boost_applied = 0
+    confidence_boost_delta = 0.0
+    confidence_boost_reasons: Dict[str, int] = defaultdict(int)
+    lexical_boost_applied = 0
+    lexical_boost_delta = 0.0
+    lexical_boost_reasons: Dict[str, int] = defaultdict(int)
+    lexical_quality_sum = 0.0
+    lexical_quality_samples = 0
+    prior_cache_seed: Optional[List[float]] = None
+    prior_cache_hits = 0
+    prior_cache_writes = 0
+    schema_tables = 0
+    schema_noise_columns = 0
+    schema_rows_adjusted = 0
+    schema_cells_salvaged = 0
+    schema_cells_cleared = 0
+    schema_item_aux_rows = 0
+    schema_item_aux_cells = 0
+    schema_trailing_notes = 0
+    schema_trailing_note_rows = 0
+    schema_item_aux_examples: List[str] = []
+    schema_trailing_examples: List[str] = []
+    total_rows_seen = 0
+    total_rows_reflowed = 0
+    total_rows_ocr_attempts = 0
+    total_rows_ocr_success = 0
+    seg_tables = 0
+    seg_row_initial = 0
+    seg_row_final = 0
+    seg_row_splits = 0
+    seg_row_merged = 0
+    seg_col_btree = 0
+    seg_col_dp = 0
+    seg_col_votes = 0
+    seg_col_mid = 0
+    seg_col_candidates_initial = 0
+    seg_col_candidates_final = 0
+    seg_rows_with_candidates = 0
+    if motion_cfg.enabled:
+        cached = _load_prior_cache_ykeys(motion_cfg.table_signature, motion_cfg.cache_dir)
+        if cached:
+            prior_cache_seed = list(cached)
+            prior_cache_hits += 1
 
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
         pages = []
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        for table in page.get("tables", []) or []:
+            if not isinstance(table, dict):
+                continue
+            dbg = table.get("dbg")
+            if not isinstance(dbg, dict):
+                continue
+            seg_dbg = dbg.get("segmentation_stats")
+            if not isinstance(seg_dbg, dict):
+                continue
+            seg_tables += 1
+            row_diag = seg_dbg.get("row") or {}
+            col_diag = seg_dbg.get("column") or {}
+            seg_row_initial += _safe_int(row_diag.get("initial_bands"))
+            seg_row_final += _safe_int(row_diag.get("refined_bands"))
+            seg_row_splits += _safe_int(row_diag.get("projection_splits"))
+            seg_row_merged += _safe_int(row_diag.get("merged"))
+            seg_col_btree += _safe_int(col_diag.get("btree_seed"))
+            seg_col_dp += _safe_int(col_diag.get("dp_centers"))
+            seg_col_votes += _safe_int(col_diag.get("vertical_votes"))
+            seg_col_mid += _safe_int(col_diag.get("global_mid_seeds"))
+            seg_col_candidates_initial += _safe_int(col_diag.get("candidates_initial"))
+            seg_col_candidates_final += _safe_int(col_diag.get("candidates_final"))
+            seg_rows_with_candidates += _safe_int(col_diag.get("rows_with_candidates"))
 
     def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
         ordered: List[str] = []
@@ -3409,9 +6665,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
     total_cells = 0
     forced_cells = 0
     numeric_tables = 0
+    numeric_tables_inferred = 0
     numeric_columns_total = 0
+    numeric_columns_inferred = 0
     numeric_columns_by_kind: Counter = Counter()
     forced_fields: Counter = Counter()
+    date_tables = 0
+    date_columns_total = 0
+    date_columns_by_role: Counter = Counter()
+    date_cells_detected = 0
+    date_cells_by_role: Counter = Counter()
+    date_precision_counts: Counter = Counter()
     surprisal_threshold = (
         float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
@@ -3435,6 +6699,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         print(f"[Export] engine={ocr_engine} pages={len(pages)} ~cells={est_cells}", flush=True)
 
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
+        records_written = 0
         for enum_idx, p in enumerate(pages):
             if stop_due_to_limit:
                 break
@@ -3450,6 +6715,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
             if page_image is None:
                 continue
             page_w, page_h = page_image.size
+            page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
             tables = p.get("tables", []) if isinstance(p, dict) else []
             for ti, t in enumerate(tables):
                 if stop_due_to_limit:
@@ -3482,6 +6748,33 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         yt = int(y1 + (y2-y1)*r/R)
                         yb = int(y1 + (y2-y1)*(r+1)/R)
                         row_bands.append((yt, yb))
+                row_heights = [int(max(1, band[1] - band[0])) for band in row_bands]
+                prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
+                if not prev_keys and prior_cache_seed:
+                    prev_keys = list(prior_cache_seed)
+                motion_entry_stats: Dict[str, Any] = {}
+                if motion_cfg.enabled:
+                    row_bands_prior, applied, motion_entry_stats = _apply_motion_prior_to_bands(
+                        prev_keys,
+                        row_bands,
+                        motion_cfg,
+                        row_heights=row_heights,
+                    )
+                    if motion_entry_stats:
+                        motion_prior_attempts.append(motion_entry_stats)
+                        sigma_val = motion_entry_stats.get("sigma_px")
+                        window_val = motion_entry_stats.get("window_px")
+                        if isinstance(sigma_val, (int, float)):
+                            motion_sigma_samples.append(float(sigma_val))
+                        if isinstance(window_val, (int, float)):
+                            motion_window_samples.append(float(window_val))
+                        if motion_entry_stats.get("auto_sigma"):
+                            motion_auto_estimated += 1
+                    if applied:
+                        row_bands = row_bands_prior
+                        motion_applied += 1
+                    elif prev_keys:
+                        motion_rejected += 1
                 R = len(row_bands)
                 if len(baselines) < R:
                     baselines.extend([[] for _ in range(R - len(baselines))])
@@ -3497,8 +6790,16 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
                 col_charset_hints: List[Optional[str]] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
+                guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
+                guard_triggered = False
                 for r in range(R):
+                    if guard_deadline and time.time() >= guard_deadline:
+                        guard_triggered = True
+                        break
                     for c in range(C):
+                        if guard_deadline and time.time() >= guard_deadline:
+                            guard_triggered = True
+                            break
                         total_cells += 1
                         cx1 = x1 + col_bounds[c]
                         cx2 = x1 + col_bounds[c+1]
@@ -3514,7 +6815,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         allowed_chars = None
                         if r > 0 and col_charset_hints and c < len(col_charset_hints):
                             allowed_chars = col_charset_hints[c]
-                        if allowed_chars and toy_runner:
+                        if blank_cfg.enabled and _should_skip_blank_crop(crop, blank_cfg):
+                            blank_skipped += 1
+                            txt, conf = "", 0.0
+                        elif allowed_chars and toy_runner:
                             txt, conf = toy_ocr_text_from_cell(crop, allowed_chars=allowed_chars)
                         else:
                             txt, conf = ocr_runner(crop)
@@ -3534,15 +6838,68 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         col_charset_hints = _column_charset_hints(headers_sample)
                     if stop_due_to_limit:
                         break
+                if guard_triggered:
+                    guard_timeouts += 1
+                    print(
+                        f"[WARN] [Export] guard timeout (page={page_index_int}, table={ti})",
+                        flush=True,
+                    )
+                    continue
                 if stop_due_to_limit:
                     break
+                if motion_cfg.enabled:
+                    mids = _row_band_midpoints(row_bands)
+                    sweep_tracker.put(
+                        doc_identifier,
+                        page_index_int,
+                        ti,
+                        mids,
+                    )
+                    if _store_prior_cache_ykeys(
+                        motion_cfg.table_signature,
+                        motion_cfg.cache_dir,
+                        mids,
+                    ):
+                        prior_cache_writes += 1
+                        prior_cache_seed = list(mids)
+                schema_adjust = _rectify_item_qty_amount_schema(grid_text, grid_conf, col_bounds)
+                if schema_adjust:
+                    grid_text, grid_conf, col_bounds, schema_meta = schema_adjust
+                    C = max(1, len(col_bounds) - 1)
+                    schema_tables += 1
+                    schema_noise_columns += int(schema_meta.get("noise_columns", 0))
+                    schema_rows_adjusted += int(schema_meta.get("rows_adjusted", 0))
+                    schema_cells_salvaged += int(schema_meta.get("cells_salvaged", 0))
+                    schema_cells_cleared += int(schema_meta.get("cells_cleared", 0))
+                    schema_item_aux_rows += int(schema_meta.get("item_aux_rows", 0))
+                    schema_item_aux_cells += int(schema_meta.get("item_aux_cells", 0))
+                    schema_trailing_notes += int(schema_meta.get("trailing_notes", 0))
+                    schema_trailing_note_rows += int(schema_meta.get("trailing_note_rows", 0))
+                    aux_samples = schema_meta.get("item_aux_examples") or []
+                    if isinstance(aux_samples, list):
+                        for sample in aux_samples:
+                            if len(schema_item_aux_examples) >= 5:
+                                break
+                            schema_item_aux_examples.append(str(sample))
+                    trailing_samples = schema_meta.get("trailing_note_examples") or []
+                    if isinstance(trailing_samples, list):
+                        for sample in trailing_samples:
+                            if len(schema_trailing_examples) >= 5:
+                                break
+                            schema_trailing_examples.append(str(sample))
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
                     if _is_total_row(grid_text[r]):
+                        total_rows_seen += 1
                         footer_rows.add(r)
+                        target_col = C - 1 if C > 0 else 0
+                        if C > 0 and _relocate_total_amount(grid_text[r], grid_conf[r], target_col):
+                            fallback_notes[(r, target_col)] = "total_realign"
+                            total_rows_reflowed += 1
                         has_numeric = any(_NUMERIC_RX.search(grid_text[r][c] or "") for c in range(C))
                         if not has_numeric and C > 0:
+                            total_rows_ocr_attempts += 1
                             target_col = C-1
                             cy1, cy2 = row_bands[r]
                             cx1 = x1 + col_bounds[target_col]
@@ -3561,14 +6918,27 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                     grid_conf[r][target_col], _normalize_confidence(alt_conf)
                                 )
                                 fallback_notes[(r, target_col)] = "footer_band"
+                                total_rows_reflowed += 1
+                                total_rows_ocr_success += 1
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
-                header_fields = _numeric_header_kinds(headers)
+                header_fields = _numeric_header_kinds(headers, grid_text)
+                inferred_columns = _NUMERIC_HEADER_INFERRED_LAST
+                date_roles = _date_header_roles(headers)
+                if date_roles and any(date_roles):
+                    date_tables += 1
+                    for role in date_roles:
+                        if role:
+                            date_columns_total += 1
+                            date_columns_by_role[role] += 1
                 if header_fields:
                     table_numeric_cols = sum(1 for kind in header_fields if kind)
                     if table_numeric_cols:
                         numeric_tables += 1
                         numeric_columns_total += table_numeric_cols
+                        if inferred_columns:
+                            numeric_tables_inferred += 1
+                            numeric_columns_inferred += inferred_columns
                         for kind in header_fields:
                             if kind:
                                 numeric_columns_by_kind[kind] += 1
@@ -3582,7 +6952,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         conf = grid_conf[r][c]
                         raw_txt = txt
                         forced_filters: Dict[str, Any] = {}
+                        boost_marker = ""
                         col_kind = header_fields[c] if header_fields and c < len(header_fields) else None
+                        date_role = date_roles[c] if date_roles and c < len(date_roles) else None
                         if col_kind and r > 0:
                             coerced_txt, forced_filters = _coerce_numeric_filters(col_kind, txt)
                             if coerced_txt and coerced_txt != txt:
@@ -3590,6 +6962,33 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 grid_text[r][c] = coerced_txt
                             elif coerced_txt:
                                 txt = coerced_txt
+                        lexical_quality, lexical_diag = _toy_text_quality(txt)
+                        lexical_quality_sum += float(lexical_quality)
+                        lexical_quality_samples += 1
+                        boost_reason = _confidence_boost_reason(forced_filters)
+                        if boost_reason and conf is not None:
+                            boosted_conf, delta = _apply_confidence_boost(conf, confidence_boost_cfg)
+                            if boosted_conf is not None and delta > 0.0:
+                                conf = float(boosted_conf)
+                                grid_conf[r][c] = float(boosted_conf)
+                                confidence_boost_applied += 1
+                                confidence_boost_delta += float(delta)
+                                confidence_boost_reasons[boost_reason] += 1
+                                boost_marker = boost_reason
+                        lexical_reason = _lexical_confidence_reason(
+                            txt, lexical_diag, lexical_boost_cfg.min_quality, lexical_quality
+                        )
+                        if lexical_reason and conf is not None:
+                            boosted_conf, delta = _apply_confidence_boost(conf, lexical_boost_cfg)
+                            if boosted_conf is not None and delta > 0.0:
+                                conf = float(boosted_conf)
+                                grid_conf[r][c] = float(boosted_conf)
+                                lexical_boost_applied += 1
+                                lexical_boost_delta += float(delta)
+                                lexical_boost_reasons[lexical_reason] += 1
+                                boost_marker = (
+                                    f"{boost_marker},{lexical_reason}" if boost_marker else lexical_reason
+                                )
                         row_texts = grid_text[r]
                         # build search/synthesis
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
@@ -3628,6 +7027,19 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 forced_fields[forced_key] += 1
                             filters.update(forced_filters)
                             filters["force_numeric"] = True
+                        if boost_marker:
+                            filters["confidence_boost"] = boost_marker
+                        if r > 0:
+                            date_payload = _extract_date_filters(txt, date_role)
+                        else:
+                            date_payload = None
+                        if date_payload:
+                            filters.update(date_payload)
+                            date_cells_detected += 1
+                            role_key = date_payload.get("date_role") or (date_role or "unlabeled")
+                            date_cells_by_role[role_key] += 1
+                            precision_key = date_payload.get("date_precision") or "unknown"
+                            date_precision_counts[precision_key] += 1
                         if note:
                             filters["linked"] = note
                         concepts = _conceptual_tags(txt, headers, row_texts)
@@ -3636,6 +7048,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             hypotheses = _hypothesize_from_text(txt, headers, concepts)
                         needs_review = bool(review_reasons)
                         rec = {
+                            "type": "cell",
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
                             "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
@@ -3650,10 +7063,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "low_conf": bool(low_conf),
                                 "ngram_coherence": float(coherence),
                                 "ngram_surprisal": float(surprisal),
+                                "lexical_quality": float(lexical_quality),
                                 "trace": trace_id,
                                 "filters": filters
                             }
                         }
+                        if boost_marker:
+                            rec["meta"]["confidence_boost"] = boost_marker
+                        if lexical_reason:
+                            rec["meta"]["lexical_reason"] = lexical_reason
                         if concepts:
                             rec["meta"]["concepts"] = concepts
                         if hypotheses:
@@ -3693,6 +7111,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if note:
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        records_written += 1
+                        if flush_every and (records_written % flush_every == 0):
+                            fw.flush()
                         count += 1
                 if log_progress:
                     fw.flush()
@@ -3734,7 +7155,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
     duration = time.time() - stats_start if stats_start else 0.0
     numeric_stats = {
         "tables": int(numeric_tables),
+        "tables_with_inferred": int(numeric_tables_inferred),
         "columns": int(numeric_columns_total),
+        "columns_inferred": int(numeric_columns_inferred),
         "columns_by_kind": dict(numeric_columns_by_kind),
         "forced_cells": int(forced_cells),
         "forced_fields": dict(forced_fields),
@@ -3750,7 +7173,126 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "numeric": numeric_stats,
         "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
+        "flush_every": int(flush_every),
     }
+    if date_cells_detected or date_columns_total:
+        export_stats["date_fields"] = {
+            "tables": int(date_tables),
+            "columns": int(date_columns_total),
+            "columns_by_role": dict(date_columns_by_role),
+            "cells": int(date_cells_detected),
+            "cells_by_role": dict(date_cells_by_role),
+            "precision": dict(date_precision_counts),
+        }
+    if blank_cfg.enabled:
+        export_stats["blank_skip"] = {
+            "skipped": int(blank_skipped),
+            "ratio": float(blank_skipped / float(max(1, total_cells))),
+            "dark_threshold": int(blank_cfg.dark_threshold),
+            "min_dark_ratio": float(blank_cfg.min_dark_ratio),
+            "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        }
+    if confidence_boost_applied:
+        export_stats["confidence_boost"] = {
+            "cells": int(confidence_boost_applied),
+            "delta_sum": round(confidence_boost_delta, 4),
+            "reasons": dict(confidence_boost_reasons),
+            "target": float(confidence_boost_cfg.target),
+            "min_input": float(confidence_boost_cfg.min_input),
+        }
+    if lexical_boost_applied:
+        export_stats["lexical_boost"] = {
+            "cells": int(lexical_boost_applied),
+            "delta_sum": round(lexical_boost_delta, 4),
+            "reasons": dict(lexical_boost_reasons),
+            "target": float(lexical_boost_cfg.target),
+            "min_input": float(lexical_boost_cfg.min_input),
+            "min_quality": float(lexical_boost_cfg.min_quality),
+        }
+    if lexical_quality_samples:
+        export_stats["lexical_quality"] = {
+            "samples": int(lexical_quality_samples),
+            "mean": round(lexical_quality_sum / float(max(1, lexical_quality_samples)), 4),
+        }
+    if guard_ms > 0:
+        export_stats["guard"] = {
+            "timeout_ms": int(guard_ms),
+            "timeouts": int(guard_timeouts),
+        }
+    if schema_tables:
+        export_stats["schema_alignment"] = {
+            "tables": int(schema_tables),
+            "noise_columns": int(schema_noise_columns),
+            "rows_adjusted": int(schema_rows_adjusted),
+            "cells_salvaged": int(schema_cells_salvaged),
+            "cells_cleared": int(schema_cells_cleared),
+            "item_aux_rows": int(schema_item_aux_rows),
+            "item_aux_cells": int(schema_item_aux_cells),
+            "trailing_notes": int(schema_trailing_notes),
+            "trailing_note_rows": int(schema_trailing_note_rows),
+        }
+        if schema_item_aux_examples:
+            export_stats["schema_alignment"]["item_aux_examples"] = schema_item_aux_examples[:5]
+        if schema_trailing_examples:
+            export_stats["schema_alignment"]["trailing_note_examples"] = schema_trailing_examples[:5]
+    if total_rows_seen:
+        export_stats["total_rows"] = {
+            "rows": int(total_rows_seen),
+            "reflowed": int(total_rows_reflowed),
+            "ocr_attempts": int(total_rows_ocr_attempts),
+            "ocr_success": int(total_rows_ocr_success),
+        }
+    if seg_tables:
+        inv_tables = 1.0 / float(max(1, seg_tables))
+        export_stats["segmentation"] = {
+            "tables": int(seg_tables),
+            "row_initial_mean": round(seg_row_initial * inv_tables, 3),
+            "row_final_mean": round(seg_row_final * inv_tables, 3),
+            "row_projection_splits_mean": round(seg_row_splits * inv_tables, 3),
+            "row_merged_mean": round(seg_row_merged * inv_tables, 3),
+            "column_btree_mean": round(seg_col_btree * inv_tables, 3),
+            "column_dp_mean": round(seg_col_dp * inv_tables, 3),
+            "column_vertical_votes_mean": round(seg_col_votes * inv_tables, 3),
+            "column_mid_seed_mean": round(seg_col_mid * inv_tables, 3),
+            "column_candidates_initial_mean": round(seg_col_candidates_initial * inv_tables, 3),
+            "column_candidates_final_mean": round(seg_col_candidates_final * inv_tables, 3),
+            "rows_with_candidates_mean": round(seg_rows_with_candidates * inv_tables, 3),
+        }
+    if motion_cfg.enabled:
+        sigma_summary = None
+        if motion_sigma_samples:
+            sigma_summary = {
+                "median": float(median(motion_sigma_samples)),
+                "min": float(min(motion_sigma_samples)),
+                "max": float(max(motion_sigma_samples)),
+                "count": len(motion_sigma_samples),
+            }
+        window_summary = None
+        if motion_window_samples:
+            window_summary = {
+                "median": float(median(motion_window_samples)),
+                "min": float(min(motion_window_samples)),
+                "max": float(max(motion_window_samples)),
+                "count": len(motion_window_samples),
+            }
+        export_stats["motion_prior"] = {
+            "sigma_px": float(motion_cfg.sigma_px),
+            "cutoff_sigma": float(motion_cfg.cutoff_sigma),
+            "accept_ratio": float(motion_cfg.accept_ratio),
+            "k_sigma_window": float(motion_cfg.k_sigma_window),
+            "applied": int(motion_applied),
+            "rejected": int(motion_rejected),
+            "auto_estimated": int(motion_auto_estimated),
+            "bandit_action": motion_cfg.bandit_action,
+            "table_signature": motion_cfg.table_signature,
+            "sigma_summary": sigma_summary,
+            "window_summary": window_summary,
+            "cache": {
+                "hits": int(prior_cache_hits),
+                "writes": int(prior_cache_writes),
+            },
+            "attempts": len(motion_prior_attempts),
+        }
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
     return count
@@ -3854,6 +7396,10 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         return summary
 
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    use_ext_variants = (
+        os.environ.get("ZOCR_EXPORT_EXT_VARIANTS", "0") == "1"
+        and ocr_engine in ("tess", "easyocr")
+    )
 
     focus_plan, focus_filters = _prepare_reanalysis_focus(focus)
     focus_stats = {"matched": 0, "skipped": 0} if focus_filters else None
@@ -4026,8 +7572,9 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
-                for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
-                    _merge_variant(txt_ext, conf_ext, transform_ext)
+                if use_ext_variants:
+                    for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
+                        _merge_variant(txt_ext, conf_ext, transform_ext)
                 seen_ambiguous: Set[str] = set()
                 for candidate in _ambiguous_variants(observed_text) + _ambiguous_variants(base_text):
                     if not candidate or candidate in seen_ambiguous:
