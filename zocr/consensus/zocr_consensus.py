@@ -2419,6 +2419,65 @@ def _looks_like_upper_token(text: str) -> bool:
 
 
 _TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
+
+_TOY_CHAR_CATEGORY_MAP = {
+    "digit": set("0123456789０１２３４５６７８９"),
+    "latin_upper": set("ABCDEFGHIJKLMNOPQRSTUVWXYZＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"),
+    "latin_lower": set("abcdefghijklmnopqrstuvwxyzａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"),
+    "kana": set(),
+    "symbol": _TOY_ALLOWED_SYMBOLS | set({'+', '−', 'ー', '―', '~'}),
+}
+_TOY_TRANSITION_PRIORS = {
+    "digit": {"digit": 1.0, "symbol": 0.95, "latin_upper": 0.7, "latin_lower": 0.7, "kana": 0.65, "kanji": 0.65},
+    "latin_upper": {"latin_upper": 1.0, "latin_lower": 0.95, "digit": 0.8, "symbol": 0.75, "kana": 0.55, "kanji": 0.55},
+    "latin_lower": {"latin_lower": 1.0, "latin_upper": 0.9, "digit": 0.7, "symbol": 0.75, "kana": 0.5, "kanji": 0.5},
+    "kanji": {"kanji": 1.0, "kana": 0.9, "digit": 0.65, "symbol": 0.7, "latin_upper": 0.55, "latin_lower": 0.55},
+    "kana": {"kana": 1.0, "kanji": 0.92, "digit": 0.68, "symbol": 0.72, "latin_upper": 0.58, "latin_lower": 0.58},
+}
+
+def _toy_char_category(ch: str) -> str:
+    if not ch:
+        return "other"
+    code = ord(ch)
+    if ch in _TOY_CHAR_CATEGORY_MAP["digit"] or 0xFF10 <= code <= 0xFF19:
+        return "digit"
+    if ch in _TOY_CHAR_CATEGORY_MAP["latin_upper"]:
+        return "latin_upper"
+    if ch in _TOY_CHAR_CATEGORY_MAP["latin_lower"]:
+        return "latin_lower"
+    if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
+        return "kana"
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+        return "kanji"
+    if ch in _TOY_CHAR_CATEGORY_MAP["symbol"]:
+        return "symbol"
+    if ch.isspace():
+        return "space"
+    return "other"
+
+def _toy_transition_gate(text: str) -> Tuple[float, str]:
+    prev_cat: Optional[str] = None
+    penalty = 0
+    transitions = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        cat = _toy_char_category(ch)
+        if prev_cat is None:
+            prev_cat = cat
+            continue
+        transitions += 1
+        priors = _TOY_TRANSITION_PRIORS.get(prev_cat)
+        score = priors.get(cat, 0.5) if priors else 0.5
+        if score < 0.6:
+            penalty += 1
+        prev_cat = cat
+    if transitions == 0:
+        return 1.0, ""
+    ratio = penalty / float(transitions)
+    gate = max(0.55, 1.0 - 0.45 * ratio)
+    reason = f"penalty:{penalty}/{transitions}"
+    return float(gate), reason
 _TOY_NOISE_CHARS = set("?`~^|'\"¤")
 _TOY_GARBLED_PATTERN = re.compile(r"[?]{2,}|[|\\/_]{3,}|={2,}|\bfax\b", re.IGNORECASE)
 _TOY_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?(?:[¥$]\s*)?[0-9][0-9,]*(?:\.[0-9]+)?%?$")
@@ -2646,6 +2705,9 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
     jp_boost, jp_reason = _japanese_token_hint(normalized, jp_profile)
     if jp_boost:
         lex_boost += jp_boost
+    transition_gate, transition_reason = _toy_transition_gate(normalized)
+    if transition_gate < 1.0:
+        base *= transition_gate
     if _TOY_GARBLED_PATTERN.search(normalized):
         base *= 0.6
     quality = float(max(0.2, min(1.6, base * lex_boost)))
@@ -2657,6 +2719,8 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
         "jp_ratio": jp_profile.get("jp_ratio", 0.0),
         "jp_hint": jp_boost,
         "jp_hint_reason": jp_reason,
+        "transition_gate": transition_gate,
+        "transition_reason": transition_reason,
     }
     return quality, diag
 
@@ -2892,6 +2956,13 @@ def _pytesseract_env_kwargs() -> Dict[str, Any]:
 _PYTESS_ENV_KWARGS = _pytesseract_env_kwargs()
 _PYTESS_ENV_SUPPORTED = True
 _PYTESS_TIMEOUT_WARNED = False
+
+
+def _pytesseract_allowed() -> bool:
+    raw = os.environ.get("ZOCR_ALLOW_PYTESSERACT")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _note_pytesseract_exception(label: str, exc: Exception) -> None:
@@ -3802,7 +3873,7 @@ def _ambiguous_variants(text: Optional[str]) -> List[str]:
 
 
 def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
-    if pytesseract is None or _PYTESS_OUTPUT is None:
+    if not _pytesseract_allowed() or pytesseract is None or _PYTESS_OUTPUT is None:
         return []
     variants: List[Tuple[str, float, str]] = []
     config = "--psm 6"
@@ -4055,6 +4126,8 @@ def _synthetic_external_variants(img: "Image.Image") -> List[Tuple[str, float, s
 
 def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
     variants: List[Tuple[str, float, str]] = []
+    if not _pytesseract_allowed():
+        return _synthetic_external_variants(img)
     tess_variants = _pytesseract_variants(img)
     variants.extend(tess_variants)
     if pytesseract is not None and tess_variants:
@@ -4601,38 +4674,86 @@ def _otsu_threshold_toy(arr):
             threshold = i
     return int(threshold)
 
+
+def _component_projection_splits(arr: "np.ndarray", axis: int, gap_ratio: float, min_span_ratio: float) -> List[Tuple[int, int, int, int]]:
+    if arr.size == 0:
+        return []
+    work = (arr > 0).astype(np.uint8)
+    height, width = work.shape[:2]
+    if axis == 1:
+        density = work.sum(axis=0)
+        span = width
+        orth = height
+    else:
+        density = work.sum(axis=1)
+        span = height
+        orth = width
+    gap_thr = max(1, int(round(gap_ratio * max(1, orth))))
+    min_span = max(1, int(round(min_span_ratio * max(1, span))))
+    segments: List[Tuple[int, int, int, int]] = []
+    idx = 0
+    while idx < span:
+        while idx < span and density[idx] <= gap_thr:
+            idx += 1
+        if idx >= span:
+            break
+        start = idx
+        while idx < span and density[idx] > gap_thr:
+            idx += 1
+        if idx - start >= min_span:
+            if axis == 1:
+                segments.append((start, 0, idx, height))
+            else:
+                segments.append((0, start, width, idx))
+    return segments
+
+def _segment_component_bbox(bw: "np.ndarray", bbox: Tuple[int, int, int, int, float]) -> List[Tuple[int, int, int, int, float]]:
+    x1, y1, x2, y2, _ = bbox
+    sub = bw[y1:y2, x1:x2]
+    if sub.size == 0:
+        return []
+    try:
+        arr = np.asarray(sub, dtype=np.uint8)
+    except Exception:
+        arr = sub
+    height = max(1, arr.shape[0])
+    width = max(1, arr.shape[1])
+    segments: List[Tuple[int, int, int, int]] = []
+    if width > height * 1.4:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=0.08, min_span_ratio=0.25)
+    if not segments and height > width * 1.8:
+        segments = _component_projection_splits(arr, axis=0, gap_ratio=0.08, min_span_ratio=0.3)
+    boxes: List[Tuple[int, int, int, int, float]] = []
+    if segments:
+        for sx1, sy1, sx2, sy2 in segments:
+            gx1, gy1 = x1 + sx1, y1 + sy1
+            gx2, gy2 = x1 + sx2, y1 + sy2
+            area = float(max(1, (gx2 - gx1) * (gy2 - gy1)))
+            boxes.append((gx1, gy1, gx2, gy2, area))
+    return boxes
+
+def _refine_component_segments(bw: "np.ndarray", bbox: Tuple[int, int, int, int, float]) -> List[Tuple[int, int, int, int, float]]:
+    queue = [bbox]
+    output: List[Tuple[int, int, int, int, float]] = []
+    steps = 0
+    while queue and steps < 32:
+        current = queue.pop()
+        children = _segment_component_bbox(bw, current)
+        if children:
+            queue.extend(children)
+        else:
+            output.append(current)
+        steps += 1
+    return output
+
 def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = _cc_label_rle(bw)
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
         return "", 0.0
-    refined: List[Tuple[int,int,int,int,float]] = []
-    for (x1, y1, x2, y2, area) in cc:
-        sub = bw[y1:y2, x1:x2]
-        if sub.size == 0:
-            continue
-        if (x2 - x1) > max(2, int(1.8 * (y2 - y1))):
-            col_density = (sub > 0).sum(axis=0)
-            gap_thr = max(1, int(0.12 * sub.shape[0]))
-            mask = col_density <= gap_thr
-            segments = []
-            idx = 0
-            L = mask.shape[0]
-            while idx < L:
-                while idx < L and mask[idx]:
-                    idx += 1
-                if idx >= L:
-                    break
-                j = idx
-                while j < L and not mask[j]:
-                    j += 1
-                if j - idx >= max(2, int(0.4 * (y2 - y1))):
-                    segments.append((x1 + idx, y1, x1 + j, y2))
-                idx = j
-            if segments:
-                refined.extend([(sx1, sy1, sx2, sy2, (sx2 - sx1) * (sy2 - sy1)) for (sx1, sy1, sx2, sy2) in segments])
-                continue
-        refined.append((x1, y1, x2, y2, area))
+    refined: List[Tuple[int, int, int, int, float]] = []
+    for bbox in cc:
+        refined.extend(_refine_component_segments(bw, bbox))
     if not refined:
         refined = cc
     refined.sort(key=lambda b: b[0])
@@ -4678,6 +4799,26 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     adj = (mean - 0.55) / (0.12 + spread * 0.5)
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
+
+
+def _shadow_correct_array(arr: "np.ndarray") -> "np.ndarray":
+    if arr.size == 0:
+        return arr
+    try:
+        img = Image.fromarray(arr, mode="L")
+    except Exception:
+        img = Image.fromarray(arr)
+    try:
+        blur = img.filter(ImageFilter.GaussianBlur(radius=3))
+    except Exception:
+        blur = img.filter(ImageFilter.BoxBlur(2))
+    low = np.asarray(blur, dtype=np.float32)
+    src = arr.astype(np.float32)
+    normalized = src - low + 128.0
+    normalized -= normalized.min()
+    peak = normalized.max() or 1.0
+    normalized = (normalized / peak) * 255.0
+    return normalized.astype(np.uint8)
 
 def toy_ocr_text_from_cell(
     crop_img: "Image.Image", bin_k: int = 15, allowed_chars: Optional[Sequence[str]] = None
@@ -4779,6 +4920,14 @@ def toy_ocr_text_from_cell(
     for delta in local_offsets:
         thr_val = int(_np.clip(thr_med + delta, 16, 240))
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
+
+    try:
+        shadow = _shadow_correct_array(arr)
+        thr_shadow = _otsu_threshold_toy(shadow)
+        _add_candidate((shadow < thr_shadow).astype(_np.uint8) * 255, {"type": "shadow_dark", "thr": thr_shadow})
+        _add_candidate((shadow > thr_shadow).astype(_np.uint8) * 255, {"type": "shadow_light", "thr": thr_shadow})
+    except Exception:
+        pass
 
     candidate_scores: Dict[str, float] = {}
     candidate_actual_conf: Dict[str, float] = {}
@@ -4928,7 +5077,12 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
     elif engine_key in ("toy", "mock", "demo"):
         runner = toy_ocr_text_from_cell
     elif engine_key.startswith("tess"):
-        if pytesseract is None or _PYTESS_OUTPUT is None:
+        if not _pytesseract_allowed():
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract disabled by ZOCR_ALLOW_PYTESSERACT=0; using toy OCR", flush=True)
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        elif pytesseract is None or _PYTESS_OUTPUT is None:
             if cache_key not in _OCR_BACKEND_WARNED:
                 print("[WARN] pytesseract not available; falling back to toy OCR")
                 _OCR_BACKEND_WARNED.add(cache_key)

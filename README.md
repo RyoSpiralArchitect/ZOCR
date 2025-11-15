@@ -178,6 +178,8 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 
 ## Export 進捗と高速化 / Export progress & acceleration / Export : progression et accélérations
 - `ZOCR_EXPORT_OCR` で Export 内の OCR バックエンドを切り替えられます（例: `fast` でセル OCR をスキップし構造のみ書き出し、`toy` / `tesseract` で再解析）。
+- `ZOCR_ALLOW_PYTESSERACT=1` を指定すると明示的に pytesseract 呼び出しを再度許可できます（既定 0 では外部 OCR を封印し Toy/Faux エンジンのみ使用します）。
+- Set `ZOCR_ALLOW_PYTESSERACT=1` if you explicitly want to spawn pytesseract; by default it stays disabled so demo/toy runs rely purely on the in-repo faux OCR stack.
 - `ZOCR_EXPORT_PROGRESS=1` と `ZOCR_EXPORT_LOG_EVERY=100`（任意）でセル処理数の進捗ログを標準出力に流し、長大なグリッドでも固まって見えません。
 - `ZOCR_EXPORT_MAX_CELLS` を指定すると巨大テーブルをサンプリングできます。進捗ログ有効時は `last_export_stats()` / `pipeline_summary.json` にページ数・セル数・数値強制件数・処理秒数が残ります。
 - Toy OCR と組み合わせる場合は `ZOCR_TOY_SWEEPS=2 ZOCR_EXPORT_OCR=fast` で 4 ページ超のインボイスでも即時に JSONL/SQL/RAG を生成できます。

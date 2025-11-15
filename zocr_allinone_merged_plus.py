@@ -2066,6 +2066,65 @@ def _looks_like_upper_token(text: str) -> bool:
 
 
 _TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
+
+_TOY_CHAR_CATEGORY_MAP = {
+    "digit": set("0123456789０１２３４５６７８９"),
+    "latin_upper": set("ABCDEFGHIJKLMNOPQRSTUVWXYZＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"),
+    "latin_lower": set("abcdefghijklmnopqrstuvwxyzａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ"),
+    "kana": set(),
+    "symbol": _TOY_ALLOWED_SYMBOLS | set({'+', '−', 'ー', '―', '~'}),
+}
+_TOY_TRANSITION_PRIORS = {
+    "digit": {"digit": 1.0, "symbol": 0.95, "latin_upper": 0.7, "latin_lower": 0.7, "kana": 0.65, "kanji": 0.65},
+    "latin_upper": {"latin_upper": 1.0, "latin_lower": 0.95, "digit": 0.8, "symbol": 0.75, "kana": 0.55, "kanji": 0.55},
+    "latin_lower": {"latin_lower": 1.0, "latin_upper": 0.9, "digit": 0.7, "symbol": 0.75, "kana": 0.5, "kanji": 0.5},
+    "kanji": {"kanji": 1.0, "kana": 0.9, "digit": 0.65, "symbol": 0.7, "latin_upper": 0.55, "latin_lower": 0.55},
+    "kana": {"kana": 1.0, "kanji": 0.92, "digit": 0.68, "symbol": 0.72, "latin_upper": 0.58, "latin_lower": 0.58},
+}
+
+def _toy_char_category(ch: str) -> str:
+    if not ch:
+        return "other"
+    code = ord(ch)
+    if ch in _TOY_CHAR_CATEGORY_MAP["digit"] or 0xFF10 <= code <= 0xFF19:
+        return "digit"
+    if ch in _TOY_CHAR_CATEGORY_MAP["latin_upper"]:
+        return "latin_upper"
+    if ch in _TOY_CHAR_CATEGORY_MAP["latin_lower"]:
+        return "latin_lower"
+    if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF or 0xFF66 <= code <= 0xFF9D:
+        return "kana"
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+        return "kanji"
+    if ch in _TOY_CHAR_CATEGORY_MAP["symbol"]:
+        return "symbol"
+    if ch.isspace():
+        return "space"
+    return "other"
+
+def _toy_transition_gate(text: str) -> Tuple[float, str]:
+    prev_cat: Optional[str] = None
+    penalty = 0
+    transitions = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        cat = _toy_char_category(ch)
+        if prev_cat is None:
+            prev_cat = cat
+            continue
+        transitions += 1
+        priors = _TOY_TRANSITION_PRIORS.get(prev_cat)
+        score = priors.get(cat, 0.5) if priors else 0.5
+        if score < 0.6:
+            penalty += 1
+        prev_cat = cat
+    if transitions == 0:
+        return 1.0, ""
+    ratio = penalty / float(transitions)
+    gate = max(0.55, 1.0 - 0.45 * ratio)
+    reason = f"penalty:{penalty}/{transitions}"
+    return float(gate), reason
 _TOY_NOISE_CHARS = set("?`~^|'\"¤")
 _TOY_GARBLED_PATTERN = re.compile(r"[?]{2,}|[|\\/_]{3,}|={2,}|\bfax\b", re.IGNORECASE)
 _TOY_NUMERIC_TOKEN_RE = re.compile(r"^[+-]?(?:[¥$]\s*)?[0-9][0-9,]*(?:\.[0-9]+)?%?$")
@@ -2293,6 +2352,9 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
     jp_boost, jp_reason = _japanese_token_hint(normalized, jp_profile)
     if jp_boost:
         lex_boost += jp_boost
+    transition_gate, transition_reason = _toy_transition_gate(normalized)
+    if transition_gate < 1.0:
+        base *= transition_gate
     if _TOY_GARBLED_PATTERN.search(normalized):
         base *= 0.6
     quality = float(max(0.2, min(1.6, base * lex_boost)))
@@ -2304,6 +2366,8 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
         "jp_ratio": jp_profile.get("jp_ratio", 0.0),
         "jp_hint": jp_boost,
         "jp_hint_reason": jp_reason,
+        "transition_gate": transition_gate,
+        "transition_reason": transition_reason,
     }
     return quality, diag
 
@@ -2539,6 +2603,13 @@ def _pytesseract_env_kwargs() -> Dict[str, Any]:
 _PYTESS_ENV_KWARGS = _pytesseract_env_kwargs()
 _PYTESS_ENV_SUPPORTED = True
 _PYTESS_TIMEOUT_WARNED = False
+
+
+def _pytesseract_allowed() -> bool:
+    raw = os.environ.get("ZOCR_ALLOW_PYTESSERACT")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _note_pytesseract_exception(label: str, exc: Exception) -> None:
@@ -3685,7 +3756,7 @@ def _ambiguous_variants(text: Optional[str]) -> List[str]:
 
 
 def _pytesseract_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
-    if pytesseract is None or _PYTESS_OUTPUT is None:
+    if not _pytesseract_allowed() or pytesseract is None or _PYTESS_OUTPUT is None:
         return []
     variants: List[Tuple[str, float, str]] = []
     config = "--psm 6"
@@ -3938,6 +4009,8 @@ def _synthetic_external_variants(img: "Image.Image") -> List[Tuple[str, float, s
 
 def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
     variants: List[Tuple[str, float, str]] = []
+    if not _pytesseract_allowed():
+        return _synthetic_external_variants(img)
     tess_variants = _pytesseract_variants(img)
     variants.extend(tess_variants)
     if pytesseract is not None and tess_variants:
@@ -4027,6 +4100,358 @@ def _resize_keep_ar(im, w, h):
     out = Image.new("L", (w,h), 0)
     out.paste(imr, ((w-tw)//2,(h-th)//2))
     return out
+
+
+_TOKEN_TEMPLATE_SIZE = (96, 28)
+_TOKEN_TEMPLATE_MAX_VARIANTS = 8
+_TOKEN_TEMPLATE_PRESETS = [
+    "item",
+    "qty",
+    "unit price",
+    "amount",
+    "total",
+    "subtotal",
+    "tax",
+    "due",
+    "date",
+    "見積金額",
+    "御見積金額",
+    "数量",
+    "単価",
+    "金額",
+    "小計",
+    "合計",
+]
+
+
+def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+_TOKEN_TEMPLATE_FONT = _load_template_font()
+
+
+def _render_template_bitmap(token: str) -> Optional["Image.Image"]:
+    text = (token or "").strip()
+    if not text:
+        return None
+    font = _TOKEN_TEMPLATE_FONT
+    try:
+        bbox = font.getbbox(text)
+    except Exception:
+        bbox = None
+    if bbox:
+        width = max(12, bbox[2] - bbox[0] + 6)
+        height = max(12, bbox[3] - bbox[1] + 6)
+    else:
+        width = max(12, len(text) * 8)
+        height = 24
+    img = Image.new("L", (width, height), 0)
+    dr = ImageDraw.Draw(img)
+    try:
+        dr.text((3, 2), text, fill=255, font=font)
+    except Exception:
+        return None
+    if not img.getbbox():
+        return None
+    return img
+
+
+def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
+    import numpy as _np
+
+    try:
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+    except Exception:
+        return None
+    resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
+    arr_f = _np.asarray(resized, dtype=_np.float32)
+    if arr_f.size == 0:
+        return None
+    std = float(arr_f.std())
+    if std < 1e-3:
+        return None
+    normed = (arr_f - float(arr_f.mean())) / (std + 1e-3)
+    return normed
+
+
+def _init_token_template_library() -> Dict[str, deque]:
+    library: Dict[str, deque] = {}
+    for token in _TOKEN_TEMPLATE_PRESETS:
+        bmp = _render_template_bitmap(token)
+        if bmp is None:
+            continue
+        norm = _normalize_template_bitmap(bmp)
+        if norm is None:
+            continue
+        dq = library.setdefault(token, deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS))
+        dq.append(norm)
+    return library
+
+
+_TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+
+_TEMPLATE_CACHE_STATE: Dict[str, Any] = {
+    "loaded_path": None,
+    "loaded": False,
+    "autosave": False,
+    "dirty": False,
+}
+
+
+def _template_cache_path() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TEMPLATE_CACHE")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "false", "none"}:
+        return None
+    return os.path.abspath(raw)
+
+
+def _update_template_variant_stats() -> None:
+    total = 0
+    for dq in _TOKEN_TEMPLATE_LIBRARY.values():
+        if dq:
+            total += len(dq)
+    _GLYPH_RUNTIME_STATS["template_cache_variants"] = float(total)
+
+
+def _ensure_template_cache_autosave() -> None:
+    if _TEMPLATE_CACHE_STATE.get("autosave"):
+        return
+    if not _template_cache_path():
+        return
+    atexit.register(_autosave_template_cache)
+    _TEMPLATE_CACHE_STATE["autosave"] = True
+
+
+def _ensure_template_cache_loaded() -> None:
+    path = _template_cache_path()
+    if not path:
+        return
+    state_path = _TEMPLATE_CACHE_STATE.get("loaded_path")
+    if _TEMPLATE_CACHE_STATE.get("loaded") and state_path == path:
+        return
+    _load_token_template_cache(path)
+
+
+def _load_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except FileNotFoundError:
+        _TEMPLATE_CACHE_STATE["loaded_path"] = path
+        _TEMPLATE_CACHE_STATE["loaded"] = True
+        _TEMPLATE_CACHE_STATE["dirty"] = False
+        _ensure_template_cache_autosave()
+        return
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    restored = 0
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if isinstance(tokens, dict):
+        for token, entry in tokens.items():
+            variants = []
+            if isinstance(entry, dict):
+                seq = entry.get("variants")
+                if isinstance(seq, list):
+                    variants = seq
+            elif isinstance(entry, list):
+                variants = entry
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                shape = variant.get("shape")
+                data = variant.get("data")
+                if not shape or not data:
+                    continue
+                try:
+                    arr = np.asarray(data, dtype=np.float32)
+                    dims = tuple(int(v) for v in shape)
+                    if len(dims) != 2 or arr.size != (dims[0] * dims[1]):
+                        continue
+                    arr = arr.reshape(dims)
+                except Exception:
+                    continue
+                dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+                if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+                    dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+                    _TOKEN_TEMPLATE_LIBRARY[token] = dq
+                dq.append(arr)
+                restored += 1
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _ensure_template_cache_autosave()
+    _update_template_variant_stats()
+    _GLYPH_RUNTIME_STATS["template_cache_loaded"] = float(restored)
+
+
+def _serialize_template_variants(dq: "deque[Any]") -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for tpl in dq:
+        try:
+            arr = np.asarray(tpl, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        payload = {
+            "shape": [int(dim) for dim in arr.shape],
+            "data": [round(float(val), 4) for val in arr.flatten().tolist()],
+        }
+        serialized.append(payload)
+    return serialized
+
+
+def _save_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    tokens: Dict[str, Any] = {}
+    total = 0
+    for token, dq in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not dq:
+            continue
+        variants = _serialize_template_variants(dq)
+        if not variants:
+            continue
+        tokens[token] = {"variants": variants}
+        total += len(variants)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {"version": 1, "tokens": tokens, "updated_at": time.time()}
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _GLYPH_RUNTIME_STATS["template_cache_saved"] = float(total)
+    _update_template_variant_stats()
+
+
+def _autosave_template_cache() -> None:
+    if not _TEMPLATE_CACHE_STATE.get("dirty"):
+        return
+    path = _template_cache_path()
+    if not path:
+        return
+    _save_token_template_cache(path)
+
+
+def _observe_token_template(token: str, arr: Any) -> None:
+    if not token:
+        return
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[token] = dq
+    dq.append(norm)
+    _TEMPLATE_CACHE_STATE["dirty"] = True
+    _update_template_variant_stats()
+
+
+def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
+    import numpy as _np
+
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return "", 0.0
+    best_token = ""
+    best_score = -1.0
+    _GLYPH_RUNTIME_STATS["template_cache_checks"] += 1.0
+    for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not variants:
+            continue
+        for tpl in variants:
+            if tpl.shape != norm.shape:
+                continue
+            score = float((norm * tpl).mean())
+            if score > best_score:
+                best_score = score
+                best_token = token
+    if best_score < 0.35:
+        _GLYPH_RUNTIME_STATS["template_cache_misses"] += 1.0
+        return "", 0.0
+    conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
+    _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
+    return best_token, conf
+
+
+def _normalized_string_distance(a: str, b: str) -> float:
+    if not a and not b:
+        return 0.0
+    if not a or not b:
+        return 1.0
+    try:
+        matcher = difflib.SequenceMatcher(a=a, b=b)
+        ratio = matcher.ratio()
+    except Exception:
+        return 1.0 if a != b else 0.0
+    return float(max(0.0, min(1.0, 1.0 - ratio)))
+
+
+def _template_override_thresholds() -> Tuple[float, float, float, float]:
+    def _get(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    strict_delta = _get("ZOCR_TEMPLATE_OVERRIDE_DELTA", 0.05)
+    min_quality = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_QUALITY", 0.6)
+    flex_delta = _get("ZOCR_TEMPLATE_OVERRIDE_FLEX", 0.02)
+    min_diff = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_DIFF", 0.3)
+    return float(strict_delta), float(min_quality), float(flex_delta), float(min_diff)
+
+
+def _decide_template_override(
+    final_text: str,
+    final_effective_conf: float,
+    final_quality: float,
+    template_text: str,
+    template_conf: float,
+) -> str:
+    if not template_text:
+        return ""
+    strict_delta, min_quality, flex_delta, min_diff = _template_override_thresholds()
+    lexical = float(final_quality)
+    if (not lexical) and final_text:
+        lexical = _toy_text_quality(final_text)[0]
+    if not final_text:
+        return "missing"
+    if template_conf >= final_effective_conf + strict_delta:
+        return "conf"
+    if lexical < min_quality and template_conf + flex_delta >= final_effective_conf:
+        distance = _normalized_string_distance(final_text, template_text)
+        if distance >= min_diff:
+            return "quality"
+    return ""
 
 
 _TOKEN_TEMPLATE_SIZE = (96, 28)
@@ -4484,38 +4909,86 @@ def _otsu_threshold_toy(arr):
             threshold = i
     return int(threshold)
 
+
+def _component_projection_splits(arr: "np.ndarray", axis: int, gap_ratio: float, min_span_ratio: float) -> List[Tuple[int, int, int, int]]:
+    if arr.size == 0:
+        return []
+    work = (arr > 0).astype(np.uint8)
+    height, width = work.shape[:2]
+    if axis == 1:
+        density = work.sum(axis=0)
+        span = width
+        orth = height
+    else:
+        density = work.sum(axis=1)
+        span = height
+        orth = width
+    gap_thr = max(1, int(round(gap_ratio * max(1, orth))))
+    min_span = max(1, int(round(min_span_ratio * max(1, span))))
+    segments: List[Tuple[int, int, int, int]] = []
+    idx = 0
+    while idx < span:
+        while idx < span and density[idx] <= gap_thr:
+            idx += 1
+        if idx >= span:
+            break
+        start = idx
+        while idx < span and density[idx] > gap_thr:
+            idx += 1
+        if idx - start >= min_span:
+            if axis == 1:
+                segments.append((start, 0, idx, height))
+            else:
+                segments.append((0, start, width, idx))
+    return segments
+
+def _segment_component_bbox(bw: "np.ndarray", bbox: Tuple[int, int, int, int, float]) -> List[Tuple[int, int, int, int, float]]:
+    x1, y1, x2, y2, _ = bbox
+    sub = bw[y1:y2, x1:x2]
+    if sub.size == 0:
+        return []
+    try:
+        arr = np.asarray(sub, dtype=np.uint8)
+    except Exception:
+        arr = sub
+    height = max(1, arr.shape[0])
+    width = max(1, arr.shape[1])
+    segments: List[Tuple[int, int, int, int]] = []
+    if width > height * 1.4:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=0.08, min_span_ratio=0.25)
+    if not segments and height > width * 1.8:
+        segments = _component_projection_splits(arr, axis=0, gap_ratio=0.08, min_span_ratio=0.3)
+    boxes: List[Tuple[int, int, int, int, float]] = []
+    if segments:
+        for sx1, sy1, sx2, sy2 in segments:
+            gx1, gy1 = x1 + sx1, y1 + sy1
+            gx2, gy2 = x1 + sx2, y1 + sy2
+            area = float(max(1, (gx2 - gx1) * (gy2 - gy1)))
+            boxes.append((gx1, gy1, gx2, gy2, area))
+    return boxes
+
+def _refine_component_segments(bw: "np.ndarray", bbox: Tuple[int, int, int, int, float]) -> List[Tuple[int, int, int, int, float]]:
+    queue = [bbox]
+    output: List[Tuple[int, int, int, int, float]] = []
+    steps = 0
+    while queue and steps < 32:
+        current = queue.pop()
+        children = _segment_component_bbox(bw, current)
+        if children:
+            queue.extend(children)
+        else:
+            output.append(current)
+        steps += 1
+    return output
+
 def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = _cc_label_rle(bw)
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
         return "", 0.0
-    refined: List[Tuple[int,int,int,int,float]] = []
-    for (x1, y1, x2, y2, area) in cc:
-        sub = bw[y1:y2, x1:x2]
-        if sub.size == 0:
-            continue
-        if (x2 - x1) > max(2, int(1.8 * (y2 - y1))):
-            col_density = (sub > 0).sum(axis=0)
-            gap_thr = max(1, int(0.12 * sub.shape[0]))
-            mask = col_density <= gap_thr
-            segments = []
-            idx = 0
-            L = mask.shape[0]
-            while idx < L:
-                while idx < L and mask[idx]:
-                    idx += 1
-                if idx >= L:
-                    break
-                j = idx
-                while j < L and not mask[j]:
-                    j += 1
-                if j - idx >= max(2, int(0.4 * (y2 - y1))):
-                    segments.append((x1 + idx, y1, x1 + j, y2))
-                idx = j
-            if segments:
-                refined.extend([(sx1, sy1, sx2, sy2, (sx2 - sx1) * (sy2 - sy1)) for (sx1, sy1, sx2, sy2) in segments])
-                continue
-        refined.append((x1, y1, x2, y2, area))
+    refined: List[Tuple[int, int, int, int, float]] = []
+    for bbox in cc:
+        refined.extend(_refine_component_segments(bw, bbox))
     if not refined:
         refined = cc
     refined.sort(key=lambda b: b[0])
@@ -4561,6 +5034,26 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     adj = (mean - 0.55) / (0.12 + spread * 0.5)
     conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
     return "".join(text), float(conf)
+
+
+def _shadow_correct_array(arr: "np.ndarray") -> "np.ndarray":
+    if arr.size == 0:
+        return arr
+    try:
+        img = Image.fromarray(arr, mode="L")
+    except Exception:
+        img = Image.fromarray(arr)
+    try:
+        blur = img.filter(ImageFilter.GaussianBlur(radius=3))
+    except Exception:
+        blur = img.filter(ImageFilter.BoxBlur(2))
+    low = np.asarray(blur, dtype=np.float32)
+    src = arr.astype(np.float32)
+    normalized = src - low + 128.0
+    normalized -= normalized.min()
+    peak = normalized.max() or 1.0
+    normalized = (normalized / peak) * 255.0
+    return normalized.astype(np.uint8)
 
 def toy_ocr_text_from_cell(
     crop_img: "Image.Image", bin_k: int = 15, allowed_chars: Optional[Sequence[str]] = None
@@ -4662,6 +5155,14 @@ def toy_ocr_text_from_cell(
     for delta in local_offsets:
         thr_val = int(_np.clip(thr_med + delta, 16, 240))
         _add_candidate((arr < thr_val).astype(_np.uint8) * 255, {"type": "sweep_local", "thr": thr_val})
+
+    try:
+        shadow = _shadow_correct_array(arr)
+        thr_shadow = _otsu_threshold_toy(shadow)
+        _add_candidate((shadow < thr_shadow).astype(_np.uint8) * 255, {"type": "shadow_dark", "thr": thr_shadow})
+        _add_candidate((shadow > thr_shadow).astype(_np.uint8) * 255, {"type": "shadow_light", "thr": thr_shadow})
+    except Exception:
+        pass
 
     candidate_scores: Dict[str, float] = {}
     candidate_actual_conf: Dict[str, float] = {}
@@ -4811,7 +5312,12 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
     elif engine_key in ("toy", "mock", "demo"):
         runner = toy_ocr_text_from_cell
     elif engine_key.startswith("tess"):
-        if pytesseract is None or _PYTESS_OUTPUT is None:
+        if not _pytesseract_allowed():
+            if cache_key not in _OCR_BACKEND_WARNED:
+                print("[WARN] pytesseract disabled by ZOCR_ALLOW_PYTESSERACT=0; using toy OCR", flush=True)
+                _OCR_BACKEND_WARNED.add(cache_key)
+            runner = toy_ocr_text_from_cell
+        elif pytesseract is None or _PYTESS_OUTPUT is None:
             if cache_key not in _OCR_BACKEND_WARNED:
                 print("[WARN] pytesseract not available; falling back to toy OCR")
                 _OCR_BACKEND_WARNED.add(cache_key)
