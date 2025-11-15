@@ -174,10 +174,15 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[EN]** Bound threshold sweeps via `ZOCR_TOY_SWEEPS` (default 5, auto-clamped to ~2–4 in toy-lite/demo runs) and opt out of header-driven numeric coercion with `ZOCR_FORCE_NUMERIC=0`.
 - **[FR]** `ZOCR_TOY_SWEEPS` (par défaut 5, ~2–4 en mode toy-lite/demo) fixe le nombre de balayages ; `ZOCR_FORCE_NUMERIC=0` désactive la coercition numérique basée sur les en-têtes.
 - `ZOCR_TOY_MEMORY` で Toy OCR のメモリ保存先を固定でき、`ZOCR_GLYPH_CACHE_LIMIT` / `ZOCR_GLYPH_PENDING_LIMIT` / `ZOCR_NGRAM_EMA_ALPHA` がキャッシュ容量や忘却率を制御します。
+- `ZOCR_TESS_UNICHARSET` / `ZOCR_TESS_WORDLIST` / `ZOCR_TESS_BIGRAM_JSON` を指定すると、Tesseract 由来の軽量な unicharset / 辞書 / n-gram を Toy OCR の文字品質判定にインポートできます（ファイルが無い場合は自動的にスキップ）。
+- **[EN]** Point `ZOCR_TESS_UNICHARSET` / `ZOCR_TESS_WORDLIST` / `ZOCR_TESS_BIGRAM_JSON` to reuse Tesseract-style glyph sets, wordlists, and bigrams for the toy OCR lexical model; the hints load lazily and are ignored when paths are absent.
+- **[FR]** `ZOCR_TESS_UNICHARSET` / `ZOCR_TESS_WORDLIST` / `ZOCR_TESS_BIGRAM_JSON` permettent d’importer des listes de caractères/dictionnaires/bigrammes à la Tesseract pour renforcer le modèle lexical du Toy OCR (les fichiers sont optionnels).
 - `--toy-lite` または demo 入力では数値列の強制正規化と sweep クランプが既定で有効になり、`pipeline_summary.json` の `toy_runtime_config` と `last_export_stats` に適用結果が保存されます。
 
 ## Export 進捗と高速化 / Export progress & acceleration / Export : progression et accélérations
 - `ZOCR_EXPORT_OCR` で Export 内の OCR バックエンドを切り替えられます（例: `fast` でセル OCR をスキップし構造のみ書き出し、`toy` / `tesseract` で再解析）。
+- `ZOCR_ALLOW_PYTESSERACT=1` を指定すると明示的に pytesseract 呼び出しを再度許可できます（既定 0 では外部 OCR を封印し Toy/Faux エンジンのみ使用します）。CLI から再度オンにする場合は `--allow-pytesseract` を付けてください（`--no-allow-pytesseract` で強制オフ）。
+- Set `ZOCR_ALLOW_PYTESSERACT=1` if you explicitly want to spawn pytesseract; by default it stays disabled so demo/toy runs rely purely on the in-repo faux OCR stack. The orchestrator CLI mirrors this via `--allow-pytesseract` / `--no-allow-pytesseract` switches.
 - `ZOCR_EXPORT_PROGRESS=1` と `ZOCR_EXPORT_LOG_EVERY=100`（任意）でセル処理数の進捗ログを標準出力に流し、長大なグリッドでも固まって見えません。
 - `ZOCR_EXPORT_MAX_CELLS` を指定すると巨大テーブルをサンプリングできます。進捗ログ有効時は `last_export_stats()` / `pipeline_summary.json` にページ数・セル数・数値強制件数・処理秒数が残ります。
 - Toy OCR と組み合わせる場合は `ZOCR_TOY_SWEEPS=2 ZOCR_EXPORT_OCR=fast` で 4 ページ超のインボイスでも即時に JSONL/SQL/RAG を生成できます。
