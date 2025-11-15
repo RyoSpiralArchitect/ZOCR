@@ -11,11 +11,19 @@ zocr/
   consensus/zocr_consensus.py    # OCR + table reconstruction helpers
   core/zocr_core.py              # augmentation, BM25, monitoring, SQL & RAG export
   orchestrator/zocr_pipeline.py  # CLI pipeline orchestrator + resume/watchdog/reporting
+  diff/                          # semantic diff engine (see zocr/diff/README.md)
 samples/
   demo_inputs/                   # place your PDFs/PNGs here for quick demos
 README.md
 zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```
+
+### Semantic diff overview
+The `zocr.diff` package turns the existing RAG bundle artifacts (`cells.jsonl`, `sections.jsonl`) into
+structured change events plus unified-text/HTML reports. See [`zocr/diff/README.md`](zocr/diff/README.md)
+for the module layout, CLI example, and an overview of why the OCR/RAG pipeline already exposes the
+necessary ingredients (structured cells, trace IDs, filters, monitoring hooks) to support semantic diffs
+without extra exporters.
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash
