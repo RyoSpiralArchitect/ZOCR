@@ -3260,6 +3260,7 @@ def _patched_run_full_pipeline(
     blank_min_pixels: Optional[int] = None,
     blank_min_ratio: Optional[float] = None,
     blank_min_area: Optional[int] = None,
+    allow_pytesseract: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
@@ -3291,6 +3292,12 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_EXPORT_BLANK_MIN_RATIO"] = str(float(blank_min_ratio))
     if blank_min_area is not None:
         os.environ["ZOCR_EXPORT_BLANK_MIN_AREA"] = str(int(blank_min_area))
+    if allow_pytesseract is True:
+        os.environ["ZOCR_ALLOW_PYTESSERACT"] = "1"
+    elif allow_pytesseract is False:
+        os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
+    else:
+        os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
 
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
@@ -4604,6 +4611,20 @@ def main():
         help="Minimum crop area required before blank skip applies",
     )
     ap.add_argument(
+        "--allow-pytesseract",
+        dest="allow_pytesseract",
+        action="store_true",
+        default=None,
+        help="Opt back into spawning pytesseract during export",
+    )
+    ap.add_argument(
+        "--no-allow-pytesseract",
+        dest="allow_pytesseract",
+        action="store_false",
+        default=None,
+        help="Force-disable pytesseract even if the environment opts in",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -4669,6 +4690,7 @@ def main():
             blank_min_pixels=args.blank_min_pixels,
             blank_min_ratio=args.blank_min_ratio,
             blank_min_area=args.blank_min_area,
+            allow_pytesseract=args.allow_pytesseract,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
