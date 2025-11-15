@@ -13,6 +13,7 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
+from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set, TypedDict
@@ -24,6 +25,12 @@ from html import escape
 
 from .prior import PriorBandit, normalize_headers_to_signature, decide_success
 from ..utils.json_utils import json_ready as _json_ready
+from ..diff import (
+    DiffAssistPlanner,
+    SemanticDiffer,
+    render_html as diff_render_html,
+    render_unified as diff_render_unified,
+)
 
 try:
     from PIL import Image  # type: ignore
@@ -190,6 +197,33 @@ def _print_stage_trace_console(stage_trace: List[Dict[str, Any]], stats: Optiona
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
+    """Run semantic diff between two pipeline outputs."""
+
+    a_cells = a_dir / "rag" / "cells.jsonl"
+    b_cells = b_dir / "rag" / "cells.jsonl"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    a_sections = a_dir / "rag" / "sections.jsonl"
+    b_sections = b_dir / "rag" / "sections.jsonl"
+
+    differ = SemanticDiffer()
+    planner = DiffAssistPlanner()
+    result = differ.compare_bundle(a_cells, b_cells, a_sections, b_sections)
+    assist_plan = planner.plan(result["events"])
+    result["assist_plan"] = assist_plan
+
+    (out_dir / "events.json").write_text(_json_dumps(result), encoding="utf-8")
+    (out_dir / "changes.diff").write_text(diff_render_unified(result["events"]), encoding="utf-8")
+    diff_render_html(result["events"], out_dir / "report.html")
+    (out_dir / "assist_plan.json").write_text(_json_dumps(assist_plan), encoding="utf-8")
+    return result
 
 
 class IntentPayload(TypedDict, total=False):
