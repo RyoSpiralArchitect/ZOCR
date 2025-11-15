@@ -343,6 +343,84 @@ def _box_mean(gray, k):
 def _binarize_pure(gray, k=31, c=10):
     m=_box_mean(gray,k); return (gray<(m-c)).astype(np.uint8)*255
 
+
+def _estimate_slant_slope(binary: "np.ndarray") -> float:
+    if np is None:
+        return 0.0
+    try:
+        coords = np.argwhere(np.asarray(binary, dtype=np.uint8) > 0)
+    except Exception:
+        return 0.0
+    if coords.size == 0:
+        return 0.0
+    y = coords[:, 0].astype(np.float64)
+    x = coords[:, 1].astype(np.float64)
+    if y.size < 128:
+        return 0.0
+    y_centered = y - float(np.mean(y))
+    x_centered = x - float(np.mean(x))
+    denom = float(np.dot(y_centered, y_centered))
+    if denom <= 1e-6:
+        return 0.0
+    slope = float(np.dot(x_centered, y_centered) / denom)
+    return float(max(-0.5, min(0.5, slope)))
+
+
+def _shear_rows_binary(binary01: "np.ndarray", slope: float) -> "np.ndarray":
+    arr = (np.asarray(binary01, dtype=np.uint8) > 0).astype(np.uint8)
+    H, W = arr.shape
+    out = np.zeros_like(arr)
+    center = H / 2.0
+    max_shift = int(min(W * 0.25, abs(slope) * H * 1.2 + 2))
+    for y in range(H):
+        shift = int(round((y - center) * slope))
+        shift = max(-max_shift, min(max_shift, shift))
+        row = arr[y]
+        if shift > 0:
+            out[y, shift:] = np.maximum(out[y, shift:], row[: W - shift])
+        elif shift < 0:
+            out[y, : W + shift] = np.maximum(out[y, : W + shift], row[-shift:])
+        else:
+            out[y] = np.maximum(out[y], row)
+    return out
+
+
+def _suppress_diagonal_bridges(binary01: "np.ndarray") -> "np.ndarray":
+    arr = (np.asarray(binary01, dtype=np.uint8) > 0).astype(np.uint8)
+    if arr.size == 0:
+        return arr
+    padded = np.pad(arr, 1, mode="constant")
+    left = padded[1:-1, :-2] > 0
+    right = padded[1:-1, 2:] > 0
+    up = padded[:-2, 1:-1] > 0
+    down = padded[2:, 1:-1] > 0
+    diag = (
+        padded[:-2, :-2]
+        | padded[:-2, 2:]
+        | padded[2:, :-2]
+        | padded[2:, 2:]
+    ) > 0
+    horiz = left | right
+    vert = up | down
+    mask = (diag & (~horiz) & (~vert))
+    trimmed = arr.copy()
+    trimmed[mask] = 0
+    return trimmed
+
+
+def _apply_italic_guard(binary: "np.ndarray") -> "np.ndarray":
+    if np is None:
+        return binary
+    arr = (np.asarray(binary, dtype=np.uint8) > 0).astype(np.uint8)
+    arr = _suppress_diagonal_bridges(arr)
+    slope = _estimate_slant_slope(arr)
+    if abs(slope) < 0.08:
+        return (arr * 255).astype(np.uint8)
+    deskewed = _shear_rows_binary(arr, -slope)
+    combined = np.maximum(arr, deskewed)
+    combined = _suppress_diagonal_bridges(combined)
+    return (combined * 255).astype(np.uint8)
+
 # ----------------- Separable dilation via prefix sums -----------------
 def _dilate_binary_rect(bw: "np.ndarray", wx: int, wy: int) -> "np.ndarray":
     H,W = bw.shape
@@ -580,6 +658,29 @@ def _refine_column_bounds_alignment(col_bounds: List[int], smooth_strength: floa
     scaled[0] = col_bounds[0]
     scaled[-1] = col_bounds[-1]
     return scaled
+
+
+def _column_blank_ratios(binary: "np.ndarray", col_bounds: Sequence[int]) -> List[float]:
+    count = max(0, len(col_bounds) - 1)
+    if count <= 0:
+        return []
+    try:
+        arr = (np.asarray(binary, dtype=np.uint8) > 0).astype(np.uint8)
+    except Exception:
+        return [0.0] * count
+    H, W = arr.shape
+    ratios: List[float] = []
+    for idx in range(count):
+        x0 = int(max(0, min(W, col_bounds[idx])))
+        x1 = int(max(0, min(W, col_bounds[idx + 1])))
+        if x1 <= x0:
+            ratios.append(1.0)
+            continue
+        slice_arr = arr[:, x0:x1]
+        total = float(max(1, slice_arr.size))
+        ink = float(slice_arr.sum())
+        ratios.append(max(0.0, min(1.0, 1.0 - ink / total)))
+    return ratios
 
 
 def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: int) -> List[int]:
@@ -970,6 +1071,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     # binarize
     k=int(params.get("k",31)); c=float(params.get("c",10.0))
     bin_img=_binarize_pure(g,k,c)
+    bin_img=_apply_italic_guard(bin_img)
     # smear
     wx = int(params.get("wx", max(3, W//120))); wy = int(params.get("wy", max(1, H//300)))
     b=_dilate_binary_rect((bin_img>0).astype(np.uint8), wx, wy)
@@ -1073,6 +1175,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
     col_bounds = _refine_column_bounds_alignment(col_bounds)
+    column_blank_ratios = _column_blank_ratios(bin_img, col_bounds)
     R=len(row_bands); C=max(1,len(col_bounds)-1)
     used=set(); cells={}
     def which_cols(xl,xr):
@@ -1099,6 +1202,9 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         yt = row_bands[r0][0]; yb = row_bands[min(R-1, r0+rs-1)][1]
         xl = col_bounds[c0]; xr = col_bounds[min(C, c0+cs)]
         return xl,yt,xr,yb
+    blank_thr = float(params.get("colspan_blank_threshold", 0.9))
+    blank_sigma = float(params.get("colspan_blank_sigma", 0.08))
+
     def try_expand_span(r,c,rs,cs,ch):
         step = 0
         while (r+rs) < R:
@@ -1136,6 +1242,44 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 break
             rs += 1; step += 1
         return rs, cs
+
+    def try_expand_colspan(r: int, c: int, rs: int, cs: int, ch: List[int]) -> int:
+        step = 0
+        while (c + cs) < C:
+            blank_ratio = column_blank_ratios[c + cs] if (c + cs) < len(column_blank_ratios) else 0.0
+            if blank_ratio < blank_thr:
+                break
+            block = cell_block_bbox(r, rs, c, cs + 1)
+            coverage_rows: List[float] = []
+            for rr in range(r, min(R, r + rs)):
+                coverage_rows.append(_coverage_ratio(chunks_by_row[rr], *block))
+            cov = float(np.median(coverage_rows)) if coverage_rows else 0.0
+            p_iou = _sigmoid((cov - tau) / max(1e-6, sigma))
+            blank_boost = _sigmoid((blank_ratio - blank_thr) / max(1e-3, blank_sigma))
+            gap_block = (
+                col_bounds[c + cs],
+                row_bands[r][0],
+                col_bounds[c + cs + 1],
+                row_bands[min(R - 1, r + rs - 1)][1],
+            )
+            gap_hits = 0
+            for rr in range(r, min(R, r + rs)):
+                cov_gap = _coverage_ratio(
+                    chunks_by_row[rr],
+                    gap_block[0],
+                    row_bands[rr][0],
+                    gap_block[2],
+                    row_bands[rr][1],
+                )
+                if cov_gap < 0.05:
+                    gap_hits += 1
+            p_gap = _sigmoid(((gap_hits / float(max(1, rs))) - 0.5) / 0.2)
+            p_comb = p_iou * blank_boost * p_gap
+            if p_comb < p_cons_thr:
+                break
+            cs += 1
+            step += 1
+        return cs
     html="<table>"
     for r in range(R):
         tag="th" if r==0 else "td"
@@ -1147,6 +1291,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
             if ent:
                 rs,cs,ch = ent
                 rs,cs = try_expand_span(r,c,rs,cs,ch)
+                cs = try_expand_colspan(r,c,rs,cs,ch)
                 for rr in range(r, min(R,r+rs)):
                     for cc in range(c, min(C,c+cs)):
                         if not (rr==r and cc==c): used.add((rr,cc))
@@ -1201,6 +1346,8 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         "candidates_initial": sum(len(r) for r in candidates_initial),
         "candidates_final": sum(len(r) for r in candidates_after),
         "rows_with_candidates": sum(1 for r in candidates_after if r),
+        "blank_columns": sum(1 for ratio in column_blank_ratios if ratio >= blank_thr),
+        "blank_ratio_mean": round(float(sum(column_blank_ratios)) / float(len(column_blank_ratios) or 1), 4),
     }
     segmentation_stats = {
         "row": row_diag,
@@ -4036,29 +4183,78 @@ _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
 _ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
     {
         "key": "item",
-        "pattern": re.compile(r"(item|品目|description|desc|details)", re.I),
+        "pattern": re.compile(r"(item|品名|品目|摘要|description|desc|details)", re.I),
         "title": "Item",
         "normalizer": None,
     },
     {
         "key": "qty",
-        "pattern": re.compile(r"(qty|数量|quantity|q'?ty|pcs?|units?)", re.I),
+        "pattern": re.compile(r"(qty|数量|quantity|q'?ty|pcs?|units?|個数|台数)", re.I),
         "title": "Qty",
         "normalizer": "qty",
     },
     {
         "key": "unit_price",
-        "pattern": re.compile(r"(unit\s*(price|cost)|単価)", re.I),
+        "pattern": re.compile(r"(unit\s*(price|cost)|単価|単価金額)", re.I),
         "title": "Unit Price",
         "normalizer": "currency",
     },
     {
         "key": "amount",
-        "pattern": re.compile(r"(amount|line\s*total|line\s*amount|金額|total)", re.I),
+        "pattern": re.compile(r"(amount|line\s*total|line\s*amount|金額|total|合計|総計|見積金額)", re.I),
         "title": "Amount",
         "normalizer": "currency",
     },
 ]
+
+_SCHEMA_SEMANTIC_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "item": (
+        "item",
+        "品名",
+        "品目",
+        "摘要",
+        "内容",
+        "名称",
+        "品番",
+        "項目",
+        "description",
+        "desc",
+        "details",
+        "備考",
+        "仕様",
+    ),
+    "qty": (
+        "qty",
+        "quantity",
+        "数量",
+        "個数",
+        "台数",
+        "数",
+        "pcs",
+        "unit",
+    ),
+    "unit_price": (
+        "unitprice",
+        "unitcost",
+        "単価",
+        "単価金額",
+        "単価(税込)",
+        "単価(税抜)",
+    ),
+    "amount": (
+        "amount",
+        "total",
+        "lineamount",
+        "linetotal",
+        "金額",
+        "合計",
+        "総計",
+        "見積金額",
+        "御見積金額",
+        "計",
+        "税込金額",
+    ),
+}
 
 
 def _schema_normalize_header_token(text: Optional[str]) -> str:
@@ -4077,6 +4273,20 @@ def _schema_normalize_header_token(text: Optional[str]) -> str:
     return "".join(pieces)
 
 
+def _build_schema_synonym_map() -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for key, tokens in _SCHEMA_SEMANTIC_SYNONYMS.items():
+        for token in tokens:
+            norm = _schema_normalize_header_token(token)
+            if not norm:
+                continue
+            mapping.setdefault(norm, key)
+    return mapping
+
+
+_SCHEMA_SYNONYM_MAP = _build_schema_synonym_map()
+
+
 def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
     if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
         return None
@@ -4091,6 +4301,10 @@ def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
                 continue
             token = normalized[idx]
             if not token or pattern is None:
+                mapped = _SCHEMA_SYNONYM_MAP.get(token)
+                if mapped == column.get("key"):
+                    best_idx = idx
+                    break
                 continue
             if pattern.search(token):
                 best_idx = idx
@@ -4144,6 +4358,110 @@ def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[st
             }
         )
     return profiles
+
+
+def _schema_token_role(text: Optional[str]) -> Optional[str]:
+    token = _schema_normalize_header_token(text)
+    if not token:
+        return None
+    mapped = _SCHEMA_SYNONYM_MAP.get(token)
+    if mapped:
+        return mapped
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        if pattern and pattern.search(token):
+            return column.get("key")
+    return None
+
+
+def _collect_schema_token_bonuses(
+    grid_text: Sequence[Sequence[str]], num_cols: int
+) -> List[defaultdict]:  # type: ignore[type-arg]
+    bonuses: List[defaultdict] = [defaultdict(float) for _ in range(max(0, num_cols))]
+    if not grid_text or num_cols <= 0:
+        return bonuses
+    sample_rows: List[Sequence[str]] = []
+    sample_rows.extend(grid_text[:2])
+    sample_rows.extend(grid_text[-2:])
+    for ridx, row in enumerate(sample_rows):
+        weight = 1.2 if ridx == 0 else (1.0 if ridx <= 2 else 0.9)
+        for idx in range(num_cols):
+            token = row[idx] if idx < len(row) else None
+            role = _schema_token_role(token)
+            if not role:
+                continue
+            bonuses[idx][role] += weight
+    return bonuses
+
+
+def _semantic_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < num_cols:
+        return None
+    bonuses = _collect_schema_token_bonuses(grid_text, num_cols)
+
+    def _score(idx: int, key: str) -> float:
+        profile = profiles[idx] if idx < len(profiles) else {
+            "numeric_ratio": 0.0,
+            "currency_ratio": 0.0,
+            "decimal_ratio": 0.0,
+            "text_ratio": 0.0,
+        }
+        score = 0.0
+        if key == "item":
+            score = profile.get("text_ratio", 0.0) * 1.2 + (1.0 - profile.get("numeric_ratio", 0.0)) * 0.4
+        elif key == "qty":
+            score = profile.get("numeric_ratio", 0.0) * 1.1 + (1.0 - profile.get("currency_ratio", 0.0)) * 0.3
+            score -= profile.get("text_ratio", 0.0) * 0.2
+        elif key == "unit_price":
+            score = profile.get("decimal_ratio", 0.0) * 1.0 + profile.get("currency_ratio", 0.0) * 0.6
+            score += profile.get("numeric_ratio", 0.0) * 0.25
+        elif key == "amount":
+            score = profile.get("currency_ratio", 0.0) * 1.2 + profile.get("numeric_ratio", 0.0) * 0.6
+        score += bonuses[idx].get(key, 0.0)
+        if key == "item":
+            score -= idx * 0.02
+        elif key == "amount":
+            score += idx * 0.01
+        return score
+
+    def _select_best(indices: Sequence[int], key: str) -> Optional[int]:
+        best_idx = None
+        best_score = -1e9
+        for idx in indices:
+            sc = _score(idx, key)
+            if sc > best_score:
+                best_score = sc
+                best_idx = idx
+        if best_idx is None or best_score < 0.1:
+            return None
+        return best_idx
+
+    all_indices = list(range(num_cols))
+    amount_idx = _select_best(all_indices, "amount")
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in all_indices if idx < amount_idx]
+    unit_price_idx = _select_best(unit_price_candidates, "unit_price")
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in all_indices if idx < unit_price_idx]
+    qty_idx = _select_best(qty_candidates, "qty")
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in all_indices if idx < qty_idx]
+    item_idx = _select_best(item_candidates, "item")
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
 
 
 def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
@@ -4268,6 +4586,10 @@ def _rectify_item_qty_amount_schema(
         return None
     strategy = "header"
     match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _semantic_item_qty_schema(grid_text)
+        if match:
+            strategy = "semantic"
     if not match:
         match = _approximate_item_qty_schema(grid_text)
         if not match:
