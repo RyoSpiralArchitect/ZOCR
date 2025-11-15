@@ -22,6 +22,8 @@ except ImportError:  # pragma: no cover - fallback for very old Python
     from typing_extensions import Literal  # type: ignore
 from html import escape
 
+from .prior import PriorBandit, normalize_headers_to_signature, decide_success
+
 try:
     from PIL import Image  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -1109,6 +1111,127 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
         insights.append(msg)
 
     return insights
+
+
+def _dedupe_insights_and_queries(summary: Dict[str, Any]) -> None:
+    """Remove RAG suggested queries that duplicate existing insights."""
+    insights = summary.get("insights")
+    queries = summary.get("rag_suggested_queries")
+    if not insights or not queries:
+        return
+
+    def _canon(val: Any) -> Optional[str]:
+        if not isinstance(val, str):
+            return None
+        return " ".join(val.split()).strip().lower()
+
+    insight_keys = {c for c in (_canon(v) for v in insights) if c}
+    if not insight_keys:
+        return
+
+    filtered: List[Any] = []
+    for q in queries:
+        canon = _canon(q)
+        if canon and canon in insight_keys:
+            continue
+        filtered.append(q)
+    summary["rag_suggested_queries"] = filtered
+
+
+def _derive_rag_bundle_status(
+    cell_count: Optional[int],
+    table_count: Optional[int],
+    page_count: Optional[int],
+    doc_ids: Optional[List[str]] = None,
+    languages: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    def _is_positive(val: Optional[int]) -> bool:
+        try:
+            return int(val) > 0
+        except (TypeError, ValueError):
+            return False
+
+    has_cells = _is_positive(cell_count)
+    has_tables = _is_positive(table_count)
+    has_pages = _is_positive(page_count)
+    issues: List[str] = []
+    if not has_cells:
+        issues.append("no_cells")
+    if has_cells and not has_tables:
+        issues.append("no_tables")
+    if has_cells and not has_pages:
+        issues.append("no_pages")
+
+    status: Dict[str, Any] = {
+        "has_cells": has_cells,
+        "has_tables": has_tables,
+        "has_pages": has_pages,
+    }
+    if doc_ids:
+        status["doc_ids"] = doc_ids
+    if languages:
+        status["languages"] = languages
+    if issues:
+        status["issues"] = issues
+    return status
+
+
+def _signature_state_path(outdir: str) -> str:
+    return os.path.join(outdir, "table_signature.json")
+
+
+def _load_saved_signature(outdir: str) -> Tuple[Optional[str], Optional[List[str]]]:
+    path = _signature_state_path(outdir)
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None, None
+    signature = payload.get("signature") if isinstance(payload, dict) else None
+    headers = payload.get("headers") if isinstance(payload, dict) else None
+    if isinstance(signature, str):
+        sig_val = signature
+    else:
+        sig_val = None
+    header_list = headers if isinstance(headers, list) else None
+    return sig_val, header_list
+
+
+def _save_signature(outdir: str, signature: str, headers: Optional[List[str]]) -> None:
+    payload = {
+        "signature": signature,
+        "headers": headers,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    path = _signature_state_path(outdir)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _extract_headers_from_jsonl(jsonl_path: str) -> Optional[List[str]]:
+    if not os.path.exists(jsonl_path):
+        return None
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                headers = rec.get("headers") if isinstance(rec, dict) else None
+                if isinstance(headers, list) and headers:
+                    return [str(h) for h in headers]
+    except Exception:
+        return None
+    return None
 
 def _generate_report(
     outdir: str,
@@ -3104,6 +3227,24 @@ def _simulate_param_shift(
         )
     return simulations
 
+def _normalize_optional_path(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    trimmed = str(path).strip()
+    if not trimmed:
+        return None
+    return os.path.abspath(os.path.expanduser(trimmed))
+
+
+def _validate_file_if_supplied(path: Optional[str], label: str) -> Optional[str]:
+    resolved = _normalize_optional_path(path)
+    if not resolved:
+        return None
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"{label} path does not exist: {resolved}")
+    return resolved
+
+
 def _patched_run_full_pipeline(
     inputs: List[str],
     outdir: str,
@@ -3126,7 +3267,74 @@ def _patched_run_full_pipeline(
     advisor_response: Optional[str] = None,
     print_stage_trace: Optional[bool] = None,
     rag_feedback: Optional[str] = None,
+    motion_prior: bool = False,
+    motion_sigma_px: Optional[float] = None,
+    motion_cutoff_sigma: Optional[float] = None,
+    motion_accept_ratio: Optional[float] = None,
+    export_guard_ms: Optional[int] = None,
+    sweeps_fixed: Optional[int] = None,
+    blank_skip: Optional[bool] = None,
+    blank_threshold: Optional[int] = None,
+    blank_min_pixels: Optional[int] = None,
+    blank_min_ratio: Optional[float] = None,
+    blank_min_area: Optional[int] = None,
+    allow_pytesseract: Optional[bool] = None,
+    tess_unicharset: Optional[str] = None,
+    tess_wordlist: Optional[str] = None,
+    tess_bigram_json: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if sweeps_fixed is not None and sweeps_fixed > 0:
+        toy_sweeps = int(sweeps_fixed)
+        os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
+        os.environ["ZOCR_TOY_SWEEP_LIMIT"] = str(toy_sweeps)
+    if motion_prior:
+        os.environ["ZOCR_EXPORT_MOTION_PRIOR"] = "1"
+    if motion_prior and motion_sigma_px is None:
+        motion_sigma_px = 10.0
+    if motion_prior and motion_cutoff_sigma is None:
+        motion_cutoff_sigma = 2.5
+    if motion_prior and motion_accept_ratio is None:
+        motion_accept_ratio = 0.6
+    if motion_sigma_px is not None:
+        os.environ["ZOCR_EXPORT_MOTION_SIGMA"] = str(motion_sigma_px)
+    if motion_cutoff_sigma is not None:
+        os.environ["ZOCR_EXPORT_MOTION_CUTOFF"] = str(motion_cutoff_sigma)
+    if motion_accept_ratio is not None:
+        os.environ["ZOCR_EXPORT_MOTION_ACCEPT"] = str(motion_accept_ratio)
+    if export_guard_ms is not None:
+        os.environ["ZOCR_EXPORT_GUARD_MS"] = str(max(0, int(export_guard_ms)))
+    if blank_skip is not None:
+        os.environ["ZOCR_EXPORT_SKIP_BLANK"] = "1" if blank_skip else "0"
+    if blank_threshold is not None:
+        os.environ["ZOCR_EXPORT_BLANK_THRESHOLD"] = str(int(blank_threshold))
+    if blank_min_pixels is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_PIXELS"] = str(int(blank_min_pixels))
+    if blank_min_ratio is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_RATIO"] = str(float(blank_min_ratio))
+    if blank_min_area is not None:
+        os.environ["ZOCR_EXPORT_BLANK_MIN_AREA"] = str(int(blank_min_area))
+    if allow_pytesseract is True:
+        os.environ["ZOCR_ALLOW_PYTESSERACT"] = "1"
+    elif allow_pytesseract is False:
+        os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
+    else:
+        os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
+    tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
+    tess_wordlist = _validate_file_if_supplied(tess_wordlist, "--tess-wordlist")
+    tess_bigram_json = _validate_file_if_supplied(tess_bigram_json, "--tess-bigram-json")
+    if tess_unicharset is not None:
+        os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
+    else:
+        os.environ.pop("ZOCR_TESS_UNICHARSET", None)
+    if tess_wordlist is not None:
+        os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
+    else:
+        os.environ.pop("ZOCR_TESS_WORDLIST", None)
+    if tess_bigram_json is not None:
+        os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
+    else:
+        os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
+
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -3337,6 +3545,25 @@ def _patched_run_full_pipeline(
         "ingest_signature": ingest_signature,
     }
 
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
     episode_info = _begin_episode(outdir)
     if episode_info:
         summary["episode"] = {"id": episode_info.get("id"), "parent": episode_info.get("parent")}
@@ -3440,6 +3667,56 @@ def _patched_run_full_pipeline(
     if "Export" in ok:
         print("[SKIP] Export JSONL (resume)")
     else:
+        os.environ.setdefault("ZOCR_EXPORT_EXT_VARIANTS", "0")
+        os.environ.setdefault("ZOCR_EXPORT_PROGRESS", "1")
+        os.environ.setdefault("ZOCR_EXPORT_LOG_EVERY", "100")
+        os.environ.setdefault("ZOCR_EXPORT_SKIP_BLANK", "1")
+        if isinstance(export_ocr_engine, str) and export_ocr_engine.lower().startswith("toy"):
+            saved_sig, saved_headers = _load_saved_signature(outdir)
+            cached_headers = _extract_headers_from_jsonl(jsonl_path)
+            headers_source = None
+            candidate_headers = None
+            if cached_headers:
+                candidate_headers = cached_headers
+                headers_source = "contextual_jsonl"
+            elif saved_headers:
+                candidate_headers = saved_headers
+                headers_source = "signature_cache"
+            if candidate_headers is None:
+                fallback_tokens: List[str] = []
+                domain_token = prof.get("domain") or domain_hint
+                if domain_token:
+                    fallback_tokens.append(str(domain_token))
+                if not fallback_tokens and inputs:
+                    fallback_tokens.append(os.path.splitext(os.path.basename(inputs[0]))[0])
+                if not fallback_tokens:
+                    fallback_tokens.append("unknown")
+                candidate_headers = fallback_tokens
+                headers_source = "fallback"
+            bandit_headers = candidate_headers
+            bandit_signature = normalize_headers_to_signature(bandit_headers)
+            bandit_state_path = os.path.join(outdir, "bandit_state.json")
+            bandit = PriorBandit(bandit_state_path)
+            bandit_action = bandit.decide(bandit_signature)
+            os.environ["ZOCR_USE_PRIOR"] = "1" if bandit_action == "WITH_PRIOR" else "0"
+            os.environ["ZOCR_PRIOR_ACTION"] = bandit_action
+            os.environ.setdefault("ZOCR_PRIOR_SIGMA", "auto")
+            os.environ.setdefault("ZOCR_K_SIGMA_WINDOW", "2.5")
+            prior_cache_dir = os.path.join(outdir, ".prior_cache")
+            ensure_dir(prior_cache_dir)
+            os.environ["ZOCR_PRIOR_CACHE"] = prior_cache_dir
+            os.environ["ZOCR_TABLE_SIGNATURE"] = bandit_signature
+            if not os.environ.get("ZOCR_TEMPLATE_CACHE"):
+                template_cache_path = os.path.join(outdir, "toy_template_cache.json")
+                os.environ["ZOCR_TEMPLATE_CACHE"] = template_cache_path
+                summary.setdefault("toy_templates", {})["cache"] = template_cache_path
+            summary["prior_bandit"] = {
+                "signature": bandit_signature,
+                "action": bandit_action,
+                "headers_preview": bandit_headers[:8] if bandit_headers else None,
+                "headers_source": headers_source,
+                "state": bandit_state_path,
+            }
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
@@ -3460,8 +3737,17 @@ def _patched_run_full_pipeline(
                 export_stats = export_stats_fn()
             except Exception:
                 export_stats = None
-            if export_stats:
-                summary["export_stats"] = _json_ready(export_stats)
+        if export_stats:
+            summary["export_stats"] = _json_ready(export_stats)
+        new_headers = _extract_headers_from_jsonl(jsonl_path)
+        if new_headers:
+            final_sig = normalize_headers_to_signature(new_headers)
+            bandit_headers = new_headers
+            bandit_signature = final_sig
+            _save_signature(outdir, final_sig, new_headers)
+            prior_meta = summary.setdefault("prior_bandit", {})
+            prior_meta["final_signature"] = final_sig
+            prior_meta["headers_preview"] = new_headers[:8]
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
     export_signals = _load_export_signals(jsonl_path)
     if export_signals:
@@ -3986,9 +4272,6 @@ def _patched_run_full_pipeline(
                     json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)
             except Exception as exc:
                 print("Profile save skipped (gate streak):", exc)
-    if safety_flags:
-        summary["safety_flags"] = safety_flags
-
     try:
         sql_paths = zocr_multidomain_core.sql_export(mm_jsonl, os.path.join(outdir, "sql"),
                                                      prefix=(prof.get("domain") or "invoice"))
@@ -4012,13 +4295,37 @@ def _patched_run_full_pipeline(
         summary["rag_sections"] = rag_manifest.get("sections")
         summary["rag_tables_json"] = rag_manifest.get("tables_json")
         summary["rag_markdown"] = rag_manifest.get("markdown")
+        summary["rag_cell_count"] = rag_manifest.get("cell_count")
+        summary["rag_table_count"] = rag_manifest.get("table_sections")
+        summary["rag_page_count"] = rag_manifest.get("page_sections")
+        summary["rag_languages"] = rag_manifest.get("languages")
+        summary["rag_doc_ids"] = rag_manifest.get("doc_ids")
+        summary["rag_bundle_metrics"] = {
+            "cells": rag_manifest.get("cell_count"),
+            "tables": rag_manifest.get("table_sections"),
+            "pages": rag_manifest.get("page_sections"),
+        }
+        summary["rag_bundle_status"] = _derive_rag_bundle_status(
+            rag_manifest.get("cell_count"),
+            rag_manifest.get("table_sections"),
+            rag_manifest.get("page_sections"),
+            doc_ids=rag_manifest.get("doc_ids"),
+            languages=rag_manifest.get("languages"),
+        )
         summary["rag_suggested_queries"] = rag_manifest.get("suggested_queries")
         summary["rag_trace_schema"] = rag_manifest.get("trace_schema")
         summary["rag_fact_tag_example"] = rag_manifest.get("fact_tag_example")
+        _dedupe_insights_and_queries(summary)
     except Exception as e:
         print("RAG bundle export skipped:", e)
         summary["rag_trace_schema"] = summary.get("rag_trace_schema") or None
         summary["rag_fact_tag_example"] = summary.get("rag_fact_tag_example") or None
+        summary["rag_bundle_status"] = {"issues": ["export_skipped"]}
+    rag_status = summary.get("rag_bundle_status")
+    if isinstance(rag_status, dict) and rag_status.get("issues"):
+        safety_flags.setdefault("rag_bundle", rag_status)
+    if safety_flags:
+        summary["safety_flags"] = safety_flags
     _call(
         "post_rag",
         manifest=summary.get("rag_manifest"),
@@ -4144,6 +4451,18 @@ def _patched_run_full_pipeline(
         }
         if stage_trace_console:
             _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
+
+    if bandit and bandit_signature and bandit_action:
+        try:
+            success_flag = decide_success(summary)
+            bandit.update(bandit_signature, bandit_action, bool(success_flag))
+            bandit.save()
+            prior_meta = summary.setdefault("prior_bandit", {})
+            prior_meta["signature"] = bandit_signature
+            prior_meta["action"] = bandit_action
+            prior_meta["success"] = bool(success_flag)
+        except Exception as exc:
+            print(f"[WARN] bandit update skipped: {exc}")
 
     _finalize_episode(outdir, summary)
 
@@ -4271,6 +4590,107 @@ def main():
         help="Normalize numeric columns according to header heuristics",
     )
     ap.add_argument(
+        "--motion-prior",
+        action="store_true",
+        help="Enable motion prior seeding between export sweeps",
+    )
+    ap.add_argument(
+        "--motion-sigma-px",
+        type=float,
+        default=None,
+        help="Motion prior std-dev in pixels (default: 10 when enabled)",
+    )
+    ap.add_argument(
+        "--motion-cutoff-sigma",
+        type=float,
+        default=None,
+        help="Reject motion priors when deviation exceeds this multiple of sigma",
+    )
+    ap.add_argument(
+        "--motion-accept-ratio",
+        type=float,
+        default=None,
+        help="Minimum inlier ratio required to accept motion prior reseeding",
+    )
+    ap.add_argument(
+        "--export-guard-ms",
+        type=int,
+        default=15000,
+        help="Abort per-table export loops after this many milliseconds",
+    )
+    ap.add_argument(
+        "--sweeps-fixed",
+        type=int,
+        default=None,
+        help="Force toy OCR threshold sweeps to a fixed count",
+    )
+    ap.add_argument(
+        "--blank-skip",
+        dest="blank_skip",
+        action="store_true",
+        default=None,
+        help="Enable blank-cell skip heuristic during export",
+    )
+    ap.add_argument(
+        "--no-blank-skip",
+        dest="blank_skip",
+        action="store_false",
+        help="Disable blank-cell skipping",
+    )
+    ap.add_argument(
+        "--blank-threshold",
+        type=int,
+        default=None,
+        help="Grayscale threshold (0-255) for blank detection",
+    )
+    ap.add_argument(
+        "--blank-min-pixels",
+        type=int,
+        default=None,
+        help="Minimum dark pixel count required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-ratio",
+        type=float,
+        default=None,
+        help="Minimum dark pixel ratio required to avoid blank skip",
+    )
+    ap.add_argument(
+        "--blank-min-area",
+        type=int,
+        default=None,
+        help="Minimum crop area required before blank skip applies",
+    )
+    ap.add_argument(
+        "--allow-pytesseract",
+        dest="allow_pytesseract",
+        action="store_true",
+        default=None,
+        help="Opt back into spawning pytesseract during export",
+    )
+    ap.add_argument(
+        "--no-allow-pytesseract",
+        dest="allow_pytesseract",
+        action="store_false",
+        default=None,
+        help="Force-disable pytesseract even if the environment opts in",
+    )
+    ap.add_argument(
+        "--tess-unicharset",
+        default=None,
+        help="Path to a Tesseract-style unicharset file for toy lexical gating",
+    )
+    ap.add_argument(
+        "--tess-wordlist",
+        default=None,
+        help="Optional newline-delimited dictionary that boosts toy OCR tokens",
+    )
+    ap.add_argument(
+        "--tess-bigram-json",
+        default=None,
+        help="JSON mapping of bigram probabilities used to penalize unlikely glyph transitions",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -4325,6 +4745,21 @@ def main():
             advisor_response=args.advisor_response,
             print_stage_trace=args.print_stage_trace,
             rag_feedback=args.rag_feedback,
+            motion_prior=args.motion_prior,
+            motion_sigma_px=args.motion_sigma_px,
+            motion_cutoff_sigma=args.motion_cutoff_sigma,
+            motion_accept_ratio=args.motion_accept_ratio,
+            export_guard_ms=args.export_guard_ms,
+            sweeps_fixed=args.sweeps_fixed,
+            blank_skip=args.blank_skip,
+            blank_threshold=args.blank_threshold,
+            blank_min_pixels=args.blank_min_pixels,
+            blank_min_ratio=args.blank_min_ratio,
+            blank_min_area=args.blank_min_area,
+            allow_pytesseract=args.allow_pytesseract,
+            tess_unicharset=args.tess_unicharset,
+            tess_wordlist=args.tess_wordlist,
+            tess_bigram_json=args.tess_bigram_json,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
