@@ -230,6 +230,19 @@ class MetaIntentPayload(TypedDict, total=False):
 _EPISODE_CONTEXT: Dict[str, Any] = {}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
+_AUTOCALIB_DEFAULT_SAMPLES = 3
+_AUTOTUNE_DEFAULT_TRIALS = 6
+
+
+def _positive_cli_value(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        intval = int(value)
+    except Exception:
+        return None
+    return intval if intval > 0 else None
+
 
 def _discover_demo_input_targets() -> List[str]:
     """Locate real demo input directories/files to honour `--input demo`."""
@@ -3385,6 +3398,8 @@ def _patched_run_full_pipeline(
     tess_unicharset: Optional[str] = None,
     tess_wordlist: Optional[str] = None,
     tess_bigram_json: Optional[str] = None,
+    autocalib_samples: Optional[int] = None,
+    autotune_trials: Optional[int] = None,
 ) -> Dict[str, Any]:
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
@@ -3496,7 +3511,76 @@ def _patched_run_full_pipeline(
 
     page_images = {idx: page for idx, page in enumerate(pages)}
 
-    pipe = zocr_onefile_consensus.Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
+    table_params: Dict[str, Any] = {}
+    table_autocalib_status: Optional[Dict[str, Any]] = None
+    table_autotune_status: Optional[Dict[str, Any]] = None
+
+    autocalib_count = _positive_cli_value(autocalib_samples)
+    autotune_count = _positive_cli_value(autotune_trials)
+
+    if autocalib_count:
+        auto_calib_fn = getattr(zocr_onefile_consensus, "auto_calibrate_params", None)
+        if callable(auto_calib_fn):
+            try:
+                calib_cfg = auto_calib_fn(pages, autocalib_count) or {}
+                if isinstance(calib_cfg, dict) and calib_cfg:
+                    table_params.update(calib_cfg)
+                    table_autocalib_status = {
+                        "status": "applied",
+                        "samples": int(autocalib_count),
+                        "keys": sorted(calib_cfg.keys()),
+                    }
+                else:
+                    table_autocalib_status = {
+                        "status": "no_change",
+                        "samples": int(autocalib_count),
+                    }
+            except Exception as exc:
+                print(f"[WARN] Auto-calibration failed: {exc}")
+                table_autocalib_status = {
+                    "status": "error",
+                    "samples": int(autocalib_count),
+                    "error": str(exc),
+                }
+        else:
+            table_autocalib_status = {
+                "status": "unavailable",
+                "samples": int(autocalib_count),
+            }
+
+    if autotune_count:
+        autotune_fn = getattr(zocr_onefile_consensus, "autotune_params", None)
+        if callable(autotune_fn):
+            try:
+                base_for_tune = table_params.copy()
+                tuned_cfg = autotune_fn(pages, base_for_tune, trials=autotune_count) or {}
+                if isinstance(tuned_cfg, dict) and tuned_cfg:
+                    table_params.update(tuned_cfg)
+                    table_autotune_status = {
+                        "status": "applied",
+                        "trials": int(autotune_count),
+                        "keys": sorted(tuned_cfg.keys()),
+                    }
+                else:
+                    table_autotune_status = {
+                        "status": "no_change",
+                        "trials": int(autotune_count),
+                    }
+            except Exception as exc:
+                print(f"[WARN] Autotune failed: {exc}")
+                table_autotune_status = {
+                    "status": "error",
+                    "trials": int(autotune_count),
+                    "error": str(exc),
+                }
+        else:
+            table_autotune_status = {
+                "status": "unavailable",
+                "trials": int(autotune_count),
+            }
+
+    pipe_cfg = {"table": table_params, "bench_iterations": 1, "eval": False}
+    pipe = zocr_onefile_consensus.Pipeline(pipe_cfg)
 
     doc_json_path = os.path.join(outdir, "doc.zocr.json")
     jsonl_path = os.path.join(outdir, "doc.contextual.jsonl")
@@ -3881,6 +3965,38 @@ def _patched_run_full_pipeline(
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
     bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
@@ -4928,6 +5044,30 @@ def main():
         help="Upper bound for toy OCR threshold sweeps (defaults to env/auto)",
     )
     ap.add_argument(
+        "--autocalib",
+        nargs="?",
+        type=int,
+        const=_AUTOCALIB_DEFAULT_SAMPLES,
+        default=None,
+        metavar="N",
+        help=(
+            "Auto-calibrate table detection using N sample pages (default %(const)s when "
+            "no explicit value is supplied). Pass 0 or omit to skip."
+        ),
+    )
+    ap.add_argument(
+        "--autotune",
+        nargs="?",
+        type=int,
+        const=_AUTOTUNE_DEFAULT_TRIALS,
+        default=None,
+        metavar="N",
+        help=(
+            "Run the unsupervised table autotuner for N trials (default %(const)s when the "
+            "flag is value-less). Pass 0 or omit to disable."
+        ),
+    )
+    ap.add_argument(
         "--force-numeric-by-header",
         action="store_true",
         help="Normalize numeric columns according to header heuristics",
@@ -5111,6 +5251,8 @@ def main():
             tess_unicharset=args.tess_unicharset,
             tess_wordlist=args.tess_wordlist,
             tess_bigram_json=args.tess_bigram_json,
+            autocalib_samples=args.autocalib,
+            autotune_trials=args.autotune,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
