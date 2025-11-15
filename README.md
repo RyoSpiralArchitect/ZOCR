@@ -71,6 +71,7 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 | `--force-numeric-by-header` | **[JA]** ヘッダ名に応じて数量/単価/金額/税率を数値に正規化。<br>**[EN]** Normalize qty/unit price/amount/tax columns according to headers.<br>**[FR]** Normalise les colonnes quantitatives selon les en-têtes. |
 | `--ingest-signature` | **[JA]** 別環境での再現ログ（signature JSON）を読み込み差分チェック。<br>**[EN]** Ingest reproducibility signature JSON from another run to compare diffs.<br>**[FR]** Ingère une signature de reproductibilité externe pour comparer les écarts. |
 | `--advisor-response` | **[JA]** 外部アドバイザ（LLM等）の助言ファイルを与えて再解析/監視の再実行に接続。<br>**[EN]** Feed advisor (LLM) responses so the orchestrator can trigger reruns based on the advice.<br>**[FR]** Fournit une réponse d’advisor afin de relancer réanalyse/monitoring selon les recommandations. |
+| `--tess-unicharset` / `--tess-wordlist` / `--tess-bigram-json` | **[JA]** Toy OCR に与える Tesseract 互換の文字集合・辞書・バイグラム表を指定。<br>**[EN]** Point to Tesseract-style unicharset / dictionary / bigram JSON files that feed the toy lexical gates.<br>**[FR]** Indique des fichiers unicharset/dictionnaire/bigrammes façon Tesseract pour alimenter les garde-fous lexicaux du Toy OCR. |
 
 ## サブコマンド / Subcommands / Sous-commandes
 - `history --outdir out_invoice --limit 10` — 直近の処理履歴を表示 / show recent history / affiche l'historique récent。
@@ -174,10 +175,15 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[EN]** Bound threshold sweeps via `ZOCR_TOY_SWEEPS` (default 5, auto-clamped to ~2–4 in toy-lite/demo runs) and opt out of header-driven numeric coercion with `ZOCR_FORCE_NUMERIC=0`.
 - **[FR]** `ZOCR_TOY_SWEEPS` (par défaut 5, ~2–4 en mode toy-lite/demo) fixe le nombre de balayages ; `ZOCR_FORCE_NUMERIC=0` désactive la coercition numérique basée sur les en-têtes.
 - `ZOCR_TOY_MEMORY` で Toy OCR のメモリ保存先を固定でき、`ZOCR_GLYPH_CACHE_LIMIT` / `ZOCR_GLYPH_PENDING_LIMIT` / `ZOCR_NGRAM_EMA_ALPHA` がキャッシュ容量や忘却率を制御します。
+- `ZOCR_TESS_UNICHARSET` / `ZOCR_TESS_WORDLIST` / `ZOCR_TESS_BIGRAM_JSON` を指定すると、Tesseract 由来の軽量な unicharset / 辞書 / n-gram を Toy OCR の文字品質判定にインポートできます（ファイルが無い場合は自動的にスキップ）。CLI から与える場合は `--tess-unicharset` / `--tess-wordlist` / `--tess-bigram-json` を使うと環境変数の設定が自動化されます。
+- **[EN]** Point `ZOCR_TESS_UNICHARSET` / `ZOCR_TESS_WORDLIST` / `ZOCR_TESS_BIGRAM_JSON` to reuse Tesseract-style glyph sets, wordlists, and bigrams for the toy OCR lexical model; the orchestrator mirrors these environment variables via the `--tess-*` CLI switches so you can swap models per run without editing your shell profile.
+- **[FR]** `ZOCR_TESS_UNICHARSET` / `ZOCR_TESS_WORDLIST` / `ZOCR_TESS_BIGRAM_JSON` importent des listes de caractères/dictionnaires/bigrammes à la Tesseract pour renforcer le Toy OCR ; les options CLI `--tess-*` fixent ces chemins automatiquement pour chaque exécution.
 - `--toy-lite` または demo 入力では数値列の強制正規化と sweep クランプが既定で有効になり、`pipeline_summary.json` の `toy_runtime_config` と `last_export_stats` に適用結果が保存されます。
 
 ## Export 進捗と高速化 / Export progress & acceleration / Export : progression et accélérations
 - `ZOCR_EXPORT_OCR` で Export 内の OCR バックエンドを切り替えられます（例: `fast` でセル OCR をスキップし構造のみ書き出し、`toy` / `tesseract` で再解析）。
+- `ZOCR_ALLOW_PYTESSERACT=1` を指定すると明示的に pytesseract 呼び出しを再度許可できます（既定 0 では外部 OCR を封印し Toy/Faux エンジンのみ使用します）。CLI から再度オンにする場合は `--allow-pytesseract` を付けてください（`--no-allow-pytesseract` で強制オフ）。
+- Set `ZOCR_ALLOW_PYTESSERACT=1` if you explicitly want to spawn pytesseract; by default it stays disabled so demo/toy runs rely purely on the in-repo faux OCR stack. The orchestrator CLI mirrors this via `--allow-pytesseract` / `--no-allow-pytesseract` switches.
 - `ZOCR_EXPORT_PROGRESS=1` と `ZOCR_EXPORT_LOG_EVERY=100`（任意）でセル処理数の進捗ログを標準出力に流し、長大なグリッドでも固まって見えません。
 - `ZOCR_EXPORT_MAX_CELLS` を指定すると巨大テーブルをサンプリングできます。進捗ログ有効時は `last_export_stats()` / `pipeline_summary.json` にページ数・セル数・数値強制件数・処理秒数が残ります。
 - Toy OCR と組み合わせる場合は `ZOCR_TOY_SWEEPS=2 ZOCR_EXPORT_OCR=fast` で 4 ページ超のインボイスでも即時に JSONL/SQL/RAG を生成できます。

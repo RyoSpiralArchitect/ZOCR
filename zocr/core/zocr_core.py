@@ -29,12 +29,127 @@ ZOCR Multi‑Domain Core (single file)
 ※ 依存：標準 Python + Pillow + numpy（Numba があれば自動使用。無ければフォールバック）。
 """
 
-import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys, html, platform
+import os, re, csv, json, math, pickle, ctypes, tempfile, subprocess, datetime, sys, html, platform, unicodedata
 from collections import defaultdict, Counter
 from typing import List, Optional, Dict, Any, Tuple, Set, Sequence
 from PIL import Image, ImageOps
 import numpy as np
 from functools import lru_cache
+
+# -------------------- Numeric header hints --------------------
+_NUMERIC_HEADER_HINTS = {
+    "qty": "qty",
+    "q'ty": "qty",
+    "quantity": "qty",
+    "unit price": "unit_price",
+    "price": "unit_price",
+    "unit cost": "unit_price",
+    "amount": "amount",
+    "total": "total",
+    "total amount": "total",
+    "subtotal": "subtotal",
+    "tax": "tax",
+    "tax amount": "tax_amount",
+    "tax %": "tax_rate",
+    "tax%": "tax_rate",
+    "tax rate": "tax_rate",
+    "vat": "tax",
+}
+
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "qty"
+        for alias in (
+            "数量",
+            "個数",
+            "台数",
+            "件数",
+            "口数",
+            "本数",
+            "点数",
+            "数量/qty",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "unit_price"
+        for alias in (
+            "単価",
+            "単価(円)",
+            "単価[円]",
+            "単価(税込)",
+            "単価(税抜)",
+            "単価(税別)",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "amount"
+        for alias in (
+            "金額",
+            "金額(税込)",
+            "金額(税抜)",
+            "金額(税別)",
+            "金額[円]",
+            "金額(円)",
+            "税込",
+            "税抜",
+            "税別",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "total"
+        for alias in (
+            "見積金額",
+            "御見積金額",
+            "御見積合計",
+            "合計金額",
+            "合計",
+            "総計",
+            "総額",
+            "計",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {alias: "subtotal" for alias in ("小計", "小計(税込)", "小計(税抜)")}
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "tax"
+        for alias in (
+            "消費税",
+            "tax",
+            "vat",
+            "gst",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "tax_amount"
+        for alias in (
+            "消費税額",
+            "税額",
+            "税金",
+        )
+    }
+)
+_NUMERIC_HEADER_HINTS.update(
+    {
+        alias: "tax_rate"
+        for alias in (
+            "税率",
+            "消費税率",
+            "税%",
+            "tax率",
+        )
+    }
+)
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
@@ -466,7 +581,30 @@ DOMAIN_KW = {
     "delivery_jp": [("納品書",1.0),("数量",0.85),("品番",0.6),("受領",0.5),("出荷",0.4)],
     "delivery_en": [("delivery",1.0),("ship",0.85),("carrier",0.7),("qty",0.6),("item",0.5)],
     "estimate": [("見積",1.0),("単価",0.8),("小計",0.6),("有効期限",0.4)],
-    "estimate_jp": [("見積書",1.0),("見積金額",0.85),("有効期限",0.6),("数量",0.5)],
+    "estimate_jp": [
+        ("見積書", 4.0),
+        ("御見積書", 3.6),
+        ("見積日", 2.3),
+        ("見積金額", 3.0),
+        ("御見積金額", 3.0),
+        ("御見積合計", 2.7),
+        ("合計金額", 2.4),
+        ("合計", 2.0),
+        ("総計", 1.8),
+        ("総額", 1.8),
+        ("計", 1.5),
+        ("小計", 1.6),
+        ("数量", 1.2),
+        ("単価", 1.2),
+        ("金額", 1.2),
+        ("有効期限", 2.5),
+        ("お見積有効期限", 2.3),
+        ("見積有効期限", 2.3),
+        ("納期", 1.4),
+        ("消費税", 1.5),
+        ("税込", 1.2),
+        ("税抜", 1.0),
+    ],
     "estimate_en": [("estimate",1.0),("quote",0.9),("valid",0.6),("subtotal",0.6),("project",0.4)],
     "receipt": [("領収",1.0),("金額",0.9),("受領",0.6),("発行日",0.4),("住所",0.3)],
     "receipt_jp": [("領収書",1.0),("税込",0.8),("受領",0.6),("発行日",0.4)],
@@ -598,6 +736,15 @@ _DOMAIN_HEADER_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
         ("tva", 0.75),
         ("sous-total", 0.6),
     ],
+    "estimate_jp": [
+        ("見積金額", 0.9),
+        ("御見積金額", 0.9),
+        ("数量", 0.7),
+        ("単価", 0.7),
+        ("金額", 0.6),
+        ("有効期限", 0.65),
+        ("納期", 0.55),
+    ],
 }
 
 _HEADER_CONCEPT_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
@@ -633,7 +780,7 @@ DOMAIN_SUGGESTED_QUERIES = {
     "contract_jp_v2": ["契約期間", "甲", "乙", "締結日"],
     "contract_en": ["effective date", "party", "term", "signature"],
     "delivery_jp": ["納品日", "数量", "品番", "受領印"],
-    "estimate_jp": ["見積金額", "有効期限", "数量", "単価"],
+    "estimate_jp": ["御見積金額", "見積金額", "有効期限", "納期"],
     "receipt_jp": ["領収金額", "発行日", "支払方法", "住所"],
     "bank_statement_en": ["ending balance", "transaction", "deposit", "withdrawal"],
     "bank_statement_jp": ["残高", "入金", "出金", "取引日"],
@@ -657,6 +804,24 @@ DOMAIN_SUGGESTED_QUERIES = {
     "grant_application_en": ["project title", "requested amount", "milestone", "deliverable"],
     "boarding_pass_en": ["flight number", "seat", "gate", "boarding time"],
     "default": ["total amount", "date", "company", "reference number"]
+}
+
+DOMAIN_MONITOR_QUERIES = {
+    "default": {
+        "q_amount": "合計 金額 消費税 円 2023 2024 2025",
+        "q_date": "請求日 発行日 2023 2024 2025",
+        "q_due": "支払期日 支払期限 期日 支払日",
+    },
+    "contract_jp_v2": {
+        "q_amount": "契約金額 代金 支払",
+        "q_date": "契約日 締結日 開始日 終了日",
+        "q_due": "契約期間 支払期日 締結日",
+    },
+    "estimate_jp": {
+        "q_amount": "見積金額 御見積金額 御見積総額 合計 合計金額 総計 計 金額 税込 税抜 円",
+        "q_date": "見積日 発行日 作成日 提出日 2023 2024 2025",
+        "q_due": "有効期限 お見積有効期限 見積有効期限 納期 納入期限 2023 2024 2025",
+    },
 }
 
 
@@ -1528,6 +1693,152 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 return (1, k)
         return sorted(keys, key=_key)
 
+    def _header_text(cell: Dict[str, Any]) -> str:
+        txt = ""
+        if isinstance(cell, dict):
+            txt = cell.get("normalized") or cell.get("text") or ""
+        txt = unicodedata.normalize("NFKC", str(txt))
+        txt = txt.strip().lower()
+        txt = txt.replace("：", ":").replace("　", " ")
+        txt = re.sub(r"\s+", " ", txt)
+        return txt
+
+    def _header_key_variants(base: str) -> List[str]:
+        variants: List[str] = []
+        body = base.strip()
+        if not body:
+            return variants
+        variants.append(body)
+        # honorific prefixes (e.g., 御見積金額 → 見積金額)
+        honorific_stripped = body.lstrip("御お")
+        if honorific_stripped and honorific_stripped not in variants:
+            variants.append(honorific_stripped)
+        collapsed = body.replace(" ", "")
+        if collapsed and collapsed not in variants:
+            variants.append(collapsed)
+        # remove bracketed suffixes such as （税込）／(tax)
+        no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", body)
+        no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+        if no_brackets and no_brackets not in variants:
+            variants.append(no_brackets)
+        simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", body)
+        simplified = re.sub(r"\s+", " ", simplified).strip()
+        if simplified and simplified not in variants:
+            variants.append(simplified)
+        simplified_compact = simplified.replace(" ", "")
+        if simplified_compact and simplified_compact not in variants:
+            variants.append(simplified_compact)
+        # split by typical separators (/,｜,|,・,、) to capture bilingual headers
+        split_tokens = re.split(r"[/｜\|・,、]", body)
+        for token in split_tokens:
+            token = token.strip()
+            if not token:
+                continue
+            token_compact = token.replace(" ", "")
+            if token and token not in variants:
+                variants.append(token)
+            if token_compact and token_compact not in variants:
+                variants.append(token_compact)
+        return variants
+
+    def _infer_numeric_columns(rows: Dict[str, Dict[str, Dict[str, Any]]]) -> Tuple[Dict[str, str], Optional[str]]:
+        if not rows:
+            return {}, None
+        ordered_rows = _sorted_numeric(list(rows.keys()))
+        if not ordered_rows:
+            return {}, None
+        header_key = ordered_rows[0]
+        header_cells = rows.get(header_key, {})
+        numeric_cols: Dict[str, str] = {}
+        all_col_keys: List[str] = []
+        for cols in rows.values():
+            for col_key in cols.keys():
+                if col_key not in all_col_keys:
+                    all_col_keys.append(col_key)
+        all_col_keys = _sorted_numeric(all_col_keys)
+        col_positions = {col: idx for idx, col in enumerate(all_col_keys)}
+
+        def _infer_from_values(col_key: str) -> Optional[str]:
+            total = 0
+            numeric_hits = 0
+            currency_hits = 0
+            decimals = 0
+            values: List[float] = []
+            for row_key in ordered_rows:
+                if row_key == header_key:
+                    continue
+                row_bucket = rows.get(row_key) or {}
+                cell = row_bucket.get(col_key)
+                if not cell:
+                    continue
+                text = cell.get("normalized") or cell.get("text")
+                if not text:
+                    continue
+                total += 1
+                if re.search(r"[¥￥円＄$元]", str(text)):
+                    currency_hits += 1
+                value = _parse_numeric_value(text)
+                if value is None:
+                    continue
+                numeric_hits += 1
+                values.append(abs(value))
+                if not float(value).is_integer():
+                    decimals += 1
+            if total < 2:
+                return None
+            ratio = numeric_hits / float(total)
+            if ratio < 0.65:
+                return None
+            avg_val = sum(values) / float(len(values)) if values else 0.0
+            col_pos = col_positions.get(col_key, 0)
+            col_count = max(1, len(all_col_keys))
+            if currency_hits >= max(1, math.ceil(total * 0.4)) or avg_val >= 1000:
+                return "total" if col_pos >= col_count - 1 else "amount"
+            if decimals > 0 and avg_val >= 1:
+                return "unit_price"
+            return "qty"
+
+        for col_key in all_col_keys:
+            cell = header_cells.get(col_key)
+            base = _header_text(cell)
+            matched = False
+            for candidate in _header_key_variants(base) or [base]:
+                if candidate in _NUMERIC_HEADER_HINTS:
+                    numeric_cols[col_key] = _NUMERIC_HEADER_HINTS[candidate]
+                    matched = True
+                    break
+            if matched:
+                continue
+            inferred_kind = _infer_from_values(col_key)
+            if inferred_kind:
+                numeric_cols[col_key] = inferred_kind
+        return numeric_cols, header_key
+
+    def _parse_numeric_value(text: Optional[str]) -> Optional[float]:
+        if text is None:
+            return None
+        body = str(text).strip()
+        if not body:
+            return None
+        negative = False
+        if body.startswith("(") and body.endswith(")"):
+            negative = True
+            body = body[1:-1]
+        body = body.replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", body)
+        if not match:
+            return None
+        token = match.group(0)
+        try:
+            value = float(token)
+        except ValueError:
+            return None
+        if negative and value > 0:
+            value = -value
+        if not math.isfinite(value):
+            return None
+        return value
+
     with open(sections_path, "w", encoding="utf-8") as fw:
         for page in sorted(page_sections.keys()):
             sec = page_sections[page]
@@ -1546,19 +1857,31 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
         for table_id in _sorted_numeric(list(tables.keys())):
             table = tables[table_id]
             rows_out = []
+            numeric_cols, header_row_key = _infer_numeric_columns(table.get("rows", {}))
             for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
                 cols = table["rows"][row_key]
                 ordered = []
                 for col_key in _sorted_numeric(list(cols.keys())):
                     cell_info = cols[col_key]
-                    ordered.append({
+                    numeric_kind = numeric_cols.get(col_key)
+                    numeric_value = None
+                    if numeric_kind and row_key != header_row_key:
+                        numeric_value = _parse_numeric_value(
+                            cell_info.get("normalized") or cell_info.get("text")
+                        )
+                    payload = {
                         "cell_id": cell_info.get("cell_id"),
                         "col": col_key,
                         "text": cell_info.get("text"),
                         "normalized": cell_info.get("normalized"),
                         "filters": cell_info.get("filters"),
                         "trace": cell_info.get("trace"),
-                    })
+                    }
+                    if numeric_kind:
+                        payload["numeric_kind"] = numeric_kind
+                    if numeric_value is not None:
+                        payload["numeric_value"] = numeric_value
+                    ordered.append(payload)
                 rows_out.append({"row_index": row_key, "cells": ordered})
             payload = {
                 "section_id": f"table-{table_id}",
@@ -1568,27 +1891,50 @@ def export_rag_bundle(jsonl: str, outdir: str, domain: Optional[str]=None,
                 "rows": rows_out,
                 "fact_tags": table.get("facts", []),
             }
+            if numeric_cols:
+                payload["numeric_columns"] = [
+                    {"col": col_key, "kind": numeric_cols[col_key]}
+                    for col_key in _sorted_numeric(list(numeric_cols.keys()))
+                ]
             fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     tables_payload = []
     for table_id in _sorted_numeric(list(tables.keys())):
         table = tables[table_id]
         rows_out = []
+        numeric_cols, header_row_key = _infer_numeric_columns(table.get("rows", {}))
         for row_key in _sorted_numeric(list(table.get("rows", {}).keys())):
             cols = table["rows"][row_key]
             ordered = []
             for col_key in _sorted_numeric(list(cols.keys())):
                 cell_info = cols[col_key]
-                ordered.append({
+                numeric_kind = numeric_cols.get(col_key)
+                numeric_value = None
+                if numeric_kind and row_key != header_row_key:
+                    numeric_value = _parse_numeric_value(
+                        cell_info.get("normalized") or cell_info.get("text")
+                    )
+                payload = {
                     "cell_id": cell_info.get("cell_id"),
                     "row": row_key,
                     "col": col_key,
                     "text": cell_info.get("text"),
                     "normalized": cell_info.get("normalized"),
                     "trace": cell_info.get("trace"),
-                })
+                }
+                if numeric_kind:
+                    payload["numeric_kind"] = numeric_kind
+                if numeric_value is not None:
+                    payload["numeric_value"] = numeric_value
+                ordered.append(payload)
             rows_out.append({"row_index": row_key, "cells": ordered})
-        tables_payload.append({"table_id": table_id, "rows": rows_out, "fact_tags": table.get("facts", [])})
+        table_payload = {"table_id": table_id, "rows": rows_out, "fact_tags": table.get("facts", [])}
+        if numeric_cols:
+            table_payload["numeric_columns"] = [
+                {"col": col_key, "kind": numeric_cols[col_key]}
+                for col_key in _sorted_numeric(list(numeric_cols.keys()))
+            ]
+        tables_payload.append(table_payload)
     with open(tables_path, "w", encoding="utf-8") as tf:
         json.dump(tables_payload, tf, ensure_ascii=False, indent=2)
 
@@ -1912,7 +2258,7 @@ def _time_queries_preloaded(ix: Dict[str,Any], raws: List[Dict[str,Any]], domain
         "delivery_jp":   ["納品", "数量", "品番", "伝票", "受領"],
         "delivery_en":   ["delivery", "tracking", "carrier", "qty", "item"],
         "estimate":      ["見積", "単価", "小計", "有効期限"],
-        "estimate_jp":   ["見積金額", "小計", "数量", "有効期限"],
+        "estimate_jp":   ["御見積金額", "見積金額", "有効期限", "納期"],
         "estimate_en":   ["estimate", "quote", "valid", "subtotal", "project"],
         "receipt":       ["領収", "合計", "発行日", "住所", "税込"],
         "receipt_jp":    ["領収書", "税込", "受領", "発行日", "現金"],
@@ -2275,13 +2621,17 @@ def monitor(jsonl: str, index_pkl: str, k: int, out_csv: str, views_log: Optiona
                     good += 1
         trust = good / len(res) if res else None
         return hit, trust
-    q_amount="合計 金額 消費税 円 2023 2024 2025"
-    q_date="請求日 発行日 2023 2024 2025"
-    q_due="支払期日 支払期限 期日 支払日"
-    if domain=="contract_jp_v2":
-        q_amount="契約金額 代金 支払"
-        q_date="契約日 締結日 開始日 終了日"
-        q_due="契約期間 支払期日 締結日"
+    domain_key = domain or "default"
+    resolved_monitor_key = _DOMAIN_ALIAS.get(domain_key, domain_key)
+    monitor_cfg = (
+        DOMAIN_MONITOR_QUERIES.get(resolved_monitor_key)
+        or DOMAIN_MONITOR_QUERIES.get(domain_key)
+        or DOMAIN_MONITOR_QUERIES["default"]
+    )
+    defaults_monitor = DOMAIN_MONITOR_QUERIES["default"]
+    q_amount = monitor_cfg.get("q_amount") or defaults_monitor["q_amount"]
+    q_date = monitor_cfg.get("q_date") or defaults_monitor["q_date"]
+    q_due = monitor_cfg.get("q_due") or defaults_monitor["q_due"]
     hit_amount, trust_amount = _score("amount", q_amount)
     hit_date, trust_date = _score("date", q_date)
     hit_due, trust_due = _score("due", q_due)
