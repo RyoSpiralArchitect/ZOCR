@@ -3261,10 +3261,7 @@ def _enforce_default_toy_feature_flags(
     feature_status: Dict[str, Any] = {}
 
     conf_enabled, conf_source = _ensure_truthy_env("ZOCR_CONF_BOOST_NUMERIC")
-    feature_status["confidence_boost"] = {"enabled": conf_enabled, "source": conf_source}
-
     lex_enabled, lex_source = _ensure_truthy_env("ZOCR_CONF_BOOST_LEXICAL")
-    feature_status["lexical_boost"] = {"enabled": lex_enabled, "source": lex_source}
 
     alpha_source = "env"
     if not os.environ.get("ZOCR_NGRAM_EMA_ALPHA"):
@@ -3274,20 +3271,66 @@ def _enforce_default_toy_feature_flags(
         alpha_value = float(os.environ.get("ZOCR_NGRAM_EMA_ALPHA", "0.05") or 0.05)
     except Exception:
         alpha_value = 0.05
-    feature_status["ngram_ema"] = {"alpha": alpha_value, "source": alpha_source}
+    snapshot_fn = getattr(zocr_onefile_consensus, "get_toy_feature_status", None)
+    if callable(snapshot_fn):
+        try:
+            snapshot = snapshot_fn()
+            if isinstance(snapshot, dict):
+                feature_status.update(snapshot)
+        except Exception:
+            feature_status = {}
 
-    motion_source = "env"
+    confidence_entry = feature_status.setdefault("confidence_boost", {})
+    confidence_entry.setdefault("enabled", conf_enabled)
+    confidence_entry.setdefault("source", conf_source)
+
+    lexical_entry = feature_status.setdefault("lexical_boost", {})
+    lexical_entry.setdefault("enabled", lex_enabled)
+    lexical_entry.setdefault("source", lex_source)
+
+    ngram_entry = feature_status.setdefault("ngram_ema", {})
+    ngram_entry.setdefault("alpha", alpha_value)
+    ngram_entry.setdefault("source", alpha_source)
+
+    motion_entry = dict(feature_status.get("motion_prior", {}))
     if motion_prior_enabled is not None:
-        motion_source = "cli"
-        motion_enabled = bool(motion_prior_enabled)
+        motion_entry["enabled"] = bool(motion_prior_enabled)
+        motion_entry["source"] = "cli"
     else:
-        motion_enabled = _env_truthy("ZOCR_EXPORT_MOTION_PRIOR", False)
-    feature_status["motion_prior"] = {"enabled": motion_enabled, "source": motion_source}
+        motion_entry.setdefault("enabled", _env_truthy("ZOCR_EXPORT_MOTION_PRIOR", True))
+        motion_entry.setdefault(
+            "source",
+            "env" if os.environ.get("ZOCR_EXPORT_MOTION_PRIOR") is not None else "default",
+        )
+    feature_status["motion_prior"] = motion_entry
+
+    blank_entry = feature_status.setdefault("blank_skip", {})
+    if "source" not in blank_entry:
+        blank_entry["source"] = (
+            "env"
+            if any(
+                os.environ.get(key) is not None
+                for key in (
+                    "ZOCR_EXPORT_SKIP_BLANK",
+                    "ZOCR_EXPORT_BLANK_THRESHOLD",
+                    "ZOCR_EXPORT_BLANK_MIN_PIXELS",
+                    "ZOCR_EXPORT_BLANK_MIN_RATIO",
+                    "ZOCR_EXPORT_BLANK_MIN_AREA",
+                )
+            )
+            else "default"
+        )
 
     if tesslite_status:
         feature_status["tesslite"] = dict(tesslite_status)
     else:
-        feature_status["tesslite"] = {"enabled": False, "source": "none"}
+        feature_status.setdefault("tesslite", {"enabled": False, "source": "none"})
+
+    if "pytesseract" not in feature_status:
+        feature_status["pytesseract"] = {
+            "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", False),
+            "source": "env" if os.environ.get("ZOCR_ALLOW_PYTESSERACT") else "default",
+        }
 
     feature_status["hotspot_detection"] = {
         "enabled": True,
@@ -3661,6 +3704,31 @@ def _patched_run_full_pipeline(
             "enabled": any(tesslite_cfg.values()),
             **{k: v for k, v in tesslite_cfg.items() if v},
         }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
     bandit: Optional[PriorBandit] = None
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None

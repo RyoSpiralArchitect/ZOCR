@@ -2678,6 +2678,94 @@ def get_tesslite_status() -> Dict[str, Any]:
     }
 
 
+def _feature_source(*names: str) -> str:
+    for name in names:
+        if name and os.environ.get(name) is not None:
+            return "env"
+    return "default"
+
+
+def get_toy_feature_status() -> Dict[str, Any]:
+    """Return a snapshot of the active toy OCR feature knobs."""
+
+    status: Dict[str, Any] = {}
+
+    conf_cfg = _confidence_boost_cfg_from_env()
+    status["confidence_boost"] = {
+        "enabled": bool(conf_cfg.enabled),
+        "target": float(conf_cfg.target),
+        "min_input": float(conf_cfg.min_input),
+        "source": _feature_source("ZOCR_CONF_BOOST_NUMERIC"),
+    }
+
+    lex_cfg = _lexical_boost_cfg_from_env()
+    status["lexical_boost"] = {
+        "enabled": bool(lex_cfg.enabled),
+        "target": float(lex_cfg.target),
+        "min_input": float(lex_cfg.min_input),
+        "min_quality": float(lex_cfg.min_quality),
+        "source": _feature_source("ZOCR_CONF_BOOST_LEXICAL"),
+    }
+
+    alpha_raw = os.environ.get("ZOCR_NGRAM_EMA_ALPHA")
+    try:
+        alpha_val = float(alpha_raw) if alpha_raw is not None else 0.05
+    except Exception:
+        alpha_val = 0.05
+    status["ngram_ema"] = {
+        "alpha": float(max(0.0, alpha_val)),
+        "source": _feature_source("ZOCR_NGRAM_EMA_ALPHA"),
+    }
+
+    motion_cfg = _motion_prior_cfg_from_env()
+    status["motion_prior"] = {
+        "enabled": bool(motion_cfg.enabled),
+        "sigma_px": float(motion_cfg.sigma_px),
+        "auto_sigma": bool(getattr(motion_cfg, "auto_sigma", False)),
+        "k_sigma_window": float(motion_cfg.k_sigma_window),
+        "cutoff_sigma": float(motion_cfg.cutoff_sigma),
+        "accept_ratio": float(motion_cfg.accept_ratio),
+        "source": _feature_source("ZOCR_EXPORT_MOTION_PRIOR", "ZOCR_USE_PRIOR"),
+    }
+
+    blank_cfg = _blank_skip_cfg_from_env()
+    status["blank_skip"] = {
+        "enabled": bool(blank_cfg.enabled),
+        "dark_threshold": int(blank_cfg.dark_threshold),
+        "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        "min_dark_ratio": float(blank_cfg.min_dark_ratio),
+        "min_area": int(blank_cfg.min_area),
+        "source": _feature_source(
+            "ZOCR_EXPORT_SKIP_BLANK",
+            "ZOCR_EXPORT_BLANK_THRESHOLD",
+            "ZOCR_EXPORT_BLANK_MIN_PIXELS",
+            "ZOCR_EXPORT_BLANK_MIN_RATIO",
+            "ZOCR_EXPORT_BLANK_MIN_AREA",
+        ),
+    }
+
+    status["tesslite"] = get_tesslite_status()
+
+    status["pytesseract"] = {
+        "allowed": _pytesseract_allowed(),
+        "source": _feature_source("ZOCR_ALLOW_PYTESSERACT"),
+    }
+
+    flush_raw = os.environ.get("ZOCR_EXPORT_FLUSH_EVERY")
+    if flush_raw:
+        try:
+            flush_val = int(flush_raw)
+        except Exception:
+            flush_val = None
+        if flush_val is not None:
+            status["export_flush"] = {
+                "interval": max(1, flush_val),
+                "source": "env",
+            }
+
+    return status
+
+
 def _tesslite_unknown_ratio(model: _TessLiteModel, text: str) -> float:
     if not model.glyphs:
         return 0.0
