@@ -4453,6 +4453,358 @@ def _decide_template_override(
             return "quality"
     return ""
 
+
+_TOKEN_TEMPLATE_SIZE = (96, 28)
+_TOKEN_TEMPLATE_MAX_VARIANTS = 8
+_TOKEN_TEMPLATE_PRESETS = [
+    "item",
+    "qty",
+    "unit price",
+    "amount",
+    "total",
+    "subtotal",
+    "tax",
+    "due",
+    "date",
+    "見積金額",
+    "御見積金額",
+    "数量",
+    "単価",
+    "金額",
+    "小計",
+    "合計",
+]
+
+
+def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+_TOKEN_TEMPLATE_FONT = _load_template_font()
+
+
+def _render_template_bitmap(token: str) -> Optional["Image.Image"]:
+    text = (token or "").strip()
+    if not text:
+        return None
+    font = _TOKEN_TEMPLATE_FONT
+    try:
+        bbox = font.getbbox(text)
+    except Exception:
+        bbox = None
+    if bbox:
+        width = max(12, bbox[2] - bbox[0] + 6)
+        height = max(12, bbox[3] - bbox[1] + 6)
+    else:
+        width = max(12, len(text) * 8)
+        height = 24
+    img = Image.new("L", (width, height), 0)
+    dr = ImageDraw.Draw(img)
+    try:
+        dr.text((3, 2), text, fill=255, font=font)
+    except Exception:
+        return None
+    if not img.getbbox():
+        return None
+    return img
+
+
+def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
+    import numpy as _np
+
+    try:
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+    except Exception:
+        return None
+    resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
+    arr_f = _np.asarray(resized, dtype=_np.float32)
+    if arr_f.size == 0:
+        return None
+    std = float(arr_f.std())
+    if std < 1e-3:
+        return None
+    normed = (arr_f - float(arr_f.mean())) / (std + 1e-3)
+    return normed
+
+
+def _init_token_template_library() -> Dict[str, deque]:
+    library: Dict[str, deque] = {}
+    for token in _TOKEN_TEMPLATE_PRESETS:
+        bmp = _render_template_bitmap(token)
+        if bmp is None:
+            continue
+        norm = _normalize_template_bitmap(bmp)
+        if norm is None:
+            continue
+        dq = library.setdefault(token, deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS))
+        dq.append(norm)
+    return library
+
+
+_TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+
+_TEMPLATE_CACHE_STATE: Dict[str, Any] = {
+    "loaded_path": None,
+    "loaded": False,
+    "autosave": False,
+    "dirty": False,
+}
+
+
+def _template_cache_path() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TEMPLATE_CACHE")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "false", "none"}:
+        return None
+    return os.path.abspath(raw)
+
+
+def _update_template_variant_stats() -> None:
+    total = 0
+    for dq in _TOKEN_TEMPLATE_LIBRARY.values():
+        if dq:
+            total += len(dq)
+    _GLYPH_RUNTIME_STATS["template_cache_variants"] = float(total)
+
+
+def _ensure_template_cache_autosave() -> None:
+    if _TEMPLATE_CACHE_STATE.get("autosave"):
+        return
+    if not _template_cache_path():
+        return
+    atexit.register(_autosave_template_cache)
+    _TEMPLATE_CACHE_STATE["autosave"] = True
+
+
+def _ensure_template_cache_loaded() -> None:
+    path = _template_cache_path()
+    if not path:
+        return
+    state_path = _TEMPLATE_CACHE_STATE.get("loaded_path")
+    if _TEMPLATE_CACHE_STATE.get("loaded") and state_path == path:
+        return
+    _load_token_template_cache(path)
+
+
+def _load_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except FileNotFoundError:
+        _TEMPLATE_CACHE_STATE["loaded_path"] = path
+        _TEMPLATE_CACHE_STATE["loaded"] = True
+        _TEMPLATE_CACHE_STATE["dirty"] = False
+        _ensure_template_cache_autosave()
+        return
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    restored = 0
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if isinstance(tokens, dict):
+        for token, entry in tokens.items():
+            variants = []
+            if isinstance(entry, dict):
+                seq = entry.get("variants")
+                if isinstance(seq, list):
+                    variants = seq
+            elif isinstance(entry, list):
+                variants = entry
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                shape = variant.get("shape")
+                data = variant.get("data")
+                if not shape or not data:
+                    continue
+                try:
+                    arr = np.asarray(data, dtype=np.float32)
+                    dims = tuple(int(v) for v in shape)
+                    if len(dims) != 2 or arr.size != (dims[0] * dims[1]):
+                        continue
+                    arr = arr.reshape(dims)
+                except Exception:
+                    continue
+                dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+                if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+                    dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+                    _TOKEN_TEMPLATE_LIBRARY[token] = dq
+                dq.append(arr)
+                restored += 1
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _ensure_template_cache_autosave()
+    _update_template_variant_stats()
+    _GLYPH_RUNTIME_STATS["template_cache_loaded"] = float(restored)
+
+
+def _serialize_template_variants(dq: "deque[Any]") -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for tpl in dq:
+        try:
+            arr = np.asarray(tpl, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        payload = {
+            "shape": [int(dim) for dim in arr.shape],
+            "data": [round(float(val), 4) for val in arr.flatten().tolist()],
+        }
+        serialized.append(payload)
+    return serialized
+
+
+def _save_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    tokens: Dict[str, Any] = {}
+    total = 0
+    for token, dq in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not dq:
+            continue
+        variants = _serialize_template_variants(dq)
+        if not variants:
+            continue
+        tokens[token] = {"variants": variants}
+        total += len(variants)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {"version": 1, "tokens": tokens, "updated_at": time.time()}
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _GLYPH_RUNTIME_STATS["template_cache_saved"] = float(total)
+    _update_template_variant_stats()
+
+
+def _autosave_template_cache() -> None:
+    if not _TEMPLATE_CACHE_STATE.get("dirty"):
+        return
+    path = _template_cache_path()
+    if not path:
+        return
+    _save_token_template_cache(path)
+
+
+def _observe_token_template(token: str, arr: Any) -> None:
+    if not token:
+        return
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[token] = dq
+    dq.append(norm)
+    _TEMPLATE_CACHE_STATE["dirty"] = True
+    _update_template_variant_stats()
+
+
+def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
+    import numpy as _np
+
+    _ensure_template_cache_loaded()
+    _ensure_template_cache_autosave()
+    norm = _normalize_template_bitmap(arr)
+    if norm is None:
+        return "", 0.0
+    best_token = ""
+    best_score = -1.0
+    _GLYPH_RUNTIME_STATS["template_cache_checks"] += 1.0
+    for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not variants:
+            continue
+        for tpl in variants:
+            if tpl.shape != norm.shape:
+                continue
+            score = float((norm * tpl).mean())
+            if score > best_score:
+                best_score = score
+                best_token = token
+    if best_score < 0.35:
+        _GLYPH_RUNTIME_STATS["template_cache_misses"] += 1.0
+        return "", 0.0
+    conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
+    _GLYPH_RUNTIME_STATS["template_cache_hits"] += 1.0
+    return best_token, conf
+
+
+def _normalized_string_distance(a: str, b: str) -> float:
+    if not a and not b:
+        return 0.0
+    if not a or not b:
+        return 1.0
+    try:
+        matcher = difflib.SequenceMatcher(a=a, b=b)
+        ratio = matcher.ratio()
+    except Exception:
+        return 1.0 if a != b else 0.0
+    return float(max(0.0, min(1.0, 1.0 - ratio)))
+
+
+def _template_override_thresholds() -> Tuple[float, float, float, float]:
+    def _get(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    strict_delta = _get("ZOCR_TEMPLATE_OVERRIDE_DELTA", 0.05)
+    min_quality = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_QUALITY", 0.6)
+    flex_delta = _get("ZOCR_TEMPLATE_OVERRIDE_FLEX", 0.02)
+    min_diff = _get("ZOCR_TEMPLATE_OVERRIDE_MIN_DIFF", 0.3)
+    return float(strict_delta), float(min_quality), float(flex_delta), float(min_diff)
+
+
+def _decide_template_override(
+    final_text: str,
+    final_effective_conf: float,
+    final_quality: float,
+    template_text: str,
+    template_conf: float,
+) -> str:
+    if not template_text:
+        return ""
+    strict_delta, min_quality, flex_delta, min_diff = _template_override_thresholds()
+    lexical = float(final_quality)
+    if (not lexical) and final_text:
+        lexical = _toy_text_quality(final_text)[0]
+    if not final_text:
+        return "missing"
+    if template_conf >= final_effective_conf + strict_delta:
+        return "conf"
+    if lexical < min_quality and template_conf + flex_delta >= final_effective_conf:
+        distance = _normalized_string_distance(final_text, template_text)
+        if distance >= min_diff:
+            return "quality"
+    return ""
+
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     if dx == 0 and dy == 0:
         return arr
