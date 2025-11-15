@@ -1595,6 +1595,10 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
     result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
     result["lexical_penalties"] = int(_GLYPH_RUNTIME_STATS.get("lexical_penalty", 0))
+    result["tess_dictionary_boosts"] = int(_GLYPH_RUNTIME_STATS.get("tess_dictionary_boosts", 0))
+    result["tess_unknown_hits"] = int(_GLYPH_RUNTIME_STATS.get("tess_unknown_hits", 0))
+    result["tess_bigram_penalties"] = int(_GLYPH_RUNTIME_STATS.get("tess_bigram_penalties", 0))
+    result["baseline_splits"] = int(_GLYPH_RUNTIME_STATS.get("baseline_splits", 0))
     result["template_matches"] = int(_GLYPH_RUNTIME_STATS.get("template_matches", 0))
     result["template_observed"] = int(_GLYPH_RUNTIME_STATS.get("template_observed", 0))
     result["template_cache_hits"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_hits", 0))
@@ -2067,6 +2071,220 @@ def _looks_like_upper_token(text: str) -> bool:
 
 _TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
 
+@dataclass
+class _TessLiteModel:
+    glyphs: Set[str]
+    dictionary: Set[str]
+    bigrams: Dict[str, Dict[str, float]]
+    ambiguous: Dict[str, Set[str]]
+    char_categories: Dict[str, str]
+    source_signature: str
+
+
+_TESSLITE_MODEL: Optional[_TessLiteModel] = None
+_TESSLITE_MODEL_SIG: Optional[str] = None
+
+
+def _tesslite_env_signature() -> str:
+    paths = [
+        os.environ.get("ZOCR_TESS_UNICHARSET", ""),
+        os.environ.get("ZOCR_TESS_WORDLIST", ""),
+        os.environ.get("ZOCR_TESS_BIGRAM_JSON", ""),
+    ]
+    stats: List[str] = []
+    for path in paths:
+        if not path:
+            stats.append("-")
+            continue
+        try:
+            st = os.stat(path)
+            stats.append(f"{path}:{int(st.st_mtime)}:{st.st_size}")
+        except Exception:
+            stats.append(f"{path}:missing")
+    return "|".join(stats)
+
+
+def _decode_unichar_token(token: str) -> str:
+    tok = token.strip().strip('"')
+    if not tok:
+        return ""
+    if tok == "NULL":
+        return ""
+    if tok.startswith("\\"):
+        try:
+            return tok.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+    return tok
+
+
+def _load_unicharset(path: str) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str, str]]:
+    glyphs: Set[str] = set()
+    ambiguous: Dict[str, Set[str]] = defaultdict(set)
+    categories: Dict[str, str] = {}
+    if not path:
+        return glyphs, ambiguous, categories
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                parts = raw.split()
+                if not parts:
+                    continue
+                ch = _decode_unichar_token(parts[0])
+                if not ch:
+                    continue
+                glyphs.add(ch)
+                if len(parts) >= 2:
+                    categories[ch] = parts[1]
+                if len(parts) >= 4 and parts[3] not in {"0", "NULL"}:
+                    ambiguous[ch].add(parts[3])
+    except Exception:
+        return set(), defaultdict(set), {}
+    return glyphs, ambiguous, categories
+
+
+def _load_wordlist(path: str) -> Set[str]:
+    words: Set[str] = set()
+    if not path:
+        return words
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                token = line.strip()
+                if not token or token.startswith("#"):
+                    continue
+                words.add(token)
+    except Exception:
+        return set()
+    return words
+
+
+def _load_bigram_json(path: str) -> Dict[str, Dict[str, float]]:
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}
+    bigrams: Dict[str, Dict[str, float]] = {}
+    if isinstance(payload, dict):
+        for prev, mapping in payload.items():
+            if not isinstance(mapping, dict):
+                continue
+            table: Dict[str, float] = {}
+            for ch, weight in mapping.items():
+                try:
+                    table[str(ch)] = float(weight)
+                except Exception:
+                    continue
+            if table:
+                bigrams[str(prev)] = table
+    return bigrams
+
+
+def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
+    counts: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    totals: Dict[str, float] = defaultdict(float)
+    for word in words:
+        prev = "\0"
+        for ch in word:
+            counts[prev][ch] += 1.0
+            totals[prev] += 1.0
+            prev = ch
+        counts[prev]["\0"] += 1.0
+        totals[prev] += 1.0
+    table: Dict[str, Dict[str, float]] = {}
+    for prev, mapping in counts.items():
+        total = max(1.0, totals.get(prev, 1.0))
+        scale: Dict[str, float] = {}
+        for ch, cnt in mapping.items():
+            scale[ch] = float(cnt / total)
+        if scale:
+            table[prev] = scale
+    return table
+
+
+def _get_tesslite_model() -> Optional[_TessLiteModel]:
+    global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG
+    signature = _tesslite_env_signature()
+    if not signature.strip("|-"):
+        _TESSLITE_MODEL = None
+        _TESSLITE_MODEL_SIG = None
+        return None
+    if _TESSLITE_MODEL is not None and signature == _TESSLITE_MODEL_SIG:
+        return _TESSLITE_MODEL
+    unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+    word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
+    bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
+    glyphs, ambiguous, categories = _load_unicharset(unichar_path)
+    dictionary = _load_wordlist(word_path)
+    bigrams = _load_bigram_json(bigram_path)
+    if not bigrams and dictionary:
+        bigrams = _build_bigrams_from_words(dictionary)
+    model = _TessLiteModel(
+        glyphs=glyphs,
+        dictionary=dictionary,
+        bigrams=bigrams,
+        ambiguous=ambiguous,
+        char_categories=categories,
+        source_signature=signature,
+    )
+    _TESSLITE_MODEL = model
+    _TESSLITE_MODEL_SIG = signature
+    return model
+
+
+def _tesslite_unknown_ratio(model: _TessLiteModel, text: str) -> float:
+    if not model.glyphs:
+        return 0.0
+    total = 0
+    missing = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        total += 1
+        if ch not in model.glyphs:
+            missing += 1
+    if total == 0:
+        return 0.0
+    return float(missing) / float(total)
+
+
+def _tesslite_dictionary_boost(model: _TessLiteModel, text: str) -> float:
+    token = text.strip()
+    if not token:
+        return 0.0
+    if token in model.dictionary:
+        return 0.15
+    lower = token.lower()
+    if lower in model.dictionary:
+        return 0.1
+    return 0.0
+
+
+def _tesslite_bigram_gate(model: _TessLiteModel, text: str) -> float:
+    if not model.bigrams or len(text) < 2:
+        return 1.0
+    penalties = 0
+    transitions = 0
+    prev = "\0"
+    for ch in text:
+        table = model.bigrams.get(prev)
+        score = table.get(ch, 0.0) if table else 0.0
+        if table is not None:
+            transitions += 1
+            if score < 0.02:
+                penalties += 1
+        prev = ch
+    if transitions == 0:
+        return 1.0
+    ratio = penalties / float(transitions)
+    return float(max(0.4, 1.0 - 0.6 * ratio))
+
 _TOY_CHAR_CATEGORY_MAP = {
     "digit": set("0123456789０１２３４５６７８９"),
     "latin_upper": set("ABCDEFGHIJKLMNOPQRSTUVWXYZＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"),
@@ -2355,6 +2573,23 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
     transition_gate, transition_reason = _toy_transition_gate(normalized)
     if transition_gate < 1.0:
         base *= transition_gate
+    tess_model = _get_tesslite_model()
+    tess_unknown = 0.0
+    tess_gate = 1.0
+    tess_dict_boost = 0.0
+    if tess_model:
+        tess_unknown = _tesslite_unknown_ratio(tess_model, normalized)
+        if tess_unknown > 0:
+            base *= max(0.35, 1.0 - 0.55 * tess_unknown)
+            _GLYPH_RUNTIME_STATS["tess_unknown_hits"] += 1.0
+        tess_gate = _tesslite_bigram_gate(tess_model, normalized)
+        if tess_gate < 1.0:
+            base *= tess_gate
+            _GLYPH_RUNTIME_STATS["tess_bigram_penalties"] += 1.0
+        tess_dict_boost = _tesslite_dictionary_boost(tess_model, normalized)
+        if tess_dict_boost > 0:
+            lex_boost += tess_dict_boost
+            _GLYPH_RUNTIME_STATS["tess_dictionary_boosts"] += 1.0
     if _TOY_GARBLED_PATTERN.search(normalized):
         base *= 0.6
     quality = float(max(0.2, min(1.6, base * lex_boost)))
@@ -2368,6 +2603,9 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
         "jp_hint_reason": jp_reason,
         "transition_gate": transition_gate,
         "transition_reason": transition_reason,
+        "tess_unknown_ratio": tess_unknown,
+        "tess_bigram_gate": tess_gate,
+        "tess_dict_boost": tess_dict_boost,
     }
     return quality, diag
 
@@ -4590,7 +4828,42 @@ def _component_projection_splits(arr: "np.ndarray", axis: int, gap_ratio: float,
                 segments.append((0, start, width, idx))
     return segments
 
-def _segment_component_bbox(bw: "np.ndarray", bbox: Tuple[int, int, int, int, float]) -> List[Tuple[int, int, int, int, float]]:
+@dataclass
+class _BaselineStats:
+    baseline: float
+    xheight: float
+    ascender: float
+    descender: float
+
+
+def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) -> Optional[_BaselineStats]:
+    if not boxes:
+        return None
+    bottoms: List[float] = []
+    heights: List[float] = []
+    ascenders: List[float] = []
+    descenders: List[float] = []
+    for _, y1, _, y2, _ in boxes:
+        h = float(max(1, y2 - y1))
+        heights.append(h)
+        bottoms.append(float(y2))
+    if not heights or not bottoms:
+        return None
+    baseline = float(median(bottoms))
+    xheight = float(max(4.0, median(heights)))
+    for _, y1, _, y2, _ in boxes:
+        bottom = float(y2)
+        top = float(y1)
+        ascenders.append(max(0.0, baseline - top))
+        descenders.append(max(0.0, bottom - baseline))
+    asc = float(max(3.0, median(ascenders) if ascenders else xheight))
+    desc = float(max(1.0, median(descenders) if descenders else xheight * 0.2))
+    return _BaselineStats(baseline=baseline, xheight=xheight, ascender=asc, descender=desc)
+
+
+def _segment_component_bbox(
+    bw: "np.ndarray", bbox: Tuple[int, int, int, int, float], baseline: Optional[_BaselineStats] = None
+) -> List[Tuple[int, int, int, int, float]]:
     x1, y1, x2, y2, _ = bbox
     sub = bw[y1:y2, x1:x2]
     if sub.size == 0:
@@ -4602,10 +4875,21 @@ def _segment_component_bbox(bw: "np.ndarray", bbox: Tuple[int, int, int, int, fl
     height = max(1, arr.shape[0])
     width = max(1, arr.shape[1])
     segments: List[Tuple[int, int, int, int]] = []
-    if width > height * 1.4:
-        segments = _component_projection_splits(arr, axis=1, gap_ratio=0.08, min_span_ratio=0.25)
-    if not segments and height > width * 1.8:
-        segments = _component_projection_splits(arr, axis=0, gap_ratio=0.08, min_span_ratio=0.3)
+    wide_ratio = 1.4
+    tall_ratio = 1.8
+    gap_ratio = 0.08
+    if baseline:
+        wide_ratio = 1.2
+        tall_ratio = 1.5
+        gap_ratio = 0.06
+    if width > height * wide_ratio:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio, min_span_ratio=0.22)
+    if not segments:
+        tall_gate = height > width * tall_ratio
+        if baseline:
+            tall_gate = height > baseline.xheight * 1.65
+        if tall_gate:
+            segments = _component_projection_splits(arr, axis=0, gap_ratio=gap_ratio, min_span_ratio=0.28)
     boxes: List[Tuple[int, int, int, int, float]] = []
     if segments:
         for sx1, sy1, sx2, sy2 in segments:
@@ -4613,15 +4897,18 @@ def _segment_component_bbox(bw: "np.ndarray", bbox: Tuple[int, int, int, int, fl
             gx2, gy2 = x1 + sx2, y1 + sy2
             area = float(max(1, (gx2 - gx1) * (gy2 - gy1)))
             boxes.append((gx1, gy1, gx2, gy2, area))
+        _GLYPH_RUNTIME_STATS["baseline_splits"] += float(len(segments))
     return boxes
 
-def _refine_component_segments(bw: "np.ndarray", bbox: Tuple[int, int, int, int, float]) -> List[Tuple[int, int, int, int, float]]:
+def _refine_component_segments(
+    bw: "np.ndarray", bbox: Tuple[int, int, int, int, float], baseline: Optional[_BaselineStats] = None
+) -> List[Tuple[int, int, int, int, float]]:
     queue = [bbox]
     output: List[Tuple[int, int, int, int, float]] = []
     steps = 0
     while queue and steps < 32:
         current = queue.pop()
-        children = _segment_component_bbox(bw, current)
+        children = _segment_component_bbox(bw, current, baseline=baseline)
         if children:
             queue.extend(children)
         else:
@@ -4634,9 +4921,10 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
     if not cc:
         return "", 0.0
+    baseline_stats = _estimate_baseline_stats(cc)
     refined: List[Tuple[int, int, int, int, float]] = []
     for bbox in cc:
-        refined.extend(_refine_component_segments(bw, bbox))
+        refined.extend(_refine_component_segments(bw, bbox, baseline=baseline_stats))
     if not refined:
         refined = cc
     refined.sort(key=lambda b: b[0])
