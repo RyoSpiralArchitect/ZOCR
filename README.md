@@ -22,6 +22,13 @@ zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 - **[JA]** `zocr.diff` は `cells.jsonl` / `sections.jsonl` を比較してイベントJSON・.diff・HTMLを生成します。`python -m zocr.diff --a out/A --b out/B` のように実行ディレクトリを渡せます。構成や詳細は [`zocr/diff/README.md`](zocr/diff/README.md) を参照してください。
 - **[EN]** `zocr.diff` compares `cells.jsonl` / `sections.jsonl` to emit JSON events plus unified-text and HTML reports. You can point it at run directories via `python -m zocr.diff --a out/A --b out/B`; see [`zocr/diff/README.md`](zocr/diff/README.md) for layout and CLI details.
 - **[FR]** `zocr.diff` compare `cells.jsonl` / `sections.jsonl` afin de produire des événements JSON, un diff texte et un rapport HTML. Il suffit de cibler les dossiers d’exécution avec `python -m zocr.diff --a out/A --b out/B`. L’architecture et l’exemple complet figurent dans [`zocr/diff/README.md`](zocr/diff/README.md).
+- **[JA]** `--out_plan` / orchestrator の `run_diff` は `assist_plan.json` を併せて吐き出し、差分イベントを再解析キュー・RAG 補助・プロファイル調整に分割します（`intent.action="reanalyze_cells"` の自動発火にも利用可）。
+- **[EN]** The CLI and `run_diff` helper can also emit `assist_plan.json` via `--out_plan`, splitting events into reanalysis queues, downstream RAG follow-ups, and profile tweaks so the pipeline can fire `intent.action="reanalyze_cells"` without hand wiring.
+- **[FR]** La CLI et `run_diff` exportent en option `assist_plan.json` (`--out_plan`), qui ventile les événements entre file de réanalyse, suivi RAG et ajustements de profil pour déclencher automatiquement `intent.action="reanalyze_cells"`.
+- **[JA]** `assist_plan.json` は `domain_tags` / `llm_directive` / `domain_briefings` を含み、請求書・契約・物流などドメイン別のハンドオフ文章を LLM に渡して downstream RAG へ即引き継げます。
+- **[EN]** Each assist plan entry now carries `domain_tags`, an LLM-friendly `llm_directive`, and `domain_briefings`, giving downstream RAG helpers invoice/contract/logistics-specific instructions without having to reverse-engineer the event payloads.
+- **[FR]** Chaque entrée du plan d’assistance expose `domain_tags`, une `llm_directive` lisible par LLM ainsi que des `domain_briefings`, ce qui livre aux assistants RAG des consignes ciblées (facture, contrat, logistique, etc.) sans devoir décoder l’événement brut.
+
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash

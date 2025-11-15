@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from .assist import DiffAssistPlanner
 from .differ import SemanticDiffer
 from .render import render_html, render_unified
 
@@ -62,15 +63,21 @@ def main() -> None:
     ap.add_argument("--out_json", default=None, help="save raw events JSON")
     ap.add_argument("--out_diff", default=None, help="save unified .diff-like text")
     ap.add_argument("--out_html", default=None, help="save HTML report")
+    ap.add_argument(
+        "--out_plan", default=None, help="save downstream reanalysis/RAG assist plan"
+    )
     args = ap.parse_args()
 
     diff = SemanticDiffer()
+    planner = DiffAssistPlanner()
     cells_a = _resolve_cells_path(args.a, "version A")
     cells_b = _resolve_cells_path(args.b, "version B")
     sec_a = _resolve_sections_path(args.sections_a)
     sec_b = _resolve_sections_path(args.sections_b)
     res = diff.compare_bundle(cells_a, cells_b, sec_a, sec_b)
     events = res["events"]
+    assist_plan = planner.plan(events)
+    res["assist_plan"] = assist_plan
 
     if args.out_json:
         Path(args.out_json).write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -83,6 +90,20 @@ def main() -> None:
 
     if args.out_html:
         render_html(events, Path(args.out_html))
+
+    if args.out_plan:
+        Path(args.out_plan).write_text(
+            json.dumps(assist_plan, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    if not args.out_plan:
+        summary = assist_plan.get("summary", {})
+        print(
+            "[assist] reanalyze={reanalyze} rag={rag} profile={profile}".format(
+                reanalyze=summary.get("reanalyze_candidates", 0),
+                rag=summary.get("rag_followups", 0),
+                profile=summary.get("profile_actions", 0),
+            )
+        )
 
 
 if __name__ == "__main__":

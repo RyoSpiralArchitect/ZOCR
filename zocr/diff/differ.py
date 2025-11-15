@@ -150,6 +150,8 @@ def table_context(table: TableView) -> Dict[str, Any]:
         "table_index": table.table_index,
         "table_rows": len(table.row_keys),
         "table_columns": len(table.headers),
+        "table_headers": table.headers[: min(len(table.headers), 16)],
+        "table_header_preview": " | ".join(table.headers[:6]),
     }
 
 

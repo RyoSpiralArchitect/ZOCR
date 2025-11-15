@@ -46,6 +46,17 @@ python -m zocr.diff \
 - **[JA]** `--sections_a` / `--sections_b` を指定すると `sections.jsonl` のパスを明示でき、未指定時は `cells.jsonl` と同じ場所を自動探索します。ディレクトリを渡した場合も `rag/sections.jsonl` を解決します。
 - **[EN]** Optional `--sections_a` / `--sections_b` flags override auto-discovery of `sections.jsonl`; directories are resolved to `rag/sections.jsonl` just like the cell inputs.
 - **[FR]** Les options `--sections_a` / `--sections_b` permettent de fournir explicitement les chemins `sections.jsonl`; lorsqu’un dossier est fourni, la CLI y cherche `rag/sections.jsonl` automatiquement.
+- **[JA]** `--out_plan` で差分イベントを再解析キュー / RAG 補助 / プロファイル更新に分類した `assist_plan.json` を保存し、既存の請求書向けフィードバックループへ即連携できます。
+- **[EN]** `--out_plan` writes an `assist_plan.json` that splits the diff feed into reanalysis queues, downstream RAG follow-ups, and profile tweaks so the invoice-domain loops can reuse it directly.
+- **[FR]** `--out_plan` génère un `assist_plan.json` qui classe les événements (réanalyse, suivi RAG, ajustements de profil) pour alimenter directement les boucles déjà en service sur le domaine facturation.
+
+### Assist plan / アシストプラン / Plan d’assistance
+- **[JA]** `assist_plan.json` は `reanalyze_queue` / `rag_followups` / `profile_actions` を含み、各エントリに行プレビューや `trace_id` を付与するため、Slack/Teams 通知や `intent.action="reanalyze_cells"` トリガにそのまま使えます。
+- **[EN]** `assist_plan.json` groups recommendations into `reanalyze_queue`, `rag_followups`, and `profile_actions` while preserving row previews plus `trace_id`s so it can feed Slack/Teams digests or fire `intent.action="reanalyze_cells"` automatically.
+- **[FR]** `assist_plan.json` regroupe les recommandations (`reanalyze_queue`, `rag_followups`, `profile_actions`) avec aperçus de lignes et `trace_id`, prêt à déclencher `intent.action="reanalyze_cells"` ou à nourrir des notifications Slack/Teams.
+- **[JA]** さらに `domain_tags` / `llm_directive` / `domain_briefings` により、請求書・契約・物流など各ドメイン向けのハンドオフ文章を LLM に直接渡せます。
+- **[EN]** Each entry also exposes `domain_tags`, an LLM-oriented `llm_directive`, and top-level `domain_briefings`, so invoice, contract, or logistics assistants get tailored instructions straight from the diff output.
+- **[FR]** Chaque entrée inclut désormais `domain_tags`, une `llm_directive` pour les LLM ainsi que des `domain_briefings`, afin que les assistants factures/contrats/logistique disposent d’instructions adaptées dès la sortie du diff.
 
 ## なぜ小さく保てるか / Why the implementation stays small / Pourquoi si peu de code suffit
 1. **構造化セル情報 / Structured cell context / Contexte cellulaire structuré** – 各レコードにページ・表・行列・テキスト・filters・`trace_id` が揃っているため、再OCRではなく構造合わせに集中できます。
@@ -60,3 +71,13 @@ python -m zocr.diff \
 Because these ingredients already exist, `zocr.diff` can focus on matching heuristics, event schemas, and renderers without inventing bespoke exporters or logging layers.
 
 Grâce à ces briques existantes, `zocr.diff` se concentre sur les heuristiques d’appariement, les schémas d’événements et les rendus, sans exiger d’exportateurs ni de journaux sur mesure.
+
+## Frontier significance / フロンティアとしての意義 / Portée de la frontière
+- **[JA]** まだ市場には「請求書・法務文書・CAD 図表・営業仕様書を意味構造ごと比較できる diff」がありません。`zocr.diff` は `cells.jsonl` / `sections.jsonl` を活かし、表・節・filters を束ねて frontier を押さえることで Z-OCR 全体の技術的アイデンティティを確立します。
+- **[EN]** No production tool currently performs semantic diffs for invoices, legal docs, CAD-like grids, and shifting business specs. By leaning on the existing bundle, `zocr.diff` owns that frontier and turns Z-OCR into the platform that names and tracks those structural deltas.
+- **[FR]** Le marché ne propose pas encore de diff sémantique couvrant factures, documents juridiques, tableaux CAD ou spécifications métier évolutives. En capitalisant sur le bundle existant, `zocr.diff` occupe cette frontière et fait de Z-OCR la plateforme qui identifie ces écarts structurels.
+
+### Downstream loops / 下流ループ連携 / Boucles aval
+- **[JA]** 生成されたイベントは `orchestrator` の monitor / intent / reanalysis ループ（請求書ドメインで実績済み）へそのまま流せます。差分イベントを Slack/Teams 通知に回し、必要に応じて `intent.action="reanalyze_cells"` を自動でリクエストすれば、中流の補助・再解析チームにもワンクリックで依頼できます。
+- **[EN]** You can pipe the events directly into the orchestrator’s monitor, intent, and reanalysis loops that already power invoice-domain reruns. Dispatching the diff feed to Slack/Teams plus auto-requesting `intent.action="reanalyze_cells"` lets downstream mid-stream assistants pick up tasks without additional plumbing.
+- **[FR]** Les événements se branchent directement sur les boucles monitor/intent/réanalyse de l’orchestrateur, déjà éprouvées côté factures. Il suffit d’alimenter Slack/Teams et de demander automatiquement `intent.action="reanalyze_cells"` pour que les équipes intermédiaires prennent le relais sans travail supplémentaire.
