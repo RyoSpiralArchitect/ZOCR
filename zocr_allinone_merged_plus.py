@@ -3058,9 +3058,19 @@ _ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
 
 
 def _schema_normalize_header_token(text: Optional[str]) -> str:
-    if not text:
+    if text is None:
         return ""
-    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
 
 
 def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
@@ -3088,6 +3098,115 @@ def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
     if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
         return None
     return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
 
 
 def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
@@ -3143,9 +3262,13 @@ def _rectify_item_qty_amount_schema(
 ) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
     if not grid_text or not grid_text[0]:
         return None
+    strategy = "header"
     match = _match_item_qty_schema(grid_text[0])
     if not match:
-        return None
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
     if any(idx + 1 >= len(col_bounds) for idx in match):
         return None
     noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
@@ -3222,6 +3345,8 @@ def _rectify_item_qty_amount_schema(
         "rows_adjusted": rows_adjusted,
         "cells_salvaged": cells_salvaged,
         "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
     }
     return new_text, new_conf, new_bounds, stats
 
@@ -4675,6 +4800,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         return max(minimum, value)
 
     log_every = max(1, _parse_env_int("ZOCR_EXPORT_LOG_EVERY", 200, 1))
+    flush_every = max(0, _parse_env_int("ZOCR_EXPORT_FLUSH_EVERY", 200, 0))
     max_cells = _parse_env_int("ZOCR_EXPORT_MAX_CELLS", 0, 0)
     cells_done = 0
     t0 = time.time()
@@ -4770,6 +4896,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         print(f"[Export] engine={ocr_engine} pages={len(pages)} ~cells={est_cells}", flush=True)
 
     with open(out_jsonl_path, "w", encoding="utf-8") as fw:
+        records_written = 0
         for enum_idx, p in enumerate(pages):
             if stop_due_to_limit:
                 break
@@ -5084,6 +5211,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if note:
                             rec["meta"]["fallback"] = note
                         fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        records_written += 1
+                        if flush_every and (records_written % flush_every == 0):
+                            fw.flush()
                         count += 1
                 if log_progress:
                     fw.flush()
@@ -5143,6 +5273,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "numeric": numeric_stats,
         "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
+        "flush_every": int(flush_every),
     }
     if date_cells_detected or date_columns_total:
         export_stats["date_fields"] = {
