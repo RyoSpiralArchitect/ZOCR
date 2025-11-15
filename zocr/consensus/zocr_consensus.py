@@ -29,6 +29,14 @@ try:
 except Exception:
     np = None
 
+try:  # shared utility helpers when running as a package
+    from ..utils.json_utils import json_ready as _json_ready  # type: ignore
+except Exception:  # pragma: no cover - fallback when relative import fails
+    try:
+        from zocr.utils.json_utils import json_ready as _json_ready  # type: ignore
+    except Exception:  # pragma: no cover - standalone fallback
+        _json_ready = None  # type: ignore
+
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
 try:
     import pytesseract  # type: ignore
@@ -121,21 +129,23 @@ def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
-def _json_ready(obj: Any):
-    """Best-effort conversion of numpy/complex objects into JSON-safe values."""
+if _json_ready is None:  # pragma: no cover - standalone fallback
 
-    if isinstance(obj, dict):
-        return {k: _json_ready(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_ready(v) for v in obj]
-    if isinstance(obj, set):
-        return [_json_ready(v) for v in obj]
-    if np is not None:
-        if isinstance(obj, np.generic):  # type: ignore[attr-defined]
-            return obj.item()
-        if isinstance(obj, np.ndarray):  # type: ignore[attr-defined]
-            return obj.tolist()
-    return obj
+    def _json_ready(obj: Any):
+        """Best-effort conversion of numpy/complex objects into JSON-safe values."""
+
+        if isinstance(obj, dict):
+            return {k: _json_ready(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_json_ready(v) for v in obj]
+        if isinstance(obj, set):
+            return [_json_ready(v) for v in obj]
+        if np is not None:
+            if isinstance(obj, np.generic):  # type: ignore[attr-defined]
+                return obj.item()
+            if isinstance(obj, np.ndarray):  # type: ignore[attr-defined]
+                return obj.tolist()
+        return obj
 
 
 def _toy_memory_series_paths(path: str) -> Tuple[str, str]:

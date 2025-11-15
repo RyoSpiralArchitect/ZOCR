@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - fallback for very old Python
 from html import escape
 
 from .prior import PriorBandit, normalize_headers_to_signature, decide_success
+from ..utils.json_utils import json_ready as _json_ready
 
 try:
     from PIL import Image  # type: ignore
@@ -58,21 +59,6 @@ def _call(stage, **kw):
             fn(**kw)
         except Exception as e:
             print(f"[PLUGIN:{stage}] {fn.__name__} -> {e}")
-
-def _json_ready(obj: Any):
-    if isinstance(obj, dict):
-        return {k: _json_ready(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_ready(v) for v in obj]
-    if isinstance(obj, set):
-        return [_json_ready(v) for v in obj]
-    if _np is not None:
-        if isinstance(obj, _np.generic):  # type: ignore[attr-defined]
-            return obj.item()
-        if isinstance(obj, _np.ndarray):  # type: ignore[attr-defined]
-            return obj.tolist()
-    return obj
-
 
 _STAGE_TRACE_SINK: Optional[List[Dict[str, Any]]] = None
 
@@ -3982,6 +3968,38 @@ def _patched_run_full_pipeline(
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
     bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
