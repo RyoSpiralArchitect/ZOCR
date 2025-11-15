@@ -11,11 +11,17 @@ zocr/
   consensus/zocr_consensus.py    # OCR + table reconstruction helpers
   core/zocr_core.py              # augmentation, BM25, monitoring, SQL & RAG export
   orchestrator/zocr_pipeline.py  # CLI pipeline orchestrator + resume/watchdog/reporting
+  diff/                          # semantic diff engine (see zocr/diff/README.md)
 samples/
   demo_inputs/                   # place your PDFs/PNGs here for quick demos
 README.md
 zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```
+
+### Semantic diff overview / セマンティック差分概要 / Aperçu du diff sémantique
+- **[JA]** `zocr.diff` は `cells.jsonl` / `sections.jsonl` を比較してイベントJSON・.diff・HTMLを生成します。構成や CLI 例は [`zocr/diff/README.md`](zocr/diff/README.md) を参照してください。
+- **[EN]** `zocr.diff` compares `cells.jsonl` / `sections.jsonl` to emit JSON events plus unified-text and HTML reports. See [`zocr/diff/README.md`](zocr/diff/README.md) for the module layout, CLI example, and pipeline prerequisites.
+- **[FR]** `zocr.diff` compare `cells.jsonl` / `sections.jsonl` afin de produire des événements JSON, un diff texte et un rapport HTML. Consultez [`zocr/diff/README.md`](zocr/diff/README.md) pour l’architecture, l’exemple CLI et les prérequis côté pipeline.
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash
