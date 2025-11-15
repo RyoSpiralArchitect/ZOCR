@@ -3261,6 +3261,9 @@ def _patched_run_full_pipeline(
     blank_min_ratio: Optional[float] = None,
     blank_min_area: Optional[int] = None,
     allow_pytesseract: Optional[bool] = None,
+    tess_unicharset: Optional[str] = None,
+    tess_wordlist: Optional[str] = None,
+    tess_bigram_json: Optional[str] = None,
 ) -> Dict[str, Any]:
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
@@ -3298,6 +3301,21 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
     else:
         os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
+    if tess_unicharset is not None:
+        if tess_unicharset:
+            os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
+        else:
+            os.environ.pop("ZOCR_TESS_UNICHARSET", None)
+    if tess_wordlist is not None:
+        if tess_wordlist:
+            os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
+        else:
+            os.environ.pop("ZOCR_TESS_WORDLIST", None)
+    if tess_bigram_json is not None:
+        if tess_bigram_json:
+            os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
+        else:
+            os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
 
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
@@ -3508,6 +3526,25 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
     bandit: Optional[PriorBandit] = None
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
@@ -4625,6 +4662,21 @@ def main():
         help="Force-disable pytesseract even if the environment opts in",
     )
     ap.add_argument(
+        "--tess-unicharset",
+        default=None,
+        help="Path to a Tesseract-style unicharset file for toy lexical gating",
+    )
+    ap.add_argument(
+        "--tess-wordlist",
+        default=None,
+        help="Optional newline-delimited dictionary that boosts toy OCR tokens",
+    )
+    ap.add_argument(
+        "--tess-bigram-json",
+        default=None,
+        help="JSON mapping of bigram probabilities used to penalize unlikely glyph transitions",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -4691,6 +4743,9 @@ def main():
             blank_min_ratio=args.blank_min_ratio,
             blank_min_area=args.blank_min_area,
             allow_pytesseract=args.allow_pytesseract,
+            tess_unicharset=args.tess_unicharset,
+            tess_wordlist=args.tess_wordlist,
+            tess_bigram_json=args.tess_bigram_json,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))

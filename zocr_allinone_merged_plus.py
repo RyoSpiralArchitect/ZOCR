@@ -3944,6 +3944,301 @@ def _rectify_item_qty_amount_schema(
     return new_text, new_conf, new_bounds, stats
 
 
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    strategy = "header"
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
+    }
+    return new_text, new_conf, new_bounds, stats
+
+
 def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
     if not headers or not _FORCE_NUMERIC:
         return []
@@ -4591,6 +4886,394 @@ def _autosave_template_cache() -> None:
         return
     _save_token_template_cache(path)
 
+
+            if height > 4:
+                proj = width // 4
+                if proj > 0:
+                    mask_rows = (arr < int(mu)).astype(np.uint8)
+                    row_sum = mask_rows.sum(axis=1)
+                    segments_row: List[Tuple[int, int]] = []
+                    start_row: Optional[int] = None
+                    for idx, val in enumerate(row_sum):
+                        if val > proj:
+                            if start_row is None:
+                                start_row = max(0, idx - 1)
+                        elif start_row is not None:
+                            segments_row.append((start_row, min(height, idx + 1)))
+                            start_row = None
+                    if start_row is not None:
+                        segments_row.append((start_row, height))
+                    if len(segments_row) > 1:
+                        texts: List[str] = []
+                        confidences: List[float] = []
+                        for y0, y1 in segments_row[:4]:
+                            try:
+                                strip = work_rgb.crop((0, y0, work_rgb.width, y1))
+                            except Exception:
+                                continue
+                            txt, conf = toy_ocr_text_from_cell(strip)
+                            if txt:
+                                texts.append(txt.strip())
+                                confidences.append(conf)
+                        if texts:
+                            joined = " ".join(t for t in texts if t)
+                            if joined:
+                                conf_guess = float(max(confidences) if confidences else 0.0)
+                                conf_avg = float(sum(confidences) / max(1, len(confidences)))
+                                conf_val = float(max(conf_guess, conf_avg + 0.05))
+                                _emit_manual(joined, conf_val, "strip_join")
+
+    return variants
+
+
+def _collect_external_ocr_variants(img: "Image.Image") -> List[Tuple[str, float, str]]:
+    variants: List[Tuple[str, float, str]] = []
+    if not _pytesseract_allowed():
+        return _synthetic_external_variants(img)
+    tess_variants = _pytesseract_variants(img)
+    variants.extend(tess_variants)
+    if pytesseract is not None and tess_variants:
+        try:
+            inverted = ImageOps.invert(img.convert("RGB"))
+        except Exception:
+            inverted = None
+        if inverted is not None:
+            for txt, conf, transform in _pytesseract_variants(inverted):
+                variants.append((txt, conf, f"{transform}+invert"))
+    if pytesseract is None or not variants:
+        variants.extend(_synthetic_external_variants(img))
+    return variants
+
+def _normalize_total_token(text: str) -> str:
+    base = (text or "").lower()
+    base = re.sub(r"[\s:_\-]+", "", base)
+    return base
+
+def _is_total_row(cells: List[str]) -> bool:
+    joined = _normalize_total_token(" ".join(cells))
+    if any(tok in joined for tok in _TOTAL_LABEL_HINTS):
+        return True
+    for cell in cells[:3]:
+        norm = _normalize_total_token(cell)
+        if not norm:
+            continue
+        if norm in _TOTAL_LABEL_HINTS:
+            return True
+        if any(norm.startswith(pref) for pref in _TOTAL_PREFIXES):
+            return True
+    return False
+
+
+def _numeric_token_value(token: str) -> Optional[float]:
+    if not token:
+        return None
+    body = token.replace(",", "")
+    if body.endswith("%"):
+        return None
+    try:
+        return float(body)
+    except Exception:
+        return None
+
+
+def _relocate_total_amount(
+    row: List[str], conf_row: List[float], target_idx: int
+) -> bool:
+    if target_idx < 0 or target_idx >= len(row):
+        return False
+    existing = _NUMERIC_RX.search(row[target_idx] or "")
+    if existing and not (existing.group(0).endswith("%")):
+        return False
+    best_idx = None
+    best_token = None
+    best_score: Optional[Tuple[float, int]] = None
+    for idx, cell in enumerate(row):
+        if idx == target_idx:
+            continue
+        match = _NUMERIC_RX.search(cell or "")
+        if not match:
+            continue
+        token = match.group(0)
+        if token.endswith("%"):
+            continue
+        value = _numeric_token_value(token)
+        magnitude = abs(value) if value is not None else 0.0
+        score = (magnitude, idx)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = idx
+            best_token = token
+    if best_idx is None or best_token is None:
+        return False
+    row[target_idx] = best_token
+    if best_idx < len(conf_row):
+        conf_row[target_idx] = max(conf_row[target_idx], conf_row[best_idx])
+    return True
+
+def _resize_keep_ar(im, w, h):
+    im = im.convert("L")
+    iw, ih = im.size
+    scale = min(max(1, w-2)/max(1, iw), max(1, h-2)/max(1, ih))
+    tw, th = max(1, int(round(iw*scale))), max(1, int(round(ih*scale)))
+    imr = im.resize((tw, th), resample=Image.BILINEAR)
+    out = Image.new("L", (w,h), 0)
+    out.paste(imr, ((w-tw)//2,(h-th)//2))
+    return out
+
+
+_TOKEN_TEMPLATE_SIZE = (96, 28)
+_TOKEN_TEMPLATE_MAX_VARIANTS = 8
+_TOKEN_TEMPLATE_PRESETS = [
+    "item",
+    "qty",
+    "unit price",
+    "amount",
+    "total",
+    "subtotal",
+    "tax",
+    "due",
+    "date",
+    "見積金額",
+    "御見積金額",
+    "数量",
+    "単価",
+    "金額",
+    "小計",
+    "合計",
+]
+
+
+def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
+
+_TOKEN_TEMPLATE_FONT = _load_template_font()
+
+
+def _render_template_bitmap(token: str) -> Optional["Image.Image"]:
+    text = (token or "").strip()
+    if not text:
+        return None
+    font = _TOKEN_TEMPLATE_FONT
+    try:
+        bbox = font.getbbox(text)
+    except Exception:
+        bbox = None
+    if bbox:
+        width = max(12, bbox[2] - bbox[0] + 6)
+        height = max(12, bbox[3] - bbox[1] + 6)
+    else:
+        width = max(12, len(text) * 8)
+        height = 24
+    img = Image.new("L", (width, height), 0)
+    dr = ImageDraw.Draw(img)
+    try:
+        dr.text((3, 2), text, fill=255, font=font)
+    except Exception:
+        return None
+    if not img.getbbox():
+        return None
+    return img
+
+
+def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
+    import numpy as _np
+
+    try:
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+    except Exception:
+        return None
+    resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
+    arr_f = _np.asarray(resized, dtype=_np.float32)
+    if arr_f.size == 0:
+        return None
+    std = float(arr_f.std())
+    if std < 1e-3:
+        return None
+    normed = (arr_f - float(arr_f.mean())) / (std + 1e-3)
+    return normed
+
+
+def _init_token_template_library() -> Dict[str, deque]:
+    library: Dict[str, deque] = {}
+    for token in _TOKEN_TEMPLATE_PRESETS:
+        bmp = _render_template_bitmap(token)
+        if bmp is None:
+            continue
+        norm = _normalize_template_bitmap(bmp)
+        if norm is None:
+            continue
+        dq = library.setdefault(token, deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS))
+        dq.append(norm)
+    return library
+
+
+_TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+
+_TEMPLATE_CACHE_STATE: Dict[str, Any] = {
+    "loaded_path": None,
+    "loaded": False,
+    "autosave": False,
+    "dirty": False,
+}
+
+
+def _template_cache_path() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TEMPLATE_CACHE")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() in {"0", "false", "none"}:
+        return None
+    return os.path.abspath(raw)
+
+
+def _update_template_variant_stats() -> None:
+    total = 0
+    for dq in _TOKEN_TEMPLATE_LIBRARY.values():
+        if dq:
+            total += len(dq)
+    _GLYPH_RUNTIME_STATS["template_cache_variants"] = float(total)
+
+
+def _ensure_template_cache_autosave() -> None:
+    if _TEMPLATE_CACHE_STATE.get("autosave"):
+        return
+    if not _template_cache_path():
+        return
+    atexit.register(_autosave_template_cache)
+    _TEMPLATE_CACHE_STATE["autosave"] = True
+
+
+def _ensure_template_cache_loaded() -> None:
+    path = _template_cache_path()
+    if not path:
+        return
+    state_path = _TEMPLATE_CACHE_STATE.get("loaded_path")
+    if _TEMPLATE_CACHE_STATE.get("loaded") and state_path == path:
+        return
+    _load_token_template_cache(path)
+
+
+def _load_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fr:
+            payload = json.load(fr)
+    except FileNotFoundError:
+        _TEMPLATE_CACHE_STATE["loaded_path"] = path
+        _TEMPLATE_CACHE_STATE["loaded"] = True
+        _TEMPLATE_CACHE_STATE["dirty"] = False
+        _ensure_template_cache_autosave()
+        return
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    restored = 0
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if isinstance(tokens, dict):
+        for token, entry in tokens.items():
+            variants = []
+            if isinstance(entry, dict):
+                seq = entry.get("variants")
+                if isinstance(seq, list):
+                    variants = seq
+            elif isinstance(entry, list):
+                variants = entry
+            for variant in variants:
+                if not isinstance(variant, dict):
+                    continue
+                shape = variant.get("shape")
+                data = variant.get("data")
+                if not shape or not data:
+                    continue
+                try:
+                    arr = np.asarray(data, dtype=np.float32)
+                    dims = tuple(int(v) for v in shape)
+                    if len(dims) != 2 or arr.size != (dims[0] * dims[1]):
+                        continue
+                    arr = arr.reshape(dims)
+                except Exception:
+                    continue
+                dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
+                if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+                    dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+                    _TOKEN_TEMPLATE_LIBRARY[token] = dq
+                dq.append(arr)
+                restored += 1
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _ensure_template_cache_autosave()
+    _update_template_variant_stats()
+    _GLYPH_RUNTIME_STATS["template_cache_loaded"] = float(restored)
+
+
+def _serialize_template_variants(dq: "deque[Any]") -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for tpl in dq:
+        try:
+            arr = np.asarray(tpl, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        payload = {
+            "shape": [int(dim) for dim in arr.shape],
+            "data": [round(float(val), 4) for val in arr.flatten().tolist()],
+        }
+        serialized.append(payload)
+    return serialized
+
+
+def _save_token_template_cache(path: str) -> None:
+    if np is None:
+        return
+    tokens: Dict[str, Any] = {}
+    total = 0
+    for token, dq in _TOKEN_TEMPLATE_LIBRARY.items():
+        if not dq:
+            continue
+        variants = _serialize_template_variants(dq)
+        if not variants:
+            continue
+        tokens[token] = {"variants": variants}
+        total += len(variants)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {"version": 1, "tokens": tokens, "updated_at": time.time()}
+    try:
+        with open(path, "w", encoding="utf-8") as fw:
+            json.dump(payload, fw, ensure_ascii=False)
+    except Exception:
+        _GLYPH_RUNTIME_STATS["template_cache_errors"] += 1.0
+        return
+    _TEMPLATE_CACHE_STATE["loaded_path"] = path
+    _TEMPLATE_CACHE_STATE["loaded"] = True
+    _TEMPLATE_CACHE_STATE["dirty"] = False
+    _GLYPH_RUNTIME_STATS["template_cache_saved"] = float(total)
+    _update_template_variant_stats()
+
+
+def _autosave_template_cache() -> None:
+    if not _TEMPLATE_CACHE_STATE.get("dirty"):
+        return
+    path = _template_cache_path()
+    if not path:
+        return
+    _save_token_template_cache(path)
+
+def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
+    import numpy as _np
 
 def _observe_token_template(token: str, arr: Any) -> None:
     if not token:
@@ -12627,6 +13310,9 @@ def _patched_run_full_pipeline(
     blank_min_ratio: Optional[float] = None,
     blank_min_area: Optional[int] = None,
     allow_pytesseract: Optional[bool] = None,
+    tess_unicharset: Optional[str] = None,
+    tess_wordlist: Optional[str] = None,
+    tess_bigram_json: Optional[str] = None,
 ) -> Dict[str, Any]:
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
@@ -12664,6 +13350,21 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
     else:
         os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
+    if tess_unicharset is not None:
+        if tess_unicharset:
+            os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
+        else:
+            os.environ.pop("ZOCR_TESS_UNICHARSET", None)
+    if tess_wordlist is not None:
+        if tess_wordlist:
+            os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
+        else:
+            os.environ.pop("ZOCR_TESS_WORDLIST", None)
+    if tess_bigram_json is not None:
+        if tess_bigram_json:
+            os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
+        else:
+            os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -12873,6 +13574,21 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
 
     episode_info = _begin_episode(outdir)
     if episode_info:
@@ -13967,6 +14683,21 @@ def main():
         help="Force-disable pytesseract even if the environment opts in",
     )
     ap.add_argument(
+        "--tess-unicharset",
+        default=None,
+        help="Path to a Tesseract-style unicharset file for toy lexical gating",
+    )
+    ap.add_argument(
+        "--tess-wordlist",
+        default=None,
+        help="Optional newline-delimited dictionary that boosts toy OCR tokens",
+    )
+    ap.add_argument(
+        "--tess-bigram-json",
+        default=None,
+        help="JSON bigram table that penalizes unlikely glyph transitions",
+    )
+    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -14033,6 +14764,9 @@ def main():
             blank_min_ratio=args.blank_min_ratio,
             blank_min_area=args.blank_min_area,
             allow_pytesseract=args.allow_pytesseract,
+            tess_unicharset=args.tess_unicharset,
+            tess_wordlist=args.tess_wordlist,
+            tess_bigram_json=args.tess_bigram_json,
         )
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
