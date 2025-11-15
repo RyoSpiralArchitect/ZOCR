@@ -3328,7 +3328,7 @@ def _enforce_default_toy_feature_flags(
 
     if "pytesseract" not in feature_status:
         feature_status["pytesseract"] = {
-            "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", False),
+            "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", True),
             "source": "env" if os.environ.get("ZOCR_ALLOW_PYTESSERACT") else "default",
         }
 
@@ -3421,8 +3421,6 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "1"
     elif allow_pytesseract is False:
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
-    else:
-        os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
     tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
     tess_wordlist = _validate_file_if_supplied(tess_wordlist, "--tess-wordlist")
     tess_bigram_json = _validate_file_if_supplied(tess_bigram_json, "--tess-bigram-json")
@@ -3704,6 +3702,31 @@ def _patched_run_full_pipeline(
             "enabled": any(tesslite_cfg.values()),
             **{k: v for k, v in tesslite_cfg.items() if v},
         }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
+        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
+    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
     bandit: Optional[PriorBandit] = None
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
@@ -4994,14 +5017,14 @@ def main():
         dest="allow_pytesseract",
         action="store_true",
         default=None,
-        help="Opt back into spawning pytesseract during export",
+        help="Explicitly allow pytesseract variants (enabled by default unless --no-allow-pytesseract or ZOCR_ALLOW_PYTESSERACT=0 is set)",
     )
     ap.add_argument(
         "--no-allow-pytesseract",
         dest="allow_pytesseract",
         action="store_false",
         default=None,
-        help="Force-disable pytesseract even if the environment opts in",
+        help="Force-disable pytesseract even when the environment would otherwise allow it",
     )
     ap.add_argument(
         "--tess-unicharset",

@@ -73,6 +73,8 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 | `--advisor-response` | **[JA]** 外部アドバイザ（LLM等）の助言ファイルを与えて再解析/監視の再実行に接続。<br>**[EN]** Feed advisor (LLM) responses so the orchestrator can trigger reruns based on the advice.<br>**[FR]** Fournit une réponse d’advisor afin de relancer réanalyse/monitoring selon les recommandations. |
 | `--tess-unicharset` / `--tess-wordlist` / `--tess-bigram-json` | **[JA]** Toy OCR に与える Tesseract 互換の文字集合・辞書・バイグラム表を指定。<br>**[EN]** Point to Tesseract-style unicharset / dictionary / bigram JSON files that feed the toy lexical gates.<br>**[FR]** Indique des fichiers unicharset/dictionnaire/bigrammes façon Tesseract pour alimenter les garde-fous lexicaux du Toy OCR. |
 
+> **[JA]** `python -m zocr consensus …` や `zocr_allinone_merged_plus.py` では `--autocalib [N]` / `--autotune [N]` を使うと、フラグ単体で既定回数（それぞれ 3 / 6）を実行し、`0` または未指定で無効化できます。<br>**[EN]** Within the standalone consensus / legacy runners, the optional `--autocalib [N]` and `--autotune [N]` flags now enable the passes with default sample/trial counts (3 / 6) when invoked without an explicit value, while omitting the flag or passing `0` keeps them disabled.<br>**[FR]** Pour les exécutables `zocr consensus` et `zocr_allinone_merged_plus.py`, les options `--autocalib [N]` / `--autotune [N]` activent désormais automatiquement les passes (3 / 6 échantillons si aucune valeur n’est fournie) ; laissez l’option absente ou indiquez `0` pour les désactiver.
+
 ## サブコマンド / Subcommands / Sous-commandes
 - `history --outdir out_invoice --limit 10` — 直近の処理履歴を表示 / show recent history / affiche l'historique récent。
 - `summary --outdir out_invoice --keys sql_csv rag_manifest` — 生成物を JSON 出力 / print artifacts / affiche les artefacts。
@@ -188,8 +190,8 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 
 ## Export 進捗と高速化 / Export progress & acceleration / Export : progression et accélérations
 - `ZOCR_EXPORT_OCR` で Export 内の OCR バックエンドを切り替えられます（例: `fast` でセル OCR をスキップし構造のみ書き出し、`toy` / `tesseract` で再解析）。
-- `ZOCR_ALLOW_PYTESSERACT=1` を指定すると明示的に pytesseract 呼び出しを再度許可できます（既定 0 では外部 OCR を封印し Toy/Faux エンジンのみ使用します）。CLI から再度オンにする場合は `--allow-pytesseract` を付けてください（`--no-allow-pytesseract` で強制オフ）。
-- Set `ZOCR_ALLOW_PYTESSERACT=1` if you explicitly want to spawn pytesseract; by default it stays disabled so demo/toy runs rely purely on the in-repo faux OCR stack. The orchestrator CLI mirrors this via `--allow-pytesseract` / `--no-allow-pytesseract` switches.
+- `ZOCR_ALLOW_PYTESSERACT=0` もしくは `--no-allow-pytesseract` を指定すると外部 pytesseract 呼び出しを完全停止できます（既定は許可で、`--allow-pytesseract` / `ZOCR_ALLOW_PYTESSERACT=1` は明示的な上書きとして残しています）。
+- Set `ZOCR_ALLOW_PYTESSERACT=0` or pass `--no-allow-pytesseract` to fully disable pytesseract; it is now allowed by default, and `--allow-pytesseract` / `ZOCR_ALLOW_PYTESSERACT=1` remain as explicit opt-ins if you need to override other settings.
 - Export 時の行バンド再シード（motion prior）は既定で常時有効になりました。`--no-motion-prior` や `ZOCR_EXPORT_MOTION_PRIOR=0` で無効化できます。<br>**[EN]** Motion-prior reseeding between toy export sweeps is now enabled by default; opt out via `--no-motion-prior` or `ZOCR_EXPORT_MOTION_PRIOR=0`. <br>**[FR]** Le motion prior est désormais actif par défaut ; utilisez `--no-motion-prior` ou `ZOCR_EXPORT_MOTION_PRIOR=0` pour revenir à l’exploration exhaustive.
 - `ZOCR_EXPORT_PROGRESS=1` と `ZOCR_EXPORT_LOG_EVERY=100`（任意）でセル処理数の進捗ログを標準出力に流し、長大なグリッドでも固まって見えません。
 - `ZOCR_EXPORT_MAX_CELLS` を指定すると巨大テーブルをサンプリングできます。進捗ログ有効時は `last_export_stats()` / `pipeline_summary.json` にページ数・セル数・数値強制件数・処理秒数が残ります。

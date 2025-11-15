@@ -1572,6 +1572,16 @@ def make_demo(out_dir: str):
     return [img_path],[ann_path]
 
 # ----------------- CLI -----------------
+_AUTOCALIB_DEFAULT_SAMPLES = 3
+_AUTOTUNE_DEFAULT_TRIALS = 6
+
+
+def _positive_cli_value(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    return value if value > 0 else None
+
+
 def main():
     p=argparse.ArgumentParser(description="Z‑OCR one‑file (Consensus + MM RAG)")
     p.add_argument("-i","--input",nargs="*",default=[],help="Images or PDF")
@@ -1597,8 +1607,30 @@ def main():
     p.add_argument("--ambiguous-low",type=float,default=0.35)
     p.add_argument("--ambiguous-high",type=float,default=0.65)
     # auto
-    p.add_argument("--autocalib",type=int,default=0)
-    p.add_argument("--autotune",type=int,default=0)
+    p.add_argument(
+        "--autocalib",
+        nargs="?",
+        type=int,
+        const=_AUTOCALIB_DEFAULT_SAMPLES,
+        default=None,
+        metavar="N",
+        help=(
+            "Auto-calibrate CC params using N sample pages (default %(const)s if no "
+            "explicit value is provided). Pass 0 or omit to disable."
+        ),
+    )
+    p.add_argument(
+        "--autotune",
+        nargs="?",
+        type=int,
+        const=_AUTOTUNE_DEFAULT_TRIALS,
+        default=None,
+        metavar="N",
+        help=(
+            "Run the unsupervised autotuner for N trials (default %(const)s when the "
+            "flag is value-less). Pass 0 or omit to skip autotuning."
+        ),
+    )
     _patch_cli_for_export_and_search(p)
     args=p.parse_args()
     ensure_dir(args.out)
@@ -1625,13 +1657,13 @@ def main():
              "baseline_sigma_factor": args.baseline_sigma_factor,
              "consensus_thr": args.consensus_thr,
              "ambiguous_low": args.ambiguous_low, "ambiguous_high": args.ambiguous_high}
-    if args.autocalib>0: tab_cfg.update(auto_calibrate_params(pages,args.autocalib))
-    if args.autotune>0: tab_cfg.update(autotune_params(pages,tab_cfg,trials=args.autotune))
+    autocalib_samples = _positive_cli_value(args.autocalib)
+    autotune_trials = _positive_cli_value(args.autotune)
+    if autocalib_samples:
+        tab_cfg.update(auto_calibrate_params(pages, autocalib_samples))
+    if autotune_trials:
+        tab_cfg.update(autotune_params(pages, tab_cfg, trials=autotune_trials))
     cfg={"table":tab_cfg,"bench_iterations":args.bench_iterations,"eval":True}
-    # subcommands first (skip pipeline run)
-    if args.cmd:
-        args.func(args)
-        return
     pipe=Pipeline(cfg)
     res, out_json = pipe.run("doc", pages, args.out, annos)
     print("Wrote:", out_json)
@@ -3404,7 +3436,7 @@ _PYTESS_TIMEOUT_WARNED = False
 def _pytesseract_allowed() -> bool:
     raw = os.environ.get("ZOCR_ALLOW_PYTESSERACT")
     if raw is None:
-        return False
+        return True
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -3908,6 +3940,11 @@ def _infer_numeric_kinds_from_values(
     _NUMERIC_HEADER_INFERRED_LAST = inferred
     return kinds
 
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
 
 def _numeric_header_kinds(
     headers: Sequence[str],
@@ -13731,7 +13768,7 @@ def _enforce_default_toy_feature_flags(
 
     if "pytesseract" not in status:
         status["pytesseract"] = {
-            "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", False),
+            "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", True),
             "source": "env" if os.environ.get("ZOCR_ALLOW_PYTESSERACT") else "default",
         }
 
@@ -13815,8 +13852,6 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "1"
     elif allow_pytesseract is False:
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
-    else:
-        os.environ.setdefault("ZOCR_ALLOW_PYTESSERACT", "0")
     tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
     tess_wordlist = _validate_file_if_supplied(tess_wordlist, "--tess-wordlist")
     tess_bigram_json = _validate_file_if_supplied(tess_bigram_json, "--tess-bigram-json")
@@ -15154,14 +15189,14 @@ def main():
         dest="allow_pytesseract",
         action="store_true",
         default=None,
-        help="Opt back into spawning pytesseract during export",
+        help="Explicitly allow pytesseract variants (enabled by default unless --no-allow-pytesseract or ZOCR_ALLOW_PYTESSERACT=0 is set)",
     )
     ap.add_argument(
         "--no-allow-pytesseract",
         dest="allow_pytesseract",
         action="store_false",
         default=None,
-        help="Force-disable pytesseract even if the environment opts in",
+        help="Force-disable pytesseract even when the environment would otherwise allow it",
     )
     ap.add_argument(
         "--tess-unicharset",
