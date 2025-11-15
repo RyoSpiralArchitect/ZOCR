@@ -89,6 +89,10 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 
 各段階は `_safe_step` でガードされ、成功・失敗・経過時間を `pipeline_history.jsonl` に追記します。
 
+- **[JA]** Item/Qty/Unit Price/Amount のスキーマ整形は先頭数行をマージした疑似ヘッダも試し、最初に一致した候補や使用した戦略を `schema_alignment.header_sources` / `strategy_breakdown` に記録するため、ヘッダ欠落ページでも自動整列が効きます。
+- **[EN]** The schema rectifier now merges the first rows into synthetic headers before falling back to semantic/heuristic detection and logs the winning header source plus strategy breakdown under `schema_alignment`, so headerless Japanese invoices/estimates still align automatically.
+- **[FR]** L’alignement Item/Qty/Unit Price/Amount fusionne désormais les premières lignes pour fabriquer des en-têtes candidats, essaie chaque option puis note la source retenue et la stratégie dans `schema_alignment`, ce qui stabilise les tableaux sans en-tête.
+
 - **[JA]** Export 段階では合議フェーズで得た `row_bands` を再利用し、行分割の精度を維持したままセル OCR を行います。
 - **[EN]** During export we reuse the consensus `row_bands` so OCR crops stay aligned with the reconstructed rows.
 - **[FR]** Pendant l'export, les `row_bands` issus du consensus sont réutilisés afin d'aligner l'OCR sur les lignes reconstruites.

@@ -4420,6 +4420,59 @@ def _build_schema_synonym_map() -> Dict[str, str]:
 _SCHEMA_SYNONYM_MAP = _build_schema_synonym_map()
 
 
+def _schema_candidate_headers(
+    grid_text: Sequence[Sequence[str]], max_rows: int = 3
+) -> List[Tuple[str, List[str]]]:
+    if not grid_text:
+        return []
+    sample_rows = [row for row in grid_text[:max_rows] if row]
+    if not sample_rows:
+        sample_rows = [grid_text[0]]
+    width = max((len(row) for row in sample_rows), default=len(grid_text[0] or []))
+    width = max(width, len(grid_text[0])) if grid_text and grid_text[0] else width
+
+    def _pad(row: Sequence[str]) -> List[str]:
+        return [
+            str(row[idx]) if idx < len(row) and row[idx] is not None else ""
+            for idx in range(width)
+        ]
+
+    candidates: List[Tuple[str, List[str]]] = []
+    seen: Set[Tuple[str, ...]] = set()
+
+    def _push(label: str, row: List[str]) -> None:
+        if not row:
+            return
+        if not any(str(cell or "").strip() for cell in row):
+            return
+        key = tuple(row)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((label, row))
+
+    for ridx, row in enumerate(sample_rows):
+        _push(f"row{ridx}", _pad(row))
+
+    max_span = min(len(sample_rows), max_rows)
+    for span in range(2, max_span + 1):
+        merged = ["" for _ in range(width)]
+        for ridx in range(span):
+            row = _pad(sample_rows[ridx])
+            for idx, token in enumerate(row):
+                token_clean = str(token or "").strip()
+                if not token_clean:
+                    continue
+                current = str(merged[idx] or "").strip()
+                if not current or len(current) <= 2:
+                    merged[idx] = token
+                elif len(token_clean) > len(current):
+                    merged[idx] = token
+        _push("+".join(f"row{ridx}" for ridx in range(span)), merged)
+
+    return candidates
+
+
 def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
     if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
         return None
@@ -4761,7 +4814,14 @@ def _rectify_item_qty_amount_schema(
     if not grid_text or not grid_text[0]:
         return None
     strategy = "header"
-    match = _match_item_qty_schema(grid_text[0])
+    header_candidates = _schema_candidate_headers(grid_text)
+    header_source = None
+    match: Optional[List[int]] = None
+    for label, header_row in header_candidates:
+        match = _match_item_qty_schema(header_row)
+        if match:
+            header_source = label
+            break
     if not match:
         match = _semantic_item_qty_schema(grid_text)
         if match:
@@ -4907,6 +4967,8 @@ def _rectify_item_qty_amount_schema(
         "trailing_notes": trailing_notes,
         "trailing_note_rows": trailing_note_rows,
         "trailing_note_examples": trailing_note_examples[:5],
+        "header_candidates": len(header_candidates),
+        "header_source": header_source,
     }
     return new_text, new_conf, new_bounds, stats
 
@@ -6580,6 +6642,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
     schema_trailing_note_rows = 0
     schema_item_aux_examples: List[str] = []
     schema_trailing_examples: List[str] = []
+    schema_header_candidates = 0
+    schema_header_sources: Dict[str, int] = defaultdict(int)
+    schema_strategy_breakdown: Dict[str, int] = defaultdict(int)
     total_rows_seen = 0
     total_rows_reflowed = 0
     total_rows_ocr_attempts = 0
@@ -6875,6 +6940,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     schema_item_aux_cells += int(schema_meta.get("item_aux_cells", 0))
                     schema_trailing_notes += int(schema_meta.get("trailing_notes", 0))
                     schema_trailing_note_rows += int(schema_meta.get("trailing_note_rows", 0))
+                    schema_header_candidates += int(schema_meta.get("header_candidates", 0))
+                    strategy_name = schema_meta.get("strategy")
+                    if strategy_name:
+                        schema_strategy_breakdown[str(strategy_name)] += 1
+                    header_source_meta = schema_meta.get("header_source")
+                    if header_source_meta:
+                        schema_header_sources[str(header_source_meta)] += 1
                     aux_samples = schema_meta.get("item_aux_examples") or []
                     if isinstance(aux_samples, list):
                         for sample in aux_samples:
@@ -7235,6 +7307,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
             export_stats["schema_alignment"]["item_aux_examples"] = schema_item_aux_examples[:5]
         if schema_trailing_examples:
             export_stats["schema_alignment"]["trailing_note_examples"] = schema_trailing_examples[:5]
+        if schema_header_candidates:
+            export_stats["schema_alignment"]["header_candidates"] = int(schema_header_candidates)
+        if schema_header_sources:
+            export_stats["schema_alignment"]["header_sources"] = dict(schema_header_sources)
+        if schema_strategy_breakdown:
+            export_stats["schema_alignment"]["strategy_breakdown"] = dict(schema_strategy_breakdown)
     if total_rows_seen:
         export_stats["total_rows"] = {
             "rows": int(total_rows_seen),
