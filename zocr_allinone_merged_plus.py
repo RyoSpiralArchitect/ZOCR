@@ -3940,6 +3940,11 @@ def _infer_numeric_kinds_from_values(
     _NUMERIC_HEADER_INFERRED_LAST = inferred
     return kinds
 
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
 
 def _numeric_header_kinds(
     headers: Sequence[str],
