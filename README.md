@@ -29,10 +29,6 @@ zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 - **[EN]** Each assist plan entry now carries `domain_tags`, an LLM-friendly `llm_directive`, and `domain_briefings`, giving downstream RAG helpers invoice/contract/logistics-specific instructions without having to reverse-engineer the event payloads.
 - **[FR]** Chaque entrée du plan d’assistance expose `domain_tags`, une `llm_directive` lisible par LLM ainsi que des `domain_briefings`, ce qui livre aux assistants RAG des consignes ciblées (facture, contrat, logistique, etc.) sans devoir décoder l’événement brut.
 
-#### Frontier & identity / フロンティアと技術的アイデンティティ / Frontière et identité
-- **[JA]** AI 市場にはまだ「請求書や法務文書を意味構造ごと差分化する」製品が存在せず、`zocr.diff` のように表×節×filters を束ねて比較できる基盤は希少です。ここを押さえることで Z-OCR 全体の技術的アイデンティティを形成でき、請求書ドメイン等で運用済みの下流 RAG／再解析ループへも即接続できます。
-- **[EN]** The AI market still lacks semantic diff tooling that understands invoices, legal decks, CAD-like tables, and business specs at the structural level. Owning this frontier with `zocr.diff` turns the pipeline into a recognizable identity play while letting us reuse the existing invoice-domain RAG + reanalysis feedback loops for downstream support agents.
-- **[FR]** Le marché IA ne dispose toujours pas d’un diff sémantique capable de traiter factures, documents juridiques, tableaux CAD ou spécifications métier au niveau structurel. En maîtrisant cette frontière via `zocr.diff`, la suite forge une identité technique claire et réutilise les boucles RAG/réanalyse déjà éprouvées sur les domaines facturation pour épauler les agents en aval.
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash
