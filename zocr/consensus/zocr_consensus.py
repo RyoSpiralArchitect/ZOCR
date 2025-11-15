@@ -4711,6 +4711,48 @@ def _schema_pick_from_noise(
     return None
 
 
+def _looks_like_numeric_token(text: Optional[str]) -> bool:
+    if text is None:
+        return False
+    body = str(text).strip()
+    if not body:
+        return False
+    compact = body.replace(",", "").replace("，", "").replace("．", ".")
+    if compact.endswith("%"):
+        compact = compact[:-1]
+    return bool(re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact))
+
+
+def _looks_like_item_context(text: Optional[str]) -> bool:
+    if text is None:
+        return False
+    body = str(text).strip()
+    if not body:
+        return False
+    if _looks_like_numeric_token(body):
+        return False
+    if any(ch.isalpha() for ch in body):
+        return True
+    for ch in body:
+        cat = unicodedata.category(ch)
+        if cat.startswith("L"):
+            return True
+    return len(body) >= 4
+
+
+def _looks_like_item_noise(text: Optional[str]) -> bool:
+    if text is None:
+        return True
+    body = str(text).strip()
+    if not body:
+        return True
+    if len(body) <= 2:
+        return True
+    if body.isupper() and len(body) <= 4 and body.isalpha():
+        return True
+    return False
+
+
 def _rectify_item_qty_amount_schema(
     grid_text: List[List[str]],
     grid_conf: List[List[float]],
@@ -4732,12 +4774,20 @@ def _rectify_item_qty_amount_schema(
     if any(idx + 1 >= len(col_bounds) for idx in match):
         return None
     noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    left_item_cols = [idx for idx in noise_cols if idx < match[0]] if match else []
+    right_amount_cols = [idx for idx in noise_cols if idx > match[-1]] if match else []
     width = len(match)
     new_text: List[List[str]] = []
     new_conf: List[List[float]] = []
     rows_adjusted = 0
     cells_salvaged = 0
     cells_cleared = 0
+    item_aux_rows = 0
+    item_aux_cells = 0
+    item_aux_examples: List[str] = []
+    trailing_notes = 0
+    trailing_note_rows = 0
+    trailing_note_examples: List[str] = []
 
     def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
         txt = row[idx] if idx < len(row) else ""
@@ -4760,11 +4810,22 @@ def _rectify_item_qty_amount_schema(
                 row_changed = True
         else:
             noise_pool = []
+            left_candidates: List[Tuple[str, float]] = []
+            trailing_candidates: List[str] = []
             for idx in sorted(noise_cols, reverse=True):
                 txt, cf = _extract(row, conf_row, idx)
                 if not txt:
                     continue
                 noise_pool.append((txt, cf))
+                if idx in left_item_cols and _looks_like_item_context(txt):
+                    cleaned = str(txt).strip()
+                    if cleaned:
+                        left_candidates.append((cleaned, cf))
+                elif idx in right_amount_cols:
+                    cleaned = str(txt).strip()
+                    if not cleaned or _looks_like_numeric_token(cleaned):
+                        continue
+                    trailing_candidates.append(cleaned)
             for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
                 normalizer_key = col_def.get("normalizer")
                 normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
@@ -4788,6 +4849,39 @@ def _rectify_item_qty_amount_schema(
                         new_row[pos] = ""
                         row_changed = True
                         cells_cleared += 1
+            if left_candidates:
+                left_candidates.reverse()
+                base_val = new_row[0] or ""
+                base_clean = base_val.strip()
+                allow_merge = (not base_clean) or _looks_like_item_noise(base_clean) or len(base_clean) <= 3
+                if allow_merge:
+                    merged_tokens: List[str] = []
+                    for token, cf in left_candidates:
+                        token_clean = token.strip()
+                        if not token_clean:
+                            continue
+                        if token_clean in merged_tokens:
+                            continue
+                        merged_tokens.append(token_clean)
+                        item_aux_cells += 1
+                        if len(item_aux_examples) < 5:
+                            item_aux_examples.append(token_clean)
+                        new_conf_row[0] = max(new_conf_row[0], cf)
+                    keep_existing = bool(base_clean and not _looks_like_item_noise(base_clean))
+                    if keep_existing and base_clean:
+                        merged_tokens.append(base_clean)
+                    if merged_tokens:
+                        merged_value = "\n".join(merged_tokens)
+                        if merged_value != new_row[0]:
+                            new_row[0] = merged_value
+                            row_changed = True
+                            item_aux_rows += 1
+            if trailing_candidates:
+                trailing_notes += len(trailing_candidates)
+                trailing_note_rows += 1
+                for token in trailing_candidates:
+                    if len(trailing_note_examples) < 5 and token not in trailing_note_examples:
+                        trailing_note_examples.append(token)
         if row_changed:
             rows_adjusted += 1
         if len(new_row) < width:
@@ -4807,6 +4901,12 @@ def _rectify_item_qty_amount_schema(
         "cells_cleared": cells_cleared,
         "strategy": strategy,
         "columns": [int(idx) for idx in match],
+        "item_aux_rows": item_aux_rows,
+        "item_aux_cells": item_aux_cells,
+        "item_aux_examples": item_aux_examples[:5],
+        "trailing_notes": trailing_notes,
+        "trailing_note_rows": trailing_note_rows,
+        "trailing_note_examples": trailing_note_examples[:5],
     }
     return new_text, new_conf, new_bounds, stats
 
@@ -6474,6 +6574,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
     schema_rows_adjusted = 0
     schema_cells_salvaged = 0
     schema_cells_cleared = 0
+    schema_item_aux_rows = 0
+    schema_item_aux_cells = 0
+    schema_trailing_notes = 0
+    schema_trailing_note_rows = 0
+    schema_item_aux_examples: List[str] = []
+    schema_trailing_examples: List[str] = []
     total_rows_seen = 0
     total_rows_reflowed = 0
     total_rows_ocr_attempts = 0
@@ -6765,6 +6871,22 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     schema_rows_adjusted += int(schema_meta.get("rows_adjusted", 0))
                     schema_cells_salvaged += int(schema_meta.get("cells_salvaged", 0))
                     schema_cells_cleared += int(schema_meta.get("cells_cleared", 0))
+                    schema_item_aux_rows += int(schema_meta.get("item_aux_rows", 0))
+                    schema_item_aux_cells += int(schema_meta.get("item_aux_cells", 0))
+                    schema_trailing_notes += int(schema_meta.get("trailing_notes", 0))
+                    schema_trailing_note_rows += int(schema_meta.get("trailing_note_rows", 0))
+                    aux_samples = schema_meta.get("item_aux_examples") or []
+                    if isinstance(aux_samples, list):
+                        for sample in aux_samples:
+                            if len(schema_item_aux_examples) >= 5:
+                                break
+                            schema_item_aux_examples.append(str(sample))
+                    trailing_samples = schema_meta.get("trailing_note_examples") or []
+                    if isinstance(trailing_samples, list):
+                        for sample in trailing_samples:
+                            if len(schema_trailing_examples) >= 5:
+                                break
+                            schema_trailing_examples.append(str(sample))
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 for r in range(R):
@@ -7104,7 +7226,15 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "rows_adjusted": int(schema_rows_adjusted),
             "cells_salvaged": int(schema_cells_salvaged),
             "cells_cleared": int(schema_cells_cleared),
+            "item_aux_rows": int(schema_item_aux_rows),
+            "item_aux_cells": int(schema_item_aux_cells),
+            "trailing_notes": int(schema_trailing_notes),
+            "trailing_note_rows": int(schema_trailing_note_rows),
         }
+        if schema_item_aux_examples:
+            export_stats["schema_alignment"]["item_aux_examples"] = schema_item_aux_examples[:5]
+        if schema_trailing_examples:
+            export_stats["schema_alignment"]["trailing_note_examples"] = schema_trailing_examples[:5]
     if total_rows_seen:
         export_stats["total_rows"] = {
             "rows": int(total_rows_seen),
