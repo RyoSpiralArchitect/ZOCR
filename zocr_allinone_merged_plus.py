@@ -2329,6 +2329,7 @@ _TOTAL_LABEL_HINTS = [
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
 _NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
+_NUMERIC_SANITIZE_RX = re.compile(r"[^0-9.+-]")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -2433,6 +2434,13 @@ class _BlankSkipConfig:
 
 
 @dataclass
+class _ConfidenceBoostConfig:
+    enabled: bool = True
+    target: float = 0.82
+    min_input: float = 0.35
+
+
+@dataclass
 class _ExportSweepTracker:
     prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
 
@@ -2481,6 +2489,35 @@ def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
     if min_area is not None:
         cfg.min_area = int(max(1, min_area))
     return cfg
+
+
+def _confidence_boost_cfg_from_env() -> _ConfidenceBoostConfig:
+    cfg = _ConfidenceBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_NUMERIC", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_TARGET", cfg.target))))
+    cfg.min_input = float(max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_MIN_INPUT", cfg.min_input))))
+    return cfg
+
+
+def _apply_confidence_boost(
+    conf: Optional[float], cfg: _ConfidenceBoostConfig
+) -> Tuple[Optional[float], float]:
+    if conf is None or not cfg.enabled:
+        return conf, 0.0
+    base = _normalize_confidence(conf)
+    if base >= cfg.target or base < cfg.min_input:
+        return base, 0.0
+    boosted = float(max(base, cfg.target))
+    return boosted, boosted - base
+
+
+def _confidence_boost_reason(payload: Optional[Dict[str, Any]]) -> str:
+    if not payload:
+        return ""
+    for key in ("amount", "subtotal", "tax_amount", "unit_price", "qty", "tax_rate"):
+        if key in payload:
+            return key
+    return ""
 
 
 def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
@@ -2675,24 +2712,65 @@ def _header_variants_for_numeric(label: str) -> List[str]:
     return variants
 
 
+def _normalize_numeric_bits(text: str, kind: str) -> Tuple[str, Optional[float], Optional[str]]:
+    work = (text or "").strip()
+    if not work:
+        return "", None, None
+    work = work.replace("，", ",").replace("．", ".")
+    neg = False
+    if work.endswith("円"):
+        work = work[:-1]
+    if work.startswith("円"):
+        work = work[1:]
+    if work.startswith("(") and work.endswith(")"):
+        neg = True
+        work = work[1:-1]
+    work = work.strip()
+    percent = "%" in work
+    work = work.replace("%", "")
+    cleaned = _NUMERIC_SANITIZE_RX.sub("", work)
+    if neg and cleaned and not cleaned.startswith("-"):
+        cleaned = "-" + cleaned
+    if not cleaned:
+        return "", None, percent
+    try:
+        value = float(cleaned)
+    except Exception:
+        value = None
+    normalized = cleaned
+    if kind == "qty" and value is not None:
+        qty_val = int(round(value))
+        value = float(qty_val)
+        normalized = str(qty_val)
+    if percent and normalized:
+        normalized = f"{normalized}%"
+    return normalized, value, percent if percent else None
+
+
 def _normalize_numeric_text(text: str, kind: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return t
-    t = t.replace("，", ",").replace("．", ".")
-    t = re.sub(r"[¥￥$,]", "", t)
-    t = t.replace("円", "")
-    t = t.replace(",", "")
-    if kind == "tax_rate":
-        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
-        return (m.group(0) + "%") if m else (text or "")
-    if kind in ("amount", "unit_price"):
-        m = re.search(r"[+\-]?\d+(?:\.\d+)?", t)
-        return m.group(0) if m else (text or "")
+    normalized, _, _ = _normalize_numeric_bits(text, kind)
+    return normalized or (text or "")
+
+
+def _coerce_numeric_filters(kind: Optional[str], text: str) -> Tuple[str, Dict[str, Any]]:
+    if not kind:
+        return text, {}
+    normalized, value, percent = _normalize_numeric_bits(text, kind)
+    payload: Dict[str, Any] = {}
+    result_text = normalized or (text or "")
+    if value is None:
+        return result_text, payload
     if kind == "qty":
-        m = re.search(r"\d+", t)
-        return m.group(0) if m else (text or "")
-    return t
+        payload["qty"] = int(round(value))
+        result_text = str(payload["qty"])
+    elif kind in ("amount", "subtotal", "tax_amount", "unit_price"):
+        payload[kind] = float(value)
+    elif kind == "tax_rate":
+        rate_val = float(value)
+        if percent or abs(rate_val) > 1.0:
+            rate_val = rate_val / 100.0
+        payload["tax_rate"] = rate_val
+    return result_text, payload
 
 
 def _infer_numeric_kinds_from_values(
@@ -4809,6 +4887,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
     guard_timeouts = 0
     blank_cfg = _blank_skip_cfg_from_env()
     blank_skipped = 0
+    confidence_boost_cfg = _confidence_boost_cfg_from_env()
+    confidence_boost_applied = 0
+    confidence_boost_delta = 0.0
+    confidence_boost_reasons: Dict[str, int] = defaultdict(int)
     schema_tables = 0
     schema_noise_columns = 0
     schema_rows_adjusted = 0
@@ -5106,6 +5188,28 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         cy1, cy2 = row_bands[r]
                         txt = grid_text[r][c]
                         conf = grid_conf[r][c]
+                        raw_txt = txt
+                        forced_filters: Dict[str, Any] = {}
+                        boost_marker = ""
+                        col_kind = header_fields[c] if header_fields and c < len(header_fields) else None
+                        date_role = date_roles[c] if date_roles and c < len(date_roles) else None
+                        if col_kind and r > 0:
+                            coerced_txt, forced_filters = _coerce_numeric_filters(col_kind, txt)
+                            if coerced_txt and coerced_txt != txt:
+                                txt = coerced_txt
+                                grid_text[r][c] = coerced_txt
+                            elif coerced_txt:
+                                txt = coerced_txt
+                        boost_reason = _confidence_boost_reason(forced_filters)
+                        if boost_reason and conf is not None:
+                            boosted_conf, delta = _apply_confidence_boost(conf, confidence_boost_cfg)
+                            if boosted_conf is not None and delta > 0.0:
+                                conf = float(boosted_conf)
+                                grid_conf[r][c] = float(boosted_conf)
+                                confidence_boost_applied += 1
+                                confidence_boost_delta += float(delta)
+                                confidence_boost_reasons[boost_reason] += 1
+                                boost_marker = boost_reason
                         # build search/synthesis
                         row_texts = grid_text[r]
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
@@ -5124,9 +5228,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             review_reasons.append("high_surprisal")
                             surprisal_samples += 1
                         trace_id = f"page={pidx},table={ti},row={r},col={c}"
-                        date_role = date_roles[c] if date_roles and c < len(date_roles) else None
+                        has_currency = ("currency" in kws) or any(
+                            sym in (raw_txt or "") for sym in ["¥", "円", "$"]
+                        )
                         filters = {
-                            "has_currency": ("currency" in kws),
+                            "has_currency": has_currency,
                             "row_index": r,
                             "col_index": c,
                             "trace_id": trace_id
@@ -5134,6 +5240,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if r in footer_rows:
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
+                        if forced_filters:
+                            forced_cells += 1
+                            for forced_key in forced_filters:
+                                forced_fields[forced_key] += 1
+                            filters.update(forced_filters)
+                            filters["force_numeric"] = True
+                        if boost_marker:
+                            filters["confidence_boost"] = boost_marker
                         if r > 0:
                             date_payload = _extract_date_filters(txt, date_role)
                         else:
@@ -5172,6 +5286,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "filters": filters
                             }
                         }
+                        if boost_marker:
+                            rec["meta"]["confidence_boost"] = boost_marker
                         if concepts:
                             rec["meta"]["concepts"] = concepts
                         if hypotheses:
@@ -5291,6 +5407,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "dark_threshold": int(blank_cfg.dark_threshold),
             "min_dark_ratio": float(blank_cfg.min_dark_ratio),
             "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        }
+    if confidence_boost_applied:
+        export_stats["confidence_boost"] = {
+            "cells": int(confidence_boost_applied),
+            "delta_sum": round(confidence_boost_delta, 4),
+            "reasons": dict(confidence_boost_reasons),
+            "target": float(confidence_boost_cfg.target),
+            "min_input": float(confidence_boost_cfg.min_input),
         }
     if guard_ms > 0:
         export_stats["guard"] = {

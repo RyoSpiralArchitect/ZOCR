@@ -1275,6 +1275,13 @@ class _BlankSkipConfig:
     min_area: int = 36
 
 
+@dataclass
+class _ConfidenceBoostConfig:
+    enabled: bool = True
+    target: float = 0.82
+    min_input: float = 0.35
+
+
 try:  # pragma: no cover - optional orchestrator helper
     from ..orchestrator.prior import estimate_sigma_px as _estimate_sigma_px  # type: ignore
 except Exception:  # pragma: no cover - fallback when orchestrator is unavailable
@@ -1378,6 +1385,35 @@ def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
     if min_area is not None:
         cfg.min_area = int(max(1, min_area))
     return cfg
+
+
+def _confidence_boost_cfg_from_env() -> _ConfidenceBoostConfig:
+    cfg = _ConfidenceBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_NUMERIC", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_TARGET", cfg.target))))
+    cfg.min_input = float(max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_MIN_INPUT", cfg.min_input))))
+    return cfg
+
+
+def _apply_confidence_boost(
+    conf: Optional[float], cfg: _ConfidenceBoostConfig
+) -> Tuple[Optional[float], float]:
+    if conf is None or not cfg.enabled:
+        return conf, 0.0
+    base = _normalize_confidence(conf)
+    if base >= cfg.target or base < cfg.min_input:
+        return base, 0.0
+    boosted = float(max(base, cfg.target))
+    return boosted, boosted - base
+
+
+def _confidence_boost_reason(payload: Optional[Dict[str, Any]]) -> str:
+    if not payload:
+        return ""
+    for key in ("amount", "subtotal", "tax_amount", "unit_price", "qty", "tax_rate"):
+        if key in payload:
+            return key
+    return ""
 
 
 def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
@@ -4977,6 +5013,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
     )
     blank_cfg = _blank_skip_cfg_from_env()
     blank_skipped = 0
+    confidence_boost_cfg = _confidence_boost_cfg_from_env()
+    confidence_boost_applied = 0
+    confidence_boost_delta = 0.0
+    confidence_boost_reasons: Dict[str, int] = defaultdict(int)
     prior_cache_seed: Optional[List[float]] = None
     prior_cache_hits = 0
     prior_cache_writes = 0
@@ -5302,6 +5342,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         conf = grid_conf[r][c]
                         raw_txt = txt
                         forced_filters: Dict[str, Any] = {}
+                        boost_marker = ""
                         col_kind = header_fields[c] if header_fields and c < len(header_fields) else None
                         date_role = date_roles[c] if date_roles and c < len(date_roles) else None
                         if col_kind and r > 0:
@@ -5311,6 +5352,16 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 grid_text[r][c] = coerced_txt
                             elif coerced_txt:
                                 txt = coerced_txt
+                        boost_reason = _confidence_boost_reason(forced_filters)
+                        if boost_reason and conf is not None:
+                            boosted_conf, delta = _apply_confidence_boost(conf, confidence_boost_cfg)
+                            if boosted_conf is not None and delta > 0.0:
+                                conf = float(boosted_conf)
+                                grid_conf[r][c] = float(boosted_conf)
+                                confidence_boost_applied += 1
+                                confidence_boost_delta += float(delta)
+                                confidence_boost_reasons[boost_reason] += 1
+                                boost_marker = boost_reason
                         row_texts = grid_text[r]
                         # build search/synthesis
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
@@ -5349,6 +5400,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 forced_fields[forced_key] += 1
                             filters.update(forced_filters)
                             filters["force_numeric"] = True
+                        if boost_marker:
+                            filters["confidence_boost"] = boost_marker
                         if r > 0:
                             date_payload = _extract_date_filters(txt, date_role)
                         else:
@@ -5387,6 +5440,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "filters": filters
                             }
                         }
+                        if boost_marker:
+                            rec["meta"]["confidence_boost"] = boost_marker
                         if concepts:
                             rec["meta"]["concepts"] = concepts
                         if hypotheses:
@@ -5506,6 +5561,14 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "dark_threshold": int(blank_cfg.dark_threshold),
             "min_dark_ratio": float(blank_cfg.min_dark_ratio),
             "min_dark_pixels": int(blank_cfg.min_dark_pixels),
+        }
+    if confidence_boost_applied:
+        export_stats["confidence_boost"] = {
+            "cells": int(confidence_boost_applied),
+            "delta_sum": round(confidence_boost_delta, 4),
+            "reasons": dict(confidence_boost_reasons),
+            "target": float(confidence_boost_cfg.target),
+            "min_input": float(confidence_boost_cfg.min_input),
         }
     if guard_ms > 0:
         export_stats["guard"] = {
