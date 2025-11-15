@@ -445,6 +445,174 @@ def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_dept
             deduped[-1] = (deduped[-1] + value) * 0.5
     return deduped
 
+
+def _vertical_vote_boundaries(
+    binary: "np.ndarray", max_candidates: int = 16, min_gap: int = 6
+) -> List[int]:
+    """Return low-ink column boundaries via a lightweight vertical voting pass."""
+
+    try:
+        arr = np.asarray(binary, dtype=np.uint8)
+    except Exception:
+        return []
+    if arr.ndim != 2 or arr.size == 0:
+        return []
+    ink = arr.sum(axis=0).astype(np.float32)
+    if ink.size == 0:
+        return []
+    norm = ink / float(max(1.0, ink.max()))
+    blank_score = 1.0 - norm
+    window = max(3, min_gap // 2 * 2 + 1)
+    kernel = np.ones(window, dtype=np.float32)
+    kernel /= float(kernel.sum() or 1.0)
+    smoothed = np.convolve(blank_score, kernel, mode="same")
+    if smoothed.size == 0:
+        return []
+    threshold = float(max(0.2, min(0.85, np.percentile(smoothed, 75))))
+    picks: List[int] = []
+    for idx in range(1, len(smoothed) - 1):
+        if smoothed[idx] < threshold:
+            continue
+        if smoothed[idx] < smoothed[idx - 1] or smoothed[idx] < smoothed[idx + 1]:
+            continue
+        if picks and idx - picks[-1] < min_gap:
+            if smoothed[idx] > smoothed[picks[-1]]:
+                picks[-1] = idx
+            continue
+        picks.append(idx)
+        if len(picks) >= max_candidates:
+            break
+    return [int(val) for val in picks]
+
+
+def _apply_column_continuity_prior(
+    candidates_by_row: List[List[int]], tolerance: int = 5
+) -> List[List[int]]:
+    if not candidates_by_row:
+        return candidates_by_row
+    refined: List[List[int]] = []
+    prev: Optional[List[int]] = None
+    tol = max(1, int(tolerance))
+    for row in candidates_by_row:
+        base = sorted({int(v) for v in row})
+        if prev:
+            augmented = list(base)
+            for anchor in prev:
+                if all(abs(anchor - cur) > tol for cur in base):
+                    augmented.append(int(anchor))
+            base = sorted({int(v) for v in augmented})
+        refined.append(base)
+        prev = base
+    return refined
+
+
+def _refine_column_bounds_alignment(
+    col_bounds: List[int], smooth_strength: float = 0.25
+) -> List[int]:
+    if len(col_bounds) <= 2:
+        return col_bounds
+    widths = [col_bounds[i + 1] - col_bounds[i] for i in range(len(col_bounds) - 1)]
+    target = float(max(1.0, median([abs(w) for w in widths]) if widths else 1.0))
+    new_bounds = [int(col_bounds[0])]
+    for width in widths:
+        deviation = float(width) - target
+        adjusted = float(width) - deviation * smooth_strength
+        adjusted = max(2.0, adjusted)
+        new_bounds.append(int(round(new_bounds[-1] + adjusted)))
+    span_orig = float(col_bounds[-1] - col_bounds[0]) or 1.0
+    span_new = float(new_bounds[-1] - new_bounds[0]) or 1.0
+    scale = span_orig / span_new
+    scaled = [int(round(col_bounds[0] + (val - new_bounds[0]) * scale)) for val in new_bounds]
+    scaled[0] = col_bounds[0]
+    scaled[-1] = col_bounds[-1]
+    return scaled
+
+
+def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: int) -> List[int]:
+    if values.size <= 2:
+        return []
+    valleys: List[int] = []
+    for idx in range(1, values.size - 1):
+        if values[idx] > threshold:
+            continue
+        if values[idx] > values[idx - 1] or values[idx] >= values[idx + 1]:
+            continue
+        if valleys and idx - valleys[-1] < min_gap:
+            if values[idx] < values[valleys[-1]]:
+                valleys[-1] = idx
+            continue
+        valleys.append(idx)
+    return valleys
+
+
+def _align_row_band_centers(
+    row_bands: List[Tuple[int, int]], height: int, med_h: float
+) -> List[Tuple[int, int]]:
+    if len(row_bands) <= 1:
+        return row_bands
+    centers = [0.5 * (y0 + y1) for (y0, y1) in row_bands]
+    diffs = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+    target_gap = float(max(2.0, median([abs(d) for d in diffs]) if diffs else med_h))
+    aligned = [centers[0]]
+    clamp_delta = med_h * 0.6
+    for idx in range(1, len(centers)):
+        expected = aligned[-1] + target_gap
+        delta = clamp(centers[idx] - expected, -clamp_delta, clamp_delta)
+        aligned.append(expected + delta * 0.35)
+    refined: List[Tuple[int, int]] = []
+    for idx, center in enumerate(aligned):
+        span = max(2.0, row_bands[idx][1] - row_bands[idx][0])
+        start = int(round(center - span / 2.0))
+        end = int(round(center + span / 2.0))
+        start = max(0, start)
+        end = min(height, max(start + 2, end))
+        refined.append((start, end))
+    return refined
+
+
+def _refine_row_bands_by_projection(
+    row_bands: List[Tuple[int, int]],
+    binary: "np.ndarray",
+    med_h: float,
+    height: int,
+) -> List[Tuple[int, int]]:
+    if not row_bands:
+        return row_bands
+    try:
+        proj = (np.asarray(binary, dtype=np.uint8) > 0).sum(axis=1).astype(np.float64)
+    except Exception:
+        return row_bands
+    if proj.size == 0:
+        return row_bands
+    kernel = np.ones(5, dtype=np.float64)
+    kernel /= float(kernel.sum() or 1.0)
+    smooth = np.convolve(proj, kernel, mode="same")
+    refined: List[Tuple[int, int]] = []
+    min_gap = int(max(2, med_h * 0.35))
+    for y0, y1 in row_bands:
+        if y1 - y0 <= 0:
+            continue
+        segment = smooth[y0:y1]
+        if (y1 - y0) > med_h * 1.6 and segment.size > 4:
+            thr = float(min(np.percentile(segment, 40), np.mean(segment) * 0.7))
+            valleys = _find_projection_valleys(segment, thr, min_gap)
+            if valleys:
+                points = [y0] + [y0 + v for v in valleys] + [y1]
+                for a, b in zip(points, points[1:]):
+                    if b - a >= max(2, int(med_h * 0.45)):
+                        refined.append((int(a), int(b)))
+                continue
+        refined.append((int(y0), int(y1)))
+    merged: List[Tuple[int, int]] = []
+    for band in refined:
+        if merged and (band[1] - band[0]) < med_h * 0.45:
+            prev = merged[-1]
+            if band[0] - prev[1] <= med_h * 0.25:
+                merged[-1] = (prev[0], max(prev[1], band[1]))
+                continue
+        merged.append(band)
+    return _align_row_band_centers(merged, height, med_h)
+
 # ----------------- Column smoothing (D²-like + λ scheduling) -----------------
 def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
     R = len(candidates_by_row)
@@ -784,6 +952,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 row_bands.append((max(0, int(start-1)), H))
     if not row_bands:
         row_bands.append((0, H))
+    row_bands = _refine_row_bands_by_projection(row_bands, bin_img, med_h, H)
     # per-row chunks & counts
     chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
     row_counts=[len(row) for row in chunks_by_row]
@@ -824,14 +993,24 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         global_mid_seeds.extend(int((btree_seed[i]+btree_seed[i+1])/2.0) for i in range(len(btree_seed)-1))
     if len(centers)>=2:
         global_mid_seeds.extend(int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1))
+    vertical_votes = _vertical_vote_boundaries(
+        bin_img,
+        max_candidates=32,
+        min_gap=int(max(4, med_w * 0.5)),
+    )
+    if vertical_votes:
+        global_mid_seeds.extend(vertical_votes)
     if global_mid_seeds:
         mids_global = sorted({int(val) for val in global_mid_seeds})
         merged_rows: List[List[int]] = []
         for row in candidates_by_row:
             merged_rows.append(sorted({*row, *mids_global}))
         candidates_by_row = merged_rows
+    continuity_tol = int(max(3, med_w * 0.35))
+    candidates_by_row = _apply_column_continuity_prior(candidates_by_row, tolerance=continuity_tol)
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
+    col_bounds = _refine_column_bounds_alignment(col_bounds)
     R=len(row_bands); C=max(1,len(col_bounds)-1)
     used=set(); cells={}
     def which_cols(xl,xr):
@@ -1989,10 +2168,36 @@ _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "T": ("7",),
 }
 
+
+def _radial_signature(arr_f: "np.ndarray") -> Tuple[float, float]:
+    if arr_f.ndim != 2 or arr_f.size == 0:
+        return 0.0, 0.0
+    arr = np.asarray(arr_f, dtype=np.float32)
+    h, w = arr.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    radius = float(max(1.0, max(cy, cx)))
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / radius
+    inner_mask = dist <= 0.4
+    outer_mask = dist >= 0.8
+    inner_val = float(arr[inner_mask].mean()) if inner_mask.any() else 0.0
+    outer_val = float(arr[outer_mask].mean()) if outer_mask.any() else 0.0
+    return inner_val, outer_val
+
+
 def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
     arr_f = np.asarray(arr, dtype=np.float32)
     if arr_f.size == 0:
-        return {"aspect": 1.0, "density": 0.0, "symmetry": 0.0, "style_var": 0.0, "count": 0}
+        return {
+            "aspect": 1.0,
+            "density": 0.0,
+            "symmetry": 0.0,
+            "style_var": 0.0,
+            "radial_inner": 0.0,
+            "radial_outer": 0.0,
+            "count": 0,
+        }
     if arr_f.max() > 1.5:
         arr_f = arr_f / 255.0
     h, w = arr_f.shape
@@ -2006,7 +2211,19 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
         style_var = float(np.var(row_profile) + np.var(col_profile))
     else:
         style_var = 0.0
-    return {"aspect": aspect, "density": density, "symmetry": symmetry, "style_var": style_var, "count": 1}
+    inner_ring = 0.0
+    outer_ring = 0.0
+    if arr_f.ndim == 2 and arr_f.size:
+        inner_ring, outer_ring = _radial_signature(arr_f)
+    return {
+        "aspect": aspect,
+        "density": density,
+        "symmetry": symmetry,
+        "style_var": style_var,
+        "radial_inner": inner_ring,
+        "radial_outer": outer_ring,
+        "count": 1,
+    }
 
 def _render_glyphs(font=None, size=16):
     # PIL's default bitmap font via ImageFont.load_default() matches our demo
@@ -4126,6 +4343,504 @@ _SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]
     "currency": _schema_normalize_currency_value,
 }
 
+_DATE_RX_SLASH = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})[./-](?P<month>0?[1-9]|1[0-2])(?:[./-](?P<day>0?[1-9]|[12]\d|3[01]))?"
+)
+_DATE_RX_KANJI = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_ERA = re.compile(
+    r"(?P<era>令和|平成|昭和)(?P<erayear>元|\d{1,2})年(?P<month>0?[1-9]|1[0-2])月(?:(?P<day>0?[1-9]|[12]\d|3[01])日)?"
+)
+_DATE_RX_COMPACT = re.compile(
+    r"(?P<year>19\d{2}|20\d{2})(?P<month>0?[1-9]|1[0-2])(?P<day>0?[1-9]|[12]\d|3[01])"
+)
+_JP_ERA_BASE = {"令和": 2018, "平成": 1988, "昭和": 1925}
+
+def _schema_pick_from_noise(
+    noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
+) -> Optional[Tuple[str, float]]:
+    if not noise_pool:
+        return None
+    for idx, (text, conf) in enumerate(list(noise_pool)):
+        normalized = normalizer(text)
+        if normalized:
+            noise_pool.pop(idx)
+            return normalized, conf
+    return None
+
+
+def _rectify_item_qty_amount_schema(
+    grid_text: List[List[str]],
+    grid_conf: List[List[float]],
+    col_bounds: List[int],
+) -> Optional[Tuple[List[List[str]], List[List[float]], List[int], Dict[str, Any]]]:
+    if not grid_text or not grid_text[0]:
+        return None
+    strategy = "header"
+    match = _match_item_qty_schema(grid_text[0])
+    if not match:
+        match = _approximate_item_qty_schema(grid_text)
+        if not match:
+            return None
+        strategy = "heuristic"
+    if any(idx + 1 >= len(col_bounds) for idx in match):
+        return None
+    noise_cols = [idx for idx in range(len(grid_text[0])) if idx not in match]
+    width = len(match)
+    new_text: List[List[str]] = []
+    new_conf: List[List[float]] = []
+    rows_adjusted = 0
+    cells_salvaged = 0
+    cells_cleared = 0
+
+    def _extract(row: Sequence[str], conf: Sequence[float], idx: int) -> Tuple[str, float]:
+        txt = row[idx] if idx < len(row) else ""
+        cf = conf[idx] if idx < len(conf) else 0.0
+        return txt, cf
+
+    for r, row in enumerate(grid_text):
+        conf_row = grid_conf[r] if r < len(grid_conf) else [0.0] * len(row)
+        new_row: List[str] = []
+        new_conf_row: List[float] = []
+        for idx in match:
+            txt, cf = _extract(row, conf_row, idx)
+            new_row.append(txt)
+            new_conf_row.append(cf)
+        row_changed = False
+        if r == 0:
+            header_titles = [col["title"] for col in _ITEM_QTY_SCHEMA_COLUMNS]
+            if new_row != header_titles:
+                new_row = header_titles
+                row_changed = True
+        else:
+            noise_pool = []
+            for idx in sorted(noise_cols, reverse=True):
+                txt, cf = _extract(row, conf_row, idx)
+                if not txt:
+                    continue
+                noise_pool.append((txt, cf))
+            for pos, col_def in enumerate(_ITEM_QTY_SCHEMA_COLUMNS):
+                normalizer_key = col_def.get("normalizer")
+                normalizer = _SCHEMA_NORMALIZERS.get(normalizer_key) or (lambda val: val)
+                normalized = normalizer(new_row[pos]) if normalizer_key else (new_row[pos] or "")
+                if normalizer_key and normalized:
+                    if normalized != new_row[pos]:
+                        new_row[pos] = normalized
+                        row_changed = True
+                        cells_salvaged += 1
+                    continue
+                if normalizer_key:
+                    candidate = _schema_pick_from_noise(noise_pool, normalizer)
+                    if candidate:
+                        value, cf = candidate
+                        new_row[pos] = value
+                        new_conf_row[pos] = max(new_conf_row[pos], cf)
+                        row_changed = True
+                        cells_salvaged += 1
+                        continue
+                    if new_row[pos]:
+                        new_row[pos] = ""
+                        row_changed = True
+                        cells_cleared += 1
+        if row_changed:
+            rows_adjusted += 1
+        if len(new_row) < width:
+            new_row.extend([""] * (width - len(new_row)))
+            new_conf_row.extend([0.0] * (width - len(new_conf_row)))
+        new_text.append(new_row)
+        new_conf.append(new_conf_row)
+
+    new_bounds: List[int] = []
+    for idx in match:
+        new_bounds.append(int(col_bounds[idx]))
+    new_bounds.append(int(col_bounds[match[-1] + 1]))
+    stats = {
+        "noise_columns": len(noise_cols),
+        "rows_adjusted": rows_adjusted,
+        "cells_salvaged": cells_salvaged,
+        "cells_cleared": cells_cleared,
+        "strategy": strategy,
+        "columns": [int(idx) for idx in match],
+    }
+    return new_text, new_conf, new_bounds, stats
+
+
+def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
+    if not headers or not _FORCE_NUMERIC:
+        return []
+    kinds = _numeric_header_kinds(headers)
+    if not kinds:
+        return []
+    hints: List[Optional[str]] = []
+    for kind in kinds:
+        hints.append(_NUMERIC_COLUMN_CHARSETS.get(kind) if kind else None)
+    return hints
+
+def _date_role_from_header(header: Optional[str]) -> Optional[str]:
+    if not header:
+        return None
+    base = header.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _date_header_roles(headers: Sequence[str]) -> List[Optional[str]]:
+    roles: List[Optional[str]] = []
+    if not headers:
+        return roles
+    for header in headers:
+        roles.append(_date_role_from_header(header))
+    return roles
+
+
+def _infer_date_role_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    base = text.strip().lower()
+    if not base:
+        return None
+    for role, tokens in _DATE_ROLE_RULES:
+        for token in tokens:
+            if token in base:
+                return role
+    if "date" in base:
+        return "date"
+    return None
+
+
+def _normalize_japanese_era_year(era: str, era_year: str) -> Optional[int]:
+    base = _JP_ERA_BASE.get(era)
+    if base is None:
+        return None
+    token = era_year.strip()
+    if token == "元":
+        offset = 1
+    else:
+        try:
+            offset = int(token)
+        except Exception:
+            return None
+    if offset <= 0:
+        return None
+    return base + offset
+
+
+def _normalize_date_value(text: str) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    norm = str(text).strip()
+    if not norm:
+        return None
+    norm = norm.translate(_FULLWIDTH_NUMBERS)
+    compact = norm.replace(" ", "").replace("　", "")
+
+    def _format(year: int, month: int, day: Optional[int]) -> Optional[Tuple[str, str]]:
+        if year < 1900 or year > 2100:
+            return None
+        if not 1 <= month <= 12:
+            return None
+        precision = "ym"
+        value = f"{year:04d}-{month:02d}"
+        if day is not None:
+            if not 1 <= day <= 31:
+                return None
+            precision = "ymd"
+            value = f"{value}-{day:02d}"
+        return value, precision
+
+    for rx in (_DATE_RX_SLASH, _DATE_RX_KANJI):
+        m = rx.search(compact)
+        if not m:
+            continue
+        try:
+            year = int(m.group("year"))
+            month = int(m.group("month"))
+            day = int(m.group("day")) if m.group("day") else None
+        except Exception:
+            continue
+        formatted = _format(year, month, day)
+        if formatted:
+            return formatted
+
+    m_era = _DATE_RX_ERA.search(compact)
+    if m_era:
+        year = _normalize_japanese_era_year(m_era.group("era"), m_era.group("erayear"))
+        try:
+            month = int(m_era.group("month"))
+            day = int(m_era.group("day")) if m_era.group("day") else None
+        except Exception:
+            month = None
+            day = None
+        if year and month:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+
+    m_compact = _DATE_RX_COMPACT.search(compact)
+    if m_compact:
+        try:
+            year = int(m_compact.group("year"))
+            month = int(m_compact.group("month"))
+            day = int(m_compact.group("day"))
+        except Exception:
+            year = month = day = None
+        if year and month and day:
+            formatted = _format(year, month, day)
+            if formatted:
+                return formatted
+    return None
+
+
+def _extract_date_filters(text: str, header_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_date_value(text)
+    if not normalized:
+        return None
+    value, precision = normalized
+    role = header_role or _infer_date_role_from_text(text)
+    payload: Dict[str, Any] = {
+        "date": value,
+        "date_precision": precision,
+    }
+    if role == "due":
+        payload["due_date"] = value
+    elif role == "issue":
+        payload["issue_date"] = value
+    elif role == "service":
+        payload["service_date"] = value
+    if role:
+        payload["date_role"] = role
+    return payload
+
+
+_NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
+    "qty": "0123456789",
+    "unit_price": "0123456789.-",
+    "amount": "0123456789.-",
+    "subtotal": "0123456789.-",
+    "tax_amount": "0123456789.-",
+    "tax_rate": "0123456789.%",
+}
+
+_ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
+    {
+        "key": "item",
+        "pattern": re.compile(r"(item|品目|description|desc|details)", re.I),
+        "title": "Item",
+        "normalizer": None,
+    },
+    {
+        "key": "qty",
+        "pattern": re.compile(r"(qty|数量|quantity|q'?ty|pcs?|units?)", re.I),
+        "title": "Qty",
+        "normalizer": "qty",
+    },
+    {
+        "key": "unit_price",
+        "pattern": re.compile(r"(unit\s*(price|cost)|単価)", re.I),
+        "title": "Unit Price",
+        "normalizer": "currency",
+    },
+    {
+        "key": "amount",
+        "pattern": re.compile(r"(amount|line\s*total|line\s*amount|金額|total)", re.I),
+        "title": "Amount",
+        "normalizer": "currency",
+    },
+]
+
+
+def _schema_normalize_header_token(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(text)).strip().lower()
+    if not normalized:
+        return ""
+    pieces: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("L") or cat.startswith("N"):
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def _match_item_qty_schema(headers: Sequence[str]) -> Optional[List[int]]:
+    if not headers or len(headers) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    normalized = [_schema_normalize_header_token(h) for h in headers]
+    selected: List[int] = []
+    used: Set[int] = set()
+    for column in _ITEM_QTY_SCHEMA_COLUMNS:
+        pattern = column.get("pattern")
+        best_idx = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            if idx in used:
+                continue
+            token = normalized[idx]
+            if not token or pattern is None:
+                continue
+            if pattern.search(token):
+                best_idx = idx
+                break
+        if best_idx is None:
+            return None
+        used.add(best_idx)
+        selected.append(best_idx)
+    if any(selected[i] >= selected[i + 1] for i in range(len(selected) - 1)):
+        return None
+    return selected
+
+
+def _column_numeric_profiles(grid_text: Sequence[Sequence[str]]) -> List[Dict[str, float]]:
+    if not grid_text:
+        return []
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols <= 0:
+        return []
+    profiles: List[Dict[str, float]] = []
+    currency_tokens = ("¥", "￥", "円", "$", "＄", "元")
+    for col in range(num_cols):
+        total = 0
+        numeric_hits = 0
+        currency_hits = 0
+        decimal_hits = 0
+        text_hits = 0
+        for row in list(grid_text)[1:]:
+            if col >= len(row):
+                continue
+            cell = str(row[col] or "").strip()
+            if not cell:
+                continue
+            total += 1
+            if any(token in cell for token in currency_tokens):
+                currency_hits += 1
+            if _NUMERIC_RX.search(cell.replace("，", ",").replace("．", ".")):
+                numeric_hits += 1
+                if "." in cell or "．" in cell:
+                    decimal_hits += 1
+            elif any(ch.isalpha() for ch in cell):
+                text_hits += 1
+        denom = float(max(1, total))
+        profiles.append(
+            {
+                "samples": float(total),
+                "numeric_ratio": float(numeric_hits) / denom,
+                "currency_ratio": float(currency_hits) / denom,
+                "decimal_ratio": float(decimal_hits) / denom,
+                "text_ratio": float(text_hits) / denom,
+            }
+        )
+    return profiles
+
+
+def _approximate_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[List[int]]:
+    if not grid_text:
+        return None
+    num_cols = max(len(row) for row in grid_text)
+    if num_cols < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+    profiles = _column_numeric_profiles(grid_text)
+    if not profiles or len(profiles) < len(_ITEM_QTY_SCHEMA_COLUMNS):
+        return None
+
+    def _best_index(indices: Sequence[int], key: Callable[[int], Tuple]) -> Optional[int]:
+        valid = [idx for idx in indices if 0 <= idx < len(profiles)]
+        if not valid:
+            return None
+        return max(valid, key=key)
+
+    amount_idx = _best_index(
+        range(num_cols),
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if amount_idx is None:
+        return None
+    unit_price_candidates = [idx for idx in range(amount_idx)]
+    unit_price_idx = _best_index(
+        unit_price_candidates,
+        lambda idx: (
+            profiles[idx]["currency_ratio"],
+            profiles[idx]["decimal_ratio"],
+            profiles[idx]["numeric_ratio"],
+            idx,
+        ),
+    )
+    if unit_price_idx is None:
+        return None
+    qty_candidates = [idx for idx in range(unit_price_idx)]
+    qty_idx = _best_index(
+        qty_candidates,
+        lambda idx: (
+            profiles[idx]["numeric_ratio"],
+            1.0 - min(1.0, profiles[idx]["decimal_ratio"]),
+            1.0 - min(1.0, profiles[idx]["currency_ratio"]),
+            -idx,
+        ),
+    )
+    if qty_idx is None:
+        return None
+    item_candidates = [idx for idx in range(qty_idx)]
+    item_idx = _best_index(
+        item_candidates,
+        lambda idx: (
+            profiles[idx]["text_ratio"],
+            1.0 - min(1.0, profiles[idx]["numeric_ratio"]),
+            -idx,
+        ),
+    )
+    if item_idx is None:
+        return None
+    indices = [item_idx, qty_idx, unit_price_idx, amount_idx]
+    if any(indices[i] >= indices[i + 1] for i in range(len(indices) - 1)):
+        return None
+    return indices
+
+
+def _schema_normalize_qty_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    compact = body.replace(",", "")
+    if not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", compact):
+        return None
+    if "." in compact:
+        compact = compact.rstrip("0").rstrip(".") or "0"
+    return compact
+
+
+def _schema_normalize_currency_value(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    match = _NUMERIC_RX.search(str(text))
+    if not match:
+        return None
+    token = match.group(0)
+    if token.endswith("%"):
+        return None
+    return token.replace(",", "")
+
+
+_SCHEMA_NORMALIZERS: Dict[Optional[str], Callable[[Optional[str]], Optional[str]]] = {
+    None: lambda txt: txt if txt else None,
+    "qty": _schema_normalize_qty_value,
+    "currency": _schema_normalize_currency_value,
+}
+
 
 def _schema_pick_from_noise(
     noise_pool: List[Tuple[str, float]], normalizer: Callable[[Optional[str]], Optional[str]]
@@ -5008,10 +5723,13 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
     cell_density = float((cell_arr > 0).mean())
     cell_aspect = float(cw) / float(ch or 1)
     cell_scaled = cell_arr / 255.0 if cell_arr.max() > 1.5 else cell_arr
+    cell_inner = 0.0
+    cell_outer = 0.0
     if cell_scaled.ndim == 2 and cell_scaled.size:
         row_profile = cell_scaled.mean(axis=1)
         col_profile = cell_scaled.mean(axis=0)
         cell_style = float(_np.var(row_profile) + _np.var(col_profile))
+        cell_inner, cell_outer = _radial_signature(cell_scaled)
     else:
         cell_style = 0.0
     allowed: Optional[Set[str]] = None
@@ -5045,6 +5763,8 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         glyph_density = feats.get("density", 0.5)
         glyph_sym = feats.get("symmetry", 0.0)
         glyph_style = feats.get("style_var", 0.0)
+        glyph_inner = feats.get("radial_inner", cell_inner)
+        glyph_outer = feats.get("radial_outer", cell_outer)
         aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
         density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
         if glyph_sym > 0.5:
@@ -5053,7 +5773,14 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         else:
             symmetry_penalty = 1.0
         style_penalty = 1.0 - min(0.35, abs(cell_style - glyph_style) * 0.8)
-        variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty * max(0.45, style_penalty)
+        radial_penalty = 1.0 - min(0.3, abs(cell_inner - glyph_inner) * 1.2 + abs(cell_outer - glyph_outer) * 0.9)
+        variant_best *= (
+            aspect_penalty
+            * max(0.4, density_penalty)
+            * symmetry_penalty
+            * max(0.45, style_penalty)
+            * max(0.5, radial_penalty)
+        )
         if variant_best > best_score:
             best_score = variant_best
             best_ch = ch_key
@@ -5126,6 +5853,10 @@ class _BaselineStats:
     xheight: float
     ascender: float
     descender: float
+    avg_width: float = 0.0
+    avg_height: float = 0.0
+    stroke_density: float = 0.0
+    aspect_median: float = 1.0
 
 
 def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) -> Optional[_BaselineStats]:
@@ -5133,12 +5864,18 @@ def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) 
         return None
     bottoms: List[float] = []
     heights: List[float] = []
+    widths: List[float] = []
+    densities: List[float] = []
     ascenders: List[float] = []
     descenders: List[float] = []
-    for _, y1, _, y2, _ in boxes:
+    for x1, y1, x2, y2, area in boxes:
         h = float(max(1, y2 - y1))
+        w = float(max(1, x2 - x1))
         heights.append(h)
+        widths.append(w)
         bottoms.append(float(y2))
+        box_area = float(max(1.0, (x2 - x1) * (y2 - y1)))
+        densities.append(float(max(0.0, area)) / box_area)
     if not heights or not bottoms:
         return None
     baseline = float(median(bottoms))
@@ -5150,7 +5887,19 @@ def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) 
         descenders.append(max(0.0, bottom - baseline))
     asc = float(max(3.0, median(ascenders) if ascenders else xheight))
     desc = float(max(1.0, median(descenders) if descenders else xheight * 0.2))
-    return _BaselineStats(baseline=baseline, xheight=xheight, ascender=asc, descender=desc)
+    avg_w = float(median(widths)) if widths else xheight
+    density = float(median(densities)) if densities else 0.5
+    aspect = float(max(0.25, min(4.0, avg_w / max(1.0, xheight))))
+    return _BaselineStats(
+        baseline=baseline,
+        xheight=xheight,
+        ascender=asc,
+        descender=desc,
+        avg_width=avg_w,
+        avg_height=float(median(heights) if heights else xheight),
+        stroke_density=density,
+        aspect_median=aspect,
+    )
 
 
 def _segment_component_bbox(
@@ -5170,12 +5919,17 @@ def _segment_component_bbox(
     wide_ratio = 1.4
     tall_ratio = 1.8
     gap_ratio = 0.08
+    density_hint = 0.0
     if baseline:
-        wide_ratio = 1.2
-        tall_ratio = 1.5
-        gap_ratio = 0.06
+        density_hint = baseline.stroke_density or 0.0
+        aspect_hint = baseline.aspect_median or 1.0
+        wide_ratio = max(1.1, min(1.8, 1.0 + aspect_hint * 0.35))
+        tall_ratio = max(1.2, min(2.2, (baseline.avg_height or baseline.xheight) / max(1.0, baseline.avg_width or baseline.xheight)))
+        gap_ratio = 0.06 * (0.85 if density_hint > 0.45 else 1.1)
     if width > height * wide_ratio:
         segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio, min_span_ratio=0.22)
+    if not segments and baseline and width > max(1.0, baseline.avg_width) * 1.75:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio * 0.8, min_span_ratio=0.2)
     if not segments:
         tall_gate = height > width * tall_ratio
         if baseline:

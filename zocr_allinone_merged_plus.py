@@ -507,6 +507,161 @@ def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_dept
             deduped[-1] = (deduped[-1] + value) * 0.5
     return deduped
 
+
+def _vertical_vote_boundaries(binary: "np.ndarray", max_candidates: int = 16, min_gap: int = 6) -> List[int]:
+    try:
+        arr = np.asarray(binary, dtype=np.uint8)
+    except Exception:
+        return []
+    if arr.ndim != 2 or arr.size == 0:
+        return []
+    ink = arr.sum(axis=0).astype(np.float32)
+    if ink.size == 0:
+        return []
+    norm = ink / float(max(1.0, ink.max()))
+    blank_score = 1.0 - norm
+    window = max(3, min_gap // 2 * 2 + 1)
+    kernel = np.ones(window, dtype=np.float32)
+    kernel /= float(kernel.sum() or 1.0)
+    smoothed = np.convolve(blank_score, kernel, mode="same")
+    if smoothed.size == 0:
+        return []
+    threshold = float(max(0.2, min(0.85, np.percentile(smoothed, 75))))
+    picks: List[int] = []
+    for idx in range(1, len(smoothed) - 1):
+        if smoothed[idx] < threshold:
+            continue
+        if smoothed[idx] < smoothed[idx - 1] or smoothed[idx] < smoothed[idx + 1]:
+            continue
+        if picks and idx - picks[-1] < min_gap:
+            if smoothed[idx] > smoothed[picks[-1]]:
+                picks[-1] = idx
+            continue
+        picks.append(idx)
+        if len(picks) >= max_candidates:
+            break
+    return [int(val) for val in picks]
+
+
+def _apply_column_continuity_prior(candidates_by_row: List[List[int]], tolerance: int = 5) -> List[List[int]]:
+    if not candidates_by_row:
+        return candidates_by_row
+    refined: List[List[int]] = []
+    prev: Optional[List[int]] = None
+    tol = max(1, int(tolerance))
+    for row in candidates_by_row:
+        base = sorted({int(v) for v in row})
+        if prev:
+            augmented = list(base)
+            for anchor in prev:
+                if all(abs(anchor - cur) > tol for cur in base):
+                    augmented.append(int(anchor))
+            base = sorted({int(v) for v in augmented})
+        refined.append(base)
+        prev = base
+    return refined
+
+
+def _refine_column_bounds_alignment(col_bounds: List[int], smooth_strength: float = 0.25) -> List[int]:
+    if len(col_bounds) <= 2:
+        return col_bounds
+    widths = [col_bounds[i + 1] - col_bounds[i] for i in range(len(col_bounds) - 1)]
+    target = float(max(1.0, median([abs(w) for w in widths]) if widths else 1.0))
+    new_bounds = [int(col_bounds[0])]
+    for width in widths:
+        deviation = float(width) - target
+        adjusted = float(width) - deviation * smooth_strength
+        adjusted = max(2.0, adjusted)
+        new_bounds.append(int(round(new_bounds[-1] + adjusted)))
+    span_orig = float(col_bounds[-1] - col_bounds[0]) or 1.0
+    span_new = float(new_bounds[-1] - new_bounds[0]) or 1.0
+    scale = span_orig / span_new
+    scaled = [int(round(col_bounds[0] + (val - new_bounds[0]) * scale)) for val in new_bounds]
+    scaled[0] = col_bounds[0]
+    scaled[-1] = col_bounds[-1]
+    return scaled
+
+
+def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: int) -> List[int]:
+    if values.size <= 2:
+        return []
+    valleys: List[int] = []
+    for idx in range(1, values.size - 1):
+        if values[idx] > threshold:
+            continue
+        if values[idx] > values[idx - 1] or values[idx] >= values[idx + 1]:
+            continue
+        if valleys and idx - valleys[-1] < min_gap:
+            if values[idx] < values[valleys[-1]]:
+                valleys[-1] = idx
+            continue
+        valleys.append(idx)
+    return valleys
+
+
+def _align_row_band_centers(row_bands: List[Tuple[int, int]], height: int, med_h: float) -> List[Tuple[int, int]]:
+    if len(row_bands) <= 1:
+        return row_bands
+    centers = [0.5 * (y0 + y1) for (y0, y1) in row_bands]
+    diffs = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+    target_gap = float(max(2.0, median([abs(d) for d in diffs]) if diffs else med_h))
+    aligned = [centers[0]]
+    clamp_delta = med_h * 0.6
+    for idx in range(1, len(centers)):
+        expected = aligned[-1] + target_gap
+        delta = clamp(centers[idx] - expected, -clamp_delta, clamp_delta)
+        aligned.append(expected + delta * 0.35)
+    refined: List[Tuple[int, int]] = []
+    for idx, center in enumerate(aligned):
+        span = max(2.0, row_bands[idx][1] - row_bands[idx][0])
+        start = int(round(center - span / 2.0))
+        end = int(round(center + span / 2.0))
+        start = max(0, start)
+        end = min(height, max(start + 2, end))
+        refined.append((start, end))
+    return refined
+
+
+def _refine_row_bands_by_projection(
+    row_bands: List[Tuple[int, int]], binary: "np.ndarray", med_h: float, height: int
+) -> List[Tuple[int, int]]:
+    if not row_bands:
+        return row_bands
+    try:
+        proj = (np.asarray(binary, dtype=np.uint8) > 0).sum(axis=1).astype(np.float64)
+    except Exception:
+        return row_bands
+    if proj.size == 0:
+        return row_bands
+    kernel = np.ones(5, dtype=np.float64)
+    kernel /= float(kernel.sum() or 1.0)
+    smooth = np.convolve(proj, kernel, mode="same")
+    refined: List[Tuple[int, int]] = []
+    min_gap = int(max(2, med_h * 0.35))
+    for y0, y1 in row_bands:
+        if y1 - y0 <= 0:
+            continue
+        segment = smooth[y0:y1]
+        if (y1 - y0) > med_h * 1.6 and segment.size > 4:
+            thr = float(min(np.percentile(segment, 40), np.mean(segment) * 0.7))
+            valleys = _find_projection_valleys(segment, thr, min_gap)
+            if valleys:
+                points = [y0] + [y0 + v for v in valleys] + [y1]
+                for a, b in zip(points, points[1:]):
+                    if b - a >= max(2, int(med_h * 0.45)):
+                        refined.append((int(a), int(b)))
+                continue
+        refined.append((int(y0), int(y1)))
+    merged: List[Tuple[int, int]] = []
+    for band in refined:
+        if merged and (band[1] - band[0]) < med_h * 0.45:
+            prev = merged[-1]
+            if band[0] - prev[1] <= med_h * 0.25:
+                merged[-1] = (prev[0], max(prev[1], band[1]))
+                continue
+        merged.append(band)
+    return _align_row_band_centers(merged, height, med_h)
+
 # ----------------- Column smoothing (D²-like + λ scheduling) -----------------
 def _smooth_per_column(candidates_by_row: List[List[int]], W: int, lam: float, H_sched: int = 1000) -> List[int]:
     R = len(candidates_by_row)
@@ -846,6 +1001,7 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
                 row_bands.append((max(0, int(start-1)), H))
     if not row_bands:
         row_bands.append((0, H))
+    row_bands = _refine_row_bands_by_projection(row_bands, bin_img, med_h, H)
     # per-row chunks & counts
     chunks_by_row=[ [list(bx) for bx in cc if not (bx[3]<=yt or bx[1]>=yb)] for (yt,yb) in row_bands ]
     row_counts=[len(row) for row in chunks_by_row]
@@ -886,14 +1042,24 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         global_mid_seeds.extend(int((btree_seed[i]+btree_seed[i+1])/2.0) for i in range(len(btree_seed)-1))
     if len(centers)>=2:
         global_mid_seeds.extend(int((centers[i]+centers[i+1])/2.0) for i in range(len(centers)-1))
+    vertical_votes = _vertical_vote_boundaries(
+        bin_img,
+        max_candidates=32,
+        min_gap=int(max(4, med_w * 0.5)),
+    )
+    if vertical_votes:
+        global_mid_seeds.extend(vertical_votes)
     if global_mid_seeds:
         mids_global = sorted({int(val) for val in global_mid_seeds})
         merged_rows: List[List[int]] = []
         for row in candidates_by_row:
             merged_rows.append(sorted({*row, *mids_global}))
         candidates_by_row = merged_rows
+    continuity_tol = int(max(3, med_w * 0.35))
+    candidates_by_row = _apply_column_continuity_prior(candidates_by_row, tolerance=continuity_tol)
     shape_lambda = float(params.get("shape_lambda", 4.0))
     col_bounds=_smooth_per_column(candidates_by_row, W, lam=shape_lambda, H_sched=max(1,H))
+    col_bounds = _refine_column_bounds_alignment(col_bounds)
     R=len(row_bands); C=max(1,len(col_bounds)-1)
     used=set(); cells={}
     def which_cols(xl,xr):
@@ -1636,10 +1802,36 @@ _AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
     "T": ("7",),
 }
 
+
+def _radial_signature(arr_f: "np.ndarray") -> Tuple[float, float]:
+    if arr_f.ndim != 2 or arr_f.size == 0:
+        return 0.0, 0.0
+    arr = np.asarray(arr_f, dtype=np.float32)
+    h, w = arr.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    radius = float(max(1.0, max(cy, cx)))
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / radius
+    inner_mask = dist <= 0.4
+    outer_mask = dist >= 0.8
+    inner_val = float(arr[inner_mask].mean()) if inner_mask.any() else 0.0
+    outer_val = float(arr[outer_mask].mean()) if outer_mask.any() else 0.0
+    return inner_val, outer_val
+
+
 def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
     arr_f = np.asarray(arr, dtype=np.float32)
     if arr_f.size == 0:
-        return {"aspect": 1.0, "density": 0.0, "symmetry": 0.0, "style_var": 0.0, "count": 0}
+        return {
+            "aspect": 1.0,
+            "density": 0.0,
+            "symmetry": 0.0,
+            "style_var": 0.0,
+            "radial_inner": 0.0,
+            "radial_outer": 0.0,
+            "count": 0,
+        }
     if arr_f.max() > 1.5:
         arr_f = arr_f / 255.0
     h, w = arr_f.shape
@@ -1653,7 +1845,19 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
         style_var = float(np.var(row_profile) + np.var(col_profile))
     else:
         style_var = 0.0
-    return {"aspect": aspect, "density": density, "symmetry": symmetry, "style_var": style_var, "count": 1}
+    inner_ring = 0.0
+    outer_ring = 0.0
+    if arr_f.ndim == 2 and arr_f.size:
+        inner_ring, outer_ring = _radial_signature(arr_f)
+    return {
+        "aspect": aspect,
+        "density": density,
+        "symmetry": symmetry,
+        "style_var": style_var,
+        "radial_inner": inner_ring,
+        "radial_outer": outer_ring,
+        "count": 1,
+    }
 
 def _render_glyphs(font=None, size=16):
     # PIL's default bitmap font via ImageFont.load_default() matches our demo
@@ -4888,10 +5092,13 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
     cell_density = float((cell_arr > 0).mean())
     cell_aspect = float(cw) / float(ch or 1)
     cell_scaled = cell_arr / 255.0 if cell_arr.max() > 1.5 else cell_arr
+    cell_inner = 0.0
+    cell_outer = 0.0
     if cell_scaled.ndim == 2 and cell_scaled.size:
         row_profile = cell_scaled.mean(axis=1)
         col_profile = cell_scaled.mean(axis=0)
         cell_style = float(_np.var(row_profile) + _np.var(col_profile))
+        cell_inner, cell_outer = _radial_signature(cell_scaled)
     else:
         cell_style = 0.0
     allowed: Optional[Set[str]] = None
@@ -4925,6 +5132,8 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         glyph_density = feats.get("density", 0.5)
         glyph_sym = feats.get("symmetry", 0.0)
         glyph_style = feats.get("style_var", 0.0)
+        glyph_inner = feats.get("radial_inner", cell_inner)
+        glyph_outer = feats.get("radial_outer", cell_outer)
         aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
         density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
         if glyph_sym > 0.5:
@@ -4933,7 +5142,14 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         else:
             symmetry_penalty = 1.0
         style_penalty = 1.0 - min(0.35, abs(cell_style - glyph_style) * 0.8)
-        variant_best *= aspect_penalty * max(0.4, density_penalty) * symmetry_penalty * max(0.45, style_penalty)
+        radial_penalty = 1.0 - min(0.3, abs(cell_inner - glyph_inner) * 1.2 + abs(cell_outer - glyph_outer) * 0.9)
+        variant_best *= (
+            aspect_penalty
+            * max(0.4, density_penalty)
+            * symmetry_penalty
+            * max(0.45, style_penalty)
+            * max(0.5, radial_penalty)
+        )
         if variant_best > best_score:
             best_score = variant_best
             best_ch = ch_key
@@ -5006,6 +5222,10 @@ class _BaselineStats:
     xheight: float
     ascender: float
     descender: float
+    avg_width: float = 0.0
+    avg_height: float = 0.0
+    stroke_density: float = 0.0
+    aspect_median: float = 1.0
 
 
 def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) -> Optional[_BaselineStats]:
@@ -5013,12 +5233,18 @@ def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) 
         return None
     bottoms: List[float] = []
     heights: List[float] = []
+    widths: List[float] = []
+    densities: List[float] = []
     ascenders: List[float] = []
     descenders: List[float] = []
-    for _, y1, _, y2, _ in boxes:
+    for x1, y1, x2, y2, area in boxes:
         h = float(max(1, y2 - y1))
+        w = float(max(1, x2 - x1))
         heights.append(h)
+        widths.append(w)
         bottoms.append(float(y2))
+        box_area = float(max(1.0, (x2 - x1) * (y2 - y1)))
+        densities.append(float(max(0.0, area)) / box_area)
     if not heights or not bottoms:
         return None
     baseline = float(median(bottoms))
@@ -5030,7 +5256,19 @@ def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) 
         descenders.append(max(0.0, bottom - baseline))
     asc = float(max(3.0, median(ascenders) if ascenders else xheight))
     desc = float(max(1.0, median(descenders) if descenders else xheight * 0.2))
-    return _BaselineStats(baseline=baseline, xheight=xheight, ascender=asc, descender=desc)
+    avg_w = float(median(widths)) if widths else xheight
+    density = float(median(densities)) if densities else 0.5
+    aspect = float(max(0.25, min(4.0, avg_w / max(1.0, xheight))))
+    return _BaselineStats(
+        baseline=baseline,
+        xheight=xheight,
+        ascender=asc,
+        descender=desc,
+        avg_width=avg_w,
+        avg_height=float(median(heights) if heights else xheight),
+        stroke_density=density,
+        aspect_median=aspect,
+    )
 
 
 def _segment_component_bbox(
@@ -5050,12 +5288,17 @@ def _segment_component_bbox(
     wide_ratio = 1.4
     tall_ratio = 1.8
     gap_ratio = 0.08
+    density_hint = 0.0
     if baseline:
-        wide_ratio = 1.2
-        tall_ratio = 1.5
-        gap_ratio = 0.06
+        density_hint = baseline.stroke_density or 0.0
+        aspect_hint = baseline.aspect_median or 1.0
+        wide_ratio = max(1.1, min(1.8, 1.0 + aspect_hint * 0.35))
+        tall_ratio = max(1.2, min(2.2, (baseline.avg_height or baseline.xheight) / max(1.0, baseline.avg_width or baseline.xheight)))
+        gap_ratio = 0.06 * (0.85 if density_hint > 0.45 else 1.1)
     if width > height * wide_ratio:
         segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio, min_span_ratio=0.22)
+    if not segments and baseline and width > max(1.0, baseline.avg_width) * 1.75:
+        segments = _component_projection_splits(arr, axis=1, gap_ratio=gap_ratio * 0.8, min_span_ratio=0.2)
     if not segments:
         tall_gate = height > width * tall_ratio
         if baseline:
