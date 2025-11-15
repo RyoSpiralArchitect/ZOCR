@@ -5,9 +5,52 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 from .differ import SemanticDiffer
 from .render import render_html, render_unified
+
+
+def _resolve_cells_path(value: str, label: str) -> Path:
+    """Accept either a direct cells.jsonl path or a run directory."""
+
+    path = Path(value)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        candidates = [
+            path / "rag" / "cells.jsonl",
+            path / "cells.jsonl",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        raise FileNotFoundError(
+            f"Could not locate cells.jsonl under '{value}'. "
+            "Pass a file path or a directory containing rag/cells.jsonl."
+        )
+    raise FileNotFoundError(f"{label} path '{value}' does not exist")
+
+
+def _resolve_sections_path(value: Optional[str]) -> Optional[Path]:
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        candidates = [
+            path / "rag" / "sections.jsonl",
+            path / "sections.jsonl",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        raise FileNotFoundError(
+            f"Could not locate sections.jsonl under '{value}'. "
+            "Pass a file path or a directory containing rag/sections.jsonl."
+        )
+    raise FileNotFoundError(f"sections path '{value}' does not exist")
 
 
 def main() -> None:
@@ -22,9 +65,11 @@ def main() -> None:
     args = ap.parse_args()
 
     diff = SemanticDiffer()
-    sec_a = Path(args.sections_a) if args.sections_a else None
-    sec_b = Path(args.sections_b) if args.sections_b else None
-    res = diff.compare_bundle(Path(args.a), Path(args.b), sec_a, sec_b)
+    cells_a = _resolve_cells_path(args.a, "version A")
+    cells_b = _resolve_cells_path(args.b, "version B")
+    sec_a = _resolve_sections_path(args.sections_a)
+    sec_b = _resolve_sections_path(args.sections_b)
+    res = diff.compare_bundle(cells_a, cells_b, sec_a, sec_b)
     events = res["events"]
 
     if args.out_json:

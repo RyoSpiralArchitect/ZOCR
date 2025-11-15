@@ -19,9 +19,9 @@ zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```
 
 ### Semantic diff overview / セマンティック差分概要 / Aperçu du diff sémantique
-- **[JA]** `zocr.diff` は `cells.jsonl` / `sections.jsonl` を比較してイベントJSON・.diff・HTMLを生成します。構成や CLI 例は [`zocr/diff/README.md`](zocr/diff/README.md) を参照してください。
-- **[EN]** `zocr.diff` compares `cells.jsonl` / `sections.jsonl` to emit JSON events plus unified-text and HTML reports. See [`zocr/diff/README.md`](zocr/diff/README.md) for the module layout, CLI example, and pipeline prerequisites.
-- **[FR]** `zocr.diff` compare `cells.jsonl` / `sections.jsonl` afin de produire des événements JSON, un diff texte et un rapport HTML. Consultez [`zocr/diff/README.md`](zocr/diff/README.md) pour l’architecture, l’exemple CLI et les prérequis côté pipeline.
+- **[JA]** `zocr.diff` は `cells.jsonl` / `sections.jsonl` を比較してイベントJSON・.diff・HTMLを生成します。`python -m zocr.diff --a out/A --b out/B` のように実行ディレクトリを渡せます。構成や詳細は [`zocr/diff/README.md`](zocr/diff/README.md) を参照してください。
+- **[EN]** `zocr.diff` compares `cells.jsonl` / `sections.jsonl` to emit JSON events plus unified-text and HTML reports. You can point it at run directories via `python -m zocr.diff --a out/A --b out/B`; see [`zocr/diff/README.md`](zocr/diff/README.md) for layout and CLI details.
+- **[FR]** `zocr.diff` compare `cells.jsonl` / `sections.jsonl` afin de produire des événements JSON, un diff texte et un rapport HTML. Il suffit de cibler les dossiers d’exécution avec `python -m zocr.diff --a out/A --b out/B`. L’architecture et l’exemple complet figurent dans [`zocr/diff/README.md`](zocr/diff/README.md).
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash

@@ -32,17 +32,20 @@ Les deux fichiers sont exportés dans `out/<run>/rag/`, ce qui permet de compare
 
 ## 組み込み CLI / Built-in CLI / CLI intégrée
 ```bash
-python -m zocr.diff.cli \
-  --a out/A/rag/cells.jsonl \
-  --b out/B/rag/cells.jsonl \
+python -m zocr.diff \
+  --a out/A \
+  --b out/B \
   --out_diff out/diff/changes.diff \
   --out_json out/diff/events.json \
   --out_html out/diff/report.html
 ```
 
-- **[JA]** `--sections_a` / `--sections_b` を指定すると `sections.jsonl` のパスを明示でき、未指定時は `cells.jsonl` と同じ場所を自動探索します。
-- **[EN]** Optional `--sections_a` / `--sections_b` flags override auto-discovery of `sections.jsonl` next to each `cells.jsonl`.
-- **[FR]** Les options `--sections_a` / `--sections_b` permettent de fournir explicitement les chemins `sections.jsonl`; sinon, ils sont détectés automatiquement à côté de chaque `cells.jsonl`.
+- **[JA]** `--a` / `--b` には `cells.jsonl` そのものか、`out/<run>/` のような実行ディレクトリを渡せます（後者は `rag/cells.jsonl` を自動解決）。
+- **[EN]** `--a` / `--b` accept either explicit `cells.jsonl` files or a run directory such as `out/<run>/` (the CLI looks for `rag/cells.jsonl`).
+- **[FR]** `--a` / `--b` peuvent pointer vers les fichiers `cells.jsonl` ou directement vers un dossier d’exécution (`out/<run>/`) ; la CLI y cherche `rag/cells.jsonl`.
+- **[JA]** `--sections_a` / `--sections_b` を指定すると `sections.jsonl` のパスを明示でき、未指定時は `cells.jsonl` と同じ場所を自動探索します。ディレクトリを渡した場合も `rag/sections.jsonl` を解決します。
+- **[EN]** Optional `--sections_a` / `--sections_b` flags override auto-discovery of `sections.jsonl`; directories are resolved to `rag/sections.jsonl` just like the cell inputs.
+- **[FR]** Les options `--sections_a` / `--sections_b` permettent de fournir explicitement les chemins `sections.jsonl`; lorsqu’un dossier est fourni, la CLI y cherche `rag/sections.jsonl` automatiquement.
 
 ## なぜ小さく保てるか / Why the implementation stays small / Pourquoi si peu de code suffit
 1. **構造化セル情報 / Structured cell context / Contexte cellulaire structuré** – 各レコードにページ・表・行列・テキスト・filters・`trace_id` が揃っているため、再OCRではなく構造合わせに集中できます。
