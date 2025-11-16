@@ -52,12 +52,18 @@ python -m zocr.diff \
 - **[JA]** `--out_agentic` を付けると AgenticRAG/GUI 連携向けに `agentic_requests.json` も書き出され、各イベントへ JA/EN 説明用プロンプトと差分画像の描画指示がセットになります。
 - **[EN]** Add `--out_agentic` to export `agentic_requests.json`, a bundle of bilingual directives plus visual-overlay briefs so Agentic RAG/GUI helpers can craft diff images or narrated summaries without reprocessing the events.
 - **[FR]** L’option `--out_agentic` produit `agentic_requests.json`, c’est-à-dire des requêtes bilingues accompagnées d’instructions de rendu pour que les agents RAG/GUI génèrent images ou explications immédiatement.
+- **[JA]** `--out_bundle` を指定するとイベント / unified diff / assist plan / agentic requests を丸ごと含む `handoff_bundle.json` が生成され、API や GUI から 1 ファイルで取得できます（orchestrator の `run_diff` も同ファイルを出力）。
+- **[EN]** Pass `--out_bundle` to produce `handoff_bundle.json`, a single artifact carrying the events, unified diff text, assist plan, and agentic requests so APIs/GUI surfaces can ingest the entire package at once (the orchestrator’s `run_diff` writes the same file).
+- **[FR]** Avec `--out_bundle`, on obtient `handoff_bundle.json`, un unique artefact qui regroupe événements, diff texte, plan d’assistance et requêtes agentic pour que l’API/la GUI récupère tout d’un coup (le `run_diff` de l’orchestrateur le génère aussi).
 - **[JA]** `--simple_text_a` / `--simple_text_b` を指定すると ToyOCR などのプレーンテキスト比較に適した軽量 differ が有効になり、git 風 unified diff と金額/数量の数値差分を `--simple_diff_out` / `--simple_json_out` で保存できます（`--simple_plan_out` を付ければ再解析/RAG 補助バンドルも同時に書き出し）。
 - **[EN]** Supplying `--simple_text_a` / `--simple_text_b` toggles the ToyOCR-friendly quick differ, producing a git-like unified diff plus amount/quantity deltas that can be persisted via `--simple_diff_out` / `--simple_json_out`; add `--simple_plan_out` to save the matching reanalysis/RAG assist bundle.
 - **[FR]** Avec `--simple_text_a` / `--simple_text_b`, on active le diff léger compatible ToyOCR, lequel exporte un diff unifié façon git et les deltas montants/quantités via `--simple_diff_out` / `--simple_json_out`, tandis que `--simple_plan_out` produit en plus le bundle d’assistance réanalyse/RAG.
 - **[JA]** 軽量 differ 単体で動かす場合も `--simple_agentic_out` を併用すれば `agentic_requests.json` を個別に保存でき、ToyOCR 由来のイベントをそのまま AgenticRAG の差分画像/説明タスクへ引き継げます。
 - **[EN]** When relying only on the quick differ, pass `--simple_agentic_out` to persist its own `agentic_requests.json`, keeping ToyOCR events compatible with the same Agentic RAG workflows.
 - **[FR]** Pour le diff léger seul, `--simple_agentic_out` exporte aussi `agentic_requests.json`, garantissant une compatibilité immédiate avec les agents RAG/GUI qui produisent images ou narratifs.
+- **[JA]** `--simple_bundle_out` を使うと軽量 differ 版の `handoff_bundle.json` も残せるため、ToyOCR で拾った差分を API / GUI / AgenticRAG へワンショットで手渡せます。
+- **[EN]** Use `--simple_bundle_out` to save the quick-differ `handoff_bundle.json`, allowing ToyOCR-style comparisons to feed APIs, GUI cards, or Agentic RAG actors from one payload.
+- **[FR]** `--simple_bundle_out` conserve la variante légère de `handoff_bundle.json`, ce qui fournit aux API/GUI ou aux agents RAG les diffs ToyOCR via un seul paquet.
 - **[JA]** 行の追加・削除も監視し、置換以外の差分（例：費目が 1 行だけ増えた請求書）でも該当金額の Δ/率を抽出します。
 - **[EN]** Inserted/deleted lines are covered alongside replacements, so a newly added fee line still yields the precise Δ/relative delta.
 - **[FR]** Les lignes ajoutées/supprimées sont également prises en compte, ce qui permet d’extraire Δ/variation même quand une seule ligne vient s’ajouter.

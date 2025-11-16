@@ -9,6 +9,7 @@ from typing import Optional
 
 from .assist import DiffAssistPlanner
 from .differ import SemanticDiffer
+from .handoff import build_handoff_bundle
 from .render import render_html, render_unified
 from .simple import SimpleTextDiffer
 
@@ -107,6 +108,11 @@ def main() -> None:
         help="save Agentic RAG request bundle (visual/narrative prompts)",
     )
     ap.add_argument(
+        "--out_bundle",
+        default=None,
+        help="save a single JSON handoff bundle (events + diff + assist + agentic)",
+    )
+    ap.add_argument(
         "--simple_text_a",
         default=None,
         help="plain-text document A (or a run dir with rag/bundle.md) for the quick differ",
@@ -148,6 +154,11 @@ def main() -> None:
         default=None,
         help="save Agentic RAG request bundle for the quick differ",
     )
+    ap.add_argument(
+        "--simple_bundle_out",
+        default=None,
+        help="save a quick-differ handoff bundle (diff + events + assist + agentic)",
+    )
     args = ap.parse_args()
 
     run_semantic = bool(args.a or args.b)
@@ -168,6 +179,7 @@ def main() -> None:
             "--out_agentic": args.out_agentic,
             "--sections_a": args.sections_a,
             "--sections_b": args.sections_b,
+            "--out_bundle": args.out_bundle,
         }
         bad = [flag for flag, val in forbidden.items() if val]
         if bad:
@@ -212,6 +224,36 @@ def main() -> None:
                     indent=2,
                 ),
                 encoding="utf-8",
+            )
+        if args.out_bundle:
+            artifacts = {
+                "events_json": str(Path(args.out_json).resolve()) if args.out_json else None,
+                "diff_text_path": str(Path(args.out_diff).resolve()) if args.out_diff else None,
+                "html_report_path": str(Path(args.out_html).resolve()) if args.out_html else None,
+                "assist_plan": str(Path(args.out_plan).resolve()) if args.out_plan else None,
+                "agentic_requests": str(Path(args.out_agentic).resolve()) if args.out_agentic else None,
+            }
+            extras = {
+                "sections": {
+                    "a": str(sec_a) if sec_a else None,
+                    "b": str(sec_b) if sec_b else None,
+                }
+            }
+            bundle = build_handoff_bundle(
+                mode="semantic",
+                source={
+                    "cells_a": str(cells_a),
+                    "cells_b": str(cells_b),
+                },
+                summary=res.get("summary", {}),
+                events=events,
+                diff_text=txt,
+                assist_plan=assist_plan,
+                artifacts=artifacts,
+                extras=extras,
+            )
+            Path(args.out_bundle).write_text(
+                json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         if not args.out_plan:
             summary = assist_plan.get("summary", {})
@@ -266,6 +308,38 @@ def main() -> None:
                     indent=2,
                 ),
                 encoding="utf-8",
+            )
+        if args.simple_bundle_out:
+            simple_artifacts = {
+                "diff_text_path": str(Path(args.simple_diff_out).resolve())
+                if args.simple_diff_out
+                else None,
+                "events_json": str(Path(args.simple_json_out).resolve())
+                if args.simple_json_out
+                else None,
+                "assist_plan": str(Path(args.simple_plan_out).resolve())
+                if args.simple_plan_out
+                else None,
+                "agentic_requests": str(Path(args.simple_agentic_out).resolve())
+                if args.simple_agentic_out
+                else None,
+            }
+            bundle = build_handoff_bundle(
+                mode="simple",
+                source={
+                    "text_a": str(simple_path_a),
+                    "text_b": str(simple_path_b),
+                    "context_lines": args.simple_context,
+                    "pair_threshold": args.simple_pair_threshold,
+                },
+                summary=simple_result.get("summary", {}),
+                events=simple_events,
+                diff_text=diff_payload,
+                assist_plan=simple_plan,
+                artifacts=simple_artifacts,
+            )
+            Path(args.simple_bundle_out).write_text(
+                json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         if not args.simple_plan_out:
             plan_summary = simple_plan.get("summary", {})

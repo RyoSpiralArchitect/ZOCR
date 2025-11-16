@@ -28,6 +28,7 @@ from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
     DiffAssistPlanner,
     SemanticDiffer,
+    build_handoff_bundle,
     render_html as diff_render_html,
     render_unified as diff_render_unified,
 )
@@ -219,12 +220,44 @@ def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
     assist_plan = planner.plan(result["events"])
     result["assist_plan"] = assist_plan
 
-    (out_dir / "events.json").write_text(_json_dumps(result), encoding="utf-8")
-    (out_dir / "changes.diff").write_text(diff_render_unified(result["events"]), encoding="utf-8")
-    diff_render_html(result["events"], out_dir / "report.html")
-    (out_dir / "assist_plan.json").write_text(_json_dumps(assist_plan), encoding="utf-8")
-    (out_dir / "agentic_requests.json").write_text(
+    events_path = out_dir / "events.json"
+    diff_path = out_dir / "changes.diff"
+    html_path = out_dir / "report.html"
+    plan_path = out_dir / "assist_plan.json"
+    agentic_path = out_dir / "agentic_requests.json"
+
+    diff_text = diff_render_unified(result["events"])
+    events_path.write_text(_json_dumps(result), encoding="utf-8")
+    diff_path.write_text(diff_text, encoding="utf-8")
+    diff_render_html(result["events"], html_path)
+    plan_path.write_text(_json_dumps(assist_plan), encoding="utf-8")
+    agentic_path.write_text(
         _json_dumps(assist_plan.get("agentic_requests", [])),
+        encoding="utf-8",
+    )
+
+    handoff = build_handoff_bundle(
+        mode="semantic",
+        source={
+            "cells_a": str(a_cells),
+            "cells_b": str(b_cells),
+            "sections_a": str(a_sections) if a_sections.exists() else None,
+            "sections_b": str(b_sections) if b_sections.exists() else None,
+        },
+        summary=result.get("summary"),
+        events=result["events"],
+        diff_text=diff_text,
+        assist_plan=assist_plan,
+        artifacts={
+            "events_json": str(events_path),
+            "diff_text_path": str(diff_path),
+            "html_report_path": str(html_path),
+            "assist_plan": str(plan_path),
+            "agentic_requests": str(agentic_path),
+        },
+    )
+    (out_dir / "handoff_bundle.json").write_text(
+        _json_dumps(handoff),
         encoding="utf-8",
     )
     return result
