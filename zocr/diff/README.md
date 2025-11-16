@@ -81,6 +81,9 @@ python -m zocr.diff \
 - **[JA]** 行マッチングは `<num>` 正規化でノイズを除き、スペース揺れやラベル差があっても同一行として扱います。結果 JSON には `line_signature` / `line_label` / `line_similarity` が含まれ、ToyOCR → RAG のハンドオフでそのまま参照できます。
 - **[EN]** Line pairing uses `<num>`-normalized fuzzy matches so even spacing tweaks or slight label edits keep pointing to the same row. The JSON now exposes `line_signature`, `line_label`, and `line_similarity`, which downstream ToyOCR/RAG agents can consume immediately.
 - **[FR]** L’appariement des lignes s’appuie sur une normalisation `<num>` afin de rester robuste aux variations d’espaces ou aux légers changements d’intitulés. Le JSON inclut `line_signature`, `line_label` et `line_similarity`, directement exploitables par les agents ToyOCR/RAG.
+- **[JA]** 通貨記号や USD/EUR/円 のような通貨コード、`千` / `万` / `億` / `k` / `M` / `B`、括弧付きマイナス、% / ％ を含む行でも金額/率を正しく抽出し、`numeric_unit` / `numeric_currency` / `numeric_is_percent` / `numeric_scale` でハンドオフ先に単位を共有します。
+- **[EN]** Currency symbols/codes plus Japanese `千` / `万` / `億` and western `k` / `M` / `B`, parenthetical negatives, and %/％ tokens are parsed in-place; the emitted events include `numeric_unit`, `numeric_currency`, `numeric_is_percent`, and `numeric_scale` so downstream ToyOCR/RAG flows keep the unit context.
+- **[FR]** Les symboles/codes de devise, les suffixes `千` / `万` / `億` ainsi que `k` / `M` / `B`, les montants négatifs entre parenthèses et les %/％ sont gérés automatiquement ; les événements exposent `numeric_unit`, `numeric_currency`, `numeric_is_percent` et `numeric_scale` pour préserver les unités dans les flux ToyOCR/RAG.
 
 ```bash
 python -m zocr.diff \

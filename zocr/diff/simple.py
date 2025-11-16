@@ -10,7 +10,7 @@ from __future__ import annotations
 import difflib
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 def _clip(text: str, limit: int = 200) -> str:
@@ -27,7 +27,126 @@ def _label_name(label: str) -> str:
         return label
 
 
-_NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+_CURRENCY_SYMBOLS = {
+    "$": "USD",
+    "€": "EUR",
+    "¥": "JPY",
+    "￥": "JPY",
+    "£": "GBP",
+    "₤": "GBP",
+    "₩": "KRW",
+    "₽": "RUB",
+    "₹": "INR",
+    "₨": "INR",
+    "₺": "TRY",
+    "₫": "VND",
+    "₱": "PHP",
+    "₦": "NGN",
+    "₲": "PYG",
+    "₴": "UAH",
+    "₪": "ILS",
+    "₡": "CRC",
+    "₭": "LAK",
+    "฿": "THB",
+}
+
+_CURRENCY_WORD_PREFIXES = {
+    "USD": "USD",
+    "US$": "USD",
+    "EUR": "EUR",
+    "JPY": "JPY",
+    "CNY": "CNY",
+    "RMB": "CNY",
+    "HKD": "HKD",
+    "TWD": "TWD",
+    "NTD": "TWD",
+    "NT$": "TWD",
+    "CAD": "CAD",
+    "AUD": "AUD",
+    "NZD": "NZD",
+    "SGD": "SGD",
+    "GBP": "GBP",
+    "CHF": "CHF",
+    "SEK": "SEK",
+    "NOK": "NOK",
+    "DKK": "DKK",
+    "KRW": "KRW",
+    "IDR": "IDR",
+    "INR": "INR",
+    "MYR": "MYR",
+    "MXN": "MXN",
+    "BRL": "BRL",
+    "ZAR": "ZAR",
+    "AED": "AED",
+    "SAR": "SAR",
+    "TRY": "TRY",
+    "ILS": "ILS",
+    "VND": "VND",
+    "PHP": "PHP",
+    "THB": "THB",
+    "COP": "COP",
+    "ARS": "ARS",
+}
+
+_CURRENCY_SUFFIXES = {
+    "円": "JPY",
+    "円(税込)": "JPY",
+    "円(税別)": "JPY",
+    "円（税別）": "JPY",
+    "円（税込）": "JPY",
+    "ドル": "USD",
+    "usd": "USD",
+    "eur": "EUR",
+    "jpy": "JPY",
+    "cny": "CNY",
+    "rmb": "CNY",
+    "hkd": "HKD",
+    "twd": "TWD",
+    "ntd": "TWD",
+    "cad": "CAD",
+    "aud": "AUD",
+    "gbp": "GBP",
+    "chf": "CHF",
+    "sgd": "SGD",
+    "krw": "KRW",
+    "myr": "MYR",
+    "idr": "IDR",
+    "thb": "THB",
+    "vnd": "VND",
+    "php": "PHP",
+    "brl": "BRL",
+    "mxn": "MXN",
+    "zar": "ZAR",
+    "aed": "AED",
+    "sar": "SAR",
+}
+
+_SCALE_SUFFIXES: List[Tuple[str, float, bool]] = [
+    ("億", 1e8, False),
+    ("万", 1e4, False),
+    ("千", 1e3, False),
+    ("bn", 1e9, True),
+    ("mm", 1e6, True),
+    ("m", 1e6, True),
+    ("b", 1e9, True),
+    ("k", 1e3, True),
+]
+
+_NUM_RE = re.compile(
+    r"""
+    (?<![\w])
+    \(?
+    (?:[$€¥£₹₩₽₺₪₫₱฿₦₲₴]|USD|EUR|JPY|CNY|RMB|CAD|AUD|NZD|SGD|HKD|TWD|NTD|CHF|KRW|GBP|INR|IDR|MYR|PHP|THB|VND|BRL|MXN|ZAR|AED|SAR|SEK|NOK|DKK)?
+    [\s]*
+    [-+]?
+    \d[\d,]*(?:\.\d+)?
+    (?:\s*(?:k|m|b|bn|mm|千|万|億))?
+    \)?
+    (?:\s*(?:%|％))?
+    (?:\s*(?:円|ドル|元|usd|eur|jpy|cny|rmb|cad|aud|gbp|chf|sgd|krw|hkd|twd|ntd)(?:\s*\([^)]*\))?)?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 class SimpleTextDiffer:
@@ -152,6 +271,14 @@ class SimpleTextDiffer:
                 event["numeric_delta"] = pair.get("delta")
                 event["relative_delta"] = pair.get("relative")
                 event["similarity"] = None
+                if pair.get("unit"):
+                    event["numeric_unit"] = pair.get("unit")
+                if pair.get("currency"):
+                    event["numeric_currency"] = pair.get("currency")
+                if pair.get("is_percent"):
+                    event["numeric_is_percent"] = True
+                if pair.get("scale"):
+                    event["numeric_scale"] = pair.get("scale")
                 events.append(event)
         return events
 
@@ -180,8 +307,8 @@ class SimpleTextDiffer:
                     continue
                 pairs = self._pair_numbers(nums_a, nums_b)
                 if not pairs and (not nums_a or not nums_b):
-                    token_a = nums_a[0] if nums_a else {"value": None, "raw": None}
-                    token_b = nums_b[0] if nums_b else {"value": None, "raw": None}
+                    token_a = nums_a[0] if nums_a else {"value": None, "raw": None, "unit": None, "currency": None, "is_percent": False, "scale": None}
+                    token_b = nums_b[0] if nums_b else {"value": None, "raw": None, "unit": None, "currency": None, "is_percent": False, "scale": None}
                     pairs = [
                         {
                             "old": token_a["value"],
@@ -190,6 +317,10 @@ class SimpleTextDiffer:
                             "relative": None,
                             "old_raw": token_a["raw"],
                             "new_raw": token_b["raw"],
+                            "unit": token_a.get("unit") or token_b.get("unit"),
+                            "currency": token_a.get("currency") or token_b.get("currency"),
+                            "is_percent": token_a.get("is_percent") or token_b.get("is_percent"),
+                            "scale": token_a.get("scale") or token_b.get("scale"),
                         }
                     ]
                 signature = self._line_signature(text_a or text_b)
@@ -269,14 +400,14 @@ class SimpleTextDiffer:
     @staticmethod
     def _extract_numbers(text: str) -> List[Dict[str, Any]]:
         tokens: List[Dict[str, Any]] = []
-        for match in _NUM_RE.finditer(text or ""):
+        if not text:
+            return tokens
+        scan_text = text.replace("（", "(").replace("）", ")")
+        for match in _NUM_RE.finditer(scan_text):
             raw = match.group(0)
-            try:
-                normalized = raw.replace(",", "")
-                value = float(normalized)
-            except Exception:
-                continue
-            tokens.append({"raw": raw, "value": value})
+            parsed = SimpleTextDiffer._normalize_numeric_token(raw)
+            if parsed:
+                tokens.append(parsed)
         return tokens
 
     @staticmethod
@@ -299,9 +430,116 @@ class SimpleTextDiffer:
                     "relative": relative,
                     "old_raw": nums_a[idx]["raw"],
                     "new_raw": nums_b[idx]["raw"],
+                    "unit": nums_a[idx].get("unit") or nums_b[idx].get("unit"),
+                    "currency": nums_a[idx].get("currency") or nums_b[idx].get("currency"),
+                    "is_percent": nums_a[idx].get("is_percent") or nums_b[idx].get("is_percent"),
+                    "scale": nums_a[idx].get("scale") or nums_b[idx].get("scale"),
                 }
             )
         return pairs
+
+    @staticmethod
+    def _normalize_numeric_token(raw: str) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
+        text = raw.strip()
+        if not text:
+            return None
+        text = text.replace("（", "(").replace("）", ")")
+        sign = 1.0
+        if text.startswith("(") and text.endswith(")"):
+            sign *= -1.0
+            text = text[1:-1].strip()
+        if text.startswith("+"):
+            text = text[1:].strip()
+        elif text.startswith("-"):
+            sign *= -1.0
+            text = text[1:].strip()
+
+        text, prefix_currency = SimpleTextDiffer._strip_currency_prefix(text)
+        currency = prefix_currency
+        text, suffix_currency = SimpleTextDiffer._strip_currency_suffix(text)
+        if suffix_currency and not currency:
+            currency = suffix_currency
+        text, is_percent = SimpleTextDiffer._strip_percent_suffix(text)
+        unit = "percent" if is_percent else None
+        text, scale_label, scale = SimpleTextDiffer._strip_scale_suffix(text)
+
+        normalized = text.replace(",", "").replace(" ", "")
+        if not normalized:
+            return None
+        try:
+            value = float(normalized)
+        except ValueError:
+            return None
+        value *= sign * scale
+        if currency and not unit:
+            unit = currency
+        return {
+            "raw": raw.strip(),
+            "value": value,
+            "currency": currency,
+            "unit": unit,
+            "is_percent": bool(is_percent),
+            "scale": scale_label,
+        }
+
+    @staticmethod
+    def _strip_currency_prefix(text: str) -> Tuple[str, Optional[str]]:
+        if not text:
+            return "", None
+        stripped = text
+        detected = None
+        while True:
+            stripped = stripped.lstrip()
+            if stripped and stripped[0] in _CURRENCY_SYMBOLS:
+                detected = detected or _CURRENCY_SYMBOLS[stripped[0]]
+                stripped = stripped[1:]
+                continue
+            matched = False
+            upper = stripped.upper()
+            for prefix in sorted(_CURRENCY_WORD_PREFIXES.keys(), key=len, reverse=True):
+                if upper.startswith(prefix):
+                    next_idx = len(prefix)
+                    if len(stripped) == next_idx or not stripped[next_idx].isalpha():
+                        detected = detected or _CURRENCY_WORD_PREFIXES[prefix]
+                        stripped = stripped[next_idx:]
+                        matched = True
+                        break
+            if not matched:
+                break
+        return stripped.strip(), detected
+
+    @staticmethod
+    def _strip_currency_suffix(text: str) -> Tuple[str, Optional[str]]:
+        stripped = text.rstrip()
+        lowered = stripped.lower()
+        for suffix in sorted(_CURRENCY_SUFFIXES.keys(), key=len, reverse=True):
+            key = suffix.lower()
+            if lowered.endswith(key):
+                new_text = stripped[: -len(suffix)].rstrip()
+                return new_text, _CURRENCY_SUFFIXES[suffix]
+        return stripped, None
+
+    @staticmethod
+    def _strip_percent_suffix(text: str) -> Tuple[str, bool]:
+        stripped = text.rstrip()
+        for suffix in ("%", "％"):
+            if stripped.endswith(suffix):
+                return stripped[: -len(suffix)].rstrip(), True
+        return stripped, False
+
+    @staticmethod
+    def _strip_scale_suffix(text: str) -> Tuple[str, Optional[str], float]:
+        stripped = text.rstrip()
+        lower = stripped.lower()
+        for suffix, factor, casefold in _SCALE_SUFFIXES:
+            key = suffix.lower() if casefold else suffix
+            target = lower if casefold else stripped
+            if target.endswith(key):
+                new_text = stripped[: -len(key)].rstrip()
+                return new_text, suffix, factor
+        return stripped, None, 1.0
 
     @staticmethod
     def _read_lines(path: Path) -> List[str]:
