@@ -2,6 +2,7 @@
 """Aggregations and derived metrics for diff events."""
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -45,6 +46,12 @@ def _bucket_key(event: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         label = "generic"
         key = "generic"
     return key, {"currency": currency, "unit": unit, "is_percent": is_percent, "label": label}
+
+
+def _top_counter(counter: Counter, limit: int = 8) -> List[str]:
+    if not counter:
+        return []
+    return [token for token, _ in counter.most_common(limit)]
 
 
 def summarize_numeric_events(events: List[Dict[str, Any]], top_n: int = 5) -> Dict[str, Any]:
@@ -141,3 +148,127 @@ def summarize_numeric_events(events: List[Dict[str, Any]], top_n: int = 5) -> Di
         "buckets": buckets,
         "top_changes": top_entries,
     }
+
+
+def _is_textual_event(event: Dict[str, Any]) -> bool:
+    if event.get("text_change_type"):
+        return True
+    if event.get("text_token_stats") or event.get("text_highlight"):
+        return True
+    if event.get("numeric_delta") is None and (event.get("old") or event.get("new")):
+        return True
+    return False
+
+
+def summarize_textual_events(events: List[Dict[str, Any]], top_n: int = 5) -> Dict[str, Any]:
+    """Aggregate rewrite-only changes for quick dashboards."""
+
+    totals: Dict[str, Dict[str, Any]] = {}
+    top_candidates: List[Tuple[float, Dict[str, Any]]] = []
+    token_added: Counter = Counter()
+    token_removed: Counter = Counter()
+    token_common: Counter = Counter()
+    count = 0
+
+    for event in events:
+        if not _is_textual_event(event):
+            continue
+        change_type = event.get("text_change_type") or "textual"
+        bucket = totals.setdefault(
+            change_type,
+            {
+                "change_type": change_type,
+                "count": 0,
+                "similarity_total": 0.0,
+                "similarity_count": 0,
+                "overlap_total": 0.0,
+                "jaccard_total": 0.0,
+                "token_stats_count": 0,
+            },
+        )
+        count += 1
+        bucket["count"] += 1
+        similarity = _safe_float(event.get("similarity"))
+        if similarity is not None:
+            bucket["similarity_total"] += similarity
+            bucket["similarity_count"] += 1
+        token_stats = event.get("text_token_stats") or {}
+        if token_stats:
+            overlap = _safe_float(token_stats.get("overlap"))
+            jaccard = _safe_float(token_stats.get("jaccard"))
+            if overlap is not None:
+                bucket["overlap_total"] += overlap
+            if jaccard is not None:
+                bucket["jaccard_total"] += jaccard
+            bucket["token_stats_count"] += 1
+            token_added.update(token_stats.get("added_tokens") or [])
+            token_removed.update(token_stats.get("removed_tokens") or [])
+            token_common.update(token_stats.get("common_tokens") or [])
+
+        description = event.get("row_preview") or event.get("line_label")
+        if not description:
+            highlight = event.get("text_highlight") or {}
+            description = highlight.get("new") or highlight.get("old")
+        description = _clip(description)
+        section = (
+            event.get("section_heading")
+            or event.get("section_heading_a")
+            or event.get("section_heading_b")
+        )
+        similarity_score = similarity if similarity is not None else 0.0
+        top_candidates.append(
+            (
+                1.0 - similarity_score,
+                {
+                    "change_type": change_type,
+                    "similarity": similarity,
+                    "section": section,
+                    "row": event.get("row_key")
+                    or event.get("row_key_a")
+                    or event.get("row_key_b"),
+                    "description": description,
+                    "highlight": event.get("text_highlight"),
+                },
+            )
+        )
+
+    if not count:
+        return {}
+
+    buckets: List[Dict[str, Any]] = []
+    for bucket in totals.values():
+        similarity_count = bucket.pop("similarity_count")
+        similarity_total = bucket.pop("similarity_total")
+        bucket["avg_similarity"] = (
+            similarity_total / similarity_count if similarity_count else None
+        )
+        stats_count = bucket.pop("token_stats_count")
+        overlap_total = bucket.pop("overlap_total")
+        jaccard_total = bucket.pop("jaccard_total")
+        bucket["avg_overlap"] = (
+            overlap_total / stats_count if stats_count else None
+        )
+        bucket["avg_jaccard"] = (
+            jaccard_total / stats_count if stats_count else None
+        )
+        buckets.append(bucket)
+
+    buckets.sort(key=lambda item: item.get("count", 0), reverse=True)
+
+    top_entries = [entry for _, entry in sorted(top_candidates, reverse=True)[:top_n]]
+
+    token_summary = {
+        "top_added_tokens": _top_counter(token_added),
+        "top_removed_tokens": _top_counter(token_removed),
+        "top_common_tokens": _top_counter(token_common),
+    }
+    token_summary = {k: v for k, v in token_summary.items() if v}
+
+    summary: Dict[str, Any] = {
+        "textual_event_count": count,
+        "change_types": buckets,
+        "top_changes": top_entries,
+    }
+    if token_summary:
+        summary["token_highlights"] = token_summary
+    return summary

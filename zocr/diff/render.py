@@ -238,6 +238,17 @@ def _format_delta(value: Optional[float]) -> str:
     return f"{num:+.4f}"
 
 
+def _format_similarity(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    pct = max(min(num, 1.0), 0.0)
+    return f"{pct:.0%}"
+
+
 def render_markdown(
     events: List[Dict[str, Any]],
     summary: Optional[Dict[str, Any]] = None,
@@ -248,6 +259,7 @@ def render_markdown(
     lines: List[str] = [f"# {title}", ""]
 
     numeric_summary = None
+    textual_summary = None
     if summary:
         label_map = {
             "tables_matched": "Tables matched",
@@ -271,6 +283,7 @@ def render_markdown(
             lines.append(f"- {key}: {summary[key]}")
         lines.append("")
         numeric_summary = summary.get("numeric_summary")
+        textual_summary = summary.get("textual_summary")
 
     if numeric_summary:
         lines.append("## Numeric overview")
@@ -309,6 +322,49 @@ def render_markdown(
                 unit_txt = f" ({unit})" if unit else ""
                 lines.append(
                     f"  - {label}: {_format_delta(entry.get('delta'))}{unit_txt}"
+                )
+        lines.append("")
+
+    if textual_summary:
+        lines.append("## Textual overview")
+        lines.append(
+            f"- Events: {textual_summary.get('textual_event_count', 0)}"
+        )
+        change_types = textual_summary.get("change_types") or []
+        if change_types:
+            lines.append("- Change types:")
+            for bucket in change_types[:5]:
+                label = bucket.get("change_type") or "textual"
+                count = bucket.get("count", 0)
+                sim = _format_similarity(bucket.get("avg_similarity"))
+                overlap = _format_similarity(bucket.get("avg_overlap"))
+                jaccard = _format_similarity(bucket.get("avg_jaccard"))
+                lines.append(
+                    f"  - {label}: count={count}, avg similarity={sim}, overlap={overlap}, jaccard={jaccard}"
+                )
+        token_highlights = textual_summary.get("token_highlights") or {}
+        if token_highlights:
+            lines.append("- Frequent tokens:")
+            for key, label in (
+                ("top_added_tokens", "Added"),
+                ("top_removed_tokens", "Removed"),
+                ("top_common_tokens", "Common"),
+            ):
+                values = token_highlights.get(key)
+                if values:
+                    tokens = ", ".join(values[:6])
+                    lines.append(f"  - {label}: {tokens}")
+        top_textual = textual_summary.get("top_changes") or []
+        if top_textual:
+            lines.append("- Notable rewrites:")
+            for entry in top_textual[:5]:
+                label = entry.get("description") or entry.get("row") or "entry"
+                section = entry.get("section")
+                sec_txt = f" (§{_md_inline(section)})" if section else ""
+                sim = _format_similarity(entry.get("similarity"))
+                change_type = entry.get("change_type")
+                lines.append(
+                    f"  - {label}{sec_txt} [{change_type}] similarity={sim}"
                 )
         lines.append("")
 
