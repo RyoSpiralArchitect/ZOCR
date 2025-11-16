@@ -3692,10 +3692,13 @@ def _patched_run_full_pipeline(
 
         pages = _dedup_pages_list(pages, require_exists=True)
 
-        if pages:
-            annos = [None] * len(pages)
-        else:
-            pages, annos = zocr_onefile_consensus.make_demo(outdir)
+        if not pages:
+            raise RuntimeError(
+                "`--input demo` was requested but no sample inputs were found. "
+                "Place demo files under samples/demo_inputs/ or samples/input_demo/."
+            )
+
+        annos = [None] * len(pages)
     else:
         pages = _collect_pages(
             inputs,
