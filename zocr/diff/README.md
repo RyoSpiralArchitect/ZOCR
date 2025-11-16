@@ -52,6 +52,9 @@ python -m zocr.diff \
 - **[JA]** `--simple_text_a` / `--simple_text_b` を指定すると ToyOCR などのプレーンテキスト比較に適した軽量 differ が有効になり、git 風 unified diff と金額/数量の数値差分を `--simple_diff_out` / `--simple_json_out` で保存できます（`--simple_plan_out` を付ければ再解析/RAG 補助バンドルも同時に書き出し）。
 - **[EN]** Supplying `--simple_text_a` / `--simple_text_b` toggles the ToyOCR-friendly quick differ, producing a git-like unified diff plus amount/quantity deltas that can be persisted via `--simple_diff_out` / `--simple_json_out`; add `--simple_plan_out` to save the matching reanalysis/RAG assist bundle.
 - **[FR]** Avec `--simple_text_a` / `--simple_text_b`, on active le diff léger compatible ToyOCR, lequel exporte un diff unifié façon git et les deltas montants/quantités via `--simple_diff_out` / `--simple_json_out`, tandis que `--simple_plan_out` produit en plus le bundle d’assistance réanalyse/RAG.
+- **[JA]** セマンティック diff を実行しない場合は `--a` / `--b` を空のままにし、上記の simple フラグと出力先のみ指定すれば軽量モード単体で完結します（`--out_*` や `--sections_*` は不要）。
+- **[EN]** To skip the semantic pass entirely, simply omit `--a` / `--b` and provide only the simple flags plus their outputs; no semantic `--out_*` / `--sections_*` parameters are required.
+- **[FR]** Pour sauter le diff sémantique, ne renseignez pas `--a` / `--b` et fournissez uniquement les options du mode léger avec leurs sorties ; nul besoin d’ajouter les paramètres `--out_*` / `--sections_*` du mode principal.
 
 ### Assist plan / アシストプラン / Plan d’assistance
 - **[JA]** `assist_plan.json` は `reanalyze_queue` / `rag_followups` / `profile_actions` を含み、各エントリに行プレビューや `trace_id` を付与するため、Slack/Teams 通知や `intent.action="reanalyze_cells"` トリガにそのまま使えます。
@@ -73,6 +76,17 @@ python -m zocr.diff \
 ```bash
 python -m zocr.diff \
   --a out/A --b out/B \
+  --simple_text_a memo_v1.txt \
+  --simple_text_b memo_v2.txt \
+  --simple_diff_out out/diff/memo.diff \
+  --simple_json_out out/diff/memo.numeric.json \
+  --simple_plan_out out/diff/memo.assist.json
+```
+
+```bash
+# semantic diff を省き、軽量モードのみ実行する例
+# Example showing the quick differ on its own / Exemple en mode léger seul
+python -m zocr.diff \
   --simple_text_a memo_v1.txt \
   --simple_text_b memo_v2.txt \
   --simple_diff_out out/diff/memo.diff \

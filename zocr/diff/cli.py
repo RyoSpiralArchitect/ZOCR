@@ -57,8 +57,8 @@ def _resolve_sections_path(value: Optional[str]) -> Optional[Path]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="ZOCR semantic diff for RAG bundles")
-    ap.add_argument("--a", required=True, help="cells.jsonl (version A)")
-    ap.add_argument("--b", required=True, help="cells.jsonl (version B)")
+    ap.add_argument("--a", default=None, help="cells.jsonl (version A)")
+    ap.add_argument("--b", default=None, help="cells.jsonl (version B)")
     ap.add_argument("--sections_a", default=None, help="sections.jsonl (version A)")
     ap.add_argument("--sections_b", default=None, help="sections.jsonl (version B)")
     ap.add_argument("--out_json", default=None, help="save raw events JSON")
@@ -100,42 +100,68 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    diff = SemanticDiffer()
+    run_semantic = bool(args.a or args.b)
     planner = DiffAssistPlanner()
-    cells_a = _resolve_cells_path(args.a, "version A")
-    cells_b = _resolve_cells_path(args.b, "version B")
-    sec_a = _resolve_sections_path(args.sections_a)
-    sec_b = _resolve_sections_path(args.sections_b)
-    res = diff.compare_bundle(cells_a, cells_b, sec_a, sec_b)
-    events = res["events"]
-    assist_plan = planner.plan(events)
-    res["assist_plan"] = assist_plan
-
-    if args.out_json:
-        Path(args.out_json).write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    txt = render_unified(events)
-    if args.out_diff:
-        Path(args.out_diff).write_text(txt, encoding="utf-8")
-    else:
-        print(txt)
-
-    if args.out_html:
-        render_html(events, Path(args.out_html))
-
-    if args.out_plan:
-        Path(args.out_plan).write_text(
-            json.dumps(assist_plan, ensure_ascii=False, indent=2), encoding="utf-8"
+    if run_semantic and not (args.a and args.b):
+        raise SystemExit("--a and --b must be provided together for semantic diff")
+    if not run_semantic and not (args.simple_text_a and args.simple_text_b):
+        raise SystemExit(
+            "Provide --a/--b for semantic diff, or --simple_text_a/--simple_text_b for the quick differ"
         )
-    if not args.out_plan:
-        summary = assist_plan.get("summary", {})
-        print(
-            "[assist] reanalyze={reanalyze} rag={rag} profile={profile}".format(
-                reanalyze=summary.get("reanalyze_candidates", 0),
-                rag=summary.get("rag_followups", 0),
-                profile=summary.get("profile_actions", 0),
+
+    if not run_semantic:
+        forbidden = {
+            "--out_json": args.out_json,
+            "--out_diff": args.out_diff,
+            "--out_html": args.out_html,
+            "--out_plan": args.out_plan,
+            "--sections_a": args.sections_a,
+            "--sections_b": args.sections_b,
+        }
+        bad = [flag for flag, val in forbidden.items() if val]
+        if bad:
+            raise SystemExit(
+                "Semantic outputs {} require --a/--b inputs".format(", ".join(bad))
             )
-        )
+
+    if run_semantic:
+        diff = SemanticDiffer()
+        cells_a = _resolve_cells_path(args.a, "version A")
+        cells_b = _resolve_cells_path(args.b, "version B")
+        sec_a = _resolve_sections_path(args.sections_a)
+        sec_b = _resolve_sections_path(args.sections_b)
+        res = diff.compare_bundle(cells_a, cells_b, sec_a, sec_b)
+        events = res["events"]
+        assist_plan = planner.plan(events)
+        res["assist_plan"] = assist_plan
+
+        if args.out_json:
+            Path(args.out_json).write_text(
+                json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+        txt = render_unified(events)
+        if args.out_diff:
+            Path(args.out_diff).write_text(txt, encoding="utf-8")
+        else:
+            print(txt)
+
+        if args.out_html:
+            render_html(events, Path(args.out_html))
+
+        if args.out_plan:
+            Path(args.out_plan).write_text(
+                json.dumps(assist_plan, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        if not args.out_plan:
+            summary = assist_plan.get("summary", {})
+            print(
+                "[assist] reanalyze={reanalyze} rag={rag} profile={profile}".format(
+                    reanalyze=summary.get("reanalyze_candidates", 0),
+                    rag=summary.get("rag_followups", 0),
+                    profile=summary.get("profile_actions", 0),
+                )
+            )
 
     if args.simple_text_a or args.simple_text_b:
         if not (args.simple_text_a and args.simple_text_b):
