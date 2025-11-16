@@ -49,6 +49,9 @@ python -m zocr.diff \
 - **[JA]** `--out_plan` で差分イベントを再解析キュー / RAG 補助 / プロファイル更新に分類した `assist_plan.json` を保存し、既存の請求書向けフィードバックループへ即連携できます。
 - **[EN]** `--out_plan` writes an `assist_plan.json` that splits the diff feed into reanalysis queues, downstream RAG follow-ups, and profile tweaks so the invoice-domain loops can reuse it directly.
 - **[FR]** `--out_plan` génère un `assist_plan.json` qui classe les événements (réanalyse, suivi RAG, ajustements de profil) pour alimenter directement les boucles déjà en service sur le domaine facturation.
+- **[JA]** `--simple_text_a` / `--simple_text_b` を指定すると ToyOCR などのプレーンテキスト比較に適した軽量 differ が有効になり、git 風 unified diff と金額/数量の数値差分を `--simple_diff_out` / `--simple_json_out` で保存できます。
+- **[EN]** Supplying `--simple_text_a` / `--simple_text_b` toggles the ToyOCR-friendly quick differ, producing a git-like unified diff plus amount/quantity deltas that can be persisted via `--simple_diff_out` / `--simple_json_out`.
+- **[FR]** Avec `--simple_text_a` / `--simple_text_b`, on active le diff léger compatible ToyOCR, lequel exporte un diff unifié façon git et les deltas montants/quantités via `--simple_diff_out` / `--simple_json_out`.
 
 ### Assist plan / アシストプラン / Plan d’assistance
 - **[JA]** `assist_plan.json` は `reanalyze_queue` / `rag_followups` / `profile_actions` を含み、各エントリに行プレビューや `trace_id` を付与するため、Slack/Teams 通知や `intent.action="reanalyze_cells"` トリガにそのまま使えます。
@@ -61,6 +64,24 @@ python -m zocr.diff \
 - **[JA]** エントリには `llm_ready_context` / `handoff_brief` も追加され、`handoff_packets` は `llm_context_examples` を添付して差分の位置・理由・旧新値をまとめたプロンプトをそのまま LLM へ渡せます。
 - **[EN]** Entries ship with `llm_ready_context` plus a concise `handoff_brief`, and each packet now lists `llm_context_examples` so downstream LLMs inherit a diff-specific prompt with the location, rationale, and before/after values.
 - **[FR]** Chaque entrée fournit `llm_ready_context` et un `handoff_brief` concis, tandis que les paquets incluent `llm_context_examples`, donnant aux LLM aval un prompt diff prêt à l’emploi (emplacement, raison, valeurs avant/après).
+
+## Quick git-style differ / 軽量 git 風 diff / Diff git simplifié
+- **[JA]** `SimpleTextDiffer` は 2 つのプレーンテキスト（ToyOCR の出力や編集済み仕様書など）を読み、git と同じ unified diff を生成しつつ、行ごとの金額・数量の差分（Δ/相対率）も JSON に書き出します。
+- **[EN]** `SimpleTextDiffer` lets you compare two plain-text documents (ToyOCR dumps, spec revisions, memo drafts) with a git-style unified diff plus structured numeric deltas (absolute + relative) per changed line.
+- **[FR]** `SimpleTextDiffer` compare deux documents texte (exports ToyOCR, spécifications modifiées, brouillons) en produisant un diff unifié façon git et des deltas numériques structurés (absolu + relatif) par ligne.
+
+```bash
+python -m zocr.diff \
+  --a out/A --b out/B \
+  --simple_text_a memo_v1.txt \
+  --simple_text_b memo_v2.txt \
+  --simple_diff_out out/diff/memo.diff \
+  --simple_json_out out/diff/memo.numeric.json
+```
+
+- **[JA]** 同一フォーマットで数値だけ揺れる社内帳票や見積書を git diff そのままの感覚で比較し、差分のうち数値が変わった箇所を Slack などに流すだけならこのモードで完結します。
+- **[EN]** When two revisions share almost identical wording/layout and you just need the amount/quantity changes (e.g., ToyOCR exports, estimates, order forms), this mode provides the entire answer without loading the heavier semantic differ.
+- **[FR]** Pour des documents quasi identiques (factures, devis, formulaires) où seules les valeurs changent, ce mode suffit : diff unifié + détection des montants modifiés, prêt pour les notifications Slack/Teams.
 
 ## なぜ小さく保てるか / Why the implementation stays small / Pourquoi si peu de code suffit
 1. **構造化セル情報 / Structured cell context / Contexte cellulaire structuré** – 各レコードにページ・表・行列・テキスト・filters・`trace_id` が揃っているため、再OCRではなく構造合わせに集中できます。

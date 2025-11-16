@@ -10,6 +10,7 @@ from typing import Optional
 from .assist import DiffAssistPlanner
 from .differ import SemanticDiffer
 from .render import render_html, render_unified
+from .simple import SimpleTextDiffer
 
 
 def _resolve_cells_path(value: str, label: str) -> Path:
@@ -66,6 +67,32 @@ def main() -> None:
     ap.add_argument(
         "--out_plan", default=None, help="save downstream reanalysis/RAG assist plan"
     )
+    ap.add_argument(
+        "--simple_text_a",
+        default=None,
+        help="plain-text document A for the git-like quick differ",
+    )
+    ap.add_argument(
+        "--simple_text_b",
+        default=None,
+        help="plain-text document B for the git-like quick differ",
+    )
+    ap.add_argument(
+        "--simple_diff_out",
+        default=None,
+        help="save the quick differ unified diff (defaults to stdout)",
+    )
+    ap.add_argument(
+        "--simple_json_out",
+        default=None,
+        help="save quick differ summary (numeric deltas, line numbers)",
+    )
+    ap.add_argument(
+        "--simple_context",
+        type=int,
+        default=3,
+        help="context lines for the quick differ (git-style)",
+    )
     args = ap.parse_args()
 
     diff = SemanticDiffer()
@@ -104,6 +131,32 @@ def main() -> None:
                 profile=summary.get("profile_actions", 0),
             )
         )
+
+    if args.simple_text_a or args.simple_text_b:
+        if not (args.simple_text_a and args.simple_text_b):
+            raise SystemExit("--simple_text_a and --simple_text_b must be provided together")
+        quick = SimpleTextDiffer(context_lines=args.simple_context)
+        simple_result = quick.compare_files(
+            Path(args.simple_text_a), Path(args.simple_text_b)
+        )
+        if args.simple_json_out:
+            Path(args.simple_json_out).write_text(
+                json.dumps(simple_result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        summary = simple_result.get("summary", {})
+        diff_payload = simple_result.get("diff", "")
+        if args.simple_diff_out:
+            Path(args.simple_diff_out).write_text(diff_payload, encoding="utf-8")
+        else:
+            print(diff_payload)
+        if not args.simple_json_out:
+            print(
+                "[simple] diff_hunks={hunks} numeric_changes={nums}".format(
+                    hunks=summary.get("diff_hunks", 0),
+                    nums=summary.get("numeric_changes", 0),
+                )
+            )
 
 
 if __name__ == "__main__":
