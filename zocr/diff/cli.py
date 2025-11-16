@@ -10,7 +10,11 @@ from typing import Optional
 from .assist import DiffAssistPlanner
 from .differ import SemanticDiffer
 from .handoff import build_handoff_bundle
-from .metrics import summarize_numeric_events, summarize_textual_events
+from .metrics import (
+    summarize_numeric_events,
+    summarize_section_events,
+    summarize_textual_events,
+)
 from .render import render_html, render_unified, render_markdown
 from .simple import SimpleTextDiffer
 
@@ -311,6 +315,9 @@ def main() -> None:
         textual_summary = summarize_textual_events(simple_events)
         if textual_summary:
             simple_result.setdefault("summary", {})["textual_summary"] = textual_summary
+        section_summary = summarize_section_events(simple_events)
+        if section_summary:
+            simple_result.setdefault("summary", {})["section_summary"] = section_summary
         simple_markdown = render_markdown(
             simple_events,
             simple_result.get("summary"),

@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .metrics import summarize_numeric_events, summarize_textual_events
+from .metrics import (
+    summarize_numeric_events,
+    summarize_section_events,
+    summarize_textual_events,
+)
 
 try:
     from rapidfuzz import fuzz  # type: ignore
@@ -755,4 +759,7 @@ class SemanticDiffer:
         textual_summary = summarize_textual_events(events)
         if textual_summary:
             summary["textual_summary"] = textual_summary
+        section_summary = summarize_section_events(events)
+        if section_summary:
+            summary["section_summary"] = section_summary
         return {"events": events, "summary": summary}

@@ -272,3 +272,119 @@ def summarize_textual_events(events: List[Dict[str, Any]], top_n: int = 5) -> Di
     if token_summary:
         summary["token_highlights"] = token_summary
     return summary
+
+
+def _section_meta(event: Dict[str, Any]) -> Tuple[str, Optional[int], Optional[List[str]]]:
+    for suffix in ("", "_a", "_b"):
+        heading = event.get(f"section_heading{suffix}")
+        if heading:
+            level = event.get(f"section_level{suffix}")
+            try:
+                level = int(level) if level is not None else None
+            except (TypeError, ValueError):
+                level = None
+            path_raw = event.get(f"section_path{suffix}") or []
+            if isinstance(path_raw, str):
+                path = [path_raw]
+            elif isinstance(path_raw, list):
+                path = [str(p) for p in path_raw if p]
+            else:
+                path = []
+            return str(heading), level, path
+    table_id = event.get("table_id")
+    if table_id:
+        return str(table_id), None, []
+    return "document", None, []
+
+
+def summarize_section_events(events: List[Dict[str, Any]], top_n: int = 5) -> Dict[str, Any]:
+    """Group events by section headings / table IDs."""
+
+    if not events:
+        return {}
+
+    totals: Dict[str, Dict[str, Any]] = {}
+    top_examples: List[Tuple[float, int, Dict[str, Any]]] = []
+    count = 0
+    example_idx = 0
+
+    for event in events:
+        section, level, path = _section_meta(event)
+        key = f"{section}|L{level}" if level is not None else section
+        bucket = totals.setdefault(
+            key,
+            {
+                "section": section,
+                "level": level,
+                "path": path,
+                "table_id": event.get("table_id"),
+                "count": 0,
+                "numeric_count": 0,
+                "textual_count": 0,
+                "event_types": Counter(),
+                "net_delta": 0.0,
+                "abs_delta": 0.0,
+            },
+        )
+        bucket["table_id"] = bucket.get("table_id") or event.get("table_id")
+        bucket["count"] += 1
+        count += 1
+        event_type = event.get("type") or "event"
+        bucket["event_types"][event_type] += 1
+        delta = _safe_float(event.get("numeric_delta"))
+        if delta is not None:
+            bucket["numeric_count"] += 1
+            bucket["net_delta"] += delta
+            bucket["abs_delta"] += abs(delta)
+        if _is_textual_event(event):
+            bucket["textual_count"] += 1
+
+        description = _clip(
+            event.get("row_preview")
+            or event.get("line_label")
+            or event.get("row_key")
+            or event.get("title")
+        )
+        score = abs(delta) if delta is not None else 1.0
+        example_idx += 1
+        top_examples.append(
+            (
+                score,
+                -example_idx,
+                {
+                    "section": section,
+                    "level": level,
+                    "table_id": event.get("table_id"),
+                    "event_type": event_type,
+                    "row": event.get("row_key")
+                    or event.get("row_key_a")
+                    or event.get("row_key_b"),
+                    "description": description,
+                    "numeric_delta": delta,
+                },
+            )
+        )
+
+    sections: List[Dict[str, Any]] = []
+    for bucket in totals.values():
+        event_types = bucket.pop("event_types")
+        bucket["event_types"] = [
+            {"type": name, "count": cnt}
+            for name, cnt in event_types.most_common(6)
+        ]
+        sections.append(bucket)
+
+    sections.sort(key=lambda item: item.get("count", 0), reverse=True)
+    top_sections = sorted(
+        sections,
+        key=lambda item: (item.get("abs_delta", 0.0), item.get("count", 0)),
+        reverse=True,
+    )[:top_n]
+    top_events = [entry for _, _, entry in sorted(top_examples, reverse=True)[:top_n]]
+
+    return {
+        "section_event_count": count,
+        "sections": sections,
+        "top_sections": top_sections,
+        "top_events": top_events,
+    }

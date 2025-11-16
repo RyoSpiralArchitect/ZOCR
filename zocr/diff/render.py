@@ -224,6 +224,14 @@ def _section_hint(event: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _format_section_label(name: Optional[str], level: Optional[int]) -> str:
+    if not name:
+        return "document"
+    if level is None:
+        return str(name)
+    return f"{name} (L{level})"
+
+
 def _format_delta(value: Optional[float]) -> str:
     if value is None:
         return "±0"
@@ -260,6 +268,7 @@ def render_markdown(
 
     numeric_summary = None
     textual_summary = None
+    section_summary = None
     if summary:
         label_map = {
             "tables_matched": "Tables matched",
@@ -284,6 +293,7 @@ def render_markdown(
         lines.append("")
         numeric_summary = summary.get("numeric_summary")
         textual_summary = summary.get("textual_summary")
+        section_summary = summary.get("section_summary")
 
     if numeric_summary:
         lines.append("## Numeric overview")
@@ -366,6 +376,38 @@ def render_markdown(
                 lines.append(
                     f"  - {label}{sec_txt} [{change_type}] similarity={sim}"
                 )
+        lines.append("")
+
+    if section_summary:
+        lines.append("## Section overview")
+        lines.append(
+            f"- Events: {section_summary.get('section_event_count', 0)}"
+        )
+        top_sections = section_summary.get("top_sections") or []
+        if top_sections:
+            lines.append("- Top sections:")
+            for entry in top_sections[:5]:
+                label = _format_section_label(
+                    entry.get("section"), entry.get("level")
+                )
+                count = entry.get("count", 0)
+                numeric = entry.get("numeric_count", 0)
+                textual = entry.get("textual_count", 0)
+                net = _format_delta(entry.get("net_delta"))
+                lines.append(
+                    f"  - {label}: events={count}, numeric={numeric}, textual={textual}, net={net}"
+                )
+        top_events = section_summary.get("top_events") or []
+        if top_events:
+            lines.append("- Representative changes:")
+            for entry in top_events[:5]:
+                label = _format_section_label(
+                    entry.get("section"), entry.get("level")
+                )
+                desc = entry.get("description") or entry.get("row") or entry.get("event_type")
+                delta = entry.get("numeric_delta")
+                delta_txt = f" {_format_delta(delta)}" if delta is not None else ""
+                lines.append(f"  - {label}: {desc}{delta_txt}")
         lines.append("")
 
     table_events = [
