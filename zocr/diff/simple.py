@@ -189,7 +189,7 @@ class SimpleTextDiffer:
         )
         diff_text = "\n".join(diff_iter)
 
-        numeric_changes = self._collect_numeric_changes(opcodes, lines_a, lines_b)
+        numeric_changes, textual_changes = self._collect_changes(opcodes, lines_a, lines_b)
         summary = {
             "total_lines_a": len(lines_a),
             "total_lines_b": len(lines_b),
@@ -200,11 +200,13 @@ class SimpleTextDiffer:
                 if tag != "equal"
             ),
             "numeric_changes": len(numeric_changes),
+            "textual_changes": len(textual_changes),
             "line_match_threshold": self.line_match_threshold,
         }
         return {
             "diff": diff_text,
             "numeric_changes": numeric_changes,
+            "textual_changes": textual_changes,
             "summary": summary,
             "labels": {"a": label_a, "b": label_b},
         }
@@ -228,7 +230,8 @@ class SimpleTextDiffer:
             int(summary.get("total_lines_a") or 0),
             int(summary.get("total_lines_b") or 0),
         )
-        for idx, change in enumerate(result.get("numeric_changes", []), start=1):
+
+        def build_base_event(change: Dict[str, Any]) -> Dict[str, Any]:
             line_a = change.get("line_a")
             line_b = change.get("line_b")
             row_key = f"line_{line_a or 'na'}_vs_{line_b or 'na'}"
@@ -264,6 +267,13 @@ class SimpleTextDiffer:
                 "line_similarity": change.get("line_similarity"),
             }
             base_event["row_ids"] = [rid for rid in base_event["row_ids"] if rid]
+            if change.get("change_type"):
+                base_event["text_change_type"] = change.get("change_type")
+            return base_event
+
+        for idx, change in enumerate(result.get("numeric_changes", []), start=1):
+            base_event = build_base_event(change)
+            base_row_key = base_event.get("row_key")
             pairs = change.get("pairs") or []
             if not pairs:
                 pairs = [
@@ -278,7 +288,11 @@ class SimpleTextDiffer:
                 ]
             for pair_idx, pair in enumerate(pairs, start=1):
                 event = dict(base_event)
-                event["row_key"] = f"{row_key}#{pair_idx}" if len(pairs) > 1 else row_key
+                event_row_key = base_row_key or base_event.get("row_key")
+                if len(pairs) > 1 and event_row_key:
+                    event["row_key"] = f"{event_row_key}#{pair_idx}"
+                elif event_row_key:
+                    event["row_key"] = event_row_key
                 event["old"] = pair.get("old_raw") if pair.get("old_raw") is not None else pair.get("old")
                 event["new"] = pair.get("new_raw") if pair.get("new_raw") is not None else pair.get("new")
                 event["numeric_delta"] = pair.get("delta")
@@ -301,15 +315,25 @@ class SimpleTextDiffer:
                 if pair.get("pair_status"):
                     event["line_pair_status"] = pair.get("pair_status")
                 events.append(event)
+        for change in result.get("textual_changes", []) or []:
+            event = build_base_event(change)
+            event["old"] = change.get("text_a") if change.get("text_a") else None
+            event["new"] = change.get("text_b") if change.get("text_b") else None
+            event["numeric_delta"] = None
+            event["relative_delta"] = None
+            if change.get("line_similarity") is not None:
+                event["similarity"] = change.get("line_similarity")
+            events.append(event)
         return events
 
-    def _collect_numeric_changes(
+    def _collect_changes(
         self,
         opcodes,
         lines_a: Sequence[str],
         lines_b: Sequence[str],
-    ) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        numeric_results: List[Dict[str, Any]] = []
+        textual_results: List[Dict[str, Any]] = []
         context_radius = self._context_radius_for_metadata()
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
@@ -325,29 +349,34 @@ class SimpleTextDiffer:
 
                 nums_a = self._extract_numbers(text_a)
                 nums_b = self._extract_numbers(text_b)
-                if not nums_a and not nums_b:
-                    continue
-                pairs = self._pair_numbers(nums_a, nums_b)
                 signature = self._line_signature(text_a or text_b)
                 label = self._line_label(text_a or text_b)
-                results.append(
+                base_change = {
+                    "line_a": line_no_a,
+                    "line_b": line_no_b,
+                    "text_a": text_a,
+                    "text_b": text_b,
+                    "line_signature": signature,
+                    "line_label": label,
+                    "line_similarity": score,
+                    "context_radius": context_radius,
+                    "context_a": self._gather_context(lines_a, line_no_a, context_radius),
+                    "context_b": self._gather_context(lines_b, line_no_b, context_radius),
+                }
+                if not nums_a and not nums_b:
+                    base_change["change_type"] = self._textual_change_type(line_no_a, line_no_b)
+                    textual_results.append(base_change)
+                    continue
+                pairs = self._pair_numbers(nums_a, nums_b)
+                base_change.update(
                     {
-                        "line_a": line_no_a,
-                        "line_b": line_no_b,
-                        "text_a": text_a,
-                        "text_b": text_b,
                         "numbers_a": [token["raw"] for token in nums_a],
                         "numbers_b": [token["raw"] for token in nums_b],
                         "pairs": pairs,
-                        "line_signature": signature,
-                        "line_label": label,
-                        "line_similarity": score,
-                        "context_radius": context_radius,
-                        "context_a": self._gather_context(lines_a, line_no_a, context_radius),
-                        "context_b": self._gather_context(lines_b, line_no_b, context_radius),
                     }
                 )
-        return results
+                numeric_results.append(base_change)
+        return numeric_results, textual_results
 
     def _align_slices(
         self,
@@ -404,6 +433,14 @@ class SimpleTextDiffer:
             return None
         label = signature.replace("<num>", "").strip(" :|-•")
         return label or None
+
+    @staticmethod
+    def _textual_change_type(line_a: Optional[int], line_b: Optional[int]) -> str:
+        if line_a is None and line_b is not None:
+            return "added"
+        if line_b is None and line_a is not None:
+            return "removed"
+        return "modified"
 
     @staticmethod
     def _extract_numbers(text: str) -> List[Dict[str, Any]]:
