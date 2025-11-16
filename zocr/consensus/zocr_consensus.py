@@ -55,6 +55,40 @@ _EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
 _TOY_SELF_CORRECTION_STACK: List[Dict[str, Any]] = []
 
 
+def _env_truthy_local(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _env_int_local(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+_DEBUG_CELLS_ENABLED = _env_truthy_local("ZOCR_EXPORT_DEBUG_CELLS", False)
+_DEBUG_CELLS_PER_PAGE = max(0, _env_int_local("ZOCR_EXPORT_DEBUG_CELLS_PER_PAGE", 0))
+_DEBUG_CELL_MIN_AREA = max(0, _env_int_local("ZOCR_EXPORT_DEBUG_CELL_MIN_AREA", 4096))
+_DEBUG_CELL_PAGE_COUNT: Dict[str, int] = defaultdict(int)
+
+
+def _allow_debug_cell_dump(page_key: str, area: int) -> bool:
+    if not _DEBUG_CELLS_ENABLED or _DEBUG_CELLS_PER_PAGE <= 0:
+        return False
+    if area < _DEBUG_CELL_MIN_AREA:
+        return False
+    if _DEBUG_CELL_PAGE_COUNT[page_key] >= _DEBUG_CELLS_PER_PAGE:
+        return False
+    _DEBUG_CELL_PAGE_COUNT[page_key] += 1
+    return True
+
+
 def _normalize_self_correction_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     if not isinstance(config, dict):
@@ -1296,12 +1330,18 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         col_jitter = float(np.median(jitters)) if jitters else 0.0
     # 低信頼セル views（曖昧帯域のみ）
     views_cells = {}
-    if amb_crops:
-        vdir = os.path.join(os.path.dirname(image_path), "views_cells")
-        ensure_dir(vdir)
+    debug_page_key = os.path.abspath(image_path) if image_path else ""
+    if amb_crops and _DEBUG_CELLS_ENABLED and _DEBUG_CELLS_PER_PAGE > 0:
+        vdir: Optional[str] = None
         for (bl, r0, c0, st) in amb_crops[:64]:
-            xl,yt,xr,yb = bl
-            crop = imc.crop((xl,yt,xr,yb))
+            xl, yt, xr, yb = bl
+            area = max(0, int(xr - xl) * int(yb - yt))
+            if not _allow_debug_cell_dump(debug_page_key, area):
+                continue
+            if vdir is None:
+                vdir = os.path.join(os.path.dirname(image_path), "views_cells")
+                ensure_dir(vdir)
+            crop = imc.crop((xl, yt, xr, yb))
             name = f"cell_r{r0}_c{c0}_s{st}"
             views_cells[name] = _make_views(crop, vdir, name)
     row_diag = {
