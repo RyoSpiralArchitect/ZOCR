@@ -550,11 +550,13 @@ class DiffAssistPlanner:
         reanalyze_similarity_threshold: float = 0.65,
         reanalyze_relative_delta: float = 0.05,
         numeric_abs_threshold: float = 1.0,
-        max_items_per_bucket: Optional[int] = 200,
+        max_items_per_bucket: Optional[int] = None,
     ) -> None:
         self.reanalyze_similarity_threshold = reanalyze_similarity_threshold
         self.reanalyze_relative_delta = reanalyze_relative_delta
         self.numeric_abs_threshold = numeric_abs_threshold
+        if max_items_per_bucket is not None and max_items_per_bucket <= 0:
+            max_items_per_bucket = None
         self.max_items_per_bucket = max_items_per_bucket
 
     def plan(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:

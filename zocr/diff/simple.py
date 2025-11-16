@@ -13,6 +13,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+try:  # pragma: no cover - optional dependency
+    from rapidfuzz import fuzz as _rapidfuzz
+except Exception:  # pragma: no cover - rapidfuzz remains optional
+    _rapidfuzz = None
+
 
 def _clip(text: str, limit: int = 200) -> str:
     text = (text or "").strip()
@@ -454,6 +459,7 @@ class SimpleTextDiffer:
             return []
 
         remaining_b = list(range(len(slice_b)))
+        right_signatures = [self._matchable_text(text) for _, text in slice_b]
         aligned: List[tuple] = []
         for left in slice_a:
             best_idx = None
@@ -461,11 +467,8 @@ class SimpleTextDiffer:
             left_sig = self._matchable_text(left[1])
             for b_idx in remaining_b:
                 right = slice_b[b_idx]
-                right_sig = self._matchable_text(right[1])
-                if not left_sig and not right_sig:
-                    score = 1.0
-                else:
-                    score = difflib.SequenceMatcher(a=left_sig, b=right_sig).ratio()
+                right_sig = right_signatures[b_idx]
+                score = self._text_similarity(left_sig, right_sig)
                 if score > best_score:
                     best_idx = b_idx
                     best_score = score
@@ -479,6 +482,13 @@ class SimpleTextDiffer:
             aligned.append((None, slice_b[b_idx], 0.0))
 
         return aligned
+
+    def _text_similarity(self, left: str, right: str) -> float:
+        if not left and not right:
+            return 1.0
+        if _rapidfuzz is not None:
+            return _rapidfuzz.token_sort_ratio(left or "", right or "") / 100.0
+        return difflib.SequenceMatcher(a=left or "", b=right or "").ratio()
 
     @staticmethod
     def _matchable_text(text: str) -> str:

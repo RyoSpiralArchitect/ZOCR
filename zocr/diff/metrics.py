@@ -139,7 +139,10 @@ def summarize_numeric_events(events: List[Dict[str, Any]], top_n: int = 5) -> Di
         key=lambda item: abs(item.get("net_delta", 0.0)),
         reverse=True,
     )
-    top_entries = [entry for _, entry in sorted(top_candidates, reverse=True)[:top_n]]
+    top_entries = [
+        entry
+        for _, entry in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:top_n]
+    ]
 
     return {
         "numeric_event_count": count,
@@ -255,7 +258,10 @@ def summarize_textual_events(events: List[Dict[str, Any]], top_n: int = 5) -> Di
 
     buckets.sort(key=lambda item: item.get("count", 0), reverse=True)
 
-    top_entries = [entry for _, entry in sorted(top_candidates, reverse=True)[:top_n]]
+    top_entries = [
+        entry
+        for _, entry in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:top_n]
+    ]
 
     token_summary = {
         "top_added_tokens": _top_counter(token_added),
