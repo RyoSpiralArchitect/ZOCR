@@ -152,9 +152,16 @@ _NUM_RE = re.compile(
 class SimpleTextDiffer:
     """Compare two plain-text documents with git-like output."""
 
-    def __init__(self, context_lines: int = 3, line_match_threshold: float = 0.6) -> None:
+    def __init__(
+        self,
+        context_lines: int = 3,
+        line_match_threshold: float = 0.6,
+        number_pair_threshold: float = 1.25,
+    ) -> None:
         self.context_lines = max(0, int(context_lines))
         self.line_match_threshold = float(line_match_threshold)
+        # Maximum acceptable pairing cost (difference + penalties) when matching numbers.
+        self.number_pair_threshold = float(number_pair_threshold)
 
     def compare_files(self, path_a: Path, path_b: Path) -> Dict[str, Any]:
         """Run the diff on two files."""
@@ -285,6 +292,14 @@ class SimpleTextDiffer:
                     event["numeric_is_percent"] = True
                 if pair.get("scale"):
                     event["numeric_scale"] = pair.get("scale")
+                if pair.get("pair_cost") is not None:
+                    event["line_pair_cost"] = pair.get("pair_cost")
+                if pair.get("pair_penalty") is not None:
+                    event["line_pair_penalty"] = pair.get("pair_penalty")
+                if pair.get("pair_gap") is not None:
+                    event["line_pair_gap"] = pair.get("pair_gap")
+                if pair.get("pair_status"):
+                    event["line_pair_status"] = pair.get("pair_status")
                 events.append(event)
         return events
 
@@ -313,23 +328,6 @@ class SimpleTextDiffer:
                 if not nums_a and not nums_b:
                     continue
                 pairs = self._pair_numbers(nums_a, nums_b)
-                if not pairs and (not nums_a or not nums_b):
-                    token_a = nums_a[0] if nums_a else {"value": None, "raw": None, "unit": None, "currency": None, "is_percent": False, "scale": None}
-                    token_b = nums_b[0] if nums_b else {"value": None, "raw": None, "unit": None, "currency": None, "is_percent": False, "scale": None}
-                    pairs = [
-                        {
-                            "old": token_a["value"],
-                            "new": token_b["value"],
-                            "delta": None,
-                            "relative": None,
-                            "old_raw": token_a["raw"],
-                            "new_raw": token_b["raw"],
-                            "unit": token_a.get("unit") or token_b.get("unit"),
-                            "currency": token_a.get("currency") or token_b.get("currency"),
-                            "is_percent": token_a.get("is_percent") or token_b.get("is_percent"),
-                            "scale": token_a.get("scale") or token_b.get("scale"),
-                        }
-                    ]
                 signature = self._line_signature(text_a or text_b)
                 label = self._line_label(text_a or text_b)
                 results.append(
@@ -420,33 +418,192 @@ class SimpleTextDiffer:
                 tokens.append(parsed)
         return tokens
 
-    @staticmethod
     def _pair_numbers(
+        self,
         nums_a: Sequence[Dict[str, Any]],
         nums_b: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        len_a, len_b = len(nums_a), len(nums_b)
+        if not len_a and not len_b:
+            return []
+        if not len_a or not len_b:
+            tokens = nums_a or nums_b
+            pairs: List[Dict[str, Any]] = []
+            for token in tokens:
+                pairs.append(self._single_side_pair(token if nums_a else None, token if nums_b else None))
+            return pairs
+
+        size = max(len_a, len_b)
+        high_cost = self.number_pair_threshold + 1.0
+        cost_matrix = [[high_cost] * size for _ in range(size)]
+        penalty_matrix = [[0.0] * size for _ in range(size)]
+        gap_matrix = [[0.0] * size for _ in range(size)]
+        for i in range(len_a):
+            for j in range(len_b):
+                total_cost, penalty, gap = self._numeric_pair_cost(nums_a[i], nums_b[j])
+                cost_matrix[i][j] = total_cost
+                penalty_matrix[i][j] = penalty
+                gap_matrix[i][j] = gap
+
+        assignment = self._hungarian(cost_matrix)
+        matched_a = set()
+        matched_b = set()
         pairs: List[Dict[str, Any]] = []
-        length = min(len(nums_a), len(nums_b))
-        for idx in range(length):
-            old = float(nums_a[idx]["value"])
-            new = float(nums_b[idx]["value"])
-            delta = new - old
-            relative = (delta / old) if abs(old) > 1e-12 else None
-            pairs.append(
-                {
-                    "old": old,
-                    "new": new,
-                    "delta": delta,
-                    "relative": relative,
-                    "old_raw": nums_a[idx]["raw"],
-                    "new_raw": nums_b[idx]["raw"],
-                    "unit": nums_a[idx].get("unit") or nums_b[idx].get("unit"),
-                    "currency": nums_a[idx].get("currency") or nums_b[idx].get("currency"),
-                    "is_percent": nums_a[idx].get("is_percent") or nums_b[idx].get("is_percent"),
-                    "scale": nums_a[idx].get("scale") or nums_b[idx].get("scale"),
-                }
-            )
+        for ai, bj in assignment:
+            if ai < len_a and bj < len_b:
+                total_cost = cost_matrix[ai][bj]
+                if total_cost <= self.number_pair_threshold:
+                    pairs.append(
+                        self._build_pair(
+                            nums_a[ai],
+                            nums_b[bj],
+                            total_cost,
+                            penalty_matrix[ai][bj],
+                            gap_matrix[ai][bj],
+                        )
+                    )
+                    matched_a.add(ai)
+                    matched_b.add(bj)
+
+        for idx in range(len_a):
+            if idx not in matched_a:
+                pairs.append(self._single_side_pair(nums_a[idx], None))
+        for idx in range(len_b):
+            if idx not in matched_b:
+                pairs.append(self._single_side_pair(None, nums_b[idx]))
         return pairs
+
+    def _numeric_pair_cost(
+        self, left: Dict[str, Any], right: Dict[str, Any]
+    ) -> Tuple[float, float, float]:
+        val_left = float(left["value"])
+        val_right = float(right["value"])
+        denom = max(abs(val_left), abs(val_right), 1.0)
+        gap = abs(val_left - val_right) / denom
+        penalty = 0.0
+        currency_left = left.get("currency")
+        currency_right = right.get("currency")
+        if currency_left and currency_right and currency_left != currency_right:
+            penalty += 0.6
+        elif (currency_left and not currency_right) or (currency_right and not currency_left):
+            penalty += 0.3
+        if bool(left.get("is_percent")) != bool(right.get("is_percent")):
+            penalty += 0.4
+        scale_left = left.get("scale")
+        scale_right = right.get("scale")
+        if scale_left and scale_right and scale_left != scale_right:
+            penalty += 0.2
+        return gap + penalty, penalty, gap
+
+    def _build_pair(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+        total_cost: float,
+        penalty: float,
+        gap: float,
+    ) -> Dict[str, Any]:
+        old = float(left["value"])
+        new = float(right["value"])
+        delta = new - old
+        relative = (delta / old) if abs(old) > 1e-12 else None
+        return {
+            "old": old,
+            "new": new,
+            "delta": delta,
+            "relative": relative,
+            "old_raw": left.get("raw"),
+            "new_raw": right.get("raw"),
+            "unit": left.get("unit") or right.get("unit"),
+            "currency": left.get("currency") or right.get("currency"),
+            "is_percent": left.get("is_percent") or right.get("is_percent"),
+            "scale": left.get("scale") or right.get("scale"),
+            "pair_cost": total_cost,
+            "pair_penalty": penalty,
+            "pair_gap": gap,
+            "pair_status": "matched",
+        }
+
+    def _single_side_pair(
+        self,
+        left: Optional[Dict[str, Any]],
+        right: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        unit = (left or {}).get("unit") or (right or {}).get("unit")
+        currency = (left or {}).get("currency") or (right or {}).get("currency")
+        scale = (left or {}).get("scale") or (right or {}).get("scale")
+        is_percent = (left or {}).get("is_percent") or (right or {}).get("is_percent")
+        status = "unmatched_a" if right is None else "unmatched_b"
+        return {
+            "old": float(left["value"]) if left else None,
+            "new": float(right["value"]) if right else None,
+            "delta": None,
+            "relative": None,
+            "old_raw": (left or {}).get("raw"),
+            "new_raw": (right or {}).get("raw"),
+            "unit": unit,
+            "currency": currency,
+            "is_percent": is_percent,
+            "scale": scale,
+            "pair_cost": None,
+            "pair_penalty": None,
+            "pair_gap": None,
+            "pair_status": status,
+        }
+
+    @staticmethod
+    def _hungarian(cost_matrix: List[List[float]]) -> List[Tuple[int, int]]:
+        if not cost_matrix:
+            return []
+        n = len(cost_matrix)
+        m = len(cost_matrix[0]) if cost_matrix else 0
+        if n != m:
+            raise ValueError("Hungarian solver expects a square cost matrix")
+        size = n
+        u = [0.0] * (size + 1)
+        v = [0.0] * (size + 1)
+        p = [0] * (size + 1)
+        way = [0] * (size + 1)
+        for i in range(1, size + 1):
+            p[0] = i
+            minv = [float("inf")] * (size + 1)
+            used = [False] * (size + 1)
+            j0 = 0
+            while True:
+                used[j0] = True
+                i0 = p[j0]
+                delta = float("inf")
+                j1 = 0
+                for j in range(1, size + 1):
+                    if used[j]:
+                        continue
+                    cur = cost_matrix[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+                for j in range(size + 1):
+                    if used[j]:
+                        u[p[j]] += delta
+                        v[j] -= delta
+                    else:
+                        minv[j] -= delta
+                j0 = j1
+                if p[j0] == 0:
+                    break
+            while True:
+                j1 = way[j0]
+                p[j0] = p[j1]
+                j0 = j1
+                if j0 == 0:
+                    break
+        assignment: List[Tuple[int, int]] = []
+        for j in range(1, size + 1):
+            if p[j]:
+                assignment.append((p[j] - 1, j - 1))
+        return assignment
 
     @staticmethod
     def _normalize_numeric_token(raw: str) -> Optional[Dict[str, Any]]:

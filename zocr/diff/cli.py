@@ -128,6 +128,12 @@ def main() -> None:
         help="context lines for the quick differ (git-style)",
     )
     ap.add_argument(
+        "--simple_pair_threshold",
+        type=float,
+        default=1.25,
+        help="max pairing cost for numeric tokens in the quick differ",
+    )
+    ap.add_argument(
         "--simple_plan_out",
         default=None,
         help="save downstream assist plan for the quick differ",
@@ -200,7 +206,10 @@ def main() -> None:
     if args.simple_text_a or args.simple_text_b:
         if not (args.simple_text_a and args.simple_text_b):
             raise SystemExit("--simple_text_a and --simple_text_b must be provided together")
-        quick = SimpleTextDiffer(context_lines=args.simple_context)
+        quick = SimpleTextDiffer(
+            context_lines=args.simple_context,
+            number_pair_threshold=args.simple_pair_threshold,
+        )
         simple_path_a = _resolve_simple_text_path(args.simple_text_a, "simple_text_a")
         simple_path_b = _resolve_simple_text_path(args.simple_text_b, "simple_text_b")
         simple_result = quick.compare_files(simple_path_a, simple_path_b)

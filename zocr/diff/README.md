@@ -87,6 +87,9 @@ python -m zocr.diff \
 - **[JA]** さらに `a_row_context` / `b_row_context` / `row_context_radius` で変更行の前後抜粋も保持され、差分周辺テキストを補助ワークフローがすぐ参照できます。
 - **[EN]** The quick differ also emits `a_row_context`, `b_row_context`, and `row_context_radius`, giving downstream helpers trimmed neighbor lines around each change.
 - **[FR]** On ajoute également `a_row_context`, `b_row_context` et `row_context_radius`, soit un extrait des lignes voisines pour que les flux d’assistance consultent instantanément le contexte local.
+- **[JA]** 複数の数値を含む行では Hungarian 法ベースのペアリングを使い、通貨/単位/パーセントの不一致にペナルティを課したうえで最適な組を選びます。`--simple_pair_threshold` で許容コストを調整でき、イベントには `line_pair_cost` / `line_pair_gap` / `line_pair_penalty` / `line_pair_status` が入るため、どの値がマッチし残差かをひと目で把握できます。
+- **[EN]** Lines carrying multiple numbers now run through a Hungarian-style assignment that favours the closest values while penalising currency/unit/percent mismatches; tune the acceptance window via `--simple_pair_threshold`. Each event exposes `line_pair_cost`, `line_pair_gap`, `line_pair_penalty`, and `line_pair_status` so you can tell which figures aligned and which ones remained unmatched.
+- **[FR]** Les lignes contenant plusieurs montants passent désormais par un appariement de type hongrois qui privilégie les valeurs les plus proches et pénalise les divergences d’unité/devise/pourcentage ; la fenêtre d’acceptation se règle via `--simple_pair_threshold`. Les événements incluent `line_pair_cost`, `line_pair_gap`, `line_pair_penalty` et `line_pair_status`, ce qui précise quelles valeurs ont été couplées ou laissées sans correspondance.
 
 ```bash
 python -m zocr.diff \
