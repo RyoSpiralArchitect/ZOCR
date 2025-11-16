@@ -682,6 +682,23 @@ class DiffAssistPlanner:
             "row_dates",
             "a_row_preview",
             "b_row_preview",
+            "a_row_context",
+            "b_row_context",
+            "row_context_radius",
+            "line_signature",
+            "line_label",
+            "line_pair_cost",
+            "line_pair_penalty",
+            "line_pair_gap",
+            "line_pair_status",
+            "text_change_type",
+            "text_token_stats",
+            "text_highlight",
+            "numeric_unit",
+            "numeric_currency",
+            "numeric_is_percent",
+            "numeric_scale",
+            "source",
         ]
         context: Dict[str, Any] = {}
         for key in context_keys:
