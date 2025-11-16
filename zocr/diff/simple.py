@@ -10,7 +10,7 @@ from __future__ import annotations
 import difflib
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 
 def _clip(text: str, limit: int = 200) -> str:
@@ -33,8 +33,9 @@ _NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 class SimpleTextDiffer:
     """Compare two plain-text documents with git-like output."""
 
-    def __init__(self, context_lines: int = 3) -> None:
+    def __init__(self, context_lines: int = 3, line_match_threshold: float = 0.6) -> None:
         self.context_lines = max(0, int(context_lines))
+        self.line_match_threshold = float(line_match_threshold)
 
     def compare_files(self, path_a: Path, path_b: Path) -> Dict[str, Any]:
         """Run the diff on two files."""
@@ -73,6 +74,7 @@ class SimpleTextDiffer:
                 if tag != "equal"
             ),
             "numeric_changes": len(numeric_changes),
+            "line_match_threshold": self.line_match_threshold,
         }
         return {
             "diff": diff_text,
@@ -125,6 +127,9 @@ class SimpleTextDiffer:
                 "b_row_preview": _clip(change.get("text_b", "")),
                 "trace_a": f"{label_a}#L{line_a}" if line_a is not None else None,
                 "trace_b": f"{label_b}#L{line_b}" if line_b is not None else None,
+                "line_signature": change.get("line_signature"),
+                "line_label": change.get("line_label"),
+                "line_similarity": change.get("line_similarity"),
             }
             base_event["row_ids"] = [rid for rid in base_event["row_ids"] if rid]
             pairs = change.get("pairs") or []
@@ -162,18 +167,12 @@ class SimpleTextDiffer:
                 continue
             slice_a = list(enumerate(lines_a[i1:i2], start=i1 + 1))
             slice_b = list(enumerate(lines_b[j1:j2], start=j1 + 1))
-            max_len = max(len(slice_a), len(slice_b))
-            if max_len == 0:
-                continue
-            for idx in range(max_len):
-                if idx < len(slice_a):
-                    line_no_a, text_a = slice_a[idx]
-                else:
-                    line_no_a, text_a = None, ""
-                if idx < len(slice_b):
-                    line_no_b, text_b = slice_b[idx]
-                else:
-                    line_no_b, text_b = None, ""
+            aligned = self._align_slices(slice_a, slice_b)
+            for left, right, score in aligned:
+                if left is None and right is None:
+                    continue
+                line_no_a, text_a = left if left else (None, "")
+                line_no_b, text_b = right if right else (None, "")
 
                 nums_a = self._extract_numbers(text_a)
                 nums_b = self._extract_numbers(text_b)
@@ -193,6 +192,8 @@ class SimpleTextDiffer:
                             "new_raw": token_b["raw"],
                         }
                     ]
+                signature = self._line_signature(text_a or text_b)
+                label = self._line_label(text_a or text_b)
                 results.append(
                     {
                         "line_a": line_no_a,
@@ -202,9 +203,68 @@ class SimpleTextDiffer:
                         "numbers_a": [token["raw"] for token in nums_a],
                         "numbers_b": [token["raw"] for token in nums_b],
                         "pairs": pairs,
+                        "line_signature": signature,
+                        "line_label": label,
+                        "line_similarity": score,
                     }
                 )
         return results
+
+    def _align_slices(
+        self,
+        slice_a: Sequence,
+        slice_b: Sequence,
+    ) -> List[tuple]:
+        """Pair lines by fuzzy text similarity (numbers blanked out)."""
+
+        if not slice_a and not slice_b:
+            return []
+
+        remaining_b = list(range(len(slice_b)))
+        aligned: List[tuple] = []
+        for left in slice_a:
+            best_idx = None
+            best_score = 0.0
+            left_sig = self._matchable_text(left[1])
+            for b_idx in remaining_b:
+                right = slice_b[b_idx]
+                right_sig = self._matchable_text(right[1])
+                if not left_sig and not right_sig:
+                    score = 1.0
+                else:
+                    score = difflib.SequenceMatcher(a=left_sig, b=right_sig).ratio()
+                if score > best_score:
+                    best_idx = b_idx
+                    best_score = score
+            if best_idx is not None and best_score >= self.line_match_threshold:
+                aligned.append((left, slice_b[best_idx], best_score))
+                remaining_b.remove(best_idx)
+            else:
+                aligned.append((left, None, 0.0))
+
+        for b_idx in remaining_b:
+            aligned.append((None, slice_b[b_idx], 0.0))
+
+        return aligned
+
+    @staticmethod
+    def _matchable_text(text: str) -> str:
+        if not text:
+            return ""
+        lowered = text.lower()
+        cleaned = _NUM_RE.sub("<num>", lowered)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _line_signature(self, text: str) -> Optional[str]:
+        signature = self._matchable_text(text)
+        return signature or None
+
+    def _line_label(self, text: str) -> Optional[str]:
+        signature = self._matchable_text(text)
+        if not signature:
+            return None
+        label = signature.replace("<num>", "").strip(" :|-•")
+        return label or None
 
     @staticmethod
     def _extract_numbers(text: str) -> List[Dict[str, Any]]:

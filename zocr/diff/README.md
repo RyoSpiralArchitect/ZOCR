@@ -78,6 +78,9 @@ python -m zocr.diff \
 - **[JA]** `SimpleTextDiffer` は 2 つのプレーンテキスト（ToyOCR の出力や編集済み仕様書など）を読み、git と同じ unified diff を生成しつつ、行ごとの金額・数量の差分（Δ/相対率）を JSON に書き出します。置換だけでなく行の追加・削除（例：費目を 1 行追加／削除）でも Δ/率を抽出します。
 - **[EN]** `SimpleTextDiffer` lets you compare two plain-text documents (ToyOCR dumps, spec revisions, memo drafts) with a git-style unified diff plus structured numeric deltas (absolute + relative) per changed line, and it now surfaces inserted/deleted rows in addition to replacements (e.g., a brand-new line item).
 - **[FR]** `SimpleTextDiffer` compare deux documents texte (exports ToyOCR, spécifications modifiées, brouillons) en produisant un diff unifié façon git et des deltas numériques structurés (absolu + relatif) par ligne, tout en détectant désormais les lignes ajoutées/supprimées au même titre que les remplacements (nouveau poste, suppression d’une ligne).
+- **[JA]** 行マッチングは `<num>` 正規化でノイズを除き、スペース揺れやラベル差があっても同一行として扱います。結果 JSON には `line_signature` / `line_label` / `line_similarity` が含まれ、ToyOCR → RAG のハンドオフでそのまま参照できます。
+- **[EN]** Line pairing uses `<num>`-normalized fuzzy matches so even spacing tweaks or slight label edits keep pointing to the same row. The JSON now exposes `line_signature`, `line_label`, and `line_similarity`, which downstream ToyOCR/RAG agents can consume immediately.
+- **[FR]** L’appariement des lignes s’appuie sur une normalisation `<num>` afin de rester robuste aux variations d’espaces ou aux légers changements d’intitulés. Le JSON inclut `line_signature`, `line_label` et `line_similarity`, directement exploitables par les agents ToyOCR/RAG.
 
 ```bash
 python -m zocr.diff \
