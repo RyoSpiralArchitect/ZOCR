@@ -1,7 +1,9 @@
 """Built-in tesslite resources for the toy OCR pipeline."""
 from __future__ import annotations
 
-DEFAULT_SIGNATURE = "tesslite_builtin_v1"
+from .domain_dictionary import ALL_KEYWORDS, all_domain_keywords
+
+DEFAULT_SIGNATURE = "tesslite_builtin_v2"
 
 # Core glyph inventory: ASCII digits/letters plus Japanese finance terms.
 DEFAULT_GLYPHS = list(
@@ -9,7 +11,7 @@ DEFAULT_GLYPHS = list(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz"
     "¥$€.,-/%()[]{}#&+"
-    "数量単価金額合計小計税込税抜御見積御請求納期期限日曜曜月火水木金土有効税率税額請求書見積書" 
+    "数量単価金額合計小計税込税抜御見積御請求納期期限日曜曜月火水木金土有効税率税額請求書見積書"
 )
 
 DEFAULT_AMBIGUOUS = {
@@ -33,44 +35,13 @@ for symbol in "¥$€":
 for token in "数量単価金額合計小計税込税抜御見積御請求納期期限日税率税額請求書見積書":
     DEFAULT_CHAR_CATEGORIES[token] = "kanji"
 
-DEFAULT_DICTIONARY = {
-    "item",
-    "items",
-    "qty",
-    "quantity",
-    "unit",
-    "unitprice",
-    "unit price",
-    "price",
-    "amount",
-    "total",
-    "subtotal",
-    "tax",
-    "taxable",
-    "tax rate",
-    "tax amount",
-    "balance",
-    "due",
-    "due date",
-    "見積",
-    "見積書",
-    "御見積",
-    "御見積金額",
-    "見積金額",
-    "数量",
-    "単価",
-    "金額",
-    "小計",
-    "合計",
-    "合計金額",
-    "税込",
-    "税抜",
-    "消費税",
-    "税率",
-    "納期",
-    "有効期限",
-    "請求金額",
-    "御請求金額",
+# Merge every domain dictionary into the built-in wordlist.
+DEFAULT_DICTIONARY = sorted(ALL_KEYWORDS)
+
+DEFAULT_DOMAIN_DICTIONARIES = {
+    token: sorted(words)
+    for token, words in all_domain_keywords().items()
+    if words
 }
 
 DEFAULT_BIGRAMS = {}

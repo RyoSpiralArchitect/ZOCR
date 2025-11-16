@@ -92,11 +92,21 @@ import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
+from pathlib import Path
 
 try:  # pragma: no cover - optional built-in tesslite bundle
     from zocr.resources import tesslite_defaults as _tesslite_defaults  # type: ignore
 except Exception:  # pragma: no cover - when the package resources are missing
     _tesslite_defaults = None  # type: ignore
+
+try:  # pragma: no cover - optional domain dictionary access
+    from zocr.resources.domain_dictionary import (  # type: ignore
+        get_domain_keywords as _get_domain_keywords,
+        all_domain_keywords as _all_domain_keywords,
+    )
+except Exception:  # pragma: no cover - when the package resources are missing
+    _get_domain_keywords = None  # type: ignore
+    _all_domain_keywords = None  # type: ignore
 
 try:
     import numpy as np
@@ -1584,36 +1594,98 @@ def autotune_params(pages, base_params, trials=6):
         if s<best_score: best_score=s; best=cand
     return best
 
-# ----------------- Demo data -----------------
-def make_demo(out_dir: str):
-    ensure_dir(out_dir)
-    W,H=900,1200
-    img=Image.new("RGB",(W,H),(255,255,255)); dr=ImageDraw.Draw(img); font=ImageFont.load_default()
-    dr.text((40,30),"INVOICE",fill=(0,0,0),font=font)
-    tbl=(40,160,860,520)
-    headers=["Item","Qty","Unit Price","Amount"]
-    cols=4
-    for i,h in enumerate(headers):
-        x=tbl[0]+int((tbl[2]-tbl[0])*i/cols)+8; dr.text((x,tbl[1]+8),h,fill=(0,0,0),font=font)
-    rows=[("Paper","10","2.00","20.00"),("Ink","2","15.00","30.00"),("Binder","5","3.00","15.00"),("Total","","","65.00")]
-    for r,row in enumerate(rows, start=1):
-        y=tbl[1]+int((tbl[3]-tbl[1])*r/5)+8
-        for c,cell in enumerate(row):
-            x=tbl[0]+int((tbl[2]-tbl[0])*c/cols)+8; dr.text((x,y),cell,fill=(0,0,0),font=font)
-    img_path=os.path.join(out_dir,"demo_inv.png"); img.save(img_path)
-    ann={"tables":[{"bbox":[40,160,860,520],
-        "html":"<table><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr>"
-               "<tr><td>Paper</td><td>10</td><td>2.00</td><td>20.00</td></tr>"
-               "<tr><td>Ink</td><td>2</td><td>15.00</td><td>30.00</td></tr>"
-               "<tr><td>Binder</td><td>5</td><td>3.00</td><td>15.00</td></tr>"
-               "<tr><td>Total</td><td></td><td></td><td>65.00</td></tr></table>"}]}
-    ann_path=os.path.join(out_dir,"demo_inv.annot.json")
-    with open(ann_path,"w",encoding="utf-8") as f: json.dump(ann,f,ensure_ascii=False,indent=2)
-    return [img_path],[ann_path]
-
 # ----------------- CLI -----------------
 _AUTOCALIB_DEFAULT_SAMPLES = 3
 _AUTOTUNE_DEFAULT_TRIALS = 6
+
+_DEMO_INPUT_SUFFIXES: Tuple[str, ...] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".gif",
+    ".pdf",
+)
+
+
+def _discover_demo_inputs_for_consensus() -> List[str]:
+    """Locate demo assets for the bundled consensus CLI."""
+
+    env_override = os.environ.get("ZOCR_DEMO_INPUTS")
+    candidate_roots: List[Path] = []
+    seen_candidates: Set[str] = set()
+
+    def _add_candidate(path: Path) -> None:
+        try:
+            resolved = path if path.is_absolute() else (Path.cwd() / path)
+            resolved = resolved.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen_candidates:
+            return
+        seen_candidates.add(key)
+        if resolved.exists():
+            candidate_roots.append(resolved)
+
+    if env_override:
+        for chunk in env_override.split(os.pathsep):
+            chunk = chunk.strip()
+            if chunk:
+                _add_candidate(Path(chunk))
+
+    here = Path(__file__).resolve()
+    repo_root = here.parent
+    search_roots = [Path.cwd(), repo_root]
+    rel_candidates = [
+        Path("samples/demo_inputs"),
+        Path("samples/input_demo"),
+        Path("demo_inputs"),
+        Path("input_demo"),
+    ]
+
+    for root in search_roots:
+        for rel in rel_candidates:
+            _add_candidate(root / rel)
+
+    files: List[str] = []
+    seen_files: Set[str] = set()
+
+    def _add_file(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen_files:
+            return
+        if resolved.is_file() and resolved.suffix.lower() in _DEMO_INPUT_SUFFIXES:
+            seen_files.add(key)
+            files.append(key)
+
+    for candidate in candidate_roots:
+        if candidate.is_file():
+            _add_file(candidate)
+        elif candidate.is_dir():
+            for entry in candidate.rglob("*"):
+                if entry.is_file() and entry.suffix.lower() in _DEMO_INPUT_SUFFIXES:
+                    _add_file(entry)
+
+    return files
+
+
+def _dedup_input_paths(paths: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for path in paths:
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        result.append(path)
+    return result
 
 
 def _positive_cli_value(value: Optional[int]) -> Optional[int]:
@@ -1628,6 +1700,11 @@ def main():
     p.add_argument("--out",default="out_consensus")
     p.add_argument("--dpi",type=int,default=200)
     p.add_argument("--demo",action="store_true")
+    p.add_argument(
+        "--domain",
+        default=None,
+        help="Domain keyword profile for the toy OCR lexicon (e.g. invoice, medical_bill)",
+    )
     p.add_argument("--bench-iterations",type=int,default=20)
     # CC params
     p.add_argument("--cc-k",type=int,default=31)
@@ -1673,13 +1750,33 @@ def main():
     )
     _patch_cli_for_export_and_search(p)
     args=p.parse_args()
+    if args.domain is not None:
+        dom = args.domain.strip()
+        if not dom or dom.lower() in {"", "auto", "default"}:
+            os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        else:
+            os.environ["ZOCR_TESS_DOMAIN"] = dom
     ensure_dir(args.out)
     # subcommands (export/index/query) do not require re-running OCR
     if args.cmd:
         args.func(args)
         return
     if args.demo:
-        pages, annos = make_demo(args.out)
+        demo_inputs = _discover_demo_inputs_for_consensus()
+        if not demo_inputs:
+            p.error(
+                "`--demo` requested but no sample inputs were found. "
+                "Place demo files under samples/demo_inputs/ or samples/input_demo/."
+            )
+        pages: List[str] = []
+        for it in demo_inputs:
+            ext = os.path.splitext(it)[1].lower()
+            if ext==".pdf":
+                pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
+            else:
+                pages.append(it)
+        pages = _dedup_input_paths(pages)
+        annos=[None]*len(pages)
     else:
         if not args.input: p.error("No input. Use --demo or -i.")
         pages=[]
@@ -1687,6 +1784,7 @@ def main():
             ext=os.path.splitext(it)[1].lower()
             if ext==".pdf": pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
             else: pages.append(it)
+        pages = _dedup_input_paths(pages)
         annos=[None]*len(pages)
     tab_cfg={"k":args.cc_k,"c":args.cc_c,"min_area":args.cc_min_area,
              "dp_lambda_factor":args.dp_lambda_factor,"shape_lambda":args.shape_lambda,
@@ -2548,30 +2646,56 @@ _TESSLITE_MODEL: Optional[_TessLiteModel] = None
 _TESSLITE_MODEL_SIG: Optional[str] = None
 _TESSLITE_LAST_SOURCE: str = "none"
 
-_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v1"
+_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v2"
 if _tesslite_defaults is not None:
     _TESSLITE_BUILTIN_SIGNATURE = str(
         getattr(_tesslite_defaults, "DEFAULT_SIGNATURE", _TESSLITE_BUILTIN_SIGNATURE)
     )
 
 
+def _tesslite_domain_token() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TESS_DOMAIN")
+    if not raw:
+        return None
+    token = raw.strip()
+    return token or None
+
+
+def _tesslite_domain_signature() -> str:
+    token = _tesslite_domain_token()
+    if not token:
+        return ""
+    return f"|domain:{token.strip().lower()}"
+
+
+def _tesslite_domain_keywords() -> Optional[Set[str]]:
+    if _get_domain_keywords is None:
+        return None
+    token = _tesslite_domain_token()
+    if not token:
+        return None
+    try:
+        words = _get_domain_keywords(token)
+    except Exception:
+        return None
+    normalized: Set[str] = set()
+    for word in words:
+        if isinstance(word, str):
+            trimmed = word.strip()
+            if trimmed:
+                normalized.add(trimmed)
+    return normalized or None
+
+
 def _tesslite_env_signature() -> str:
-    paths = [
-        os.environ.get("ZOCR_TESS_UNICHARSET", ""),
-        os.environ.get("ZOCR_TESS_WORDLIST", ""),
-        os.environ.get("ZOCR_TESS_BIGRAM_JSON", ""),
-    ]
-    stats: List[str] = []
-    for path in paths:
-        if not path:
-            stats.append("-")
-            continue
-        try:
-            st = os.stat(path)
-            stats.append(f"{path}:{int(st.st_mtime)}:{st.st_size}")
-        except Exception:
-            stats.append(f"{path}:missing")
-    return "|".join(stats)
+    path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+    if not path:
+        return "-"
+    try:
+        st = os.stat(path)
+        return f"{path}:{int(st.st_mtime)}:{st.st_size}"
+    except Exception:
+        return f"{path}:missing"
 
 
 def _tesslite_builtin_available() -> bool:
@@ -2617,13 +2741,11 @@ def _tesslite_builtin_payload() -> Tuple[
 
 def _tesslite_effective_source() -> Tuple[bool, str, bool]:
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
-    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
-    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
-    env_supplied = any([unichar, wordlist, bigram])
-    if env_supplied:
-        return True, _tesslite_env_signature(), False
+    suffix = _tesslite_domain_signature()
+    if unichar:
+        return True, f"{_tesslite_env_signature()}{suffix}", False
     if _tesslite_builtin_available():
-        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}", True
+        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}{suffix}", True
     return False, "", False
 
 
@@ -2669,46 +2791,6 @@ def _load_unicharset(path: str) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str
     return glyphs, ambiguous, categories
 
 
-def _load_wordlist(path: str) -> Set[str]:
-    words: Set[str] = set()
-    if not path:
-        return words
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                token = line.strip()
-                if not token or token.startswith("#"):
-                    continue
-                words.add(token)
-    except Exception:
-        return set()
-    return words
-
-
-def _load_bigram_json(path: str) -> Dict[str, Dict[str, float]]:
-    if not path:
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception:
-        return {}
-    bigrams: Dict[str, Dict[str, float]] = {}
-    if isinstance(payload, dict):
-        for prev, mapping in payload.items():
-            if not isinstance(mapping, dict):
-                continue
-            table: Dict[str, float] = {}
-            for ch, weight in mapping.items():
-                try:
-                    table[str(ch)] = float(weight)
-                except Exception:
-                    continue
-            if table:
-                bigrams[str(prev)] = table
-    return bigrams
-
-
 def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
     counts: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     totals: Dict[str, float] = defaultdict(float)
@@ -2741,15 +2823,19 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
         return None
     if _TESSLITE_MODEL is not None and signature == _TESSLITE_MODEL_SIG:
         return _TESSLITE_MODEL
+    builtin_payload = _tesslite_builtin_payload()
+    built_glyphs, built_ambiguous, built_categories, built_dictionary, built_bigrams = builtin_payload
     if use_builtin:
-        glyphs, ambiguous, categories, dictionary, bigrams = _tesslite_builtin_payload()
+        glyphs, ambiguous, categories, dictionary, bigrams = builtin_payload
     else:
         unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
-        word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
-        bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
         glyphs, ambiguous, categories = _load_unicharset(unichar_path)
-        dictionary = _load_wordlist(word_path)
-        bigrams = _load_bigram_json(bigram_path)
+        dictionary = set(built_dictionary)
+        bigrams = {prev: dict(mapping) for prev, mapping in built_bigrams.items()}
+    domain_subset = _tesslite_domain_keywords()
+    if domain_subset:
+        dictionary = set(domain_subset)
+        bigrams = _build_bigrams_from_words(dictionary)
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
@@ -2769,16 +2855,15 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
 def get_tesslite_status() -> Dict[str, Any]:
     enabled, signature, use_builtin = _tesslite_effective_source()
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
-    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
-    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
-    source = "builtin" if use_builtin else ("env" if enabled else "none")
+    source = "builtin" if use_builtin else ("custom_unicharset" if enabled else "none")
     return {
         "enabled": bool(enabled),
         "signature": signature or None,
         "source": source,
         "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
-        "wordlist": wordlist if wordlist else ("builtin" if use_builtin else None),
-        "bigram_json": bigram if bigram else ("builtin" if use_builtin else None),
+        "wordlist": "builtin" if enabled else None,
+        "bigram_json": "builtin" if enabled else None,
+        "domain": _tesslite_domain_token(),
     }
 
 
@@ -8537,7 +8622,7 @@ def infer_row_fields(swin: str) -> Dict[str, Any]:
     return out
 
 # Domain keywords for boosts
-DOMAIN_KW = {
+_STATIC_DOMAIN_KW = {
     "invoice": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求",0.4),("登録",0.3),("住所",0.3),("単価",0.3),("数量",0.3)],
     "invoice_jp_v2": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求日",0.5),("発行日",0.4)],
     "invoice_en": [("invoice",1.0),("total",0.9),("amount",0.85),("tax",0.7),("due",0.5),("bill",0.4)],
@@ -8655,29 +8740,90 @@ for _dom_conf in DOMAIN_DEFAULTS.values():
 
 _DOMAIN_ALIAS = {
     "invoice": "invoice_jp_v2",
+    "invoice_ja": "invoice_jp_v2",
+    "invoice_en": "invoice_en",
     "contract": "contract_jp_v2",
     "delivery": "delivery_jp",
     "estimate": "estimate_jp",
     "receipt": "receipt_jp",
     "bank_statement": "bank_statement_en",
+    "bank_statement_ja": "bank_statement_jp",
+    "bank_statement_en": "bank_statement_en",
     "utility_bill": "utility_bill_en",
+    "utility_bill_ja": "utility_bill_jp",
+    "utility_bill_en": "utility_bill_en",
     "insurance_claim": "insurance_claim_en",
+    "insurance_claim_ja": "insurance_claim_jp",
+    "insurance_claim_en": "insurance_claim_en",
     "tax_form": "tax_form_en",
+    "tax_form_ja": "tax_form_jp",
+    "tax_form_en": "tax_form_en",
     "tax_return": "tax_form_en",
     "payslip": "payslip_en",
+    "payslip_ja": "payslip_jp",
+    "payslip_en": "payslip_en",
     "rental_agreement": "rental_agreement_en",
+    "rental_agreement_ja": "rental_agreement_jp",
+    "rental_agreement_en": "rental_agreement_en",
     "lease_contract": "rental_agreement_en",
     "loan_statement": "loan_statement_en",
+    "loan_statement_ja": "loan_statement_jp",
+    "loan_statement_en": "loan_statement_en",
     "loan_summary": "loan_statement_en",
     "travel_itinerary": "travel_itinerary_en",
+    "travel_itinerary_ja": "travel_itinerary_jp",
+    "travel_itinerary_en": "travel_itinerary_en",
     "travel_plan": "travel_itinerary_en",
     "medical_bill": "medical_bill_en",
+    "medical_bill_ja": "medical_bill_jp",
+    "medical_bill_en": "medical_bill_en",
     "medical_invoice": "medical_bill_en",
     "customs_declaration": "customs_declaration_en",
+    "customs_declaration_ja": "customs_declaration_en",
+    "customs_declaration_en": "customs_declaration_en",
     "customs_form": "customs_declaration_en",
     "grant_application": "grant_application_en",
-    "boarding_pass": "boarding_pass_en"
+    "grant_application_ja": "grant_application_en",
+    "grant_application_en": "grant_application_en",
+    "boarding_pass": "boarding_pass_en",
+    "boarding_pass_ja": "boarding_pass_en",
+    "boarding_pass_en": "boarding_pass_en",
+    "purchase_order_ja": "purchase_order",
+    "purchase_order_en": "purchase_order",
+    "shipping_notice_ja": "shipping_notice",
+    "shipping_notice_en": "shipping_notice",
+    "expense_report_ja": "expense",
+    "expense_report_en": "expense",
 }
+
+
+def _build_domain_kw() -> Dict[str, List[Tuple[str, float]]]:
+    base: Dict[str, List[Tuple[str, float]]] = {
+        dom: list(entries) for dom, entries in _STATIC_DOMAIN_KW.items()
+    }
+    if _all_domain_keywords is None:
+        return base
+    try:
+        mapping = _all_domain_keywords()
+    except Exception:
+        return base
+    for token, words in mapping.items():
+        if not words:
+            continue
+        target = token if token in base else _DOMAIN_ALIAS.get(token)
+        if not target or target not in base:
+            continue
+        seen = {kw for kw, _ in base[target]}
+        for word in sorted(words):
+            if word in seen:
+                continue
+            weight = 0.45 if len(word) <= 3 else 0.35 if len(word) <= 6 else 0.25
+            base[target].append((word, weight))
+            seen.add(word)
+    return base
+
+
+DOMAIN_KW = _build_domain_kw()
 
 _DOMAIN_HEADER_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
     "invoice_jp_v2": [
@@ -10960,6 +11106,21 @@ def _is_auto_domain(value: Optional[str]) -> bool:
         norm = value.strip().lower()
         return norm in {"", "auto", "autodetect", "detect", "default"}
     return False
+
+
+def _apply_tess_domain_env(domain: Optional[str]) -> Optional[str]:
+    if domain is None:
+        os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        return None
+    if isinstance(domain, str):
+        token = domain.strip()
+    else:
+        token = str(domain).strip()
+    if not token or _is_auto_domain(token):
+        os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        return None
+    os.environ["ZOCR_TESS_DOMAIN"] = token
+    return token
 
 
 def _prepare_domain_hints(inputs: List[str], extra_paths: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -13964,8 +14125,6 @@ def _patched_run_full_pipeline(
     blank_min_area: Optional[int] = None,
     allow_pytesseract: Optional[bool] = None,
     tess_unicharset: Optional[str] = None,
-    tess_wordlist: Optional[str] = None,
-    tess_bigram_json: Optional[str] = None,
     dry_run: bool = False,
     topdir_only: bool = False,
     max_pages: Optional[int] = None,
@@ -14009,20 +14168,10 @@ def _patched_run_full_pipeline(
     elif allow_pytesseract is False:
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
     tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
-    tess_wordlist = _validate_file_if_supplied(tess_wordlist, "--tess-wordlist")
-    tess_bigram_json = _validate_file_if_supplied(tess_bigram_json, "--tess-bigram-json")
     if tess_unicharset is not None:
         os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
     else:
         os.environ.pop("ZOCR_TESS_UNICHARSET", None)
-    if tess_wordlist is not None:
-        os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
-    else:
-        os.environ.pop("ZOCR_TESS_WORDLIST", None)
-    if tess_bigram_json is not None:
-        os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
-    else:
-        os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
     if max_cells is not None and max_cells > 0:
         os.environ["ZOCR_EXPORT_MAX_CELLS"] = str(int(max_cells))
     else:
@@ -14077,10 +14226,13 @@ def _patched_run_full_pipeline(
 
         pages = _dedup_pages_list(pages, require_exists=True)
 
-        if pages:
-            annos = [None] * len(pages)
-        else:
-            pages, annos = zocr_onefile_consensus.make_demo(outdir)
+        if not pages:
+            raise RuntimeError(
+                "`--input demo` was requested but no sample inputs were found. "
+                "Place demo files under samples/demo_inputs/ or samples/input_demo/."
+            )
+
+        annos = [None] * len(pages)
     else:
         pages = _collect_pages(
             inputs,
@@ -14256,8 +14408,6 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
     }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
@@ -14352,6 +14502,8 @@ def _patched_run_full_pipeline(
             selected_confidence = float(domain_hints.get("best_score") or 0.0)
         except Exception:
             selected_confidence = None
+    tess_domain_env = _apply_tess_domain_env(prof.get("domain"))
+    domain_auto_summary["tess_domain_env"] = tess_domain_env
     summary["domain_autodetect"] = domain_auto_summary
     
     if "OCR" in ok:
@@ -14698,6 +14850,8 @@ def _patched_run_full_pipeline(
         if selected_source is None:
             selected_source = "default"
     _apply_domain_defaults(prof, prof.get("domain"))
+    final_tess_domain = _apply_tess_domain_env(prof.get("domain"))
+    domain_auto_summary["tess_domain_env"] = final_tess_domain
     try:
         with open(prof_path, "w", encoding="utf-8") as pf:
             json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)
@@ -15422,16 +15576,6 @@ def main():
         help="Path to a Tesseract-style unicharset file for toy lexical gating",
     )
     ap.add_argument(
-        "--tess-wordlist",
-        default=None,
-        help="Optional newline-delimited dictionary that boosts toy OCR tokens",
-    )
-    ap.add_argument(
-        "--tess-bigram-json",
-        default=None,
-        help="JSON bigram table that penalizes unlikely glyph transitions",
-    )
-    ap.add_argument(
         "--print-stage-trace",
         action="store_true",
         help="Print the stage timing table after the run",
@@ -15501,8 +15645,6 @@ def main():
             blank_min_area=args.blank_min_area,
             allow_pytesseract=args.allow_pytesseract,
             tess_unicharset=args.tess_unicharset,
-            tess_wordlist=args.tess_wordlist,
-            tess_bigram_json=args.tess_bigram_json,
             dry_run=args.dry_run,
             topdir_only=args.topdir_only,
             max_pages=max_pages_budget,
