@@ -54,9 +54,13 @@ python -m zocr.diff \
 - **[JA]** `assist_plan.json` は `reanalyze_queue` / `rag_followups` / `profile_actions` を含み、各エントリに行プレビューや `trace_id` を付与するため、Slack/Teams 通知や `intent.action="reanalyze_cells"` トリガにそのまま使えます。
 - **[EN]** `assist_plan.json` groups recommendations into `reanalyze_queue`, `rag_followups`, and `profile_actions` while preserving row previews plus `trace_id`s so it can feed Slack/Teams digests or fire `intent.action="reanalyze_cells"` automatically.
 - **[FR]** `assist_plan.json` regroupe les recommandations (`reanalyze_queue`, `rag_followups`, `profile_actions`) avec aperçus de lignes et `trace_id`, prêt à déclencher `intent.action="reanalyze_cells"` ou à nourrir des notifications Slack/Teams.
-- **[JA]** さらに `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` があり、請求書・契約・物流だけでなく医療・保険・製造・エネルギー・コンプラなど各ドメイン専用のハンドオフを diff テンプレ付きで生成します。
-- **[EN]** Each entry also exposes `domain_tags`, an LLM-oriented `llm_directive`, aggregated `domain_briefings`, and consolidated `handoff_packets`, so invoice/contract/logistics plus healthcare/insurance/manufacturing/energy/compliance assistants receive bespoke prompts from the diff feed.
-- **[FR]** Chaque entrée inclut désormais `domain_tags`, une `llm_directive`, des `domain_briefings` et des `handoff_packets`, livrant des consignes spécialisées pour les domaines facture/contrat/logistique mais aussi santé/assurance/fabrication/énergie/conformité directement depuis le diff.
+- **[JA]** さらに `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` があり、請求書・契約・物流だけでなく医療・保険・製造・エネルギー・コンプラ・不動産・通信・小売・官公庁・教育・テック・マーケ・航空・建設にも対応した diff テンプレを生成します。
+- **[EN]** Each entry also exposes `domain_tags`, an LLM-oriented `llm_directive`, aggregated `domain_briefings`, and consolidated `handoff_packets`, covering invoice/contract/logistics plus healthcare/insurance/manufacturing/energy/compliance as well as real-estate/telecom/retail/public-sector/education/technology/marketing/aviation/construction use cases.
+- **[FR]** Chaque entrée inclut désormais `domain_tags`, une `llm_directive`, des `domain_briefings` et des `handoff_packets`, afin de servir les domaines facture/contrat/logistique, santé/assurance/fabrication/énergie/conformité mais aussi immobilier/télécom/retail/secteur public/éducation/technologie/marketing/aviation/construction.
+
+- **[JA]** エントリには `llm_ready_context` / `handoff_brief` も追加され、`handoff_packets` は `llm_context_examples` を添付して差分の位置・理由・旧新値をまとめたプロンプトをそのまま LLM へ渡せます。
+- **[EN]** Entries ship with `llm_ready_context` plus a concise `handoff_brief`, and each packet now lists `llm_context_examples` so downstream LLMs inherit a diff-specific prompt with the location, rationale, and before/after values.
+- **[FR]** Chaque entrée fournit `llm_ready_context` et un `handoff_brief` concis, tandis que les paquets incluent `llm_context_examples`, donnant aux LLM aval un prompt diff prêt à l’emploi (emplacement, raison, valeurs avant/après).
 
 ## なぜ小さく保てるか / Why the implementation stays small / Pourquoi si peu de code suffit
 1. **構造化セル情報 / Structured cell context / Contexte cellulaire structuré** – 各レコードにページ・表・行列・テキスト・filters・`trace_id` が揃っているため、再OCRではなく構造合わせに集中できます。

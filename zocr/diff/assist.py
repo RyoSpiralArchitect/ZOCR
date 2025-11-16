@@ -156,6 +156,131 @@ DOMAIN_PATTERNS: Dict[str, List[str]] = {
         "規制",
         "監査",
     ],
+    "real_estate": [
+        "lease",
+        "rent",
+        "tenant",
+        "landlord",
+        "property",
+        "parcel",
+        "sqft",
+        "㎡",
+        "建物",
+        "土地",
+        "assessor",
+    ],
+    "telecom": [
+        "telecom",
+        "carrier",
+        "bandwidth",
+        "5g",
+        "lte",
+        "sim",
+        "通信",
+        "network",
+        "fiber",
+        "spectrum",
+    ],
+    "retail": [
+        "retail",
+        "pos",
+        "store",
+        "店舗",
+        "inventory",
+        "sku",
+        "merch",
+        "category",
+        "sales",
+        "売上",
+        "basket",
+    ],
+    "pharma": [
+        "pharma",
+        "drug",
+        "compound",
+        "clinical",
+        "trial",
+        "fda",
+        "gmp",
+        "dose",
+        "治験",
+        "薬",
+        "製薬",
+    ],
+    "public_sector": [
+        "municipal",
+        "ordinance",
+        "budget",
+        "council",
+        "prefecture",
+        "省庁",
+        "city",
+        "公共",
+        "procurement",
+        "grant",
+        "appropriation",
+    ],
+    "education": [
+        "curriculum",
+        "syllabus",
+        "semester",
+        "credit",
+        "student",
+        "enrollment",
+        "学期",
+        "授業",
+        "faculty",
+        "campus",
+    ],
+    "technology": [
+        "release notes",
+        "version",
+        "api",
+        "module",
+        "repository",
+        "commit",
+        "feature",
+        "テック",
+        "システム",
+        "仕様",
+    ],
+    "marketing": [
+        "campaign",
+        "impression",
+        "ctr",
+        "leads",
+        "pipeline",
+        "広告",
+        "branding",
+        "creative",
+        "媒体",
+        "budget",
+    ],
+    "aviation": [
+        "flight",
+        "aircraft",
+        "tail",
+        "iata",
+        "icao",
+        "runway",
+        "gate",
+        "crew",
+        "airline",
+        "航班",
+        "機材",
+    ],
+    "construction": [
+        "bid",
+        "blueprint",
+        "contractor",
+        "site",
+        "施工",
+        "建設",
+        "permit",
+        "rfi",
+        "punch list",
+        "工程表",
+    ],
 }
 
 DOMAIN_SUMMARY_NOTES: Dict[str, str] = {
@@ -171,6 +296,16 @@ DOMAIN_SUMMARY_NOTES: Dict[str, str] = {
     "manufacturing": "Manufacturing/BOM change – list affected part numbers, assembly steps, and lot IDs.",
     "energy": "Energy/utility adjustment – highlight meter IDs, generation totals, and emission factors.",
     "compliance": "Compliance/audit variance – mention control IDs, audit steps, and deadlines.",
+    "real_estate": "Real-estate or lease shift – cite parcel IDs, lease numbers, and rent adjustments.",
+    "telecom": "Telecom/network delta – call out carrier IDs, circuit numbers, and bandwidth impacts.",
+    "retail": "Retail/POS change – list store IDs, SKU counts, and sales deltas per channel.",
+    "pharma": "Pharma/clinical update – mention protocol IDs, compound names, and dose changes.",
+    "public_sector": "Public-sector memo – reference ordinance numbers, budget lines, and grant codes.",
+    "education": "Education/academic diff – cite course codes, semesters, and enrollment counts.",
+    "technology": "Technology/spec update – highlight version numbers, API endpoints, and module owners.",
+    "marketing": "Marketing/campaign shift – include campaign IDs, spend deltas, and KPI impacts.",
+    "aviation": "Aviation/operations change – mention flight numbers, aircraft tails, and route timing.",
+    "construction": "Construction/project variance – reference bid IDs, site codes, and schedule impacts.",
     "general": "General structured document – keep row/table context and cite trace IDs for quick reopening.",
 }
 
@@ -187,6 +322,16 @@ DOMAIN_DIRECTIVES: Dict[str, str] = {
     "manufacturing": "Surface BOM lines, part numbers, quantities, and assembly stage changes.",
     "energy": "List meter IDs, generation/consumption deltas, and emission metrics.",
     "compliance": "Tie the change back to control IDs, regulatory clauses, and due dates.",
+    "real_estate": "Flag lease IDs, parcel references, and rent/tax adjustments.",
+    "telecom": "Call out circuit IDs, bandwidth tiers, and outage windows.",
+    "retail": "Mention store/SKU codes, unit deltas, and promo windows.",
+    "pharma": "Reference protocol IDs, batch numbers, and dosing/timeline deltas.",
+    "public_sector": "Point to ordinance numbers, budget line items, and grant identifiers.",
+    "education": "List course codes, term spans, and enrollment counts.",
+    "technology": "Highlight version numbers, API routes, and affected modules.",
+    "marketing": "Mention campaign IDs, spend deltas, KPIs, and creative slots.",
+    "aviation": "List flight numbers, aircraft tails, gate/runway changes, and timing deltas.",
+    "construction": "Reference project/site codes, bid packages, and schedule/cost impacts.",
     "general": "Stick to the table context and include trace IDs so downstream LLMs can reopen the snippet.",
 }
 
@@ -194,6 +339,12 @@ LLM_ACTION_GUIDANCE: Dict[str, str] = {
     "reanalyze_cells": "Re-run OCR / structured parsing on the referenced cells before promoting them downstream.",
     "rag_followup": "Prepare a concise explanation for the downstream RAG assistant describing what changed and why the stakeholder should care.",
     "profile_update": "Update extraction heuristics or header dictionaries so future runs stay aligned.",
+}
+
+ACTION_CONTEXT_HINTS: Dict[str, str] = {
+    "reanalyze_cells": "Re-run OCR/structure capture on the cited cells before escalating.",
+    "rag_followup": "Draft a downstream explanation that highlights the contextual change.",
+    "profile_update": "Update header/column/profile rules so future runs stay aligned.",
 }
 
 
@@ -246,6 +397,7 @@ class DiffAssistPlanner:
                 if not entry:
                     continue
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=severity)
+                self._attach_llm_context(entry, tags, severity)
                 _bump(tags)
                 if severity == "high":
                     reanalyze.add(_assign(entry), self.max_items_per_bucket)
@@ -254,11 +406,13 @@ class DiffAssistPlanner:
             elif etype in {"row_added", "row_removed", "table_added", "table_removed", "section_added", "section_removed"}:
                 entry = self._basic_entry(event, action="rag_followup", reason=self._row_or_table_reason(event))
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=None)
+                self._attach_llm_context(entry, tags, severity=None)
                 _bump(tags)
                 rag.add(_assign(entry), self.max_items_per_bucket)
             elif etype in {"header_renamed", "col_moved", "section_title_changed", "section_level_changed"}:
                 entry = self._basic_entry(event, action="profile_update", reason=self._profile_reason(event))
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=None)
+                self._attach_llm_context(entry, tags, severity=None)
                 _bump(tags)
                 profile.add(_assign(entry), self.max_items_per_bucket)
 
@@ -429,6 +583,19 @@ class DiffAssistPlanner:
             entry["llm_directive"] = directive
         return tags
 
+    def _attach_llm_context(
+        self,
+        entry: Dict[str, Any],
+        domain_tags: List[str],
+        severity: Optional[str],
+    ) -> None:
+        context = self._llm_context(entry, domain_tags, severity)
+        if context:
+            entry["llm_ready_context"] = context
+        brief = self._handoff_brief(entry, domain_tags, severity)
+        if brief:
+            entry["handoff_brief"] = brief
+
     def _infer_domains(self, event: Dict[str, Any]) -> List[str]:
         tokens: List[str] = []
         keys = [
@@ -541,6 +708,94 @@ class DiffAssistPlanner:
             if part
         ).strip()
 
+    def _llm_context(
+        self,
+        entry: Dict[str, Any],
+        domain_tags: List[str],
+        severity: Optional[str],
+    ) -> Optional[str]:
+        action = entry.get("action", "rag_followup")
+        domain = domain_tags[0] if domain_tags else "general"
+        severity_label = severity or entry.get("severity") or "info"
+        lines: List[str] = []
+        action_hint = ACTION_CONTEXT_HINTS.get(action)
+        if action_hint:
+            lines.append(action_hint)
+        lines.append(
+            f"Action={action} | Domain={domain} | Event={entry.get('event_type')} | Severity={severity_label}"
+        )
+        if entry.get("reason"):
+            lines.append(f"Reason: {entry['reason']}")
+        focus_parts: List[str] = []
+        row_ref = entry.get("row_key") or entry.get("row_key_b") or entry.get("row_key_a")
+        if row_ref:
+            focus_parts.append(f"row={row_ref}")
+        if entry.get("row_ids"):
+            focus_parts.append("ids=" + ",".join(map(str, entry["row_ids"][:3])))
+        if entry.get("row_dates"):
+            focus_parts.append("dates=" + ",".join(map(str, entry["row_dates"][:3])))
+        if entry.get("table_page") is not None:
+            focus_parts.append(f"page={entry['table_page']}")
+        if entry.get("table_index") is not None:
+            focus_parts.append(f"table={entry['table_index']}")
+        header_preview = entry.get("table_header_preview") or entry.get("table_headers")
+        if header_preview:
+            focus_parts.append(f"headers={header_preview}")
+        if entry.get("title"):
+            focus_parts.append(f"title={entry['title']}")
+        if focus_parts:
+            lines.append("Focus: " + ", ".join(focus_parts))
+        value_parts: List[str] = []
+        if entry.get("old") is not None or entry.get("new") is not None:
+            value_parts.append(f"old='{entry.get('old')}' → new='{entry.get('new')}'")
+        if entry.get("numeric_delta") is not None:
+            value_parts.append(f"Δ={entry['numeric_delta']:+g}")
+        if entry.get("relative_delta") is not None:
+            try:
+                value_parts.append(f"rΔ={float(entry['relative_delta']):+.2%}")
+            except (TypeError, ValueError):
+                pass
+        if entry.get("similarity") is not None:
+            value_parts.append(f"sim={float(entry['similarity']):.2f}")
+        trace = entry.get("trace_b") or entry.get("trace_a")
+        if trace:
+            value_parts.append(f"trace={trace}")
+        preview = entry.get("a_row_preview") or entry.get("b_row_preview") or entry.get("row_preview")
+        if preview:
+            value_parts.append(f"row≈{preview}")
+        if value_parts:
+            lines.append("Values: " + "; ".join(value_parts))
+        return "\n".join(lines).strip() if lines else None
+
+    def _handoff_brief(
+        self,
+        entry: Dict[str, Any],
+        domain_tags: List[str],
+        severity: Optional[str],
+    ) -> Optional[str]:
+        domain = domain_tags[0] if domain_tags else "general"
+        action = entry.get("action", "rag_followup")
+        severity_label = severity or entry.get("severity")
+        parts = [f"{domain}:{entry.get('event_type')}→{action}"]
+        if severity_label:
+            parts.append(f"severity={severity_label}")
+        if entry.get("reason"):
+            parts.append(entry["reason"])
+        focus = entry.get("row_key") or entry.get("row_key_b") or entry.get("title")
+        if focus:
+            parts.append(f"focus={focus}")
+        if entry.get("numeric_delta") is not None:
+            parts.append(f"Δ={entry['numeric_delta']:+g}")
+        if entry.get("relative_delta") is not None:
+            try:
+                parts.append(f"rΔ={float(entry['relative_delta']):+.2%}")
+            except (TypeError, ValueError):
+                pass
+        trace = entry.get("trace_b") or entry.get("trace_a")
+        if trace:
+            parts.append(f"trace={trace}")
+        return " | ".join(part for part in parts if part)
+
     def _domain_briefings(self, counter: Dict[str, int]) -> List[Dict[str, Any]]:
         if not counter:
             return []
@@ -580,6 +835,16 @@ class DiffAssistPlanner:
             action_hint = LLM_ACTION_GUIDANCE.get(action, "")
             sample_refs = self._sample_entry_refs(entries)
             llm_prompt = self._packet_prompt(domain, action, entries, summary_note, action_hint, sample_refs)
+            context_examples = [
+                entry.get("llm_ready_context")
+                for entry in entries[:3]
+                if entry.get("llm_ready_context")
+            ]
+            brief_examples = [
+                entry.get("handoff_brief")
+                for entry in entries[:4]
+                if entry.get("handoff_brief")
+            ]
             packets.append(
                 {
                     "domain": domain,
@@ -589,6 +854,8 @@ class DiffAssistPlanner:
                     "action_hint": action_hint,
                     "sample_refs": sample_refs,
                     "llm_prompt": llm_prompt,
+                    "llm_context_examples": context_examples,
+                    "handoff_briefs": brief_examples,
                     "entry_ids": [entry.get("entry_id") for entry in entries],
                 }
             )

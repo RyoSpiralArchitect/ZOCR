@@ -25,9 +25,13 @@ zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 - **[JA]** `--out_plan` / orchestrator の `run_diff` は `assist_plan.json` を併せて吐き出し、差分イベントを再解析キュー・RAG 補助・プロファイル調整に分割します（`intent.action="reanalyze_cells"` の自動発火にも利用可）。
 - **[EN]** The CLI and `run_diff` helper can also emit `assist_plan.json` via `--out_plan`, splitting events into reanalysis queues, downstream RAG follow-ups, and profile tweaks so the pipeline can fire `intent.action="reanalyze_cells"` without hand wiring.
 - **[FR]** La CLI et `run_diff` exportent en option `assist_plan.json` (`--out_plan`), qui ventile les événements entre file de réanalyse, suivi RAG et ajustements de profil pour déclencher automatiquement `intent.action="reanalyze_cells"`.
-- **[JA]** `assist_plan.json` には `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` が入っており、請求書・契約・物流に加えて医療・保険・製造・コンプラなどのハンドオフ文章を diff 専用テンプレで LLM に渡せます。
-- **[EN]** Each assist plan entry now carries `domain_tags`, an LLM-friendly `llm_directive`, aggregated `domain_briefings`, and batched `handoff_packets`, so invoice/contract/logistics plus healthcare/insurance/manufacturing/compliance helpers receive diff-specific prompts instantly.
-- **[FR]** Chaque plan d’assistance expose désormais `domain_tags`, `llm_directive`, `domain_briefings` et `handoff_packets`, offrant des consignes prêtes à l’emploi aux assistants facture/contrat/logistique ainsi qu’aux équipes santé/assurance/fabrication/conformité.
+- **[JA]** `assist_plan.json` には `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` がまとまり、請求書・契約・物流だけでなく医療・保険・製造・エネルギー・コンプラ・不動産・通信・小売・官公庁・教育・テック・マーケ・航空・建設まで業種別のハンドオフ文面を diff 専用テンプレで生成します。
+- **[EN]** Each assist plan entry now bundles `domain_tags`, an LLM-ready `llm_directive`, rolling `domain_briefings`, and `handoff_packets`, covering not just invoice/contract/logistics but also healthcare/insurance/manufacturing/energy/compliance plus real-estate/telecom/retail/public-sector/education/technology/marketing/aviation/construction scenarios.
+- **[FR]** Chaque plan d’assistance regroupe `domain_tags`, `llm_directive`, `domain_briefings` et `handoff_packets`, ce qui fournit des consignes adaptées aux domaines facture/contrat/logistique mais aussi santé/assurance/fabrication/énergie/conformité ainsi qu’aux cas immobilier/télécom/retail/secteur public/éducation/technologie/marketing/aviation/construction.
+
+- **[JA]** エントリごとに `llm_ready_context` / `handoff_brief` が追加され、`handoff_packets` には `llm_context_examples` も添付されるため、差分の理由・位置・旧新値をまとめた diff 専用プロンプトをそのまま下流 RAG/補助 LLM へ渡せます。
+- **[EN]** Entries now expose `llm_ready_context` plus a compact `handoff_brief`, while each packet carries `llm_context_examples`, letting downstream RAG/support LLMs consume a diff-specific prompt that already lists the location, reason, and before/after values.
+- **[FR]** Chaque entrée fournit désormais `llm_ready_context` et un `handoff_brief` concis, et les paquets incluent `llm_context_examples`, de sorte que les agents RAG/LLM en aval reçoivent immédiatement un prompt diff détaillant emplacement, raison et valeurs avant/après.
 
 #### Frontier & identity / フロンティアと技術的アイデンティティ / Frontière et identité
 - **[JA]** AI 市場にはまだ「請求書や法務文書を意味構造ごと差分化する」製品が存在せず、`zocr.diff` のように表×節×filters を束ねて比較できる基盤は希少です。ここを押さえることで Z-OCR 全体の技術的アイデンティティを形成でき、請求書ドメイン等で運用済みの下流 RAG／再解析ループへも即接続できます。
