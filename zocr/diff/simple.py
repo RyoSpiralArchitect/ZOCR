@@ -150,6 +150,14 @@ _NUM_RE = re.compile(
 )
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9一-龠ぁ-んァ-ン％%€$¥£₩₽₺₪₫₱₦₲₴₹<>'\-_/.,]+")
+_MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*\S)\s*$")
+_SETEXT_HEADING_RE = re.compile(r"^[=\-]{3,}$")
+_JP_ARTICLE_RE = re.compile(r"^(第[〇零一二三四五六七八九十百千0-9]+[条章節項]).*")
+_KEYWORD_HEADING_RE = re.compile(
+    r"^(?:Section|Article|Clause|Chapter|Chapitre|Annexe|Annex|Appendix|Schedule)\s+"
+    r"[A-Za-z0-9IVXLC\.\-]+(?:[\s:).\-–—]+.*)?$",
+    re.IGNORECASE,
+)
 
 
 class SimpleTextDiffer:
@@ -192,7 +200,11 @@ class SimpleTextDiffer:
         )
         diff_text = "\n".join(diff_iter)
 
-        numeric_changes, textual_changes = self._collect_changes(opcodes, lines_a, lines_b)
+        sections_a = self._section_map(lines_a)
+        sections_b = self._section_map(lines_b)
+        numeric_changes, textual_changes = self._collect_changes(
+            opcodes, lines_a, lines_b, sections_a, sections_b
+        )
         summary = {
             "total_lines_a": len(lines_a),
             "total_lines_b": len(lines_b),
@@ -269,6 +281,24 @@ class SimpleTextDiffer:
                 "line_label": change.get("line_label"),
                 "line_similarity": change.get("line_similarity"),
             }
+            if change.get("section_heading"):
+                base_event["section_heading"] = change.get("section_heading")
+            if change.get("section_level") is not None:
+                base_event["section_level"] = change.get("section_level")
+            if change.get("section_path"):
+                base_event["section_path"] = list(change.get("section_path"))
+            if change.get("section_heading_a"):
+                base_event["section_heading_a"] = change.get("section_heading_a")
+            if change.get("section_level_a") is not None:
+                base_event["section_level_a"] = change.get("section_level_a")
+            if change.get("section_path_a"):
+                base_event["section_path_a"] = list(change.get("section_path_a"))
+            if change.get("section_heading_b"):
+                base_event["section_heading_b"] = change.get("section_heading_b")
+            if change.get("section_level_b") is not None:
+                base_event["section_level_b"] = change.get("section_level_b")
+            if change.get("section_path_b"):
+                base_event["section_path_b"] = list(change.get("section_path_b"))
             base_event["row_ids"] = [rid for rid in base_event["row_ids"] if rid]
             if change.get("change_type"):
                 base_event["text_change_type"] = change.get("change_type")
@@ -338,6 +368,8 @@ class SimpleTextDiffer:
         opcodes,
         lines_a: Sequence[str],
         lines_b: Sequence[str],
+        sections_a: Dict[int, Dict[str, Any]],
+        sections_b: Dict[int, Dict[str, Any]],
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         numeric_results: List[Dict[str, Any]] = []
         textual_results: List[Dict[str, Any]] = []
@@ -358,6 +390,8 @@ class SimpleTextDiffer:
                 nums_b = self._extract_numbers(text_b)
                 signature = self._line_signature(text_a or text_b)
                 label = self._line_label(text_a or text_b)
+                section_info_a = sections_a.get(line_no_a) if line_no_a else None
+                section_info_b = sections_b.get(line_no_b) if line_no_b else None
                 base_change = {
                     "line_a": line_no_a,
                     "line_b": line_no_b,
@@ -370,6 +404,22 @@ class SimpleTextDiffer:
                     "context_a": self._gather_context(lines_a, line_no_a, context_radius),
                     "context_b": self._gather_context(lines_b, line_no_b, context_radius),
                 }
+                if section_info_a:
+                    base_change["section_heading_a"] = section_info_a.get("heading")
+                    base_change["section_level_a"] = section_info_a.get("level")
+                    if section_info_a.get("path"):
+                        base_change["section_path_a"] = list(section_info_a["path"])
+                if section_info_b:
+                    base_change["section_heading_b"] = section_info_b.get("heading")
+                    base_change["section_level_b"] = section_info_b.get("level")
+                    if section_info_b.get("path"):
+                        base_change["section_path_b"] = list(section_info_b["path"])
+                section_source = section_info_a or section_info_b
+                if section_source:
+                    base_change["section_heading"] = section_source.get("heading")
+                    base_change["section_level"] = section_source.get("level")
+                    if section_source.get("path"):
+                        base_change["section_path"] = list(section_source["path"])
                 if not nums_a and not nums_b:
                     base_change["change_type"] = self._textual_change_type(line_no_a, line_no_b)
                     tokens_a = self._tokenize_for_text(text_a)
@@ -876,3 +926,43 @@ class SimpleTextDiffer:
                 prefix = f"L{line_no}: " if line_no is not None else ""
                 parts.append(f"{prefix}{text}")
         return "\n".join(parts) if parts else None
+
+    def _section_map(self, lines: Sequence[str]) -> Dict[int, Dict[str, Any]]:
+        mapping: Dict[int, Dict[str, Any]] = {}
+        stack: List[Dict[str, Any]] = []
+        for idx, _line in enumerate(lines, start=1):
+            heading, level = self._detect_heading(idx - 1, lines)
+            if heading:
+                while stack and stack[-1]["level"] >= level:
+                    stack.pop()
+                stack.append({"heading": heading, "level": level})
+            if stack:
+                mapping[idx] = {
+                    "heading": stack[-1]["heading"],
+                    "level": stack[-1]["level"],
+                    "path": [entry["heading"] for entry in stack],
+                }
+        return mapping
+
+    def _detect_heading(
+        self, index: int, lines: Sequence[str]
+    ) -> Tuple[Optional[str], Optional[int]]:
+        if index < 0 or index >= len(lines):
+            return None, None
+        raw = lines[index]
+        stripped = (raw or "").strip()
+        if not stripped:
+            return None, None
+        hash_match = _MARKDOWN_HEADING_RE.match(raw)
+        if hash_match:
+            return hash_match.group(2).strip(), len(hash_match.group(1))
+        if index + 1 < len(lines):
+            underline = lines[index + 1].strip()
+            if underline and _SETEXT_HEADING_RE.match(underline):
+                level = 1 if underline.startswith("=") else 2
+                return stripped, level
+        if _JP_ARTICLE_RE.match(stripped):
+            return stripped, 2
+        if _KEYWORD_HEADING_RE.match(stripped):
+            return stripped, 2
+        return None, None
