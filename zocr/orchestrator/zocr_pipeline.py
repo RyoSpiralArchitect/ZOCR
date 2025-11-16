@@ -223,6 +223,10 @@ def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
     (out_dir / "changes.diff").write_text(diff_render_unified(result["events"]), encoding="utf-8")
     diff_render_html(result["events"], out_dir / "report.html")
     (out_dir / "assist_plan.json").write_text(_json_dumps(assist_plan), encoding="utf-8")
+    (out_dir / "agentic_requests.json").write_text(
+        _json_dumps(assist_plan.get("agentic_requests", [])),
+        encoding="utf-8",
+    )
     return result
 
 

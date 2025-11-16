@@ -102,6 +102,11 @@ def main() -> None:
         "--out_plan", default=None, help="save downstream reanalysis/RAG assist plan"
     )
     ap.add_argument(
+        "--out_agentic",
+        default=None,
+        help="save Agentic RAG request bundle (visual/narrative prompts)",
+    )
+    ap.add_argument(
         "--simple_text_a",
         default=None,
         help="plain-text document A (or a run dir with rag/bundle.md) for the quick differ",
@@ -138,6 +143,11 @@ def main() -> None:
         default=None,
         help="save downstream assist plan for the quick differ",
     )
+    ap.add_argument(
+        "--simple_agentic_out",
+        default=None,
+        help="save Agentic RAG request bundle for the quick differ",
+    )
     args = ap.parse_args()
 
     run_semantic = bool(args.a or args.b)
@@ -155,6 +165,7 @@ def main() -> None:
             "--out_diff": args.out_diff,
             "--out_html": args.out_html,
             "--out_plan": args.out_plan,
+            "--out_agentic": args.out_agentic,
             "--sections_a": args.sections_a,
             "--sections_b": args.sections_b,
         }
@@ -193,6 +204,15 @@ def main() -> None:
             Path(args.out_plan).write_text(
                 json.dumps(assist_plan, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+        if args.out_agentic:
+            Path(args.out_agentic).write_text(
+                json.dumps(
+                    assist_plan.get("agentic_requests", []),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         if not args.out_plan:
             summary = assist_plan.get("summary", {})
             print(
@@ -202,6 +222,10 @@ def main() -> None:
                     profile=summary.get("profile_actions", 0),
                 )
             )
+            agentic_count = summary.get(
+                "agentic_requests", len(assist_plan.get("agentic_requests", []))
+            )
+            print(f"[assist.agentic] requests={agentic_count}")
 
     if args.simple_text_a or args.simple_text_b:
         if not (args.simple_text_a and args.simple_text_b):
@@ -234,6 +258,15 @@ def main() -> None:
                 json.dumps(simple_plan, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        if args.simple_agentic_out:
+            Path(args.simple_agentic_out).write_text(
+                json.dumps(
+                    simple_plan.get("agentic_requests", []),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         if not args.simple_plan_out:
             plan_summary = simple_plan.get("summary", {})
             print(
@@ -243,6 +276,10 @@ def main() -> None:
                     profile=plan_summary.get("profile_actions", 0),
                 )
             )
+            agentic_count = plan_summary.get(
+                "agentic_requests", len(simple_plan.get("agentic_requests", []))
+            )
+            print(f"[simple.agentic] requests={agentic_count}")
         if not args.simple_json_out:
             print(
                 "[simple] diff_hunks={hunks} numeric_changes={nums}".format(

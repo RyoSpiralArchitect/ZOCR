@@ -610,6 +610,8 @@ class DiffAssistPlanner:
         elif domain_counter:
             summary["primary_domain"] = max(domain_counter.items(), key=lambda kv: kv[1])[0]
         packets = self._build_handoff_packets([reanalyze, rag, profile])
+        agentic_requests = self._build_agentic_requests(events)
+        summary["agentic_requests"] = len(agentic_requests)
         return {
             "summary": summary,
             "reanalyze_queue": reanalyze.entries,
@@ -617,6 +619,7 @@ class DiffAssistPlanner:
             "profile_actions": profile.entries,
             "domain_briefings": domain_briefings,
             "handoff_packets": packets,
+            "agentic_requests": agentic_requests,
         }
 
     # ------------------------------------------------------------------
@@ -1068,6 +1071,142 @@ class DiffAssistPlanner:
                 }
             )
         return packets[:20]
+
+    def _build_agentic_requests(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        requests: List[Dict[str, Any]] = []
+        seq = count(1)
+        for event in events:
+            ctx = self._extract_context(event)
+            directive = self._agentic_directive(event, ctx)
+            if not directive:
+                continue
+            domain_tags = self._infer_domains(event)
+            request = {
+                "request_id": f"agentic_{next(seq)}",
+                "event_type": event.get("type"),
+                "domain_tags": domain_tags,
+                "llm_directive": directive,
+                "preferred_outputs": self._agentic_outputs(event),
+                "context": ctx,
+                "source": event.get("source") or "semantic_diff",
+            }
+            focus = self._agentic_focus(event, ctx)
+            if focus:
+                request["handoff_focus"] = focus
+            visual = self._agentic_visual_brief(event, ctx)
+            if visual:
+                request["visual_brief"] = visual
+            narrative = self._agentic_narrative_brief(event, ctx, domain_tags)
+            if narrative:
+                request["narrative_brief"] = narrative
+            if event.get("text_highlight"):
+                request["annotated_excerpt"] = event.get("text_highlight")
+            requests.append(request)
+        return requests
+
+    def _agentic_outputs(self, event: Dict[str, Any]) -> List[str]:
+        outputs = ["narrative_explanation"]
+        etype = event.get("type")
+        if etype in {"cell_updated", "row_added", "row_removed", "table_added", "table_removed"}:
+            outputs.append("diff_overlay_image")
+        if event.get("text_change_type"):
+            outputs.append("annotated_excerpt")
+        if event.get("section_heading") or event.get("section_heading_a") or event.get("section_heading_b"):
+            outputs.append("section_summary_card")
+        return outputs
+
+    def _agentic_focus(self, event: Dict[str, Any], ctx: Dict[str, Any]) -> Optional[List[str]]:
+        focus: List[str] = []
+        row_label = ctx.get("row_key") or ctx.get("line_label")
+        heading = ctx.get("section_heading") or ctx.get("section_heading_b") or ctx.get("section_heading_a")
+        if row_label:
+            focus.append(f"Emphasize row/line '{row_label}'.")
+        if heading:
+            focus.append(f"Mention section '{heading}'.")
+        if event.get("type") == "cell_updated" and ctx.get("old") is not None and ctx.get("new") is not None:
+            focus.append("Show before vs after numeric values in a badge or overlay.")
+        if event.get("text_change_type"):
+            focus.append("Highlight the rewritten sentence and explain why it changed.")
+        if not focus:
+            return None
+        return focus
+
+    def _agentic_visual_brief(self, event: Dict[str, Any], ctx: Dict[str, Any]) -> Optional[str]:
+        row_label = ctx.get("row_key") or ctx.get("line_label")
+        old = ctx.get("old")
+        new = ctx.get("new")
+        if event.get("type") == "cell_updated" and row_label and old is not None and new is not None:
+            return (
+                f"Render a miniature table strip for '{row_label}' showing the old value '{old}'"
+                f" versus the new value '{new}' with arrows/colour chips."
+            )
+        if event.get("text_change_type") and ctx.get("text_highlight"):
+            return "Create a side-by-side paragraph snippet with additions/removals highlighted."
+        if event.get("type") in {"row_added", "row_removed"} and row_label:
+            return f"Show the full row '{row_label}' and annotate whether it was added or removed."
+        return None
+
+    def _agentic_narrative_brief(
+        self,
+        event: Dict[str, Any],
+        ctx: Dict[str, Any],
+        domain_tags: List[str],
+    ) -> Optional[str]:
+        domain = domain_tags[0] if domain_tags else "general"
+        row_label = ctx.get("row_key") or ctx.get("line_label") or "this entry"
+        heading = ctx.get("section_heading") or ctx.get("section_path") or ctx.get("section_heading_b")
+        etype = event.get("type")
+        if etype == "cell_updated":
+            old = ctx.get("old")
+            new = ctx.get("new")
+            if old is None and new is None:
+                return None
+            return (
+                f"Explain in JA/EN how {row_label} under {heading or 'the noted section'} changed from"
+                f" '{old}' to '{new}', and why that matters for the {domain} workflow."
+            )
+        if event.get("text_change_type"):
+            change_type = event.get("text_change_type")
+            return (
+                f"Summarize the {change_type} in {row_label} within {heading or 'the current section'} and"
+                " clarify the intent (policy note, legal clause, etc.) for downstream RAG agents."
+            )
+        if etype in {"row_added", "row_removed"}:
+            action = "was added" if etype == "row_added" else "was removed"
+            return f"Describe why row '{row_label}' {action} and suggest any follow-up actions for {domain} reviewers."
+        if etype in {"table_added", "table_removed"}:
+            action = "appeared" if etype == "table_added" else "disappeared"
+            return f"Document that a table {action} and list the primary headers so the Agentic RAG can create visual summaries."
+        return None
+
+    def _agentic_directive(self, event: Dict[str, Any], ctx: Dict[str, Any]) -> Optional[str]:
+        etype = event.get("type")
+        row_label = ctx.get("row_key") or ctx.get("line_label") or ctx.get("row_key_b")
+        heading = ctx.get("section_heading") or ctx.get("section_path") or ctx.get("section_heading_b")
+        old = ctx.get("old")
+        new = ctx.get("new")
+        base = [
+            "Produce a concise explanation in Japanese *and* English so end users understand the change without reopening the document.",
+            "If tools allow, prepare a diff-style image or overlay plus optional narration for the Agentic RAG GUI.",
+            "Retain key identifiers (row keys, trace IDs, section titles) in your response for downstream linking.",
+        ]
+        if etype == "cell_updated" and old is not None and new is not None:
+            detail = f"Focus on {row_label or 'the affected row'} (section {heading or '?'}) changing from '{old}' to '{new}'."
+        elif event.get("text_change_type"):
+            change_type = event.get("text_change_type")
+            detail = (
+                f"Describe the {change_type} text update around {row_label or 'the paragraph'}"
+                f" and highlight the edits shown in `text_highlight`."
+            )
+        elif etype in {"row_added", "row_removed"}:
+            action = "addition" if etype == "row_added" else "removal"
+            detail = f"Explain the {action} of row {row_label or ''} and note any downstream tasks."
+        elif etype in {"table_added", "table_removed"}:
+            detail = "Summarize why the table structure changed and what users should verify."
+        else:
+            detail = "Summarize the structural adjustment for downstream review."
+        base.append(detail)
+        return " ".join(base)
 
     def _sample_entry_refs(self, entries: List[Dict[str, Any]], limit: int = 8) -> List[str]:
         refs: List[str] = []
