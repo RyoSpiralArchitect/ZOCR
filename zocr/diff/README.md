@@ -52,9 +52,15 @@ python -m zocr.diff \
 - **[JA]** `--out_agentic` を付けると AgenticRAG/GUI 連携向けに `agentic_requests.json` も書き出され、各イベントへ JA/EN 説明用プロンプトと差分画像の描画指示がセットになります。
 - **[EN]** Add `--out_agentic` to export `agentic_requests.json`, a bundle of bilingual directives plus visual-overlay briefs so Agentic RAG/GUI helpers can craft diff images or narrated summaries without reprocessing the events.
 - **[FR]** L’option `--out_agentic` produit `agentic_requests.json`, c’est-à-dire des requêtes bilingues accompagnées d’instructions de rendu pour que les agents RAG/GUI génèrent images ou explications immédiatement.
-- **[JA]** `--out_bundle` を指定するとイベント / unified diff / assist plan / agentic requests を丸ごと含む `handoff_bundle.json` が生成され、API や GUI から 1 ファイルで取得できます（orchestrator の `run_diff` も同ファイルを出力）。
-- **[EN]** Pass `--out_bundle` to produce `handoff_bundle.json`, a single artifact carrying the events, unified diff text, assist plan, and agentic requests so APIs/GUI surfaces can ingest the entire package at once (the orchestrator’s `run_diff` writes the same file).
-- **[FR]** Avec `--out_bundle`, on obtient `handoff_bundle.json`, un unique artefact qui regroupe événements, diff texte, plan d’assistance et requêtes agentic pour que l’API/la GUI récupère tout d’un coup (le `run_diff` de l’orchestrateur le génère aussi).
+- **[JA]** `--out_markdown` を指定すると `report.md` が得られ、Slack/Teams 共有やナレッジベース貼付が容易になります（orchestrator の `run_diff` も同ファイルを出力し、`handoff_bundle.json` には `markdown_report` として本文を内包します）。
+- **[EN]** Use `--out_markdown` to emit `report.md`, a shareable Markdown digest for chats/dashboards; the orchestrator’s `run_diff` writes the same file and `handoff_bundle.json` embeds the text via `markdown_report`.
+- **[FR]** Avec `--out_markdown`, on produit `report.md`, un résumé Markdown prêt pour Slack/Teams ou la documentation ; `run_diff` génère le même fichier et `handoff_bundle.json` embarque ce texte dans `markdown_report`.
+- **[JA]** `--out_bundle` を指定するとイベント / unified diff / Markdown レポート / assist plan / agentic requests を丸ごと含む `handoff_bundle.json` が生成され、API や GUI から 1 ファイルで取得できます（orchestrator の `run_diff` も同ファイルを出力）。
+- **[EN]** Pass `--out_bundle` to produce `handoff_bundle.json`, a single artifact carrying the events, unified diff text, Markdown digest, assist plan, and agentic requests so APIs/GUI surfaces can ingest the entire package at once (the orchestrator’s `run_diff` writes the same file).
+- **[FR]** Avec `--out_bundle`, on obtient `handoff_bundle.json`, un unique artefact regroupant événements, diff texte, résumé Markdown, plan d’assistance et requêtes agentic afin que l’API/la GUI récupère tout d’un coup (le `run_diff` de l’orchestrateur le génère aussi).
+- **[JA]** `summary.numeric_summary` には通貨/単位ごとのバケット、総和、最大差トップ5が入り、`assist_plan.json` や handoff bundle だけ見ても「USD +12,000 / % -3pt」のような勘所が即分かります（軽量 diff も同じ構造）。
+- **[EN]** `summary.numeric_summary` now aggregates the net/absolute totals, per-currency or per-unit buckets, and the five largest swings so even a dashboard or handoff bundle alone can highlight “USD +12,000 / % -3pt”; the quick differ produces the same payload.
+- **[FR]** `summary.numeric_summary` regroupe désormais totaux nets/absolus, compartiments par devise/unité et les cinq plus fortes variations afin que les bundles ou tableaux de bord annoncent immédiatement « USD +12 000 / % −3 pts » ; le diff léger fournit la même structure.
 - **[JA]** `assist_plan.json` には `impact_summary` が加わり、総スコア・バケット別件数・トップエントリがまとまります。各 recommendation と agentic request にも `impact_score` / `impact_bucket` が入るため、GUI や API から重要度順のソートが可能です。
 - **[EN]** `assist_plan.json` now includes an `impact_summary` (total score, bucket counts, top entries) while every recommendation and agentic request exposes `impact_score` / `impact_bucket`, making it easy for GUIs/APIs to sort the feed by urgency.
 - **[FR]** `assist_plan.json` comporte désormais `impact_summary` (score total, compte par compartiment, meilleures entrées) et chaque recommandation/requête agentic fournit `impact_score` / `impact_bucket`, ce qui permet de trier le flux selon l’importance côté GUI/API.
@@ -64,9 +70,12 @@ python -m zocr.diff \
 - **[JA]** 軽量 differ 単体で動かす場合も `--simple_agentic_out` を併用すれば `agentic_requests.json` を個別に保存でき、ToyOCR 由来のイベントをそのまま AgenticRAG の差分画像/説明タスクへ引き継げます。
 - **[EN]** When relying only on the quick differ, pass `--simple_agentic_out` to persist its own `agentic_requests.json`, keeping ToyOCR events compatible with the same Agentic RAG workflows.
 - **[FR]** Pour le diff léger seul, `--simple_agentic_out` exporte aussi `agentic_requests.json`, garantissant une compatibilité immédiate avec les agents RAG/GUI qui produisent images ou narratifs.
-- **[JA]** `--simple_bundle_out` を使うと軽量 differ 版の `handoff_bundle.json` も残せるため、ToyOCR で拾った差分を API / GUI / AgenticRAG へワンショットで手渡せます。
-- **[EN]** Use `--simple_bundle_out` to save the quick-differ `handoff_bundle.json`, allowing ToyOCR-style comparisons to feed APIs, GUI cards, or Agentic RAG actors from one payload.
-- **[FR]** `--simple_bundle_out` conserve la variante légère de `handoff_bundle.json`, ce qui fournit aux API/GUI ou aux agents RAG les diffs ToyOCR via un seul paquet.
+- **[JA]** `--simple_bundle_out` を使うと軽量 differ 版の `handoff_bundle.json` も残せるため、ToyOCR で拾った差分と Markdown サマリを API / GUI / AgenticRAG へワンショットで手渡せます。
+- **[EN]** Use `--simple_bundle_out` to save the quick-differ `handoff_bundle.json`, allowing ToyOCR-style comparisons (plus the Markdown digest) to feed APIs, GUI cards, or Agentic RAG actors from one payload.
+- **[FR]** `--simple_bundle_out` conserve la variante légère de `handoff_bundle.json`, désormais accompagnée du résumé Markdown pour livrer aux API/GUI ou aux agents RAG l’ensemble du paquet en une seule fois.
+- **[JA]** `--simple_markdown_out` で軽量 diff 専用の `report.md` も得られるため、git 風 diff を開かなくても差分の概要を共有できます。
+- **[EN]** Add `--simple_markdown_out` to capture a quick-differ `report.md`, letting you paste a chat-friendly summary without reopening the raw git-style diff.
+- **[FR]** En ajoutant `--simple_markdown_out`, le diff léger exporte également `report.md`, un résumé partageable sans rouvrir le diff brut.
 - **[JA]** 行の追加・削除も監視し、置換以外の差分（例：費目が 1 行だけ増えた請求書）でも該当金額の Δ/率を抽出します。
 - **[EN]** Inserted/deleted lines are covered alongside replacements, so a newly added fee line still yields the precise Δ/relative delta.
 - **[FR]** Les lignes ajoutées/supprimées sont également prises en compte, ce qui permet d’extraire Δ/variation même quand une seule ligne vient s’ajouter.
@@ -134,7 +143,8 @@ python -m zocr.diff \
   --simple_text_b memo_v2.txt \
   --simple_diff_out out/diff/memo.diff \
   --simple_json_out out/diff/memo.numeric.json \
-  --simple_plan_out out/diff/memo.assist.json
+  --simple_plan_out out/diff/memo.assist.json \
+  --simple_markdown_out out/diff/memo.md
 ```
 
 ```bash
@@ -145,7 +155,8 @@ python -m zocr.diff \
   --simple_text_b memo_v2.txt \
   --simple_diff_out out/diff/memo.diff \
   --simple_json_out out/diff/memo.numeric.json \
-  --simple_plan_out out/diff/memo.assist.json
+  --simple_plan_out out/diff/memo.assist.json \
+  --simple_markdown_out out/diff/memo.md
 ```
 
 - **[JA]** 同一フォーマットで数値だけ揺れる社内帳票や見積書を git diff そのままの感覚で比較し、差分のうち数値が変わった箇所を Slack などに流すだけならこのモードで完結します。

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .metrics import summarize_numeric_events
+
 try:
     from rapidfuzz import fuzz  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -747,4 +749,7 @@ class SemanticDiffer:
             "events": len(events),
             "section_events": len(section_events),
         }
+        numeric_summary = summarize_numeric_events(events)
+        if numeric_summary:
+            summary["numeric_summary"] = numeric_summary
         return {"events": events, "summary": summary}

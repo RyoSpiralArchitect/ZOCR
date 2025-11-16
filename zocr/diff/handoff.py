@@ -12,6 +12,7 @@ def build_handoff_bundle(
     summary: Optional[Dict[str, Any]],
     events: List[Dict[str, Any]],
     diff_text: str,
+    markdown_text: Optional[str] = None,
     assist_plan: Dict[str, Any],
     artifacts: Optional[Dict[str, Any]] = None,
     extras: Optional[Dict[str, Any]] = None,
@@ -27,6 +28,8 @@ def build_handoff_bundle(
         "assist_plan": assist_plan,
         "agentic_requests": assist_plan.get("agentic_requests", []),
     }
+    if markdown_text:
+        bundle["markdown_report"] = markdown_text
     if artifacts:
         bundle["artifacts"] = {key: val for key, val in artifacts.items() if val}
     if extras:

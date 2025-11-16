@@ -30,6 +30,7 @@ from ..diff import (
     SemanticDiffer,
     build_handoff_bundle,
     render_html as diff_render_html,
+    render_markdown as diff_render_markdown,
     render_unified as diff_render_unified,
 )
 
@@ -225,10 +226,17 @@ def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
     html_path = out_dir / "report.html"
     plan_path = out_dir / "assist_plan.json"
     agentic_path = out_dir / "agentic_requests.json"
+    markdown_path = out_dir / "report.md"
 
     diff_text = diff_render_unified(result["events"])
+    markdown_text = diff_render_markdown(
+        result["events"],
+        result.get("summary"),
+        title="ZOCR Semantic Diff",
+    )
     events_path.write_text(_json_dumps(result), encoding="utf-8")
     diff_path.write_text(diff_text, encoding="utf-8")
+    markdown_path.write_text(markdown_text, encoding="utf-8")
     diff_render_html(result["events"], html_path)
     plan_path.write_text(_json_dumps(assist_plan), encoding="utf-8")
     agentic_path.write_text(
@@ -247,11 +255,13 @@ def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
         summary=result.get("summary"),
         events=result["events"],
         diff_text=diff_text,
+        markdown_text=markdown_text,
         assist_plan=assist_plan,
         artifacts={
             "events_json": str(events_path),
             "diff_text_path": str(diff_path),
             "html_report_path": str(html_path),
+            "markdown_report_path": str(markdown_path),
             "assist_plan": str(plan_path),
             "agentic_requests": str(agentic_path),
         },

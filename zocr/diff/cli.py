@@ -10,7 +10,8 @@ from typing import Optional
 from .assist import DiffAssistPlanner
 from .differ import SemanticDiffer
 from .handoff import build_handoff_bundle
-from .render import render_html, render_unified
+from .metrics import summarize_numeric_events
+from .render import render_html, render_unified, render_markdown
 from .simple import SimpleTextDiffer
 
 
@@ -100,6 +101,11 @@ def main() -> None:
     ap.add_argument("--out_diff", default=None, help="save unified .diff-like text")
     ap.add_argument("--out_html", default=None, help="save HTML report")
     ap.add_argument(
+        "--out_markdown",
+        default=None,
+        help="save Markdown summary report (human-friendly digest)",
+    )
+    ap.add_argument(
         "--out_plan", default=None, help="save downstream reanalysis/RAG assist plan"
     )
     ap.add_argument(
@@ -131,6 +137,11 @@ def main() -> None:
         "--simple_json_out",
         default=None,
         help="save quick differ summary (numeric deltas, line numbers)",
+    )
+    ap.add_argument(
+        "--simple_markdown_out",
+        default=None,
+        help="save Markdown summary for the quick differ",
     )
     ap.add_argument(
         "--simple_context",
@@ -204,6 +215,9 @@ def main() -> None:
             )
 
         txt = render_unified(events)
+        markdown = render_markdown(
+            events, res.get("summary"), title="ZOCR Semantic Diff"
+        )
         if args.out_diff:
             Path(args.out_diff).write_text(txt, encoding="utf-8")
         else:
@@ -211,6 +225,9 @@ def main() -> None:
 
         if args.out_html:
             render_html(events, Path(args.out_html))
+
+        if args.out_markdown:
+            Path(args.out_markdown).write_text(markdown, encoding="utf-8")
 
         if args.out_plan:
             Path(args.out_plan).write_text(
@@ -230,6 +247,9 @@ def main() -> None:
                 "events_json": str(Path(args.out_json).resolve()) if args.out_json else None,
                 "diff_text_path": str(Path(args.out_diff).resolve()) if args.out_diff else None,
                 "html_report_path": str(Path(args.out_html).resolve()) if args.out_html else None,
+                "markdown_report_path": str(Path(args.out_markdown).resolve())
+                if args.out_markdown
+                else None,
                 "assist_plan": str(Path(args.out_plan).resolve()) if args.out_plan else None,
                 "agentic_requests": str(Path(args.out_agentic).resolve()) if args.out_agentic else None,
             }
@@ -248,6 +268,7 @@ def main() -> None:
                 summary=res.get("summary", {}),
                 events=events,
                 diff_text=txt,
+                markdown_text=markdown,
                 assist_plan=assist_plan,
                 artifacts=artifacts,
                 extras=extras,
@@ -284,6 +305,14 @@ def main() -> None:
         )
         simple_plan = planner.plan(simple_events)
         simple_result["assist_plan"] = simple_plan
+        numeric_summary = summarize_numeric_events(simple_events)
+        if numeric_summary:
+            simple_result.setdefault("summary", {})["numeric_summary"] = numeric_summary
+        simple_markdown = render_markdown(
+            simple_events,
+            simple_result.get("summary"),
+            title="ZOCR Quick Diff",
+        )
         if args.simple_json_out:
             Path(args.simple_json_out).write_text(
                 json.dumps(simple_result, ensure_ascii=False, indent=2),
@@ -295,6 +324,12 @@ def main() -> None:
             Path(args.simple_diff_out).write_text(diff_payload, encoding="utf-8")
         else:
             print(diff_payload)
+        if args.simple_markdown_out:
+            Path(args.simple_markdown_out).write_text(
+                simple_markdown,
+                encoding="utf-8",
+            )
+
         if args.simple_plan_out:
             Path(args.simple_plan_out).write_text(
                 json.dumps(simple_plan, ensure_ascii=False, indent=2),
@@ -317,6 +352,9 @@ def main() -> None:
                 "events_json": str(Path(args.simple_json_out).resolve())
                 if args.simple_json_out
                 else None,
+                "markdown_report_path": str(Path(args.simple_markdown_out).resolve())
+                if args.simple_markdown_out
+                else None,
                 "assist_plan": str(Path(args.simple_plan_out).resolve())
                 if args.simple_plan_out
                 else None,
@@ -335,6 +373,7 @@ def main() -> None:
                 summary=simple_result.get("summary", {}),
                 events=simple_events,
                 diff_text=diff_payload,
+                markdown_text=simple_markdown,
                 assist_plan=simple_plan,
                 artifacts=simple_artifacts,
             )
