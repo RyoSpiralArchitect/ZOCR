@@ -535,10 +535,11 @@ class _Bucket:
     name: str
     entries: List[Dict[str, Any]]
 
-    def add(self, entry: Dict[str, Any], limit: Optional[int]) -> None:
+    def add(self, entry: Dict[str, Any], limit: Optional[int]) -> bool:
         if limit is not None and len(self.entries) >= limit:
-            return
+            return False
         self.entries.append(entry)
+        return True
 
 
 class DiffAssistPlanner:
@@ -561,6 +562,9 @@ class DiffAssistPlanner:
         rag = _Bucket("rag_followups", [])
         profile = _Bucket("profile_actions", [])
         domain_counter: Dict[str, int] = defaultdict(int)
+        impact_counter: Dict[str, int] = defaultdict(int)
+        impact_examples: List[Tuple[float, Dict[str, Any]]] = []
+        impact_total = 0.0
         seq = count(1)
 
         def _bump(tags: List[str]) -> None:
@@ -572,6 +576,18 @@ class DiffAssistPlanner:
             entry["entry_id"] = f"entry_{next(seq)}"
             return entry
 
+        def _record_impact(entry: Dict[str, Any]) -> None:
+            nonlocal impact_total
+            score = float(entry.get("impact_score") or 0.0)
+            bucket = entry.get("impact_bucket") or self._impact_bucket(score)
+            entry["impact_score"] = round(score, 3)
+            entry["impact_bucket"] = bucket
+            if score <= 0 and bucket == "info":
+                return
+            impact_total += score
+            impact_counter[bucket] += 1
+            impact_examples.append((score, entry))
+
         for event in events:
             etype = event.get("type")
             if etype == "cell_updated":
@@ -581,22 +597,39 @@ class DiffAssistPlanner:
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=severity)
                 self._attach_llm_context(entry, tags, severity)
                 _bump(tags)
+                assigned = _assign(entry)
                 if severity == "high":
-                    reanalyze.add(_assign(entry), self.max_items_per_bucket)
+                    if reanalyze.add(assigned, self.max_items_per_bucket):
+                        _record_impact(assigned)
                 else:
-                    rag.add(_assign(entry), self.max_items_per_bucket)
+                    if rag.add(assigned, self.max_items_per_bucket):
+                        _record_impact(assigned)
             elif etype in {"row_added", "row_removed", "table_added", "table_removed", "section_added", "section_removed"}:
-                entry = self._basic_entry(event, action="rag_followup", reason=self._row_or_table_reason(event))
+                entry = self._basic_entry(
+                    event,
+                    action="rag_followup",
+                    reason=self._row_or_table_reason(event),
+                    impact_score=self._structure_impact(event),
+                )
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=None)
                 self._attach_llm_context(entry, tags, severity=None)
                 _bump(tags)
-                rag.add(_assign(entry), self.max_items_per_bucket)
+                assigned = _assign(entry)
+                if rag.add(assigned, self.max_items_per_bucket):
+                    _record_impact(assigned)
             elif etype in {"header_renamed", "col_moved", "section_title_changed", "section_level_changed"}:
-                entry = self._basic_entry(event, action="profile_update", reason=self._profile_reason(event))
+                entry = self._basic_entry(
+                    event,
+                    action="profile_update",
+                    reason=self._profile_reason(event),
+                    impact_score=self._structure_impact(event),
+                )
                 tags = self._annotate_entry(entry, event, action=entry["action"], severity=None)
                 self._attach_llm_context(entry, tags, severity=None)
                 _bump(tags)
-                profile.add(_assign(entry), self.max_items_per_bucket)
+                assigned = _assign(entry)
+                if profile.add(assigned, self.max_items_per_bucket):
+                    _record_impact(assigned)
 
         summary = {
             "events": len(events),
@@ -604,6 +637,9 @@ class DiffAssistPlanner:
             "rag_followups": len(rag.entries),
             "profile_actions": len(profile.entries),
         }
+        summary["impact_score_total"] = round(impact_total, 3)
+        if impact_counter:
+            summary["impact_bucket_counts"] = dict(impact_counter)
         domain_briefings = self._domain_briefings(domain_counter)
         if domain_briefings:
             summary["primary_domain"] = domain_briefings[0]["domain"]
@@ -612,6 +648,24 @@ class DiffAssistPlanner:
         packets = self._build_handoff_packets([reanalyze, rag, profile])
         agentic_requests = self._build_agentic_requests(events)
         summary["agentic_requests"] = len(agentic_requests)
+        top_entries: List[Dict[str, Any]] = []
+        for score, entry in sorted(impact_examples, key=lambda kv: kv[0], reverse=True)[:10]:
+            top_entries.append(
+                {
+                    "entry_id": entry.get("entry_id"),
+                    "action": entry.get("action"),
+                    "domain": (entry.get("domain_tags") or ["general"])[0],
+                    "impact_score": round(score, 3),
+                    "impact_bucket": entry.get("impact_bucket"),
+                    "reason": entry.get("reason"),
+                    "row_key": entry.get("row_key") or entry.get("row_key_b") or entry.get("title"),
+                }
+            )
+        impact_summary = {
+            "total_score": round(impact_total, 3),
+            "bucket_counts": dict(impact_counter),
+            "top_entries": top_entries,
+        }
         return {
             "summary": summary,
             "reanalyze_queue": reanalyze.entries,
@@ -620,10 +674,29 @@ class DiffAssistPlanner:
             "domain_briefings": domain_briefings,
             "handoff_packets": packets,
             "agentic_requests": agentic_requests,
+            "impact_summary": impact_summary,
         }
 
     # ------------------------------------------------------------------
     def _prepare_cell_entry(self, event: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+        score, severity, reason = self._cell_event_metrics(event)
+        action = "reanalyze_cells" if severity == "high" else "rag_followup"
+
+        entry = {
+            "action": action,
+            "event_type": "cell_updated",
+            "severity": severity,
+            "reason": reason,
+            "impact_score": score,
+            "impact_bucket": self._impact_bucket(score),
+        }
+        entry.update(self._extract_context(event))
+        if severity == "low":
+            # Low severity updates are usually noise; skip to keep plan concise
+            return None, severity
+        return entry, severity
+
+    def _cell_event_metrics(self, event: Dict[str, Any]) -> Tuple[float, str, str]:
         similarity = event.get("similarity")
         relative_delta = event.get("relative_delta")
         numeric_delta = event.get("numeric_delta")
@@ -636,17 +709,17 @@ class DiffAssistPlanner:
         else:
             gap = max(0.0, 1.0 - float(similarity))
             score += gap
-            reason_parts.append(f"similarity={similarity:.2f}")
+            reason_parts.append(f"similarity={float(similarity):.2f}")
         if relative_delta is not None:
             gap = min(1.0, abs(float(relative_delta)))
             score += gap
-            reason_parts.append(f"relative_delta={relative_delta:+.2%}")
+            reason_parts.append(f"relative_delta={float(relative_delta):+.2%}")
         elif numeric_delta is not None:
             gap = min(1.0, abs(float(numeric_delta)) / max(1.0, self.numeric_abs_threshold))
             score += gap
-            reason_parts.append(f"numeric_delta={numeric_delta:+g}")
+            reason_parts.append(f"numeric_delta={float(numeric_delta):+g}")
 
-        if similarity is not None and similarity <= self.reanalyze_similarity_threshold:
+        if similarity is not None and float(similarity) <= self.reanalyze_similarity_threshold:
             score = max(score, 1.0)
         if relative_delta is not None and abs(float(relative_delta)) >= self.reanalyze_relative_delta:
             score = max(score, 1.0)
@@ -654,20 +727,8 @@ class DiffAssistPlanner:
             score = max(score, 1.0)
 
         severity = "high" if score >= 1.0 else ("medium" if score >= 0.6 else "low")
-        action = "reanalyze_cells" if severity == "high" else "rag_followup"
         reason = ", ".join(reason_parts) or "cell_changed"
-
-        entry = {
-            "action": action,
-            "event_type": "cell_updated",
-            "severity": severity,
-            "reason": reason,
-        }
-        entry.update(self._extract_context(event))
-        if severity == "low":
-            # Low severity updates are usually noise; skip to keep plan concise
-            return None, severity
-        return entry, severity
+        return score, severity, reason
 
     def _extract_context(self, event: Dict[str, Any]) -> Dict[str, Any]:
         context_keys = [
@@ -732,7 +793,13 @@ class DiffAssistPlanner:
             context["similarity"] = event.get("similarity")
         return context
 
-    def _basic_entry(self, event: Dict[str, Any], action: str, reason: str) -> Dict[str, Any]:
+    def _basic_entry(
+        self,
+        event: Dict[str, Any],
+        action: str,
+        reason: str,
+        impact_score: Optional[float] = None,
+    ) -> Dict[str, Any]:
         payload = {"action": action, "event_type": event.get("type"), "reason": reason}
         payload.update(self._extract_context(event))
         if event.get("title"):
@@ -749,6 +816,9 @@ class DiffAssistPlanner:
             payload["from_level"] = event.get("from_level")
         if event.get("to_level") is not None:
             payload["to_level"] = event.get("to_level")
+        if impact_score is not None:
+            payload["impact_score"] = impact_score
+            payload["impact_bucket"] = self._impact_bucket(impact_score)
         return payload
 
     def _row_or_table_reason(self, event: Dict[str, Any]) -> str:
@@ -778,6 +848,31 @@ class DiffAssistPlanner:
         if etype == "section_level_changed":
             return "section level changed"
         return "profile adjustment"
+
+    def _structure_impact(self, event: Dict[str, Any]) -> float:
+        etype = event.get("type")
+        if etype in {"table_added", "table_removed"}:
+            return 1.25
+        if etype in {"row_added", "row_removed"}:
+            return 0.95
+        if etype in {"section_added", "section_removed"}:
+            return 0.85
+        if etype in {"header_renamed", "col_moved"}:
+            return 0.65
+        if etype in {"section_title_changed", "section_level_changed"}:
+            return 0.55
+        return 0.4
+
+    def _impact_bucket(self, score: float) -> str:
+        if score >= 1.5:
+            return "critical"
+        if score >= 1.0:
+            return "high"
+        if score >= 0.6:
+            return "medium"
+        if score >= 0.3:
+            return "low"
+        return "info"
 
     def _annotate_entry(
         self,
@@ -1081,6 +1176,7 @@ class DiffAssistPlanner:
             if not directive:
                 continue
             domain_tags = self._infer_domains(event)
+            impact_score, impact_bucket = self._event_impact(event)
             request = {
                 "request_id": f"agentic_{next(seq)}",
                 "event_type": event.get("type"),
@@ -1089,7 +1185,10 @@ class DiffAssistPlanner:
                 "preferred_outputs": self._agentic_outputs(event),
                 "context": ctx,
                 "source": event.get("source") or "semantic_diff",
+                "impact_bucket": impact_bucket,
             }
+            if impact_score:
+                request["impact_score"] = round(impact_score, 3)
             focus = self._agentic_focus(event, ctx)
             if focus:
                 request["handoff_focus"] = focus
@@ -1103,6 +1202,27 @@ class DiffAssistPlanner:
                 request["annotated_excerpt"] = event.get("text_highlight")
             requests.append(request)
         return requests
+
+    def _event_impact(self, event: Dict[str, Any]) -> Tuple[float, str]:
+        etype = event.get("type")
+        if etype == "cell_updated":
+            score, _, _ = self._cell_event_metrics(event)
+            return score, self._impact_bucket(score)
+        if etype in {
+            "row_added",
+            "row_removed",
+            "table_added",
+            "table_removed",
+            "section_added",
+            "section_removed",
+            "header_renamed",
+            "col_moved",
+            "section_title_changed",
+            "section_level_changed",
+        }:
+            score = self._structure_impact(event)
+            return score, self._impact_bucket(score)
+        return 0.0, "info"
 
     def _agentic_outputs(self, event: Dict[str, Any]) -> List[str]:
         outputs = ["narrative_explanation"]
