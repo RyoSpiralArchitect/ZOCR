@@ -6,7 +6,7 @@ Déposez vos PDF/PNG dans `samples/demo_inputs/` afin que `--input demo` s'appui
 
 ## 📂 One folder, many domains
 
-旧来の `samples/<domain>/` ディレクトリは廃止しました。GUI で種別を選ぶ前提のため、サンプルはすべて `samples/demo_inputs/`
+サンプルはすべて `samples/demo_inputs/`
 配下にまとめてください。ファイル名や CLI の `--domain` でコンテキストを切り替えられます。
 All domain-specific subfolders have been merged into `samples/demo_inputs/`. Keep every sample there—the orchestrator and future
 GUI will decide which domain profile to use.
