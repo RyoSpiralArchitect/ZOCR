@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -147,6 +148,8 @@ _NUM_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9一-龠ぁ-んァ-ン％%€$¥£₩₽₺₪₫₱₦₲₴₹<>'\-_/.,]+")
 
 
 class SimpleTextDiffer:
@@ -323,6 +326,10 @@ class SimpleTextDiffer:
             event["relative_delta"] = None
             if change.get("line_similarity") is not None:
                 event["similarity"] = change.get("line_similarity")
+            if change.get("text_token_stats"):
+                event["text_token_stats"] = change.get("text_token_stats")
+            if change.get("text_highlight"):
+                event["text_highlight"] = change.get("text_highlight")
             events.append(event)
         return events
 
@@ -365,6 +372,14 @@ class SimpleTextDiffer:
                 }
                 if not nums_a and not nums_b:
                     base_change["change_type"] = self._textual_change_type(line_no_a, line_no_b)
+                    tokens_a = self._tokenize_for_text(text_a)
+                    tokens_b = self._tokenize_for_text(text_b)
+                    token_stats = self._textual_token_stats(tokens_a, tokens_b)
+                    highlight = self._textual_highlight(text_a, text_b)
+                    if token_stats:
+                        base_change["text_token_stats"] = token_stats
+                    if highlight:
+                        base_change["text_highlight"] = highlight
                     textual_results.append(base_change)
                     continue
                 pairs = self._pair_numbers(nums_a, nums_b)
@@ -441,6 +456,87 @@ class SimpleTextDiffer:
         if line_b is None and line_a is not None:
             return "removed"
         return "modified"
+
+    def _tokenize_for_text(self, text: Optional[str]) -> List[str]:
+        if not text:
+            return []
+        lowered = text.lower()
+        normalized = _NUM_RE.sub("<num>", lowered)
+        return [token for token in _TOKEN_RE.findall(normalized) if token]
+
+    @staticmethod
+    def _top_tokens(counter: Counter, limit: int = 6) -> List[str]:
+        if not counter:
+            return []
+        return [token for token, _ in counter.most_common(limit)]
+
+    def _textual_token_stats(
+        self, tokens_a: Sequence[str], tokens_b: Sequence[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not tokens_a and not tokens_b:
+            return None
+        counter_a = Counter(tokens_a)
+        counter_b = Counter(tokens_b)
+        added_counter = counter_b - counter_a
+        removed_counter = counter_a - counter_b
+        common_counter = counter_a & counter_b
+        overlap = 0.0
+        longest = max(len(tokens_a), len(tokens_b), 1)
+        if longest:
+            overlap = sum(common_counter.values()) / float(longest)
+        set_a = set(tokens_a)
+        set_b = set(tokens_b)
+        union = len(set_a | set_b)
+        jaccard = (len(set_a & set_b) / union) if union else 0.0
+        return {
+            "added_tokens": self._top_tokens(added_counter),
+            "removed_tokens": self._top_tokens(removed_counter),
+            "common_tokens": self._top_tokens(common_counter),
+            "token_overlap": overlap,
+            "token_jaccard": jaccard,
+        }
+
+    def _textual_highlight(
+        self, text_a: Optional[str], text_b: Optional[str]
+    ) -> Optional[Dict[str, str]]:
+        tokens_a = (text_a or "").split()
+        tokens_b = (text_b or "").split()
+        if tokens_a == tokens_b:
+            return None
+        if not tokens_a and not tokens_b:
+            return None
+        matcher = difflib.SequenceMatcher(a=tokens_a, b=tokens_b)
+        old_parts: List[str] = []
+        new_parts: List[str] = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                segment = " ".join(tokens_a[i1:i2])
+                if segment:
+                    old_parts.append(segment)
+                    new_parts.append(segment)
+            elif tag == "delete":
+                segment = " ".join(tokens_a[i1:i2])
+                if segment:
+                    old_parts.append(f"[[{segment}]]")
+            elif tag == "insert":
+                segment = " ".join(tokens_b[j1:j2])
+                if segment:
+                    new_parts.append(f"[[{segment}]]")
+            elif tag == "replace":
+                old_segment = " ".join(tokens_a[i1:i2])
+                new_segment = " ".join(tokens_b[j1:j2])
+                if old_segment:
+                    old_parts.append(f"[[{old_segment}]]")
+                if new_segment:
+                    new_parts.append(f"[[{new_segment}]]")
+        old_highlight = " ".join(part for part in old_parts if part).strip()
+        new_highlight = " ".join(part for part in new_parts if part).strip()
+        if not old_highlight and not new_highlight:
+            return None
+        return {
+            "old": old_highlight or None,
+            "new": new_highlight or None,
+        }
 
     @staticmethod
     def _extract_numbers(text: str) -> List[Dict[str, Any]]:
