@@ -225,6 +225,9 @@ class SimpleTextDiffer:
             line_a = change.get("line_a")
             line_b = change.get("line_b")
             row_key = f"line_{line_a or 'na'}_vs_{line_b or 'na'}"
+            a_context = self._context_preview(change.get("context_a"))
+            b_context = self._context_preview(change.get("context_b"))
+            context_radius = change.get("context_radius") or self._context_radius_for_metadata()
             base_event = {
                 "type": "cell_updated",
                 "source": "simple_text_differ",
@@ -244,6 +247,9 @@ class SimpleTextDiffer:
                 ],
                 "a_row_preview": _clip(change.get("text_a", "")),
                 "b_row_preview": _clip(change.get("text_b", "")),
+                "a_row_context": a_context,
+                "b_row_context": b_context,
+                "row_context_radius": context_radius,
                 "trace_a": f"{label_a}#L{line_a}" if line_a is not None else None,
                 "trace_b": f"{label_b}#L{line_b}" if line_b is not None else None,
                 "line_signature": change.get("line_signature"),
@@ -289,6 +295,7 @@ class SimpleTextDiffer:
         lines_b: Sequence[str],
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
+        context_radius = self._context_radius_for_metadata()
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
                 continue
@@ -337,6 +344,9 @@ class SimpleTextDiffer:
                         "line_signature": signature,
                         "line_label": label,
                         "line_similarity": score,
+                        "context_radius": context_radius,
+                        "context_a": self._gather_context(lines_a, line_no_a, context_radius),
+                        "context_b": self._gather_context(lines_b, line_no_b, context_radius),
                     }
                 )
         return results
@@ -544,3 +554,35 @@ class SimpleTextDiffer:
     @staticmethod
     def _read_lines(path: Path) -> List[str]:
         return Path(path).read_text(encoding="utf-8").splitlines()
+
+    def _context_radius_for_metadata(self) -> int:
+        return self.context_lines if self.context_lines > 0 else 2
+
+    def _gather_context(
+        self,
+        lines: Sequence[str],
+        line_no: Optional[int],
+        radius: int,
+    ) -> List[Dict[str, Any]]:
+        if line_no is None or not lines or radius <= 0:
+            return []
+        start = max(1, line_no - radius)
+        end = min(len(lines), line_no + radius)
+        context: List[Dict[str, Any]] = []
+        for idx in range(start, end + 1):
+            if idx == line_no:
+                continue
+            context.append({"line": idx, "text": lines[idx - 1]})
+        return context
+
+    def _context_preview(self, ctx: Optional[Sequence[Dict[str, Any]]]) -> Optional[str]:
+        if not ctx:
+            return None
+        parts = []
+        for item in ctx:
+            line_no = item.get("line")
+            text = _clip(item.get("text", ""))
+            if text:
+                prefix = f"L{line_no}: " if line_no is not None else ""
+                parts.append(f"{prefix}{text}")
+        return "\n".join(parts) if parts else None

@@ -84,6 +84,9 @@ python -m zocr.diff \
 - **[JA]** 通貨記号や USD/EUR/円 のような通貨コード、`千` / `万` / `億` / `k` / `M` / `B`、括弧付きマイナス、% / ％ を含む行でも金額/率を正しく抽出し、`numeric_unit` / `numeric_currency` / `numeric_is_percent` / `numeric_scale` でハンドオフ先に単位を共有します。
 - **[EN]** Currency symbols/codes plus Japanese `千` / `万` / `億` and western `k` / `M` / `B`, parenthetical negatives, and %/％ tokens are parsed in-place; the emitted events include `numeric_unit`, `numeric_currency`, `numeric_is_percent`, and `numeric_scale` so downstream ToyOCR/RAG flows keep the unit context.
 - **[FR]** Les symboles/codes de devise, les suffixes `千` / `万` / `億` ainsi que `k` / `M` / `B`, les montants négatifs entre parenthèses et les %/％ sont gérés automatiquement ; les événements exposent `numeric_unit`, `numeric_currency`, `numeric_is_percent` et `numeric_scale` pour préserver les unités dans les flux ToyOCR/RAG.
+- **[JA]** さらに `a_row_context` / `b_row_context` / `row_context_radius` で変更行の前後抜粋も保持され、差分周辺テキストを補助ワークフローがすぐ参照できます。
+- **[EN]** The quick differ also emits `a_row_context`, `b_row_context`, and `row_context_radius`, giving downstream helpers trimmed neighbor lines around each change.
+- **[FR]** On ajoute également `a_row_context`, `b_row_context` et `row_context_radius`, soit un extrait des lignes voisines pour que les flux d’assistance consultent instantanément le contexte local.
 
 ```bash
 python -m zocr.diff \
