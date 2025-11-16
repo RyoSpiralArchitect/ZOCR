@@ -121,6 +121,40 @@ _EASYOCR_READER_CACHE: Dict[Tuple[Tuple[str, ...], bool], Any] = {}
 _TOY_SELF_CORRECTION_STACK: List[Dict[str, Any]] = []
 
 
+def _env_truthy_local(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _env_int_local(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+_DEBUG_CELLS_ENABLED = _env_truthy_local("ZOCR_EXPORT_DEBUG_CELLS", False)
+_DEBUG_CELLS_PER_PAGE = max(0, _env_int_local("ZOCR_EXPORT_DEBUG_CELLS_PER_PAGE", 0))
+_DEBUG_CELL_MIN_AREA = max(0, _env_int_local("ZOCR_EXPORT_DEBUG_CELL_MIN_AREA", 4096))
+_DEBUG_CELL_PAGE_COUNT: Dict[str, int] = defaultdict(int)
+
+
+def _allow_debug_cell_dump(page_key: str, area: int) -> bool:
+    if not _DEBUG_CELLS_ENABLED or _DEBUG_CELLS_PER_PAGE <= 0:
+        return False
+    if area < _DEBUG_CELL_MIN_AREA:
+        return False
+    if _DEBUG_CELL_PAGE_COUNT[page_key] >= _DEBUG_CELLS_PER_PAGE:
+        return False
+    _DEBUG_CELL_PAGE_COUNT[page_key] += 1
+    return True
+
+
 def _normalize_self_correction_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
     if not isinstance(config, dict):
@@ -1318,12 +1352,18 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         col_jitter = float(np.median(jitters)) if jitters else 0.0
     # 低信頼セル views（曖昧帯域のみ）
     views_cells = {}
-    if amb_crops:
-        vdir = os.path.join(os.path.dirname(image_path), "views_cells")
-        ensure_dir(vdir)
+    debug_page_key = os.path.abspath(image_path) if image_path else ""
+    if amb_crops and _DEBUG_CELLS_ENABLED and _DEBUG_CELLS_PER_PAGE > 0:
+        vdir: Optional[str] = None
         for (bl, r0, c0, st) in amb_crops[:64]:
-            xl,yt,xr,yb = bl
-            crop = imc.crop((xl,yt,xr,yb))
+            xl, yt, xr, yb = bl
+            area = max(0, int(xr - xl) * int(yb - yt))
+            if not _allow_debug_cell_dump(debug_page_key, area):
+                continue
+            if vdir is None:
+                vdir = os.path.join(os.path.dirname(image_path), "views_cells")
+                ensure_dir(vdir)
+            crop = imc.crop((xl, yt, xr, yb))
             name = f"cell_r{r0}_c{c0}_s{st}"
             views_cells[name] = _make_views(crop, vdir, name)
     row_diag = {
@@ -10531,9 +10571,10 @@ All-in-one pipeline orchestrator:
 Outputs are consolidated under a single outdir.
 """
 
-import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math
+import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math, fnmatch
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Set, TypedDict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Set, Sequence, TypedDict
 try:
     from typing import Literal  # py39+
 except ImportError:  # pragma: no cover
@@ -10744,6 +10785,52 @@ class MetaIntentPayload(TypedDict, total=False):
 
 _EPISODE_CONTEXT: Dict[str, Any] = {}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+_INPUT_ENUM_FILE_EXCLUDES: Tuple[str, ...] = (
+    "*.microscope.*",
+    "*.xray*",
+    "*.overlay*",
+    "*.json",
+    "*.jsonl",
+    "*.csv",
+    "*.tsv",
+    "*.html",
+    "*.htm",
+    "*.pkl",
+    "*.npz",
+    "*.npy",
+    "*.yaml",
+    "*.yml",
+    "*.ini",
+    "*.cfg",
+    "*.txt",
+    "*.log",
+)
+_INPUT_ENUM_SEGMENT_EXCLUDES: Tuple[str, ...] = (
+    "out",
+    "out_*",
+    "out-*",
+    "outputs",
+    "output",
+    "debug",
+    "debug_*",
+    "debug-*",
+    "tmp",
+    "tmp_*",
+    "temp",
+    "temp_*",
+    "cache",
+    "cache_*",
+    "views",
+    "views_*",
+    "views_cells",
+    "__pycache__",
+    ".git",
+)
+_INPUT_ENUM_PATH_EXCLUDES: Tuple[str, ...] = (
+    "**/out*/*",
+    "**/debug*/*",
+    "**/views_cells/*",
+)
 
 
 def _discover_demo_input_targets() -> List[str]:
@@ -11929,43 +12016,111 @@ def _write_pipeline_meta(outdir: str, seed: int):
     with open(os.path.join(outdir, "pipeline_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-def _collect_pages(inputs: List[str], dpi: int) -> List[str]:
+def _collect_pages(
+    inputs: List[str],
+    dpi: int,
+    *,
+    recursive: bool = True,
+    exclude_segments: Optional[Sequence[str]] = None,
+    exclude_files: Optional[Sequence[str]] = None,
+    exclude_paths: Optional[Sequence[str]] = None,
+) -> List[str]:
     pages: List[str] = []
-    def _handle_path(path: str):
-        nonlocal pages
-        if os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
-                dirs.sort()
-                for fn in sorted(files):
-                    full = os.path.join(root, fn)
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext == ".pdf":
-                        try:
-                            pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(full, dpi=dpi))
-                        except Exception as e:
-                            raise RuntimeError(f"PDF rasterization failed for {full}: {e}")
-                    elif ext in _IMAGE_EXTS:
-                        pages.append(full)
+    allowed_exts = _IMAGE_EXTS | {".pdf"}
+    seg_patterns = tuple(seg.lower() for seg in (exclude_segments or _INPUT_ENUM_SEGMENT_EXCLUDES))
+    file_patterns = tuple(pat.lower() for pat in (exclude_files or _INPUT_ENUM_FILE_EXCLUDES))
+    path_patterns = tuple(pat.lower() for pat in (exclude_paths or _INPUT_ENUM_PATH_EXCLUDES))
+
+    def _should_skip(path: str) -> bool:
+        if not path:
+            return False
+        p = Path(path)
+        norm_path = str(p).replace("\\", "/").lower()
+        for pat in path_patterns:
+            if fnmatch.fnmatch(norm_path, pat):
+                return True
+        name = p.name.lower()
+        for pat in file_patterns:
+            if fnmatch.fnmatch(name, pat):
+                return True
+        parts = [segment.lower() for segment in p.parts if segment not in {"", os.sep}]
+        for segment in parts:
+            for pat in seg_patterns:
+                if fnmatch.fnmatch(segment, pat):
+                    return True
+        return False
+
+    def _append_file(full: str) -> None:
+        if _should_skip(full):
             return
-        ext = os.path.splitext(path)[1].lower()
+        ext = os.path.splitext(full)[1].lower()
         if ext == ".pdf":
             try:
-                pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(path, dpi=dpi))
+                pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(full, dpi=dpi))
             except Exception as e:
-                raise RuntimeError(f"PDF rasterization failed for {path}: {e}")
-        elif ext in _IMAGE_EXTS or not ext:
-            pages.append(path)
+                raise RuntimeError(f"PDF rasterization failed for {full}: {e}")
+            return
+        if ext in allowed_exts:
+            pages.append(full)
+
+    def _handle_directory(path: str) -> None:
+        if _should_skip(path):
+            return
+        if recursive:
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [
+                    d
+                    for d in sorted(dirs)
+                    if not _should_skip(os.path.join(root, d))
+                ]
+                for fn in sorted(files):
+                    full = os.path.join(root, fn)
+                    if not os.path.isfile(full):
+                        continue
+                    _append_file(full)
+        else:
+            for fn in sorted(os.listdir(path)):
+                full = os.path.join(path, fn)
+                if not os.path.isfile(full):
+                    continue
+                _append_file(full)
+
+    def _handle_path(path: str) -> None:
+        if os.path.isdir(path):
+            _handle_directory(path)
+            return
+        if _should_skip(path):
+            return
+        if not os.path.exists(path):
+            ext = os.path.splitext(path)[1].lower()
+            if ext in allowed_exts:
+                pages.append(path)
+            return
+        _append_file(path)
 
     for raw in inputs:
         candidates = [raw]
         if any(ch in raw for ch in "*?[]"):
             candidates = sorted(glob.glob(raw)) or [raw]
         for cand in candidates:
-            if os.path.exists(cand):
-                _handle_path(cand)
-            else:
-                pages.append(cand)
+            _handle_path(cand)
+
+    pages.sort(key=lambda p: str(p).lower())
     return pages
+
+
+def _dedup_pages_list(items: List[str], require_exists: bool) -> List[str]:
+    filtered: List[str] = []
+    seen_paths: Set[str] = set()
+    for page in items:
+        norm = os.path.abspath(page)
+        if norm in seen_paths:
+            continue
+        if require_exists and not os.path.exists(page):
+            continue
+        seen_paths.add(norm)
+        filtered.append(page)
+    return filtered
 
 def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:
     prof_path = os.path.join(outdir, "auto_profile.json")
@@ -13811,6 +13966,12 @@ def _patched_run_full_pipeline(
     tess_unicharset: Optional[str] = None,
     tess_wordlist: Optional[str] = None,
     tess_bigram_json: Optional[str] = None,
+    dry_run: bool = False,
+    topdir_only: bool = False,
+    max_pages: Optional[int] = None,
+    max_cells: Optional[int] = None,
+    debug_cells: Optional[bool] = None,
+    debug_cells_per_page: Optional[int] = None,
 ) -> Dict[str, Any]:
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
@@ -13862,6 +14023,15 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
     else:
         os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
+    if max_cells is not None and max_cells > 0:
+        os.environ["ZOCR_EXPORT_MAX_CELLS"] = str(int(max_cells))
+    else:
+        os.environ.pop("ZOCR_EXPORT_MAX_CELLS", None)
+    debug_cells_per_page_val = max(0, int(debug_cells_per_page or 0))
+    if debug_cells is None:
+        debug_cells = debug_cells_per_page_val > 0
+    os.environ["ZOCR_EXPORT_DEBUG_CELLS"] = "1" if debug_cells else "0"
+    os.environ["ZOCR_EXPORT_DEBUG_CELLS_PER_PAGE"] = str(debug_cells_per_page_val)
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -13895,29 +14065,41 @@ def _patched_run_full_pipeline(
         else:
             real_demo_targets = _discover_demo_input_targets()
 
-        pages = _collect_pages(real_demo_targets, dpi=dpi) if real_demo_targets else []
+        pages = (
+            _collect_pages(
+                real_demo_targets,
+                dpi=dpi,
+                recursive=not topdir_only,
+            )
+            if real_demo_targets
+            else []
+        )
 
-        filtered_pages: List[str] = []
-        seen_page_paths = set()
-        for page in pages:
-            norm = os.path.abspath(page)
-            if norm in seen_page_paths:
-                continue
-            if not os.path.exists(page):
-                continue
-            seen_page_paths.add(norm)
-            filtered_pages.append(page)
-        pages = filtered_pages
+        pages = _dedup_pages_list(pages, require_exists=True)
 
         if pages:
             annos = [None] * len(pages)
         else:
             pages, annos = zocr_onefile_consensus.make_demo(outdir)
     else:
-        pages = _collect_pages(inputs, dpi=dpi)
+        pages = _collect_pages(
+            inputs,
+            dpi=dpi,
+            recursive=not topdir_only,
+        )
+        pages = _dedup_pages_list(pages, require_exists=False)
         annos = [None] * len(pages)
     if not pages:
         raise RuntimeError("No input pages provided")
+
+    page_budget = max_pages if max_pages and max_pages > 0 else None
+    if page_budget and len(pages) > page_budget:
+        raise RuntimeError(
+            f"Input enumeration produced {len(pages)} pages (budget={page_budget})"
+        )
+
+    if dry_run:
+        return {"status": "dry_run", "files": list(pages)}
 
     page_images = {idx: page for idx, page in enumerate(pages)}
 
@@ -15074,6 +15256,28 @@ def main():
     ap.add_argument("--outdir", default="out_allinone")
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--domain", default=None)
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Enumerate input files and exit",
+    )
+    ap.add_argument(
+        "--topdir-only",
+        action="store_true",
+        help="Do not recurse into subdirectories when enumerating inputs",
+    )
+    ap.add_argument(
+        "--max-pages",
+        type=int,
+        default=0,
+        help="Fail if input enumeration exceeds this many pages (0 = unlimited)",
+    )
+    ap.add_argument(
+        "--max-cells",
+        type=int,
+        default=0,
+        help="Hard cap for exported cells (0 = unlimited)",
+    )
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--no-tune", action="store_true")
     ap.add_argument("--tune-budget", type=int, default=20)
@@ -15180,6 +15384,25 @@ def main():
         help="Minimum crop area required before blank skip applies",
     )
     ap.add_argument(
+        "--debug-cells",
+        dest="debug_cells",
+        action="store_true",
+        default=None,
+        help="Enable per-cell microscope/xray dumps",
+    )
+    ap.add_argument(
+        "--no-debug-cells",
+        dest="debug_cells",
+        action="store_false",
+        help="Disable per-cell microscope/xray dumps",
+    )
+    ap.add_argument(
+        "--debug-cells-per-page",
+        type=int,
+        default=None,
+        help="Max number of debug cell crops to emit per page (0 = disable)",
+    )
+    ap.add_argument(
         "--allow-pytesseract",
         dest="allow_pytesseract",
         action="store_true",
@@ -15240,6 +15463,8 @@ def main():
     if toy_sweeps is not None and toy_sweeps <= 0:
         toy_sweeps = None
     force_numeric_flag = True if args.force_numeric_by_header else None
+    max_pages_budget = args.max_pages if args.max_pages and args.max_pages > 0 else None
+    max_cells_budget = args.max_cells if args.max_cells and args.max_cells > 0 else None
     try:
         res = _patched_run_full_pipeline(
             inputs=args.input,
@@ -15278,7 +15503,19 @@ def main():
             tess_unicharset=args.tess_unicharset,
             tess_wordlist=args.tess_wordlist,
             tess_bigram_json=args.tess_bigram_json,
+            dry_run=args.dry_run,
+            topdir_only=args.topdir_only,
+            max_pages=max_pages_budget,
+            max_cells=max_cells_budget,
+            debug_cells=args.debug_cells,
+            debug_cells_per_page=args.debug_cells_per_page,
         )
+        if isinstance(res, dict) and res.get("status") == "dry_run":
+            files = res.get("files") or []
+            print(f"[DRY] {len(files)} file(s)")
+            for path in files:
+                print(f" - {path}")
+            return
         print("\n[SUCCESS] Summary written:", os.path.join(args.outdir, "pipeline_summary.json"))
         print(json.dumps(res, ensure_ascii=False, indent=2))
     except Exception as e:
