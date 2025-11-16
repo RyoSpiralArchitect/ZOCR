@@ -158,25 +158,39 @@ class SimpleTextDiffer:
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         for tag, i1, i2, j1, j2 in opcodes:
-            if tag not in {"replace"}:
+            if tag == "equal":
                 continue
             slice_a = list(enumerate(lines_a[i1:i2], start=i1 + 1))
             slice_b = list(enumerate(lines_b[j1:j2], start=j1 + 1))
-            for (line_no_a, text_a), (line_no_b, text_b) in zip(slice_a, slice_b):
+            max_len = max(len(slice_a), len(slice_b))
+            if max_len == 0:
+                continue
+            for idx in range(max_len):
+                if idx < len(slice_a):
+                    line_no_a, text_a = slice_a[idx]
+                else:
+                    line_no_a, text_a = None, ""
+                if idx < len(slice_b):
+                    line_no_b, text_b = slice_b[idx]
+                else:
+                    line_no_b, text_b = None, ""
+
                 nums_a = self._extract_numbers(text_a)
                 nums_b = self._extract_numbers(text_b)
                 if not nums_a and not nums_b:
                     continue
                 pairs = self._pair_numbers(nums_a, nums_b)
                 if not pairs and (not nums_a or not nums_b):
+                    token_a = nums_a[0] if nums_a else {"value": None, "raw": None}
+                    token_b = nums_b[0] if nums_b else {"value": None, "raw": None}
                     pairs = [
                         {
-                            "old": nums_a[0]["value"] if nums_a else None,
-                            "new": nums_b[0]["value"] if nums_b else None,
+                            "old": token_a["value"],
+                            "new": token_b["value"],
                             "delta": None,
                             "relative": None,
-                            "old_raw": nums_a[0]["raw"] if nums_a else None,
-                            "new_raw": nums_b[0]["raw"] if nums_b else None,
+                            "old_raw": token_a["raw"],
+                            "new_raw": token_b["raw"],
                         }
                     ]
                 results.append(

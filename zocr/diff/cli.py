@@ -55,6 +55,40 @@ def _resolve_sections_path(value: Optional[str]) -> Optional[Path]:
     raise FileNotFoundError(f"sections path '{value}' does not exist")
 
 
+_SIMPLE_TEXT_CANDIDATES = (
+    ("rag", "bundle.md"),
+    ("", "bundle.md"),
+    ("rag", "bundle.txt"),
+    ("", "bundle.txt"),
+    ("rag", "markdown.md"),
+    ("", "markdown.md"),
+    ("rag", "markdown.txt"),
+    ("", "markdown.txt"),
+    ("rag", "preview.md"),
+    ("", "preview.md"),
+    ("rag", "preview.txt"),
+    ("", "preview.txt"),
+)
+
+
+def _resolve_simple_text_path(value: str, label: str) -> Path:
+    """Resolve quick-differ inputs from either files or run directories."""
+
+    path = Path(value)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        for parent, leaf in _SIMPLE_TEXT_CANDIDATES:
+            candidate = path / parent / leaf if parent else path / leaf
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(
+            f"Could not locate a markdown/text file under '{value}'. "
+            "Looked for bundle.md/preview.md (optionally under rag/)."
+        )
+    raise FileNotFoundError(f"{label} path '{value}' does not exist")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="ZOCR semantic diff for RAG bundles")
     ap.add_argument("--a", default=None, help="cells.jsonl (version A)")
@@ -70,12 +104,12 @@ def main() -> None:
     ap.add_argument(
         "--simple_text_a",
         default=None,
-        help="plain-text document A for the git-like quick differ",
+        help="plain-text document A (or a run dir with rag/bundle.md) for the quick differ",
     )
     ap.add_argument(
         "--simple_text_b",
         default=None,
-        help="plain-text document B for the git-like quick differ",
+        help="plain-text document B (or a run dir with rag/bundle.md) for the quick differ",
     )
     ap.add_argument(
         "--simple_diff_out",
@@ -167,8 +201,8 @@ def main() -> None:
         if not (args.simple_text_a and args.simple_text_b):
             raise SystemExit("--simple_text_a and --simple_text_b must be provided together")
         quick = SimpleTextDiffer(context_lines=args.simple_context)
-        simple_path_a = Path(args.simple_text_a)
-        simple_path_b = Path(args.simple_text_b)
+        simple_path_a = _resolve_simple_text_path(args.simple_text_a, "simple_text_a")
+        simple_path_b = _resolve_simple_text_path(args.simple_text_b, "simple_text_b")
         simple_result = quick.compare_files(simple_path_a, simple_path_b)
         simple_events = quick.events_from_result(
             simple_result, str(simple_path_a), str(simple_path_b)

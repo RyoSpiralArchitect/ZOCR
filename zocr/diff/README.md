@@ -52,6 +52,12 @@ python -m zocr.diff \
 - **[JA]** `--simple_text_a` / `--simple_text_b` を指定すると ToyOCR などのプレーンテキスト比較に適した軽量 differ が有効になり、git 風 unified diff と金額/数量の数値差分を `--simple_diff_out` / `--simple_json_out` で保存できます（`--simple_plan_out` を付ければ再解析/RAG 補助バンドルも同時に書き出し）。
 - **[EN]** Supplying `--simple_text_a` / `--simple_text_b` toggles the ToyOCR-friendly quick differ, producing a git-like unified diff plus amount/quantity deltas that can be persisted via `--simple_diff_out` / `--simple_json_out`; add `--simple_plan_out` to save the matching reanalysis/RAG assist bundle.
 - **[FR]** Avec `--simple_text_a` / `--simple_text_b`, on active le diff léger compatible ToyOCR, lequel exporte un diff unifié façon git et les deltas montants/quantités via `--simple_diff_out` / `--simple_json_out`, tandis que `--simple_plan_out` produit en plus le bundle d’assistance réanalyse/RAG.
+- **[JA]** 行の追加・削除も監視し、置換以外の差分（例：費目が 1 行だけ増えた請求書）でも該当金額の Δ/率を抽出します。
+- **[EN]** Inserted/deleted lines are covered alongside replacements, so a newly added fee line still yields the precise Δ/relative delta.
+- **[FR]** Les lignes ajoutées/supprimées sont également prises en compte, ce qui permet d’extraire Δ/variation même quand une seule ligne vient s’ajouter.
+- **[JA]** simple 入力にも `cells.jsonl` と同様にディレクトリを渡せ、`rag/bundle.md` → `bundle.md` → `preview.md` → `.txt` の順に探索するため、ToyOCR/ZOCR の RAG 出力フォルダを指すだけで比較が走ります。
+- **[EN]** Like the semantic inputs, the simple mode accepts run directories: the resolver scans `rag/bundle.md`, `bundle.md`, `preview.md`, then `.txt` variants so pointing at a ToyOCR/ZOCR run folder is enough.
+- **[FR]** À l’instar des entrées sémantiques, le mode léger accepte un dossier d’exécution : il y cherche successivement `rag/bundle.md`, `bundle.md`, `preview.md` puis les variantes `.txt`, ce qui suffit pour comparer un dossier ToyOCR/ZOCR tel quel.
 - **[JA]** セマンティック diff を実行しない場合は `--a` / `--b` を空のままにし、上記の simple フラグと出力先のみ指定すれば軽量モード単体で完結します（`--out_*` や `--sections_*` は不要）。
 - **[EN]** To skip the semantic pass entirely, simply omit `--a` / `--b` and provide only the simple flags plus their outputs; no semantic `--out_*` / `--sections_*` parameters are required.
 - **[FR]** Pour sauter le diff sémantique, ne renseignez pas `--a` / `--b` et fournissez uniquement les options du mode léger avec leurs sorties ; nul besoin d’ajouter les paramètres `--out_*` / `--sections_*` du mode principal.
@@ -69,9 +75,9 @@ python -m zocr.diff \
 - **[FR]** Chaque entrée fournit `llm_ready_context` et un `handoff_brief` concis, tandis que les paquets incluent `llm_context_examples`, donnant aux LLM aval un prompt diff prêt à l’emploi (emplacement, raison, valeurs avant/après).
 
 ## Quick git-style differ / 軽量 git 風 diff / Diff git simplifié
-- **[JA]** `SimpleTextDiffer` は 2 つのプレーンテキスト（ToyOCR の出力や編集済み仕様書など）を読み、git と同じ unified diff を生成しつつ、行ごとの金額・数量の差分（Δ/相対率）も JSON に書き出します。
-- **[EN]** `SimpleTextDiffer` lets you compare two plain-text documents (ToyOCR dumps, spec revisions, memo drafts) with a git-style unified diff plus structured numeric deltas (absolute + relative) per changed line.
-- **[FR]** `SimpleTextDiffer` compare deux documents texte (exports ToyOCR, spécifications modifiées, brouillons) en produisant un diff unifié façon git et des deltas numériques structurés (absolu + relatif) par ligne.
+- **[JA]** `SimpleTextDiffer` は 2 つのプレーンテキスト（ToyOCR の出力や編集済み仕様書など）を読み、git と同じ unified diff を生成しつつ、行ごとの金額・数量の差分（Δ/相対率）を JSON に書き出します。置換だけでなく行の追加・削除（例：費目を 1 行追加／削除）でも Δ/率を抽出します。
+- **[EN]** `SimpleTextDiffer` lets you compare two plain-text documents (ToyOCR dumps, spec revisions, memo drafts) with a git-style unified diff plus structured numeric deltas (absolute + relative) per changed line, and it now surfaces inserted/deleted rows in addition to replacements (e.g., a brand-new line item).
+- **[FR]** `SimpleTextDiffer` compare deux documents texte (exports ToyOCR, spécifications modifiées, brouillons) en produisant un diff unifié façon git et des deltas numériques structurés (absolu + relatif) par ligne, tout en détectant désormais les lignes ajoutées/supprimées au même titre que les remplacements (nouveau poste, suppression d’une ligne).
 
 ```bash
 python -m zocr.diff \
