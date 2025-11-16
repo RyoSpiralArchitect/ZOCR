@@ -3563,8 +3563,6 @@ def _patched_run_full_pipeline(
     blank_min_area: Optional[int] = None,
     allow_pytesseract: Optional[bool] = None,
     tess_unicharset: Optional[str] = None,
-    tess_wordlist: Optional[str] = None,
-    tess_bigram_json: Optional[str] = None,
     autocalib_samples: Optional[int] = None,
     autotune_trials: Optional[int] = None,
     dry_run: bool = False,
@@ -3610,20 +3608,10 @@ def _patched_run_full_pipeline(
     elif allow_pytesseract is False:
         os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
     tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
-    tess_wordlist = _validate_file_if_supplied(tess_wordlist, "--tess-wordlist")
-    tess_bigram_json = _validate_file_if_supplied(tess_bigram_json, "--tess-bigram-json")
     if tess_unicharset is not None:
         os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
     else:
         os.environ.pop("ZOCR_TESS_UNICHARSET", None)
-    if tess_wordlist is not None:
-        os.environ["ZOCR_TESS_WORDLIST"] = tess_wordlist
-    else:
-        os.environ.pop("ZOCR_TESS_WORDLIST", None)
-    if tess_bigram_json is not None:
-        os.environ["ZOCR_TESS_BIGRAM_JSON"] = tess_bigram_json
-    else:
-        os.environ.pop("ZOCR_TESS_BIGRAM_JSON", None)
     if max_cells is not None and max_cells > 0:
         os.environ["ZOCR_EXPORT_MAX_CELLS"] = str(int(max_cells))
     else:
@@ -3692,10 +3680,13 @@ def _patched_run_full_pipeline(
 
         pages = _dedup_pages_list(pages, require_exists=True)
 
-        if pages:
-            annos = [None] * len(pages)
-        else:
-            pages, annos = zocr_onefile_consensus.make_demo(outdir)
+        if not pages:
+            raise RuntimeError(
+                "`--input demo` was requested but no sample inputs were found. "
+                "Place demo files under samples/demo_inputs/ or samples/input_demo/."
+            )
+
+        annos = [None] * len(pages)
     else:
         pages = _collect_pages(
             inputs,
@@ -3961,9 +3952,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     if any(tesslite_cfg.values()):
         sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
         signature = sig_fn() if callable(sig_fn) else None
@@ -3980,9 +3969,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     if any(tesslite_cfg.values()):
         sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
         signature = sig_fn() if callable(sig_fn) else None
@@ -3999,9 +3986,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4017,34 +4002,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
-    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
-    if callable(tesslite_status_fn):
-        summary["tesslite"] = tesslite_status_fn()
-    else:
-        summary["tesslite"] = {
-            "enabled": any(tesslite_cfg.values()),
-            **{k: v for k, v in tesslite_cfg.items() if v},
-        }
-
-    toy_feature_defaults = _enforce_default_toy_feature_flags(
-        motion_prior_enabled=motion_prior,
-        tesslite_status=summary.get("tesslite"),
-    )
-    if toy_feature_defaults:
-        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
-    bandit: Optional[PriorBandit] = None
-    bandit_action: Optional[str] = None
-    bandit_signature: Optional[str] = None
-    bandit_headers: Optional[List[str]] = None
-
-    tesslite_cfg = {
-        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4067,9 +4025,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4092,9 +4048,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4117,9 +4071,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4142,9 +4094,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4167,9 +4117,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4192,9 +4140,30 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4224,9 +4193,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4256,9 +4223,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4288,9 +4253,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4320,9 +4283,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -4352,9 +4313,7 @@ def _patched_run_full_pipeline(
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-        "wordlist": os.environ.get("ZOCR_TESS_WORDLIST") or None,
-        "bigram_json": os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None,
-    }
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -5546,16 +5505,6 @@ def main():
         help="Path to a Tesseract-style unicharset file for toy lexical gating",
     )
     ap.add_argument(
-        "--tess-wordlist",
-        default=None,
-        help="Optional newline-delimited dictionary that boosts toy OCR tokens",
-    )
-    ap.add_argument(
-        "--tess-bigram-json",
-        default=None,
-        help="JSON mapping of bigram probabilities used to penalize unlikely glyph transitions",
-    )
-    ap.add_argument(
         "--debug-cells",
         dest="debug_cells",
         action="store_true",
@@ -5644,8 +5593,6 @@ def main():
             blank_min_area=args.blank_min_area,
             allow_pytesseract=args.allow_pytesseract,
             tess_unicharset=args.tess_unicharset,
-            tess_wordlist=args.tess_wordlist,
-            tess_bigram_json=args.tess_bigram_json,
             autocalib_samples=args.autocalib,
             autotune_trials=args.autotune,
             dry_run=args.dry_run,

@@ -18,6 +18,7 @@ from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
+from pathlib import Path
 
 try:  # pragma: no cover - optional built-in tesslite tables
     from ..resources import tesslite_defaults as _tesslite_defaults  # type: ignore
@@ -1562,36 +1563,98 @@ def autotune_params(pages, base_params, trials=6):
         if s<best_score: best_score=s; best=cand
     return best
 
-# ----------------- Demo data -----------------
-def make_demo(out_dir: str):
-    ensure_dir(out_dir)
-    W,H=900,1200
-    img=Image.new("RGB",(W,H),(255,255,255)); dr=ImageDraw.Draw(img); font=ImageFont.load_default()
-    dr.text((40,30),"INVOICE",fill=(0,0,0),font=font)
-    tbl=(40,160,860,520)
-    headers=["Item","Qty","Unit Price","Amount"]
-    cols=4
-    for i,h in enumerate(headers):
-        x=tbl[0]+int((tbl[2]-tbl[0])*i/cols)+8; dr.text((x,tbl[1]+8),h,fill=(0,0,0),font=font)
-    rows=[("Paper","10","2.00","20.00"),("Ink","2","15.00","30.00"),("Binder","5","3.00","15.00"),("Total","","","65.00")]
-    for r,row in enumerate(rows, start=1):
-        y=tbl[1]+int((tbl[3]-tbl[1])*r/5)+8
-        for c,cell in enumerate(row):
-            x=tbl[0]+int((tbl[2]-tbl[0])*c/cols)+8; dr.text((x,y),cell,fill=(0,0,0),font=font)
-    img_path=os.path.join(out_dir,"demo_inv.png"); img.save(img_path)
-    ann={"tables":[{"bbox":[40,160,860,520],
-        "html":"<table><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Amount</th></tr>"
-               "<tr><td>Paper</td><td>10</td><td>2.00</td><td>20.00</td></tr>"
-               "<tr><td>Ink</td><td>2</td><td>15.00</td><td>30.00</td></tr>"
-               "<tr><td>Binder</td><td>5</td><td>3.00</td><td>15.00</td></tr>"
-               "<tr><td>Total</td><td></td><td></td><td>65.00</td></tr></table>"}]}
-    ann_path=os.path.join(out_dir,"demo_inv.annot.json")
-    with open(ann_path,"w",encoding="utf-8") as f: json.dump(ann,f,ensure_ascii=False,indent=2)
-    return [img_path],[ann_path]
-
 # ----------------- CLI -----------------
 _AUTOCALIB_DEFAULT_SAMPLES = 3
 _AUTOTUNE_DEFAULT_TRIALS = 6
+
+_DEMO_INPUT_SUFFIXES: Tuple[str, ...] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".gif",
+    ".pdf",
+)
+
+
+def _discover_demo_inputs_for_consensus() -> List[str]:
+    """Locate demo input files for the standalone consensus CLI."""
+
+    env_override = os.environ.get("ZOCR_DEMO_INPUTS")
+    candidate_roots: List[Path] = []
+    seen_candidates: Set[str] = set()
+
+    def _add_candidate(path: Path) -> None:
+        try:
+            resolved = path if path.is_absolute() else (Path.cwd() / path)
+            resolved = resolved.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen_candidates:
+            return
+        seen_candidates.add(key)
+        if resolved.exists():
+            candidate_roots.append(resolved)
+
+    if env_override:
+        for chunk in env_override.split(os.pathsep):
+            chunk = chunk.strip()
+            if chunk:
+                _add_candidate(Path(chunk))
+
+    here = Path(__file__).resolve()
+    repo_root = here.parents[2] if len(here.parents) >= 3 else here.parent
+    search_roots = [Path.cwd(), repo_root]
+    rel_candidates = [
+        Path("samples/demo_inputs"),
+        Path("samples/input_demo"),
+        Path("demo_inputs"),
+        Path("input_demo"),
+    ]
+
+    for root in search_roots:
+        for rel in rel_candidates:
+            _add_candidate(root / rel)
+
+    files: List[str] = []
+    seen_files: Set[str] = set()
+
+    def _add_file(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen_files:
+            return
+        if resolved.is_file() and resolved.suffix.lower() in _DEMO_INPUT_SUFFIXES:
+            seen_files.add(key)
+            files.append(key)
+
+    for candidate in candidate_roots:
+        if candidate.is_file():
+            _add_file(candidate)
+        elif candidate.is_dir():
+            for entry in candidate.rglob("*"):
+                if entry.is_file() and entry.suffix.lower() in _DEMO_INPUT_SUFFIXES:
+                    _add_file(entry)
+
+    return files
+
+
+def _dedup_input_paths(paths: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for path in paths:
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        result.append(path)
+    return result
 
 
 def _positive_cli_value(value: Optional[int]) -> Optional[int]:
@@ -1657,7 +1720,21 @@ def main():
         args.func(args)
         return
     if args.demo:
-        pages, annos = make_demo(args.out)
+        demo_inputs = _discover_demo_inputs_for_consensus()
+        if not demo_inputs:
+            p.error(
+                "`--demo` requested but no sample inputs were found. "
+                "Place demo files under samples/demo_inputs/ or samples/input_demo/."
+            )
+        pages: List[str] = []
+        for it in demo_inputs:
+            ext = os.path.splitext(it)[1].lower()
+            if ext == ".pdf":
+                pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
+            else:
+                pages.append(it)
+        pages = _dedup_input_paths(pages)
+        annos = [None] * len(pages)
     else:
         if not args.input: p.error("No input. Use --demo or -i.")
         pages=[]
@@ -1665,6 +1742,7 @@ def main():
             ext=os.path.splitext(it)[1].lower()
             if ext==".pdf": pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
             else: pages.append(it)
+        pages = _dedup_input_paths(pages)
         annos=[None]*len(pages)
     tab_cfg={"k":args.cc_k,"c":args.cc_c,"min_area":args.cc_min_area,
              "dp_lambda_factor":args.dp_lambda_factor,"shape_lambda":args.shape_lambda,
@@ -2942,7 +3020,7 @@ _TESSLITE_MODEL: Optional[_TessLiteModel] = None
 _TESSLITE_MODEL_SIG: Optional[str] = None
 _TESSLITE_LAST_SOURCE: str = "none"
 
-_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v1"
+_TESSLITE_BUILTIN_SIGNATURE = "tesslite_builtin_v2"
 if _tesslite_defaults is not None:
     _TESSLITE_BUILTIN_SIGNATURE = str(
         getattr(_tesslite_defaults, "DEFAULT_SIGNATURE", _TESSLITE_BUILTIN_SIGNATURE)
@@ -2991,30 +3069,19 @@ def _tesslite_builtin_payload() -> Tuple[
 
 
 def _tesslite_env_signature() -> str:
-    paths = [
-        os.environ.get("ZOCR_TESS_UNICHARSET", ""),
-        os.environ.get("ZOCR_TESS_WORDLIST", ""),
-        os.environ.get("ZOCR_TESS_BIGRAM_JSON", ""),
-    ]
-    stats: List[str] = []
-    for path in paths:
-        if not path:
-            stats.append("-")
-            continue
-        try:
-            st = os.stat(path)
-            stats.append(f"{path}:{int(st.st_mtime)}:{st.st_size}")
-        except Exception:
-            stats.append(f"{path}:missing")
-    return "|".join(stats)
+    path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+    if not path:
+        return "-"
+    try:
+        st = os.stat(path)
+        return f"{path}:{int(st.st_mtime)}:{st.st_size}"
+    except Exception:
+        return f"{path}:missing"
 
 
 def _tesslite_effective_source() -> Tuple[bool, str, bool]:
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
-    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
-    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
-    env_supplied = any([unichar, wordlist, bigram])
-    if env_supplied:
+    if unichar:
         return True, _tesslite_env_signature(), False
     if _tesslite_builtin_available():
         return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}", True
@@ -3063,46 +3130,6 @@ def _load_unicharset(path: str) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str
     return glyphs, ambiguous, categories
 
 
-def _load_wordlist(path: str) -> Set[str]:
-    words: Set[str] = set()
-    if not path:
-        return words
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                token = line.strip()
-                if not token or token.startswith("#"):
-                    continue
-                words.add(token)
-    except Exception:
-        return set()
-    return words
-
-
-def _load_bigram_json(path: str) -> Dict[str, Dict[str, float]]:
-    if not path:
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception:
-        return {}
-    bigrams: Dict[str, Dict[str, float]] = {}
-    if isinstance(payload, dict):
-        for prev, mapping in payload.items():
-            if not isinstance(mapping, dict):
-                continue
-            table: Dict[str, float] = {}
-            for ch, weight in mapping.items():
-                try:
-                    table[str(ch)] = float(weight)
-                except Exception:
-                    continue
-            if table:
-                bigrams[str(prev)] = table
-    return bigrams
-
-
 def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
     counts: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     totals: Dict[str, float] = defaultdict(float)
@@ -3135,15 +3162,15 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
         return None
     if _TESSLITE_MODEL is not None and signature == _TESSLITE_MODEL_SIG:
         return _TESSLITE_MODEL
+    builtin_payload = _tesslite_builtin_payload()
+    built_glyphs, built_ambiguous, built_categories, built_dictionary, built_bigrams = builtin_payload
     if use_builtin:
-        glyphs, ambiguous, categories, dictionary, bigrams = _tesslite_builtin_payload()
+        glyphs, ambiguous, categories, dictionary, bigrams = builtin_payload
     else:
         unichar_path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
-        word_path = os.environ.get("ZOCR_TESS_WORDLIST", "")
-        bigram_path = os.environ.get("ZOCR_TESS_BIGRAM_JSON", "")
         glyphs, ambiguous, categories = _load_unicharset(unichar_path)
-        dictionary = _load_wordlist(word_path)
-        bigrams = _load_bigram_json(bigram_path)
+        dictionary = set(built_dictionary)
+        bigrams = {prev: dict(mapping) for prev, mapping in built_bigrams.items()}
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
@@ -3163,16 +3190,14 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
 def get_tesslite_status() -> Dict[str, Any]:
     enabled, signature, use_builtin = _tesslite_effective_source()
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
-    wordlist = os.environ.get("ZOCR_TESS_WORDLIST") or None
-    bigram = os.environ.get("ZOCR_TESS_BIGRAM_JSON") or None
-    source = "builtin" if use_builtin else ("env" if enabled else "none")
+    source = "builtin" if use_builtin else ("custom_unicharset" if enabled else "none")
     return {
         "enabled": bool(enabled),
         "signature": signature or None,
         "source": source,
         "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
-        "wordlist": wordlist if wordlist else ("builtin" if use_builtin else None),
-        "bigram_json": bigram if bigram else ("builtin" if use_builtin else None),
+        "wordlist": "builtin" if enabled else None,
+        "bigram_json": "builtin" if enabled else None,
     }
 
 
