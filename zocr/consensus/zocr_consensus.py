@@ -25,6 +25,11 @@ try:  # pragma: no cover - optional built-in tesslite tables
 except Exception:  # pragma: no cover - fallback when package data is unavailable
     _tesslite_defaults = None  # type: ignore
 
+try:  # pragma: no cover - optional domain dictionary access
+    from ..resources.domain_dictionary import get_domain_keywords as _get_domain_keywords  # type: ignore
+except Exception:  # pragma: no cover - fallback when package data is unavailable
+    _get_domain_keywords = None  # type: ignore
+
 try:
     import numpy as np
 except Exception:
@@ -1669,6 +1674,11 @@ def main():
     p.add_argument("--out",default="out_consensus")
     p.add_argument("--dpi",type=int,default=200)
     p.add_argument("--demo",action="store_true")
+    p.add_argument(
+        "--domain",
+        default=None,
+        help="Domain keyword profile for the toy OCR lexicon (e.g. invoice, medical_bill)",
+    )
     p.add_argument("--bench-iterations",type=int,default=20)
     # CC params
     p.add_argument("--cc-k",type=int,default=31)
@@ -1714,6 +1724,12 @@ def main():
     )
     _patch_cli_for_export_and_search(p)
     args=p.parse_args()
+    if args.domain is not None:
+        dom = args.domain.strip()
+        if not dom or dom.lower() in {"", "auto", "default"}:
+            os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        else:
+            os.environ["ZOCR_TESS_DOMAIN"] = dom
     ensure_dir(args.out)
     # subcommands (export/index/query) do not require re-running OCR
     if args.cmd:
@@ -3027,6 +3043,40 @@ if _tesslite_defaults is not None:
     )
 
 
+def _tesslite_domain_token() -> Optional[str]:
+    raw = os.environ.get("ZOCR_TESS_DOMAIN")
+    if not raw:
+        return None
+    token = raw.strip()
+    return token or None
+
+
+def _tesslite_domain_signature() -> str:
+    token = _tesslite_domain_token()
+    if not token:
+        return ""
+    return f"|domain:{token.strip().lower()}"
+
+
+def _tesslite_domain_keywords() -> Optional[Set[str]]:
+    if _get_domain_keywords is None:
+        return None
+    token = _tesslite_domain_token()
+    if not token:
+        return None
+    try:
+        words = _get_domain_keywords(token)
+    except Exception:
+        return None
+    normalized: Set[str] = set()
+    for word in words:
+        if isinstance(word, str):
+            trimmed = word.strip()
+            if trimmed:
+                normalized.add(trimmed)
+    return normalized or None
+
+
 def _tesslite_builtin_available() -> bool:
     disable = os.environ.get("ZOCR_TESSLITE_DISABLE_BUILTIN", "").strip().lower()
     if disable in {"1", "true", "yes", "on"}:
@@ -3081,10 +3131,11 @@ def _tesslite_env_signature() -> str:
 
 def _tesslite_effective_source() -> Tuple[bool, str, bool]:
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
+    suffix = _tesslite_domain_signature()
     if unichar:
-        return True, _tesslite_env_signature(), False
+        return True, f"{_tesslite_env_signature()}{suffix}", False
     if _tesslite_builtin_available():
-        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}", True
+        return True, f"builtin:{_TESSLITE_BUILTIN_SIGNATURE}{suffix}", True
     return False, "", False
 
 
@@ -3171,6 +3222,10 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
         glyphs, ambiguous, categories = _load_unicharset(unichar_path)
         dictionary = set(built_dictionary)
         bigrams = {prev: dict(mapping) for prev, mapping in built_bigrams.items()}
+    domain_subset = _tesslite_domain_keywords()
+    if domain_subset:
+        dictionary = set(domain_subset)
+        bigrams = _build_bigrams_from_words(dictionary)
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
@@ -3198,6 +3253,7 @@ def get_tesslite_status() -> Dict[str, Any]:
         "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
         "wordlist": "builtin" if enabled else None,
         "bigram_json": "builtin" if enabled else None,
+        "domain": _tesslite_domain_token(),
     }
 
 

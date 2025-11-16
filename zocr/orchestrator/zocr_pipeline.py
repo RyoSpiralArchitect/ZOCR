@@ -486,6 +486,21 @@ def _is_auto_domain(value: Optional[str]) -> bool:
     return False
 
 
+def _apply_tess_domain_env(domain: Optional[str]) -> Optional[str]:
+    if domain is None:
+        os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        return None
+    if isinstance(domain, str):
+        token = domain.strip()
+    else:
+        token = str(domain).strip()
+    if not token or _is_auto_domain(token):
+        os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        return None
+    os.environ["ZOCR_TESS_DOMAIN"] = token
+    return token
+
+
 def _prepare_domain_hints(inputs: List[str], extra_paths: Optional[List[str]] = None) -> Dict[str, Any]:
     tokens_raw: List[str] = []
     token_trace: List[Dict[str, Any]] = []
@@ -4411,6 +4426,8 @@ def _patched_run_full_pipeline(
             selected_confidence = float(domain_hints.get("best_score") or 0.0)
         except Exception:
             selected_confidence = None
+    tess_domain_env = _apply_tess_domain_env(prof.get("domain"))
+    domain_auto_summary["tess_domain_env"] = tess_domain_env
     summary["domain_autodetect"] = domain_auto_summary
     
     if "OCR" in ok:
@@ -4809,6 +4826,8 @@ def _patched_run_full_pipeline(
         if selected_source is None:
             selected_source = "default"
     _apply_domain_defaults(prof, prof.get("domain"))
+    final_tess_domain = _apply_tess_domain_env(prof.get("domain"))
+    domain_auto_summary["tess_domain_env"] = final_tess_domain
     try:
         with open(prof_path, "w", encoding="utf-8") as pf:
             json.dump(_json_ready(prof), pf, ensure_ascii=False, indent=2)

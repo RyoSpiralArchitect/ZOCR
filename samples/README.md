@@ -6,7 +6,7 @@ Déposez vos PDF/PNG dans `samples/demo_inputs/` afin que `--input demo` s'appui
 
 ## 📂 One folder, many domains
 
-旧来の `samples/<domain>/` ディレクトリは廃止しました。GUI で種別を選ぶ前提のため、サンプルはすべて `samples/demo_inputs/`
+サンプルはすべて `samples/demo_inputs/`
 配下にまとめてください。ファイル名や CLI の `--domain` でコンテキストを切り替えられます。
 All domain-specific subfolders have been merged into `samples/demo_inputs/`. Keep every sample there—the orchestrator and future
 GUI will decide which domain profile to use.
@@ -36,3 +36,6 @@ Tous les exemples résident désormais dans `samples/demo_inputs/`; le domaine s
 > ℹ️ キーワードは `zocr.resources.domain_dictionary` にも収録され、Toy OCR の組込み辞書として利用されます。
 The keyword lists above feed into `zocr.resources.domain_dictionary`, which powers the bundled toy OCR lexicon.
 Les listes de mots-clés ci-dessus alimentent `zocr.resources.domain_dictionary`, utilisé par le dictionnaire embarqué.
+
+`--domain`（またはパイプライン側の domain 設定）を指定すると、そのドメインのキーワード辞書が toy OCR の lexicon に適用されます。
+Passing `--domain` (or configuring the pipeline domain) forces the toy OCR lexicon to load that domain's keyword bundle.

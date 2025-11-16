@@ -1,7 +1,7 @@
 """Built-in tesslite resources for the toy OCR pipeline."""
 from __future__ import annotations
 
-from .domain_dictionary import ALL_KEYWORDS
+from .domain_dictionary import ALL_KEYWORDS, all_domain_keywords
 
 DEFAULT_SIGNATURE = "tesslite_builtin_v2"
 
@@ -37,5 +37,11 @@ for token in "数量単価金額合計小計税込税抜御見積御請求納期
 
 # Merge every domain dictionary into the built-in wordlist.
 DEFAULT_DICTIONARY = sorted(ALL_KEYWORDS)
+
+DEFAULT_DOMAIN_DICTIONARIES = {
+    token: sorted(words)
+    for token, words in all_domain_keywords().items()
+    if words
+}
 
 DEFAULT_BIGRAMS = {}
