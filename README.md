@@ -11,11 +11,38 @@ zocr/
   consensus/zocr_consensus.py    # OCR + table reconstruction helpers
   core/zocr_core.py              # augmentation, BM25, monitoring, SQL & RAG export
   orchestrator/zocr_pipeline.py  # CLI pipeline orchestrator + resume/watchdog/reporting
+  diff/                          # semantic diff engine (see zocr/diff/README.md)
 samples/
   demo_inputs/                   # place your PDFs/PNGs here for quick demos
 README.md
 zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```
+
+### Semantic diff overview / セマンティック差分概要 / Aperçu du diff sémantique
+- **[JA]** `zocr.diff` は `cells.jsonl` / `sections.jsonl` を比較してイベントJSON・.diff・HTMLを生成します。`python -m zocr.diff --a out/A --b out/B` のように実行ディレクトリを渡せます。構成や詳細は [`zocr/diff/README.md`](zocr/diff/README.md) を参照してください。
+- **[EN]** `zocr.diff` compares `cells.jsonl` / `sections.jsonl` to emit JSON events plus unified-text and HTML reports. You can point it at run directories via `python -m zocr.diff --a out/A --b out/B`; see [`zocr/diff/README.md`](zocr/diff/README.md) for layout and CLI details.
+- **[FR]** `zocr.diff` compare `cells.jsonl` / `sections.jsonl` afin de produire des événements JSON, un diff texte et un rapport HTML. Il suffit de cibler les dossiers d’exécution avec `python -m zocr.diff --a out/A --b out/B`. L’architecture et l’exemple complet figurent dans [`zocr/diff/README.md`](zocr/diff/README.md).
+- **[JA]** `--out_plan` / orchestrator の `run_diff` は `assist_plan.json` を併せて吐き出し、差分イベントを再解析キュー・RAG 補助・プロファイル調整に分割します（`intent.action="reanalyze_cells"` の自動発火にも利用可）。
+- **[EN]** The CLI and `run_diff` helper can also emit `assist_plan.json` via `--out_plan`, splitting events into reanalysis queues, downstream RAG follow-ups, and profile tweaks so the pipeline can fire `intent.action="reanalyze_cells"` without hand wiring.
+- **[FR]** La CLI et `run_diff` exportent en option `assist_plan.json` (`--out_plan`), qui ventile les événements entre file de réanalyse, suivi RAG et ajustements de profil pour déclencher automatiquement `intent.action="reanalyze_cells"`.
+- **[JA]** `--simple_text_a` / `--simple_text_b` で ToyOCR 互換の軽量 differ を呼び出せ、git 風 unified diff と金額・数量の数値差分をセットで取得できます（`--simple_diff_out` / `--simple_json_out` に加えて `--simple_plan_out` で再解析/RAG 補助バンドルも保存）。
+- **[EN]** `--simple_text_a` / `--simple_text_b` enable the ToyOCR-friendly quick differ, printing a git-style unified diff plus the extracted amount/quantity deltas (persist via `--simple_diff_out` / `--simple_json_out`, and add `--simple_plan_out` to capture the matching reanalysis/RAG assist bundle).
+- **[FR]** `--simple_text_a` / `--simple_text_b` activent le diff léger compatible ToyOCR : diff unifié façon git + deltas numériques montants/quantités, enregistrables via `--simple_diff_out` / `--simple_json_out`, tandis que `--simple_plan_out` exporte le bundle d’assistance réanalyse/RAG correspondant.
+- **[JA]** セマンティック diff を飛ばして軽量モードだけ動かす場合は `--a` / `--b` を省略し、`--simple_text_a` / `--simple_text_b` と関連出力フラグだけ指定すれば完結します（`--out_*` や `--sections_*` は不要）。
+- **[EN]** To run only the lightweight quick differ, omit `--a` / `--b` entirely and supply just `--simple_text_a` / `--simple_text_b` plus the desired simple outputs—no semantic `--out_*` or `--sections_*` flags are needed.
+- **[FR]** Pour exécuter uniquement le diff léger, laissez `--a` / `--b` vides et fournissez simplement `--simple_text_a` / `--simple_text_b` avec les sorties associées ; inutile d’ajouter les options `--out_*` / `--sections_*` du diff sémantique.
+- **[JA]** `assist_plan.json` には `domain_tags` / `llm_directive` / `domain_briefings` / `handoff_packets` がまとまり、請求書・契約・物流だけでなく医療・保険・製造・エネルギー・コンプラ・不動産・通信・小売・官公庁・教育・テック・マーケ・航空・建設まで業種別のハンドオフ文面を diff 専用テンプレで生成します。
+- **[EN]** Each assist plan entry now bundles `domain_tags`, an LLM-ready `llm_directive`, rolling `domain_briefings`, and `handoff_packets`, covering not just invoice/contract/logistics but also healthcare/insurance/manufacturing/energy/compliance plus real-estate/telecom/retail/public-sector/education/technology/marketing/aviation/construction scenarios.
+- **[FR]** Chaque plan d’assistance regroupe `domain_tags`, `llm_directive`, `domain_briefings` et `handoff_packets`, ce qui fournit des consignes adaptées aux domaines facture/contrat/logistique mais aussi santé/assurance/fabrication/énergie/conformité ainsi qu’aux cas immobilier/télécom/retail/secteur public/éducation/technologie/marketing/aviation/construction.
+
+- **[JA]** エントリごとに `llm_ready_context` / `handoff_brief` が追加され、`handoff_packets` には `llm_context_examples` も添付されるため、差分の理由・位置・旧新値をまとめた diff 専用プロンプトをそのまま下流 RAG/補助 LLM へ渡せます。
+- **[EN]** Entries now expose `llm_ready_context` plus a compact `handoff_brief`, while each packet carries `llm_context_examples`, letting downstream RAG/support LLMs consume a diff-specific prompt that already lists the location, reason, and before/after values.
+- **[FR]** Chaque entrée fournit désormais `llm_ready_context` et un `handoff_brief` concis, et les paquets incluent `llm_context_examples`, de sorte que les agents RAG/LLM en aval reçoivent immédiatement un prompt diff détaillant emplacement, raison et valeurs avant/après.
+
+#### Frontier & identity / フロンティアと技術的アイデンティティ / Frontière et identité
+- **[JA]** AI 市場にはまだ「請求書や法務文書を意味構造ごと差分化する」製品が存在せず、`zocr.diff` のように表×節×filters を束ねて比較できる基盤は希少です。ここを押さえることで Z-OCR 全体の技術的アイデンティティを形成でき、請求書ドメイン等で運用済みの下流 RAG／再解析ループへも即接続できます。
+- **[EN]** The AI market still lacks semantic diff tooling that understands invoices, legal decks, CAD-like tables, and business specs at the structural level. Owning this frontier with `zocr.diff` turns the pipeline into a recognizable identity play while letting us reuse the existing invoice-domain RAG + reanalysis feedback loops for downstream support agents.
+- **[FR]** Le marché IA ne dispose toujours pas d’un diff sémantique capable de traiter factures, documents juridiques, tableaux CAD ou spécifications métier au niveau structurel. En maîtrisant cette frontière via `zocr.diff`, la suite forge une identité technique claire et réutilise les boucles RAG/réanalyse déjà éprouvées sur les domaines facturation pour épauler les agents en aval.
 
 ## クイックスタート / Quickstart / Démarrage rapide
 ```bash
