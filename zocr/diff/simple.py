@@ -13,6 +13,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 
+def _clip(text: str, limit: int = 200) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _label_name(label: str) -> str:
+    try:
+        return Path(label).name or label
+    except Exception:
+        return label
+
+
 _NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 
 
@@ -64,7 +78,77 @@ class SimpleTextDiffer:
             "diff": diff_text,
             "numeric_changes": numeric_changes,
             "summary": summary,
+            "labels": {"a": label_a, "b": label_b},
         }
+
+    # ------------------------------------------------------------------
+    def events_from_result(
+        self,
+        result: Dict[str, Any],
+        label_a: str,
+        label_b: str,
+    ) -> List[Dict[str, Any]]:
+        """Convert numeric changes into assist-plan friendly events."""
+
+        events: List[Dict[str, Any]] = []
+        doc_a = _label_name(label_a)
+        doc_b = _label_name(label_b)
+        table_id = f"simple_text::{doc_a}::{doc_b}"
+        headers = [doc_a, doc_b]
+        summary = result.get("summary", {})
+        total_rows = max(
+            int(summary.get("total_lines_a") or 0),
+            int(summary.get("total_lines_b") or 0),
+        )
+        for idx, change in enumerate(result.get("numeric_changes", []), start=1):
+            line_a = change.get("line_a")
+            line_b = change.get("line_b")
+            row_key = f"line_{line_a or 'na'}_vs_{line_b or 'na'}"
+            base_event = {
+                "type": "cell_updated",
+                "source": "simple_text_differ",
+                "table_id": table_id,
+                "table_page": None,
+                "table_index": 0,
+                "table_rows": total_rows or None,
+                "table_columns": 2,
+                "table_headers": headers,
+                "table_header_preview": f"{doc_a} ↔ {doc_b}",
+                "row_key": row_key,
+                "row_key_a": f"line_{line_a}" if line_a is not None else None,
+                "row_key_b": f"line_{line_b}" if line_b is not None else None,
+                "row_ids": [
+                    f"{doc_a}:L{line_a}" if line_a is not None else None,
+                    f"{doc_b}:L{line_b}" if line_b is not None else None,
+                ],
+                "a_row_preview": _clip(change.get("text_a", "")),
+                "b_row_preview": _clip(change.get("text_b", "")),
+                "trace_a": f"{label_a}#L{line_a}" if line_a is not None else None,
+                "trace_b": f"{label_b}#L{line_b}" if line_b is not None else None,
+            }
+            base_event["row_ids"] = [rid for rid in base_event["row_ids"] if rid]
+            pairs = change.get("pairs") or []
+            if not pairs:
+                pairs = [
+                    {
+                        "old": None,
+                        "new": None,
+                        "delta": None,
+                        "relative": None,
+                        "old_raw": None,
+                        "new_raw": None,
+                    }
+                ]
+            for pair_idx, pair in enumerate(pairs, start=1):
+                event = dict(base_event)
+                event["row_key"] = f"{row_key}#{pair_idx}" if len(pairs) > 1 else row_key
+                event["old"] = pair.get("old_raw") if pair.get("old_raw") is not None else pair.get("old")
+                event["new"] = pair.get("new_raw") if pair.get("new_raw") is not None else pair.get("new")
+                event["numeric_delta"] = pair.get("delta")
+                event["relative_delta"] = pair.get("relative")
+                event["similarity"] = None
+                events.append(event)
+        return events
 
     def _collect_numeric_changes(
         self,

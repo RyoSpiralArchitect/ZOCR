@@ -93,6 +93,11 @@ def main() -> None:
         default=3,
         help="context lines for the quick differ (git-style)",
     )
+    ap.add_argument(
+        "--simple_plan_out",
+        default=None,
+        help="save downstream assist plan for the quick differ",
+    )
     args = ap.parse_args()
 
     diff = SemanticDiffer()
@@ -136,9 +141,14 @@ def main() -> None:
         if not (args.simple_text_a and args.simple_text_b):
             raise SystemExit("--simple_text_a and --simple_text_b must be provided together")
         quick = SimpleTextDiffer(context_lines=args.simple_context)
-        simple_result = quick.compare_files(
-            Path(args.simple_text_a), Path(args.simple_text_b)
+        simple_path_a = Path(args.simple_text_a)
+        simple_path_b = Path(args.simple_text_b)
+        simple_result = quick.compare_files(simple_path_a, simple_path_b)
+        simple_events = quick.events_from_result(
+            simple_result, str(simple_path_a), str(simple_path_b)
         )
+        simple_plan = planner.plan(simple_events)
+        simple_result["assist_plan"] = simple_plan
         if args.simple_json_out:
             Path(args.simple_json_out).write_text(
                 json.dumps(simple_result, ensure_ascii=False, indent=2),
@@ -150,6 +160,20 @@ def main() -> None:
             Path(args.simple_diff_out).write_text(diff_payload, encoding="utf-8")
         else:
             print(diff_payload)
+        if args.simple_plan_out:
+            Path(args.simple_plan_out).write_text(
+                json.dumps(simple_plan, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if not args.simple_plan_out:
+            plan_summary = simple_plan.get("summary", {})
+            print(
+                "[simple.assist] reanalyze={reanalyze} rag={rag} profile={profile}".format(
+                    reanalyze=plan_summary.get("reanalyze_candidates", 0),
+                    rag=plan_summary.get("rag_followups", 0),
+                    profile=plan_summary.get("profile_actions", 0),
+                )
+            )
         if not args.simple_json_out:
             print(
                 "[simple] diff_hunks={hunks} numeric_changes={nums}".format(
