@@ -721,6 +721,16 @@ class DiffAssistPlanner:
             score += gap
             reason_parts.append(f"numeric_delta={float(numeric_delta):+g}")
 
+        confidence = event.get("confidence")
+        if confidence is not None:
+            try:
+                conf_val = float(confidence)
+            except (TypeError, ValueError):
+                conf_val = None
+            if conf_val is not None:
+                score = max(score, conf_val * 1.05)
+                reason_parts.append(f"confidence={conf_val:.2f}")
+
         if similarity is not None and float(similarity) <= self.reanalyze_similarity_threshold:
             score = max(score, 1.0)
         if relative_delta is not None and abs(float(relative_delta)) >= self.reanalyze_relative_delta:
@@ -774,6 +784,7 @@ class DiffAssistPlanner:
             "numeric_is_percent",
             "numeric_scale",
             "source",
+            "confidence",
         ]
         context: Dict[str, Any] = {}
         for key in context_keys:

@@ -18,6 +18,8 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - rapidfuzz remains optional
     _rapidfuzz = None
 
+from .scoring import estimate_confidence
+
 
 def _clip(text: str, limit: int = 200) -> str:
     text = (text or "").strip()
@@ -352,6 +354,11 @@ class SimpleTextDiffer:
                     event["line_pair_gap"] = pair.get("pair_gap")
                 if pair.get("pair_status"):
                     event["line_pair_status"] = pair.get("pair_status")
+                event["confidence"] = estimate_confidence(
+                    similarity=change.get("line_similarity"),
+                    relative_delta=pair.get("relative"),
+                    numeric_delta=pair.get("delta"),
+                )
                 events.append(event)
         for change in result.get("textual_changes", []) or []:
             event = build_base_event(change)
@@ -365,6 +372,11 @@ class SimpleTextDiffer:
                 event["text_token_stats"] = change.get("text_token_stats")
             if change.get("text_highlight"):
                 event["text_highlight"] = change.get("text_highlight")
+            event["confidence"] = estimate_confidence(
+                similarity=change.get("line_similarity"),
+                relative_delta=None,
+                numeric_delta=None,
+            )
             events.append(event)
         return events
 

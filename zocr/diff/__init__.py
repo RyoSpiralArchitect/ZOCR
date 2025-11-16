@@ -7,6 +7,7 @@ from .metrics import (
     summarize_textual_events,
 )
 from .render import render_unified, render_html, render_markdown
+from .scoring import estimate_confidence
 from .simple import SimpleTextDiffer
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "summarize_numeric_events",
     "summarize_section_events",
     "summarize_textual_events",
+    "estimate_confidence",
 ]

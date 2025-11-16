@@ -15,6 +15,7 @@ from .metrics import (
     summarize_section_events,
     summarize_textual_events,
 )
+from .scoring import estimate_confidence
 
 try:
     from rapidfuzz import fuzz  # type: ignore
@@ -486,7 +487,7 @@ class SemanticDiffer:
         if a is None and b is None:
             return None
         if a is None:
-            return {
+            event = {
                 "type": "cell_updated",
                 "old": None,
                 "new": b.text,
@@ -496,8 +497,10 @@ class SemanticDiffer:
                 "trace_a": None,
                 "trace_b": b.trace_id,
             }
+            event["confidence"] = estimate_confidence(similarity=0.0)
+            return event
         if b is None:
-            return {
+            event = {
                 "type": "cell_updated",
                 "old": a.text,
                 "new": None,
@@ -507,6 +510,8 @@ class SemanticDiffer:
                 "trace_a": a.trace_id,
                 "trace_b": None,
             }
+            event["confidence"] = estimate_confidence(similarity=0.0)
+            return event
 
         a_txt, b_txt = norm_text(a.text), norm_text(b.text)
         if a_txt == b_txt:
@@ -535,7 +540,7 @@ class SemanticDiffer:
             except Exception:
                 pass
 
-        return {
+        event = {
             "type": "cell_updated",
             "old": a_txt,
             "new": b_txt,
@@ -545,6 +550,10 @@ class SemanticDiffer:
             "trace_a": a.trace_id,
             "trace_b": b.trace_id,
         }
+        event["confidence"] = estimate_confidence(
+            similarity=sim, relative_delta=relative_delta, numeric_delta=numeric_delta
+        )
+        return event
 
     def compare_tables(self, a: TableView, b: TableView) -> List[dict]:
         events: List[dict] = []

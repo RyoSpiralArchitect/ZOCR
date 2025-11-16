@@ -63,6 +63,14 @@ def render_unified(events: List[dict]) -> str:
                 extra.append(f"rΔ={rd:+.2%}")
             if sim is not None:
                 extra.append(f"sim={sim:.2f}")
+            conf = e.get("confidence")
+            if conf is not None:
+                try:
+                    conf_val = float(conf)
+                except (TypeError, ValueError):
+                    conf_val = None
+                if conf_val is not None:
+                    extra.append(f"conf={conf_val:.2f}")
             extras = (" " + " ".join(extra)) if extra else ""
             row_ctx = e.get("row_key_a") or e.get("row_key")
             row_pair = e.get("row_key_b")
@@ -110,6 +118,14 @@ def render_html(events: List[dict], out_path: Path) -> None:
                 meta.append(f"rΔ={e['relative_delta']:+.2%}")
             if e.get("similarity") is not None:
                 meta.append(f"sim={e['similarity']:.2f}")
+            conf = e.get("confidence")
+            if conf is not None:
+                try:
+                    conf_val = float(conf)
+                except (TypeError, ValueError):
+                    conf_val = None
+                if conf_val is not None:
+                    meta.append(f"conf={conf_val:.2f}")
             meta_s = " | ".join(meta)
             row_key_a = e.get("row_key_a")
             row_key_b = e.get("row_key_b")
@@ -511,6 +527,14 @@ def render_markdown(
                 metrics.append(f"currency={ev['numeric_currency']}")
             if ev.get("numeric_is_percent"):
                 metrics.append("percent")
+            conf = ev.get("confidence")
+            if conf is not None:
+                try:
+                    conf_val = float(conf)
+                except (TypeError, ValueError):
+                    conf_val = None
+                if conf_val is not None:
+                    metrics.append(f"conf={conf_val:.2f}")
             section = _section_hint(ev)
             section_txt = f" (§{_md_inline(section, 48)})" if section else ""
             metric_txt = f" ({', '.join(metrics)})" if metrics else ""
