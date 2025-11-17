@@ -158,20 +158,32 @@ _NUMERIC_HEADER_HINTS.update(
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
+_HAS_NUMBA_PARALLEL = False
 try:
     from numba import njit, prange
-    from numba import atomic
     _HAS_NUMBA = True
+    try:
+        from numba import atomic as _numba_atomic
+        atomic = _numba_atomic
+        _HAS_NUMBA_PARALLEL = True
+    except Exception:
+        atomic = None
 except Exception:
     def njit(*a, **k):
         def deco(f): return f
         return deco
+
     def prange(n):
         return range(n)
+
+    atomic = None
+
+if atomic is None:
     class _AtomicStub:
         @staticmethod
         def add(arr, idx, val):
             arr[idx] += val
+
     atomic = _AtomicStub()
 
 if __name__.startswith("zocr."):
@@ -1388,23 +1400,26 @@ def build_index(jsonl: str, out_pkl: str):
                 df[tid]+=1
         return df
 
-    @njit(parallel=True, cache=True)
-    def _compute_df_parallel(arr_unique, lengths, V):
-        n=arr_unique.shape[0]
-        df=np.zeros(V, dtype=np.int64)
-        for i in prange(n):
-            L=lengths[i]
-            for j in range(L):
-                tid=arr_unique[i,j]
-                if tid<0:
-                    break
-                atomic.add(df, tid, 1)
-        return df
+    if _HAS_NUMBA_PARALLEL:
+        @njit(parallel=True, cache=True)
+        def _compute_df_parallel(arr_unique, lengths, V):
+            n=arr_unique.shape[0]
+            df=np.zeros(V, dtype=np.int64)
+            for i in prange(n):
+                L=lengths[i]
+                for j in range(L):
+                    tid=arr_unique[i,j]
+                    if tid<0:
+                        break
+                    atomic.add(df, tid, 1)
+            return df
+    else:
+        _compute_df_parallel = None  # type: ignore
 
     df=None
     if _HAS_NUMBA:
         try:
-            if V <= 200000:
+            if _HAS_NUMBA_PARALLEL and V <= 200000 and _compute_df_parallel is not None:
                 df=_compute_df_parallel(arr_unique, uniq_lengths, V)
             else:
                 df=_compute_df(arr_unique, uniq_lengths, V)
