@@ -6764,6 +6764,51 @@ def export_jsonl_with_ocr(doc_json_path: str,
     doc_dir = os.path.dirname(os.path.abspath(doc_json_path))
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    _page_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+    doc_image_inventory: Optional[Dict[str, List[str]]] = None
+
+    def _ensure_doc_inventory() -> Dict[str, List[str]]:
+        nonlocal doc_image_inventory
+        if doc_image_inventory is not None:
+            return doc_image_inventory
+        inventory: Dict[str, List[str]] = defaultdict(list)
+        search_roots: deque[Tuple[str, int]] = deque()
+        seen_dirs: Set[str] = set()
+        base_root = os.path.abspath(doc_dir) if doc_dir else os.getcwd()
+        search_roots.append((base_root, 0))
+        preferred_subdirs = [
+            "pages",
+            "images",
+            "imgs",
+            "page_images",
+            "input_pages",
+            "inputs",
+        ]
+        for sub in preferred_subdirs:
+            subdir = os.path.join(base_root, sub)
+            if os.path.isdir(subdir):
+                search_roots.append((os.path.abspath(subdir), 1))
+        max_depth = 2
+        while search_roots:
+            current, depth = search_roots.popleft()
+            if current in seen_dirs:
+                continue
+            seen_dirs.add(current)
+            try:
+                entries = os.listdir(current)
+            except Exception:
+                continue
+            for name in entries:
+                full = os.path.join(current, name)
+                if os.path.isdir(full):
+                    if depth < max_depth:
+                        search_roots.append((full, depth + 1))
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in _page_exts:
+                    inventory[name.lower()].append(full)
+        doc_image_inventory = inventory
+        return doc_image_inventory
 
     progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
     log_progress = progress_flag not in {"", "0", "false", "no"}
@@ -6895,6 +6940,18 @@ def export_jsonl_with_ocr(doc_json_path: str,
     ) -> List[str]:
         ordered: List[str] = []
         seen: Set[str] = set()
+        base_names: Set[str] = set()
+
+        def _remember_basename(candidate: Optional[str]) -> None:
+            if not isinstance(candidate, str):
+                return
+            cand = candidate.strip()
+            if not cand:
+                return
+            base = os.path.basename(cand)
+            if base:
+                base_names.add(base.lower())
+
         def _add_candidate(candidate: Optional[str]) -> None:
             if not isinstance(candidate, str):
                 return
@@ -6904,11 +6961,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
             if cand not in seen:
                 seen.add(cand)
                 ordered.append(cand)
+                _remember_basename(cand)
             if not os.path.isabs(cand):
                 resolved = os.path.abspath(os.path.join(doc_dir, cand))
                 if resolved not in seen:
                     seen.add(resolved)
                     ordered.append(resolved)
+                    _remember_basename(resolved)
 
         def _index_candidates(primary: Optional[int], fallback: Optional[int]) -> List[int]:
             values: List[int] = []
@@ -6933,6 +6992,12 @@ def export_jsonl_with_ocr(doc_json_path: str,
             if 0 <= idx_val < len(page_lookup_order):
                 _add_candidate(page_lookup_order[idx_val])
         _add_candidate(default_image_path)
+
+        if base_names:
+            inventory = _ensure_doc_inventory()
+            for base in base_names:
+                for fallback in inventory.get(base, []):
+                    _add_candidate(fallback)
         return ordered
 
     def _load_page_image(
