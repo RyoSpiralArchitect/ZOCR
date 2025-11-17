@@ -1539,8 +1539,19 @@ def _pdf_resolve_raster_plan(
     base_dpi: int, inspection: Optional[_PdfInspection]
 ) -> Tuple[int, Optional[int]]:
     dpi = max(1, base_dpi or 200)
-    min_dpi = max(72, _env_int_local("ZOCR_PDF_MIN_DPI", 120))
+    snapshot_mode = _env_truthy_local("ZOCR_PIPELINE_SNAPSHOT", False)
+    if snapshot_mode:
+        snapshot_pct = _env_int_local("ZOCR_PDF_SNAPSHOT_DPI_PCT", 80)
+        if 0 < snapshot_pct < 100:
+            dpi = max(1, int(dpi * (snapshot_pct / 100.0)))
+    hard_floor = max(48, _env_int_local("ZOCR_PDF_MIN_DPI_FLOOR", 72))
+    soft_min = max(hard_floor, _env_int_local("ZOCR_PDF_MIN_DPI", 120))
     budget = max(0, _env_int_local("ZOCR_PDF_PIXEL_BUDGET", 320_000_000))
+    if snapshot_mode:
+        snap_budget = max(0, _env_int_local("ZOCR_PDF_SNAPSHOT_PIXEL_BUDGET", 220_000_000))
+        if snap_budget > 0:
+            budget = snap_budget if budget <= 0 else min(budget, snap_budget)
+    ideal_dpi = dpi
     if inspection and budget > 0 and dpi > 0:
         width_pt = inspection.max_width_pt or 612.0
         height_pt = inspection.max_height_pt or 792.0
@@ -1550,8 +1561,14 @@ def _pdf_resolve_raster_plan(
         total_pixels = per_page * max(1, inspection.page_count)
         if total_pixels > budget:
             scale = math.sqrt(budget / total_pixels)
-            dpi = max(min_dpi, int(dpi * scale))
+            ideal_dpi = max(1, int(max(1.0, dpi) * scale))
+    if ideal_dpi < soft_min:
+        dpi = max(hard_floor, ideal_dpi)
+    else:
+        dpi = max(soft_min, min(dpi, ideal_dpi))
     limit = max(0, _env_int_local("ZOCR_PDF_MAX_PAGES", 0))
+    if snapshot_mode and limit <= 0:
+        limit = max(0, _env_int_local("ZOCR_PDF_SNAPSHOT_MAX_PAGES", 0))
     if limit <= 0:
         page_limit: Optional[int] = None
     else:
@@ -14458,7 +14475,10 @@ def _patched_run_full_pipeline(
         pass
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
     if snapshot:
+        os.environ["ZOCR_PIPELINE_SNAPSHOT"] = "1"
         _write_pipeline_meta(outdir, seed)
+    else:
+        os.environ.pop("ZOCR_PIPELINE_SNAPSHOT", None)
 
     ok = _read_ok_steps(outdir) if resume else set()
 

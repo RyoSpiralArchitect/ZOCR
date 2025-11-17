@@ -3660,7 +3660,10 @@ def _patched_run_full_pipeline(
         pass
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
     if snapshot:
+        os.environ["ZOCR_PIPELINE_SNAPSHOT"] = "1"
         _write_pipeline_meta(outdir, seed)
+    else:
+        os.environ.pop("ZOCR_PIPELINE_SNAPSHOT", None)
 
     ok = _read_ok_steps(outdir) if resume else set()
 
