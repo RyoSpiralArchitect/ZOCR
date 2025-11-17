@@ -1659,6 +1659,40 @@ def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
         return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
     return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
+
+def detect_pdf_raster_backends() -> Dict[str, Any]:
+    """Report the availability of Poppler/pdfium raster backends."""
+
+    status: Dict[str, Any] = {"status": "missing", "active": None, "hint": None}
+    poppler_path = shutil.which("pdftoppm")
+    poppler_hint = "Install poppler-utils (pdftoppm) for the fastest multi-page rasterization"
+    status["poppler_pdftoppm"] = {
+        "status": "available" if poppler_path else "missing",
+        "path": poppler_path,
+        "hint": None if poppler_path else poppler_hint,
+    }
+    try:
+        import importlib.util as _importlib_util
+
+        pdfium_available = _importlib_util.find_spec("pypdfium2") is not None
+    except Exception:
+        pdfium_available = False
+    pdfium_hint = "`pip install pypdfium2` to enable the builtin PDF raster fallback"
+    status["pypdfium2"] = {
+        "status": "available" if pdfium_available else "missing",
+        "hint": None if pdfium_available else pdfium_hint,
+    }
+    if poppler_path:
+        status["status"] = "ready"
+        status["active"] = "poppler_pdftoppm"
+    elif pdfium_available:
+        status["status"] = "ready"
+        status["active"] = "pypdfium2"
+        status["hint"] = "Poppler not found; falling back to pypdfium2"
+    else:
+        status["hint"] = "Install poppler-utils (pdftoppm) or `pip install pypdfium2`"
+    return status
+
 # ----------------- Pipeline + Metrics -----------------
 def _rows_cols_from_html(html: str) -> Tuple[int,int]:
     rows=_flatten_table(_parse_table_tree(html))
@@ -7345,6 +7379,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 if not isinstance(t, dict):
                     continue
                 tables_processed += 1
+                table_guarded = False
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -7462,11 +7497,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         break
                 if guard_triggered:
                     guard_timeouts += 1
+                    table_guarded = True
                     print(
                         f"[WARN] [Export] guard timeout (page={page_index_int}, table={ti})",
                         flush=True,
                     )
-                    continue
                 if stop_due_to_limit:
                     break
                 if motion_cfg.enabled:
@@ -7626,6 +7661,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         coherence = _ngram_coherence(txt) if txt else 0.0
                         surprisal = _ngram_surprisal(txt) if txt else 0.0
                         review_reasons: List[str] = []
+                        if table_guarded:
+                            review_reasons.append("guard_timeout")
                         if low_conf:
                             review_reasons.append("low_conf")
                             low_conf_samples += 1
@@ -7645,6 +7682,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             "col_index": c,
                             "trace_id": trace_id
                         }
+                        if table_guarded:
+                            filters["guard_timeout"] = True
                         if col_kind:
                             filters["numeric_header_kind"] = col_kind
                         if r in footer_rows:
@@ -7697,6 +7736,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "filters": filters
                             }
                         }
+                        if table_guarded:
+                            rec["meta"]["guard_timeout"] = True
                         if boost_marker:
                             rec["meta"]["confidence_boost"] = boost_marker
                         if lexical_reason:

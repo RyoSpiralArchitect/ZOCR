@@ -206,6 +206,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** Poppler (`pdftoppm`) が見つからない場合でも、`pypdfium2` がインストールされていれば自動でフォールバックして PDF を PNG に変換します。両方揃っている環境では Poppler が優先されますが、失敗時は即座に pdfium へ切り替わります。
 - **[EN]** When Poppler (`pdftoppm`) is missing, the pipeline now falls back to `pypdfium2` automatically, so PDFs can be rasterized without any system packages. If both are available Poppler is used first, with pdfium acting as the safety net.
 - **[FR]** Si Poppler (`pdftoppm`) est absent, `pypdfium2` prend automatiquement le relais afin de rasteriser les PDF sans dépendance système. Lorsque les deux sont présents, Poppler reste prioritaire et pdfium sert de filet de sécurité.
+- **[JA]** 依存関係ダイアグ (`dependencies.pdf_raster`) で Poppler / pdfium の有効状況とアクティブなバックエンドを表示し、pdfium だけが入っている環境でも「Poppler が無い」という警告が残らないようになりました。
+- **[EN]** The dependency diagnostics (`dependencies.pdf_raster`) now spell out which backend is active (Poppler vs `pypdfium2`), so the summary/logs stop nagging about missing Poppler once the pdfium fallback is installed.
+- **[FR]** Les diagnostics de dépendances (`dependencies.pdf_raster`) précisent désormais quel backend est actif (Poppler ou `pypdfium2`), évitant les alertes « missing » lorsque seul le fallback pdfium est présent.
 - **[JA]** 6 ページ以上の PDF では pdfium 側がデフォルトで並列レンダリング（最大 4 ワーカー、CPU 数に応じて自動調整）を行い、ページ枚数に比例して高速化します。
 - **[EN]** For PDFs with ≥6 pages the pdfium path renders pages in parallel (up to four workers by default, auto-tuned to your CPU) which dramatically shortens the raster stage.
 - **[FR]** Pour les PDF de 6 pages ou plus, la voie pdfium effectue le rendu en parallèle (jusqu’à quatre workers selon le CPU), accélérant nettement l’étape de rasterisation.
@@ -233,6 +236,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 
 ## Export 進捗と高速化 / Export progress & acceleration / Export : progression et accélérations
 - `ZOCR_EXPORT_OCR` で Export 内の OCR バックエンドを切り替えられます（例: `fast` でセル OCR をスキップし構造のみ書き出し、`toy` / `tesseract` で再解析）。
+- **[JA]** セル輸出用のガード (`ZOCR_EXPORT_GUARD_MS` / `--export-guard-ms`) は既定で無効になりました。値を指定した場合も処理済みセルは `guard_timeout` フラグ付きで JSONL に残るため、長大テーブルでも途中結果が失われません。
+- **[EN]** The per-table export guard (`ZOCR_EXPORT_GUARD_MS` / `--export-guard-ms`) is now opt-in. Leave it unset to let slow tables finish; if you do set a limit the exporter still writes whatever cells were processed and tags them with `guard_timeout` for downstream review.
+- **[FR]** La garde d’export par table (`ZOCR_EXPORT_GUARD_MS` / `--export-guard-ms`) est désactivée par défaut. Fixez-la uniquement si vous souhaitez un plafond temporel ; même en cas de dépassement, les cellules déjà traitées sont écrites avec l’étiquette `guard_timeout` pour faciliter les revues.
 - `ZOCR_ALLOW_PYTESSERACT=0` もしくは `--no-allow-pytesseract` を指定すると外部 pytesseract 呼び出しを完全停止できます（既定は許可で、`--allow-pytesseract` / `ZOCR_ALLOW_PYTESSERACT=1` は明示的な上書きとして残しています）。
 - Set `ZOCR_ALLOW_PYTESSERACT=0` or pass `--no-allow-pytesseract` to fully disable pytesseract; it is now allowed by default, and `--allow-pytesseract` / `ZOCR_ALLOW_PYTESSERACT=1` remain as explicit opt-ins if you need to override other settings.
 - Export 時の行バンド再シード（motion prior）は既定で常時有効になりました。`--no-motion-prior` や `ZOCR_EXPORT_MOTION_PRIOR=0` で無効化できます。<br>**[EN]** Motion-prior reseeding between toy export sweeps is now enabled by default; opt out via `--no-motion-prior` or `ZOCR_EXPORT_MOTION_PRIOR=0`. <br>**[FR]** Le motion prior est désormais actif par défaut ; utilisez `--no-motion-prior` ou `ZOCR_EXPORT_MOTION_PRIOR=0` pour revenir à l’exploration exhaustive.

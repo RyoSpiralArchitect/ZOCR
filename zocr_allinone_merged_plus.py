@@ -1684,6 +1684,38 @@ def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
         return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
     return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
+
+def detect_pdf_raster_backends() -> Dict[str, Any]:
+    status: Dict[str, Any] = {"status": "missing", "active": None, "hint": None}
+    poppler_path = shutil.which("pdftoppm")
+    poppler_hint = "Install poppler-utils (pdftoppm) for the fastest multi-page rasterization"
+    status["poppler_pdftoppm"] = {
+        "status": "available" if poppler_path else "missing",
+        "path": poppler_path,
+        "hint": None if poppler_path else poppler_hint,
+    }
+    try:
+        import importlib.util as _importlib_util
+
+        pdfium_available = _importlib_util.find_spec("pypdfium2") is not None
+    except Exception:
+        pdfium_available = False
+    pdfium_hint = "`pip install pypdfium2` to enable the builtin PDF raster fallback"
+    status["pypdfium2"] = {
+        "status": "available" if pdfium_available else "missing",
+        "hint": None if pdfium_available else pdfium_hint,
+    }
+    if poppler_path:
+        status["status"] = "ready"
+        status["active"] = "poppler_pdftoppm"
+    elif pdfium_available:
+        status["status"] = "ready"
+        status["active"] = "pypdfium2"
+        status["hint"] = "Poppler not found; falling back to pypdfium2"
+    else:
+        status["hint"] = "Install poppler-utils (pdftoppm) or `pip install pypdfium2`"
+    return status
+
 # ----------------- Pipeline + Metrics -----------------
 def _rows_cols_from_html(html: str) -> Tuple[int,int]:
     rows=_flatten_table(_parse_table_tree(html))
@@ -7060,6 +7092,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 if not isinstance(t, dict):
                     continue
                 tables_processed += 1
+                table_guarded = False
                 guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
                 guard_triggered = False
                 prev_keys: Optional[List[float]] = None
@@ -7160,11 +7193,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         break
                 if guard_triggered:
                     guard_timeouts += 1
+                    table_guarded = True
                     print(
                         f"[WARN] [Export] guard timeout (page={page_index_int}, table={ti})",
                         flush=True,
                     )
-                    continue
                 if stop_due_to_limit:
                     break
                 if motion_cfg.enabled:
@@ -7316,6 +7349,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         coherence = _ngram_coherence(txt) if txt else 0.0
                         surprisal = _ngram_surprisal(txt) if txt else 0.0
                         review_reasons: List[str] = []
+                        if table_guarded:
+                            review_reasons.append("guard_timeout")
                         if low_conf:
                             review_reasons.append("low_conf")
                             low_conf_samples += 1
@@ -7335,6 +7370,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             "col_index": c,
                             "trace_id": trace_id
                         }
+                        if table_guarded:
+                            filters["guard_timeout"] = True
                         if r in footer_rows:
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
@@ -7385,6 +7422,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "filters": filters
                             }
                         }
+                        if table_guarded:
+                            rec["meta"]["guard_timeout"] = True
                         if boost_marker:
                             rec["meta"]["confidence_boost"] = boost_marker
                         if lexical_reason:
@@ -11325,14 +11364,25 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     """Summarise optional dependencies so operators can self-check the environment."""
     diag: Dict[str, Any] = {}
 
-    poppler_path = shutil.which("pdftoppm")
-    diag["poppler_pdftoppm"] = {
-        "status": "available" if poppler_path else "missing",
-        "path": poppler_path,
-        "hint": None
-        if poppler_path
-        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
-    }
+    detect_pdf_backends = getattr(zocr_onefile_consensus, "detect_pdf_raster_backends", None)
+    if callable(detect_pdf_backends):
+        try:
+            diag["pdf_raster"] = detect_pdf_backends()
+        except Exception:
+            pass
+    if "pdf_raster" not in diag:
+        poppler_path = shutil.which("pdftoppm")
+        diag["pdf_raster"] = {
+            "status": "ready" if poppler_path else "missing",
+            "active": "poppler_pdftoppm" if poppler_path else None,
+            "poppler_pdftoppm": {
+                "status": "available" if poppler_path else "missing",
+                "path": poppler_path,
+            },
+            "hint": None
+            if poppler_path
+            else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
+        }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
     numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
@@ -15774,8 +15824,8 @@ def main():
     ap.add_argument(
         "--export-guard-ms",
         type=int,
-        default=15000,
-        help="Abort per-table export loops after this many milliseconds",
+        default=None,
+        help="Abort per-table export loops after this many milliseconds (default: disabled)",
     )
     ap.add_argument(
         "--sweeps-fixed",

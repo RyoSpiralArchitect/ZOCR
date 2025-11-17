@@ -432,14 +432,25 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     """Summarise optional dependencies so operators can self-check the environment."""
     diag: Dict[str, Any] = {}
 
-    poppler_path = shutil.which("pdftoppm")
-    diag["poppler_pdftoppm"] = {
-        "status": "available" if poppler_path else "missing",
-        "path": poppler_path,
-        "hint": None
-        if poppler_path
-        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
-    }
+    detect_pdf_backends = getattr(zocr_onefile_consensus, "detect_pdf_raster_backends", None)
+    if callable(detect_pdf_backends):
+        try:
+            diag["pdf_raster"] = detect_pdf_backends()
+        except Exception:
+            pass
+    if "pdf_raster" not in diag:
+        poppler_path = shutil.which("pdftoppm")
+        diag["pdf_raster"] = {
+            "status": "ready" if poppler_path else "missing",
+            "active": "poppler_pdftoppm" if poppler_path else None,
+            "poppler_pdftoppm": {
+                "status": "available" if poppler_path else "missing",
+                "path": poppler_path,
+            },
+            "hint": None
+            if poppler_path
+            else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
+        }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
     numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
@@ -5470,8 +5481,8 @@ def main():
     ap.add_argument(
         "--export-guard-ms",
         type=int,
-        default=15000,
-        help="Abort per-table export loops after this many milliseconds",
+        default=None,
+        help="Abort per-table export loops after this many milliseconds (default: disabled)",
     )
     ap.add_argument(
         "--sweeps-fixed",
