@@ -28,6 +28,9 @@ zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```bash
 # 1. 依存関係 / Dependencies / Dépendances
 python -m pip install numpy pillow tqdm numba
+# PDF を扱う場合は以下のいずれかを追加:
+#   • macOS/Linux: brew/apt 等で poppler-utils (pdftoppm) を入れる
+#   • もしくは `python -m pip install pypdfium2`
 
 # 2. サンプル入力（任意） / Optional sample input / Entrée d'exemple optionnelle
 #   → Put your PDFs/PNGs under samples/demo_inputs/ (or keep it empty to use the synthetic demo)
@@ -198,6 +201,17 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[EN]** The same bundled dictionary powers the toy OCR, consensus exporter, and the `zocr.core` retrieval boosts, so no part of the stack expects external wordlists/bigram JSON anymore.
 - **[FR]** Ce dictionnaire embarqué alimente aussi bien le Toy OCR que l’exporteur consensus et le noyau `zocr.core`, supprimant toute dépendance aux dictionnaires/bigrammes externes.
 - `ZOCR_TESS_DOMAIN` または CLI の `--domain` / パイプラインの domain 設定を指定すると、Toy OCR の内蔵辞書が該当ドメインのキーワード集合に切り替わります。プロファイルや自動判別で domain が確定するとパイプライン側で `ZOCR_TESS_DOMAIN` も自動更新されます。
+
+## PDF レンダリング最適化 / PDF rasterization knobs / Optimisations PDF
+- **[JA]** Poppler (`pdftoppm`) が見つからない場合でも、`pypdfium2` がインストールされていれば自動でフォールバックして PDF を PNG に変換します。両方揃っている環境では Poppler が優先されますが、失敗時は即座に pdfium へ切り替わります。
+- **[EN]** When Poppler (`pdftoppm`) is missing, the pipeline now falls back to `pypdfium2` automatically, so PDFs can be rasterized without any system packages. If both are available Poppler is used first, with pdfium acting as the safety net.
+- **[FR]** Si Poppler (`pdftoppm`) est absent, `pypdfium2` prend automatiquement le relais afin de rasteriser les PDF sans dépendance système. Lorsque les deux sont présents, Poppler reste prioritaire et pdfium sert de filet de sécurité.
+- **[JA]** 6 ページ以上の PDF では pdfium 側がデフォルトで並列レンダリング（最大 4 ワーカー、CPU 数に応じて自動調整）を行い、ページ枚数に比例して高速化します。
+- **[EN]** For PDFs with ≥6 pages the pdfium path renders pages in parallel (up to four workers by default, auto-tuned to your CPU) which dramatically shortens the raster stage.
+- **[FR]** Pour les PDF de 6 pages ou plus, la voie pdfium effectue le rendu en parallèle (jusqu’à quatre workers selon le CPU), accélérant nettement l’étape de rasterisation.
+- `ZOCR_PDF_WORKERS` を設定するとワーカー数を固定できます（例: `ZOCR_PDF_WORKERS=2 python -m zocr run ...`）。`ZOCR_PDF_PARALLEL_MIN_PAGES` で並列化を開始する閾値も調整可能です。
+- Set `ZOCR_PDF_WORKERS` to clamp the worker count (e.g. `ZOCR_PDF_WORKERS=2 python -m zocr run ...`). Use `ZOCR_PDF_PARALLEL_MIN_PAGES` to raise/lower the page-count threshold.
+- Fixez `ZOCR_PDF_WORKERS` pour imposer un nombre précis de workers (ex. `ZOCR_PDF_WORKERS=2 python -m zocr run ...`). Le seuil d’activation peut être ajusté via `ZOCR_PDF_PARALLEL_MIN_PAGES`.
 - **[EN]** Set `ZOCR_TESS_DOMAIN` (or pass `--domain` to the consensus CLI / orchestrator) to clamp the bundled lexicon to a specific domain keyword set. The pipeline writes this env var automatically whenever its profile or autodetector selects a domain.
 - **[FR]** Utilisez `ZOCR_TESS_DOMAIN` (ou l’option `--domain` côté CLI/pipe) pour restreindre le dictionnaire embarqué au jeu de mots-clés d’un domaine. L’orchestrateur met à jour cette variable dès qu’un domaine est choisi par le profil ou la détection automatique.
 - **[JA]** 追加指定なしでもリポジトリ同梱の tesslite セット（JP/EN インボイス語彙）が自動で読み込まれます。`--tess-*` / `ZOCR_TESS_*` を指定すると上書きされ、`ZOCR_TESSLITE_DISABLE_BUILTIN=1` で無効化できます。<br>**[EN]** A bundled tesslite glyph/dictionary set now loads automatically—override it with `--tess-*` / `ZOCR_TESS_*` or disable via `ZOCR_TESSLITE_DISABLE_BUILTIN=1`. <br>**[FR]** Un jeu tesslite intégré est actif par défaut ; remplacez-le via `--tess-*` / `ZOCR_TESS_*` ou désactivez-le avec `ZOCR_TESSLITE_DISABLE_BUILTIN=1`.

@@ -88,7 +88,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit, difflib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit, difflib, concurrent.futures
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -1418,12 +1418,127 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     return html, (dbg if want_dbg else {})
 
 # ----------------- PDF raster -----------------
+def _pdf_parallel_workers(page_count: int) -> int:
+    if page_count <= 1:
+        return 1
+    min_pages = max(2, _env_int_local("ZOCR_PDF_PARALLEL_MIN_PAGES", 6))
+    if page_count < min_pages:
+        return 1
+    forced = _env_int_local("ZOCR_PDF_WORKERS", 0)
+    if forced > 0:
+        return max(1, min(forced, page_count))
+    cpu = os.cpu_count() or 1
+    if cpu <= 2:
+        return 1
+    default = min(4, cpu - 1)
+    return max(1, min(default, page_count))
+
+
+def _pdf_chunk_ranges(page_count: int, workers: int) -> List[Tuple[int, int]]:
+    if workers <= 1 or page_count <= 0:
+        return [(0, page_count)]
+    chunk = max(1, math.ceil(page_count / workers))
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    while start < page_count:
+        end = min(page_count, start + chunk)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _pdfium_render_linear(doc: Any, tmpdir: str, scale: float) -> List[str]:
+    out_paths: List[str] = []
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            page_path = os.path.join(tmpdir, f"page-{i+1:04d}.png")
+            im.convert("RGB").save(page_path, format="PNG")
+            out_paths.append(page_path)
+    finally:
+        doc.close()
+    return out_paths
+
+
+def _render_pdf_chunk_task(args: Tuple[str, Tuple[int, int], float, str]) -> List[Tuple[int, str]]:
+    pdf_path, bounds, scale, tmpdir = args
+    start, end = bounds
+    import pypdfium2
+
+    doc = pypdfium2.PdfDocument(pdf_path)
+    out: List[Tuple[int, str]] = []
+    try:
+        for idx in range(start, min(end, len(doc))):
+            page = doc[idx]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            path = os.path.join(tmpdir, f"page-{idx+1:04d}.png")
+            im.convert("RGB").save(path, format="PNG")
+            out.append((idx, path))
+    finally:
+        doc.close()
+    return out
+
+
+def _pdfium_render_parallel(pdf_path: str, page_count: int, tmpdir: str, scale: float, workers: int) -> List[str]:
+    ranges = _pdf_chunk_ranges(page_count, workers)
+    tasks = []
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for bounds in ranges:
+                if bounds[0] >= bounds[1]:
+                    continue
+                tasks.append(pool.submit(_render_pdf_chunk_task, (pdf_path, bounds, scale, tmpdir)))
+            ordered: List[Tuple[int, str]] = []
+            for fut in concurrent.futures.as_completed(tasks):
+                ordered.extend(fut.result())
+    except Exception:
+        import pypdfium2
+
+        doc = pypdfium2.PdfDocument(pdf_path)
+        return _pdfium_render_linear(doc, tmpdir, scale)
+    ordered.sort(key=lambda item: item[0])
+    return [path for _, path in ordered]
+
+
+def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise RuntimeError(
+            "pdftoppm not found and pypdfium2 is unavailable; install poppler-utils "
+            "or `pip install pypdfium2` to rasterize PDFs"
+        ) from exc
+
+    tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
+    scale = float(dpi) / 72.0 if dpi else 1.0
+    doc = pypdfium2.PdfDocument(pdf_path)
+    page_count = len(doc)
+    if page_count <= 0:
+        doc.close()
+        return []
+    workers = _pdf_parallel_workers(page_count)
+    if workers <= 1:
+        return _pdfium_render_linear(doc, tmpdir, scale)
+    doc.close()
+    return _pdfium_render_parallel(pdf_path, page_count, tmpdir, scale, workers)
+
+
 def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
     exe=shutil.which("pdftoppm")
-    if not exe: raise RuntimeError("pdftoppm not found; install poppler-utils")
-    tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
-    subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    if exe:
+        tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
+        subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
 # ----------------- Pipeline + Metrics -----------------
 def _rows_cols_from_html(html: str) -> Tuple[int,int]:
@@ -8214,16 +8329,25 @@ from functools import lru_cache
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
+_HAS_NUMBA_PARALLEL = False
 try:
     from numba import njit, prange
-    from numba import atomic
     _HAS_NUMBA = True
+    try:
+        from numba import atomic as _numba_atomic
+        atomic = _numba_atomic
+        _HAS_NUMBA_PARALLEL = True
+    except Exception:
+        atomic = None
 except Exception:
     def njit(*a, **k):
         def deco(f): return f
         return deco
     def prange(n):
         return range(n)
+    atomic = None
+
+if atomic is None:
     class _AtomicStub:
         @staticmethod
         def add(arr, idx, val):
@@ -9441,23 +9565,26 @@ def build_index(jsonl: str, out_pkl: str):
                 df[tid]+=1
         return df
 
-    @njit(parallel=True, cache=True)
-    def _compute_df_parallel(arr_unique, lengths, V):
-        n=arr_unique.shape[0]
-        df=np.zeros(V, dtype=np.int64)
-        for i in prange(n):
-            L=lengths[i]
-            for j in range(L):
-                tid=arr_unique[i,j]
-                if tid<0:
-                    break
-                atomic.add(df, tid, 1)
-        return df
+    if _HAS_NUMBA_PARALLEL:
+        @njit(parallel=True, cache=True)
+        def _compute_df_parallel(arr_unique, lengths, V):
+            n=arr_unique.shape[0]
+            df=np.zeros(V, dtype=np.int64)
+            for i in prange(n):
+                L=lengths[i]
+                for j in range(L):
+                    tid=arr_unique[i,j]
+                    if tid<0:
+                        break
+                    atomic.add(df, tid, 1)
+            return df
+    else:
+        _compute_df_parallel = None  # type: ignore
 
     df=None
     if _HAS_NUMBA:
         try:
-            if V <= 200000:
+            if _HAS_NUMBA_PARALLEL and V <= 200000 and _compute_df_parallel is not None:
                 df=_compute_df_parallel(arr_unique, uniq_lengths, V)
             else:
                 df=_compute_df(arr_unique, uniq_lengths, V)
@@ -11058,13 +11185,22 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     diag["poppler_pdftoppm"] = {
         "status": "available" if poppler_path else "missing",
         "path": poppler_path,
-        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+        "hint": None
+        if poppler_path
+        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
     }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
+    if numba_enabled:
+        detail = "Numba acceleration active"
+        if not numba_parallel:
+            detail += " (atomic.add unavailable; DF reduction running serially)"
+    else:
+        detail = "Falling back to pure Python BM25 scoring"
     diag["numba"] = {
         "status": "enabled" if numba_enabled else "python-fallback",
-        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+        "detail": detail,
     }
 
     libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
