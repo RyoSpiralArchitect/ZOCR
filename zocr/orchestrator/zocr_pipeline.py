@@ -451,6 +451,12 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
             if poppler_path
             else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
         }
+    pdf_diag = diag.get("pdf_raster")
+    if isinstance(pdf_diag, dict):
+        for backend in ("poppler_pdftoppm", "pypdfium2"):
+            entry = pdf_diag.get(backend)
+            if isinstance(entry, dict):
+                diag[backend] = dict(entry)
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
     numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))

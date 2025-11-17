@@ -13,7 +13,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib, concurrent.futures
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib, concurrent.futures, glob
 from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
@@ -7032,9 +7032,80 @@ def export_jsonl_with_ocr(doc_json_path: str,
     page_lookup: Dict[int, str] = {}
     page_lookup_order: List[str] = []
     default_image_path: Optional[str]
+    temp_dirs_to_cleanup: List[str] = []
+
+    def _expand_single_source(candidate: str) -> Optional[List[str]]:
+        if not isinstance(candidate, str):
+            return None
+        cand = candidate.strip()
+        if not cand:
+            return None
+        matched: List[str] = []
+        has_glob = any(ch in cand for ch in "*?[]")
+        globbed = []
+        if has_glob:
+            globbed = sorted(glob.glob(cand))
+        for entry in (globbed or [cand]):
+            if not entry:
+                continue
+            entry_norm = entry
+            if not os.path.isabs(entry_norm):
+                entry_norm = os.path.abspath(entry_norm)
+            if os.path.isdir(entry_norm):
+                try:
+                    for fn in sorted(os.listdir(entry_norm)):
+                        ext = os.path.splitext(fn)[1].lower()
+                        if ext in _page_exts:
+                            matched.append(os.path.join(entry_norm, fn))
+                except Exception:
+                    continue
+                continue
+            ext = os.path.splitext(entry_norm)[1].lower()
+            if ext == ".pdf" and os.path.exists(entry_norm):
+                try:
+                    pdf_pages = pdf_to_images_via_poppler(entry_norm)
+                except Exception as exc:
+                    print(f"[WARN] [Export] failed to rasterize PDF {entry_norm}: {exc}")
+                    continue
+                if pdf_pages:
+                    tmpdir = os.path.dirname(pdf_pages[0])
+                    if os.path.basename(tmpdir).startswith(("zocr_pdf_", "zocr_pdfium_")):
+                        temp_dirs_to_cleanup.append(tmpdir)
+                    matched.extend(pdf_pages)
+                continue
+            if ext in _page_exts and os.path.exists(entry_norm):
+                matched.append(entry_norm)
+        return matched or None
+
+    def _sequence_from_sources(items: Sequence[str]) -> List[str]:
+        seq: List[str] = []
+        seen_seq: Set[str] = set()
+        for raw in items:
+            if not isinstance(raw, str):
+                continue
+            expanded = _expand_single_source(raw)
+            candidates = expanded if expanded else [raw]
+            for cand in candidates:
+                if not isinstance(cand, str):
+                    continue
+                token = cand.strip()
+                if not token:
+                    continue
+                if token not in seen_seq:
+                    seen_seq.add(token)
+                    seq.append(token)
+        return seq
+
     if isinstance(source_images, str):
-        default_image_path = source_images
-        page_lookup_order = [source_images]
+        expanded = _expand_single_source(source_images)
+        if expanded:
+            seq = expanded
+            page_lookup = {i: path for i, path in enumerate(seq)}
+            page_lookup_order = list(seq)
+            default_image_path = seq[0] if seq else None
+        else:
+            default_image_path = source_images
+            page_lookup_order = [source_images]
     elif isinstance(source_images, Mapping):
         ordered_items: List[Tuple[int, str]] = []
         for key, value in source_images.items():
@@ -7051,7 +7122,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
             page_lookup_order = [value for _, value in ordered_items]
         default_image_path = page_lookup.get(min(page_lookup.keys())) if page_lookup else None
     else:
-        seq = [p for p in source_images if isinstance(p, str)]
+        seq = _sequence_from_sources(list(source_images))
         page_lookup = {i: path for i, path in enumerate(seq)}
         page_lookup_order = list(seq)
         default_image_path = seq[0] if seq else None
@@ -7227,6 +7298,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
             seg_col_candidates_final += _safe_int(col_diag.get("candidates_final"))
             seg_rows_with_candidates += _safe_int(col_diag.get("rows_with_candidates"))
 
+    missing_page_images: List[Dict[str, Any]] = []
+
     def _candidate_paths(
         path: Optional[str],
         index: Optional[int],
@@ -7299,16 +7372,29 @@ def export_jsonl_with_ocr(doc_json_path: str,
         index: Optional[int],
         fallback_index: Optional[int],
     ) -> Optional["Image.Image"]:
+        tried: List[str] = []
+        last_error: Optional[str] = None
         for target in _candidate_paths(path, index, fallback_index):
+            tried.append(target)
             if target in image_cache:
                 return image_cache[target]
             try:
                 with Image.open(target) as img:
                     loaded = img.convert("RGB")
             except Exception:
+                last_error = f"failed to open {target}"
                 continue
             image_cache[target] = loaded
             return loaded
+        missing_entry: Dict[str, Any] = {
+            "index": int(index) if isinstance(index, int) else None,
+            "fallback": int(fallback_index) if isinstance(fallback_index, int) else None,
+        }
+        if tried:
+            missing_entry["candidates"] = tried[:6]
+        if last_error:
+            missing_entry["error"] = last_error
+        missing_page_images.append(missing_entry)
         return None
 
     count = 0
@@ -7791,6 +7877,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 break
         if log_progress:
             print(f"[Export] done: {count} records", flush=True)
+    if missing_page_images:
+        sample = missing_page_images[: min(3, len(missing_page_images))]
+        print(
+            f"[WARN] [Export] missing page bitmaps for {len(missing_page_images)} pages",
+            f"examples={sample}",
+            flush=True,
+        )
     signals_path = out_jsonl_path + ".signals.json"
     learn_path = out_jsonl_path + ".learning.jsonl"
     summary_payload: Dict[str, Any] = {
@@ -7803,6 +7896,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "high_surprisal_ratio": float(surprisal_samples / float(max(1, count))),
         "review_ratio": float(len(learning_signals) / float(max(1, count))),
     }
+    if missing_page_images:
+        summary_payload["missing_pages"] = int(len(missing_page_images))
     if surprisal_threshold > 0.0:
         summary_payload["surprisal_threshold"] = float(surprisal_threshold)
     try:
@@ -7889,6 +7984,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "timeout_ms": int(guard_ms),
             "timeouts": int(guard_timeouts),
         }
+    if missing_page_images:
+        export_stats["missing_pages"] = {
+            "count": int(len(missing_page_images)),
+            "samples": missing_page_images[: min(3, len(missing_page_images))],
+        }
     if schema_tables:
         export_stats["schema_alignment"] = {
             "tables": int(schema_tables),
@@ -7971,6 +8071,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
         }
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
+    for tmpdir in temp_dirs_to_cleanup:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
     return count
 
 

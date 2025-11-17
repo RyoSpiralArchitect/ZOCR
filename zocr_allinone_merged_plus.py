@@ -88,30 +88,35 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit, difflib, concurrent.futures
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib, concurrent.futures, glob
+from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
 from pathlib import Path
 
-try:  # pragma: no cover - optional built-in tesslite bundle
-    from zocr.resources import tesslite_defaults as _tesslite_defaults  # type: ignore
-except Exception:  # pragma: no cover - when the package resources are missing
+try:  # pragma: no cover - optional built-in tesslite tables
+    from ..resources import tesslite_defaults as _tesslite_defaults  # type: ignore
+except Exception:  # pragma: no cover - fallback when package data is unavailable
     _tesslite_defaults = None  # type: ignore
 
 try:  # pragma: no cover - optional domain dictionary access
-    from zocr.resources.domain_dictionary import (  # type: ignore
-        get_domain_keywords as _get_domain_keywords,
-        all_domain_keywords as _all_domain_keywords,
-    )
-except Exception:  # pragma: no cover - when the package resources are missing
+    from ..resources.domain_dictionary import get_domain_keywords as _get_domain_keywords  # type: ignore
+except Exception:  # pragma: no cover - fallback when package data is unavailable
     _get_domain_keywords = None  # type: ignore
-    _all_domain_keywords = None  # type: ignore
 
 try:
     import numpy as np
 except Exception:
     np = None
+
+try:  # shared utility helpers when running as a package
+    from ..utils.json_utils import json_ready as _json_ready  # type: ignore
+except Exception:  # pragma: no cover - fallback when relative import fails
+    try:
+        from zocr.utils.json_utils import json_ready as _json_ready  # type: ignore
+    except Exception:  # pragma: no cover - standalone fallback
+        _json_ready = None  # type: ignore
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
 try:
@@ -180,15 +185,21 @@ def _normalize_self_correction_config(config: Optional[Dict[str, Any]]) -> Dict[
 
 
 def push_toy_self_correction(config: Optional[Dict[str, Any]]) -> None:
+    """Push a new toy OCR self-correction configuration onto the active stack."""
+
     _TOY_SELF_CORRECTION_STACK.append(_normalize_self_correction_config(config))
 
 
 def pop_toy_self_correction() -> None:
+    """Pop the most recent toy OCR self-correction configuration."""
+
     if _TOY_SELF_CORRECTION_STACK:
         _TOY_SELF_CORRECTION_STACK.pop()
 
 
 def current_toy_self_correction() -> Dict[str, Any]:
+    """Return the merged toy OCR self-correction configuration."""
+
     merged: Dict[str, Any] = {}
     for cfg in _TOY_SELF_CORRECTION_STACK:
         for key, value in cfg.items():
@@ -203,6 +214,8 @@ def current_toy_self_correction() -> Dict[str, Any]:
 
 @contextlib.contextmanager
 def toy_self_correction_scope(config: Optional[Dict[str, Any]]):
+    """Context manager helper to apply a temporary toy self-correction config."""
+
     push_toy_self_correction(config)
     try:
         yield
@@ -229,6 +242,25 @@ if __name__.startswith("zocr."):
 # ----------------- Utils -----------------
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
+
+
+if _json_ready is None:  # pragma: no cover - standalone fallback
+
+    def _json_ready(obj: Any):
+        """Best-effort conversion of numpy/complex objects into JSON-safe values."""
+
+        if isinstance(obj, dict):
+            return {k: _json_ready(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_json_ready(v) for v in obj]
+        if isinstance(obj, set):
+            return [_json_ready(v) for v in obj]
+        if np is not None:
+            if isinstance(obj, np.generic):  # type: ignore[attr-defined]
+                return obj.item()
+            if isinstance(obj, np.ndarray):  # type: ignore[attr-defined]
+                return obj.tolist()
+        return obj
 
 
 def _toy_memory_series_paths(path: str) -> Tuple[str, str]:
@@ -589,6 +621,8 @@ def _dp_means_1d(points, lam, iters=3):
 
 
 def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -> List[List[float]]:
+    """Recursively partition column centers using a B-tree like split rule."""
+
     ordered = sorted(float(v) for v in values if math.isfinite(v))
     if not ordered:
         return []
@@ -614,6 +648,8 @@ def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -
 
 
 def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_depth: int = 5) -> List[float]:
+    """Return stable column centers derived from a B-tree style recursive sort."""
+
     buckets = _btree_partition(points, min_bucket=max(1, min_bucket), max_depth=max(1, max_depth))
     centers: List[float] = []
     for bucket in buckets:
@@ -630,7 +666,11 @@ def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_dept
     return deduped
 
 
-def _vertical_vote_boundaries(binary: "np.ndarray", max_candidates: int = 16, min_gap: int = 6) -> List[int]:
+def _vertical_vote_boundaries(
+    binary: "np.ndarray", max_candidates: int = 16, min_gap: int = 6
+) -> List[int]:
+    """Return low-ink column boundaries via a lightweight vertical voting pass."""
+
     try:
         arr = np.asarray(binary, dtype=np.uint8)
     except Exception:
@@ -665,7 +705,9 @@ def _vertical_vote_boundaries(binary: "np.ndarray", max_candidates: int = 16, mi
     return [int(val) for val in picks]
 
 
-def _apply_column_continuity_prior(candidates_by_row: List[List[int]], tolerance: int = 5) -> List[List[int]]:
+def _apply_column_continuity_prior(
+    candidates_by_row: List[List[int]], tolerance: int = 5
+) -> List[List[int]]:
     if not candidates_by_row:
         return candidates_by_row
     refined: List[List[int]] = []
@@ -684,7 +726,9 @@ def _apply_column_continuity_prior(candidates_by_row: List[List[int]], tolerance
     return refined
 
 
-def _refine_column_bounds_alignment(col_bounds: List[int], smooth_strength: float = 0.25) -> List[int]:
+def _refine_column_bounds_alignment(
+    col_bounds: List[int], smooth_strength: float = 0.25
+) -> List[int]:
     if len(col_bounds) <= 2:
         return col_bounds
     widths = [col_bounds[i + 1] - col_bounds[i] for i in range(len(col_bounds) - 1)]
@@ -744,7 +788,9 @@ def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: in
     return valleys
 
 
-def _align_row_band_centers(row_bands: List[Tuple[int, int]], height: int, med_h: float) -> List[Tuple[int, int]]:
+def _align_row_band_centers(
+    row_bands: List[Tuple[int, int]], height: int, med_h: float
+) -> List[Tuple[int, int]]:
     if len(row_bands) <= 1:
         return row_bands
     centers = [0.5 * (y0 + y1) for (y0, y1) in row_bands]
@@ -768,7 +814,10 @@ def _align_row_band_centers(row_bands: List[Tuple[int, int]], height: int, med_h
 
 
 def _refine_row_bands_by_projection(
-    row_bands: List[Tuple[int, int]], binary: "np.ndarray", med_h: float, height: int
+    row_bands: List[Tuple[int, int]],
+    binary: "np.ndarray",
+    med_h: float,
+    height: int,
 ) -> Tuple[List[Tuple[int, int]], Dict[str, int]]:
     stats = {
         "segments": 0,
@@ -1397,8 +1446,8 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
         "candidates_final": sum(len(r) for r in candidates_after),
         "rows_with_candidates": sum(1 for r in candidates_after if r),
         "blank_columns": sum(1 for ratio in column_blank_ratios if ratio >= blank_thr),
-        "blank_ratio_mean": round(float(sum(column_blank_ratios)) / float(len(column_blank_ratios) or 1), 4),
-    }
+        "blank_ratio_mean": round(float(sum(column_blank_ratios)) / float(len(column_blank_ratios) or 1), 4)
+        }
     segmentation_stats = {
         "row": row_diag,
         "column": column_diag,
@@ -1635,6 +1684,7 @@ def _pdfium_render_parallel(pdf_path: str, page_count: int, tmpdir: str, scale: 
             for fut in concurrent.futures.as_completed(tasks):
                 ordered.extend(fut.result())
     except Exception:
+        # Fallback to linear rendering if parallel execution fails for any reason.
         import pypdfium2
 
         doc = pypdfium2.PdfDocument(pdf_path)
@@ -1686,6 +1736,8 @@ def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
 
 
 def detect_pdf_raster_backends() -> Dict[str, Any]:
+    """Report the availability of Poppler/pdfium raster backends."""
+
     status: Dict[str, Any] = {"status": "missing", "active": None, "hint": None}
     poppler_path = shutil.which("pdftoppm")
     poppler_hint = "Install poppler-utils (pdftoppm) for the fastest multi-page rasterization"
@@ -1902,7 +1954,7 @@ _DEMO_INPUT_SUFFIXES: Tuple[str, ...] = (
 
 
 def _discover_demo_inputs_for_consensus() -> List[str]:
-    """Locate demo assets for the bundled consensus CLI."""
+    """Locate demo input files for the standalone consensus CLI."""
 
     env_override = os.environ.get("ZOCR_DEMO_INPUTS")
     candidate_roots: List[Path] = []
@@ -1928,7 +1980,7 @@ def _discover_demo_inputs_for_consensus() -> List[str]:
                 _add_candidate(Path(chunk))
 
     here = Path(__file__).resolve()
-    repo_root = here.parent
+    repo_root = here.parents[2] if len(here.parents) >= 3 else here.parent
     search_roots = [Path.cwd(), repo_root]
     rel_candidates = [
         Path("samples/demo_inputs"),
@@ -2023,8 +2075,8 @@ def main():
         default=None,
         metavar="N",
         help=(
-            "Auto-calibrate CC params using N sample pages (default %(const)s if no "
-            "explicit value is provided). Pass 0 or omit to disable."
+            "Auto-calibrate CC params using N sample pages (default %(const)s when "
+            "the flag is provided without a value). Pass 0 or omit the flag to disable."
         ),
     )
     p.add_argument(
@@ -2036,7 +2088,7 @@ def main():
         metavar="N",
         help=(
             "Run the unsupervised autotuner for N trials (default %(const)s when the "
-            "flag is value-less). Pass 0 or omit to skip autotuning."
+            "flag has no explicit value). Pass 0 or omit to skip autotuning."
         ),
     )
     _patch_cli_for_export_and_search(p)
@@ -2062,12 +2114,12 @@ def main():
         pages: List[str] = []
         for it in demo_inputs:
             ext = os.path.splitext(it)[1].lower()
-            if ext==".pdf":
+            if ext == ".pdf":
                 pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
             else:
                 pages.append(it)
         pages = _dedup_input_paths(pages)
-        annos=[None]*len(pages)
+        annos = [None] * len(pages)
     else:
         if not args.input: p.error("No input. Use --demo or -i.")
         pages=[]
@@ -2110,7 +2162,422 @@ _ASCII_SET = (
     " +#=_[]{}"
 )
 
-_GLYPH_VARIANT_LIMIT = 6
+def _initial_toy_sweep_limit(default: int = 2) -> int:
+    candidates = ("ZOCR_TOY_SWEEPS", "ZOCR_TOY_SWEEP_LIMIT")
+    for key in candidates:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            return max(1, int(raw.strip()))
+        except Exception:
+            continue
+    return max(1, int(default))
+
+
+_INITIAL_TOY_SWEEP_LIMIT = _initial_toy_sweep_limit()
+_GLYPH_VARIANT_LIMIT = int(_INITIAL_TOY_SWEEP_LIMIT)
+
+
+@dataclass
+class MotionPriorCfg:
+    enabled: bool = False
+    sigma_px: float = 8.0
+    cutoff_sigma: float = 2.5
+    accept_ratio: float = 0.5
+    k_sigma_window: float = 2.5
+    auto_sigma: bool = False
+    sigma_min_ratio: float = 0.15
+    sigma_max_ratio: float = 1.5
+    table_signature: Optional[str] = None
+    cache_dir: Optional[str] = None
+    bandit_action: Optional[str] = None
+
+
+@dataclass
+class _BlankSkipConfig:
+    enabled: bool = False
+    dark_threshold: int = 210
+    min_dark_pixels: int = 8
+    min_dark_ratio: float = 0.002
+    min_area: int = 36
+
+
+@dataclass
+class _ConfidenceBoostConfig:
+    enabled: bool = True
+    target: float = 0.82
+    min_input: float = 0.35
+
+
+@dataclass
+class _LexicalBoostConfig(_ConfidenceBoostConfig):
+    min_quality: float = 0.85
+
+
+try:  # pragma: no cover - optional orchestrator helper
+    from ..orchestrator.prior import estimate_sigma_px as _estimate_sigma_px  # type: ignore
+except Exception:  # pragma: no cover - fallback when orchestrator is unavailable
+
+    def _estimate_sigma_px(
+        delta_y: Sequence[float],
+        median_row_h: float,
+        s_min_ratio: float = 0.15,
+        s_max_ratio: float = 1.5,
+    ) -> float:
+        if not delta_y:
+            return max(1.0, 0.5 * float(median_row_h or 1.0))
+        med = median(delta_y)
+        mad = median([abs(d - med) for d in delta_y])
+        sigma = 1.4826 * mad
+        sigma_min = s_min_ratio * max(1.0, median_row_h)
+        sigma_max = s_max_ratio * max(1.0, median_row_h)
+        return float(min(max(sigma, sigma_min), sigma_max))
+
+
+@dataclass
+class _ExportSweepTracker:
+    prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
+
+    def get(self, doc_id: str, page_index: int, table_index: int) -> Optional[List[float]]:
+        return self.prev_y.get((doc_id, page_index, table_index))
+
+    def put(
+        self,
+        doc_id: str,
+        page_index: int,
+        table_index: int,
+        y_keys: Sequence[float],
+    ) -> None:
+        self.prev_y[(doc_id, page_index, table_index)] = [float(y) for y in y_keys]
+
+
+_EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
+
+
+def _motion_prior_cfg_from_env() -> MotionPriorCfg:
+    enabled = _env_flag("ZOCR_EXPORT_MOTION_PRIOR", True) or _env_flag("ZOCR_USE_PRIOR", False)
+    cfg = MotionPriorCfg(enabled=enabled)
+    cfg.table_signature = os.environ.get("ZOCR_TABLE_SIGNATURE")
+    cfg.cache_dir = os.environ.get("ZOCR_PRIOR_CACHE")
+    cfg.bandit_action = os.environ.get("ZOCR_PRIOR_ACTION")
+    cfg.k_sigma_window = float(max(0.1, _env_float("ZOCR_K_SIGMA_WINDOW", cfg.k_sigma_window)))
+    cfg.sigma_min_ratio = float(max(0.01, _env_float("ZOCR_PRIOR_SIGMA_MIN_RATIO", cfg.sigma_min_ratio)))
+    cfg.sigma_max_ratio = float(max(cfg.sigma_min_ratio, _env_float("ZOCR_PRIOR_SIGMA_MAX_RATIO", cfg.sigma_max_ratio)))
+    sigma_raw = os.environ.get("ZOCR_PRIOR_SIGMA")
+    sigma_override: Optional[float] = None
+    if sigma_raw:
+        if sigma_raw.strip().lower() == "auto":
+            cfg.auto_sigma = True
+        else:
+            try:
+                sigma_override = float(sigma_raw)
+            except Exception:
+                sigma_override = None
+    elif cfg.enabled:
+        cfg.auto_sigma = True
+    if sigma_override is None:
+        sigma_env = os.environ.get("ZOCR_EXPORT_MOTION_SIGMA")
+        if sigma_env:
+            try:
+                sigma_override = float(sigma_env)
+            except Exception:
+                sigma_override = None
+    if sigma_override is not None:
+        cfg.sigma_px = max(0.5, float(sigma_override))
+        cfg.auto_sigma = False
+    cutoff_raw = os.environ.get("ZOCR_EXPORT_MOTION_CUTOFF")
+    if cutoff_raw:
+        try:
+            cfg.cutoff_sigma = max(0.1, float(cutoff_raw))
+        except Exception:
+            pass
+    accept_raw = os.environ.get("ZOCR_EXPORT_MOTION_ACCEPT")
+    if accept_raw:
+        try:
+            cfg.accept_ratio = float(max(0.0, min(1.0, float(accept_raw))))
+        except Exception:
+            pass
+    return cfg
+
+
+def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
+    cfg = _BlankSkipConfig(enabled=_env_flag("ZOCR_EXPORT_SKIP_BLANK", True))
+    if not cfg.enabled:
+        return cfg
+    thr = _env_int("ZOCR_EXPORT_BLANK_THRESHOLD", cfg.dark_threshold)
+    if thr is not None:
+        cfg.dark_threshold = int(max(1, min(255, thr)))
+    min_px = _env_int("ZOCR_EXPORT_BLANK_MIN_PIXELS", cfg.min_dark_pixels)
+    if min_px is not None:
+        cfg.min_dark_pixels = int(max(1, min_px))
+    min_ratio = _env_float("ZOCR_EXPORT_BLANK_MIN_RATIO", cfg.min_dark_ratio)
+    if isinstance(min_ratio, (int, float)):
+        cfg.min_dark_ratio = float(max(0.0, min(0.1, min_ratio)))
+    min_area = _env_int("ZOCR_EXPORT_BLANK_MIN_AREA", cfg.min_area)
+    if min_area is not None:
+        cfg.min_area = int(max(1, min_area))
+    return cfg
+
+
+def _confidence_boost_cfg_from_env() -> _ConfidenceBoostConfig:
+    cfg = _ConfidenceBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_NUMERIC", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_TARGET", cfg.target))))
+    cfg.min_input = float(max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_MIN_INPUT", cfg.min_input))))
+    return cfg
+
+
+def _lexical_boost_cfg_from_env() -> _LexicalBoostConfig:
+    cfg = _LexicalBoostConfig()
+    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_LEXICAL", True)
+    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_LEXICAL_TARGET", cfg.target))))
+    cfg.min_input = float(
+        max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_INPUT", cfg.min_input)))
+    )
+    cfg.min_quality = float(
+        max(0.0, min(1.5, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_QUALITY", cfg.min_quality)))
+    )
+    return cfg
+
+
+def _apply_confidence_boost(
+    conf: Optional[float], cfg: _ConfidenceBoostConfig
+) -> Tuple[Optional[float], float]:
+    if conf is None or not cfg.enabled:
+        return conf, 0.0
+    base = _normalize_confidence(conf)
+    if base >= cfg.target or base < cfg.min_input:
+        return base, 0.0
+    boosted = float(max(base, cfg.target))
+    return boosted, boosted - base
+
+
+def _confidence_boost_reason(payload: Optional[Dict[str, Any]]) -> str:
+    if not payload:
+        return ""
+    for key in ("amount", "subtotal", "tax_amount", "unit_price", "qty", "tax_rate"):
+        if key in payload:
+            return key
+    return ""
+
+
+def _lexical_confidence_reason(
+    text: Optional[str],
+    lexical_diag: Dict[str, Any],
+    min_quality: float,
+    quality: float,
+) -> str:
+    if not text or quality < min_quality:
+        return ""
+    canonical = (lexical_diag.get("canonical") or "").strip()
+    if canonical:
+        hint = _LEXICAL_CONF_CANONICAL_HINTS.get(canonical)
+        if hint:
+            return f"lexical:{hint}"
+    normalized_jp = _normalize_japanese_token(text)
+    if normalized_jp:
+        hint = _LEXICAL_CONF_JP_HINTS.get(normalized_jp)
+        if hint:
+            return f"lexical:{hint}"
+    jp_reason = lexical_diag.get("jp_hint_reason")
+    if lexical_diag.get("jp_hint") and jp_reason:
+        return f"lexical:jp_{jp_reason}"
+    return ""
+
+
+def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
+    if not cfg.enabled:
+        return False
+    try:
+        w, h = img.size
+    except Exception:
+        return False
+    area = max(1, int(w) * int(h))
+    if area < cfg.min_area:
+        return False
+    try:
+        gray = img.convert("L")
+        hist = gray.histogram()
+    except Exception:
+        return False
+    if not hist:
+        return False
+    thr = max(1, min(256, int(cfg.dark_threshold)))
+    dark = int(sum(hist[:thr]))
+    if dark < cfg.min_dark_pixels:
+        return True
+    ratio = dark / float(area)
+    if ratio <= cfg.min_dark_ratio:
+        return True
+    return False
+
+
+def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
+    mids: List[float] = []
+    for top, bottom in row_bands:
+        try:
+            mid = (float(top) + float(bottom)) * 0.5
+        except Exception:
+            continue
+        if math.isfinite(mid):
+            mids.append(mid)
+    return mids
+
+
+def _prior_cache_path(cache_dir: str, signature: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", signature.strip()) or "unknown"
+    return os.path.join(cache_dir, f"{safe}.ykeys.json")
+
+
+def _load_prior_cache_ykeys(signature: Optional[str], cache_dir: Optional[str]) -> Optional[List[float]]:
+    if not signature or not cache_dir:
+        return None
+    path = _prior_cache_path(cache_dir, signature)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    values = payload.get("y_keys") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return None
+    result: List[float] = []
+    for val in values:
+        try:
+            result.append(float(val))
+        except Exception:
+            continue
+    return result or None
+
+
+def _store_prior_cache_ykeys(
+    signature: Optional[str], cache_dir: Optional[str], y_keys: Sequence[float]
+) -> bool:
+    if not signature or not cache_dir or not y_keys:
+        return False
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        return False
+    path = _prior_cache_path(cache_dir, signature)
+    payload = {"y_keys": [float(y) for y in y_keys]}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _reseed_row_bands_with_prior(
+    prev_keys: Sequence[float],
+    row_bands: Sequence[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[float, float]]]:
+    if not prev_keys or not row_bands:
+        return list(row_bands), []
+    mids = _row_band_midpoints(row_bands)
+    if not mids:
+        return list(row_bands), []
+    ordered = sorted(((mid, idx) for idx, mid in enumerate(mids)), key=lambda item: item[0])
+    ordered_mids = [mid for mid, _ in ordered]
+    used = [False] * len(ordered)
+    matches: List[Tuple[float, float]] = []
+    reseed_indices: List[int] = []
+    for prev_val in prev_keys:
+        pos = bisect.bisect_left(ordered_mids, prev_val)
+        best_idx = None
+        best_dist = float("inf")
+        for offset in (pos - 1, pos, pos + 1):
+            if 0 <= offset < len(ordered) and not used[offset]:
+                cand_mid, cand_idx = ordered[offset]
+                dist = abs(cand_mid - prev_val)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = offset
+        if best_idx is None:
+            continue
+        used[best_idx] = True
+        cand_mid, cand_idx = ordered[best_idx]
+        matches.append((cand_mid, float(prev_val)))
+        reseed_indices.append(cand_idx)
+    for offset, (_, idx) in enumerate(ordered):
+        if not used[offset]:
+            reseed_indices.append(idx)
+    reseeded = [row_bands[idx] for idx in reseed_indices]
+    return reseeded, matches
+
+
+def _apply_motion_prior_to_bands(
+    prev_keys: Optional[Sequence[float]],
+    row_bands: List[Tuple[int, int]],
+    cfg: MotionPriorCfg,
+    row_heights: Optional[Sequence[int]] = None,
+) -> Tuple[List[Tuple[int, int]], bool, Dict[str, Any]]:
+    stats: Dict[str, Any] = {}
+    if not cfg.enabled or not prev_keys or not row_bands:
+        return row_bands, False, stats
+    reseeded, matches = _reseed_row_bands_with_prior(prev_keys, row_bands)
+    if not reseeded:
+        return row_bands, False, stats
+    heights = row_heights or [int(max(1, band[1] - band[0])) for band in row_bands]
+    med_height = float(median(heights)) if heights else max(1.0, abs(row_bands[0][1] - row_bands[0][0]))
+    deltas = [cand_mid - prev_val for cand_mid, prev_val in matches]
+    sigma_px = float(cfg.sigma_px)
+    auto_used = False
+    if cfg.auto_sigma:
+        sigma_px = _estimate_sigma_px(deltas, med_height, cfg.sigma_min_ratio, cfg.sigma_max_ratio)
+        auto_used = True
+    sigma_px = max(1e-3, float(sigma_px))
+    k_sigma = max(0.1, float(cfg.k_sigma_window))
+    window = k_sigma * sigma_px
+    cutoff = float(cfg.cutoff_sigma) * sigma_px
+    stats.update(
+        {
+            "sigma_px": float(sigma_px),
+            "window_px": float(window),
+            "auto_sigma": bool(auto_used),
+            "deltas": len(deltas),
+            "median_row_h": float(med_height),
+            "k_sigma_window": float(k_sigma),
+        }
+    )
+    limited: List[Tuple[int, int]] = []
+    trimmed = 0
+    if window > 0:
+        for idx, band in enumerate(reseeded):
+            top, bottom = band
+            mid = (float(top) + float(bottom)) * 0.5
+            target = float(prev_keys[idx]) if idx < len(prev_keys) else mid
+            if abs(mid - target) > window:
+                trimmed += 1
+                height = max(1.0, float(bottom - top))
+                center = target + max(-window, min(window, mid - target))
+                half = height * 0.5
+                new_top = int(round(center - half))
+                new_bottom = int(round(center + half))
+                limited.append((new_top, new_bottom))
+            else:
+                limited.append(band)
+    else:
+        limited = list(reseeded)
+    if trimmed:
+        stats["trimmed"] = int(trimmed)
+    reseeded = limited
+    inside = 0
+    total = len(matches)
+    for cand_mid, prev_val in matches:
+        if abs(cand_mid - prev_val) <= cutoff:
+            inside += 1
+    stats["inliers"] = int(inside)
+    stats["matches"] = int(total)
+    actual_ratio = inside / float(total or 1)
+    stats["accept_ratio"] = float(actual_ratio)
+    if actual_ratio >= cfg.accept_ratio:
+        return reseeded, True, stats
+    return row_bands, False, stats
 
 
 def _parse_threshold_limit(value: str, default: int) -> int:
@@ -2923,6 +3390,7 @@ def _looks_like_upper_token(text: str) -> bool:
 
 _TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
 
+
 @dataclass
 class _TessLiteModel:
     glyphs: Set[str]
@@ -2978,17 +3446,6 @@ def _tesslite_domain_keywords() -> Optional[Set[str]]:
     return normalized or None
 
 
-def _tesslite_env_signature() -> str:
-    path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
-    if not path:
-        return "-"
-    try:
-        st = os.stat(path)
-        return f"{path}:{int(st.st_mtime)}:{st.st_size}"
-    except Exception:
-        return f"{path}:missing"
-
-
 def _tesslite_builtin_available() -> bool:
     disable = os.environ.get("ZOCR_TESSLITE_DISABLE_BUILTIN", "").strip().lower()
     if disable in {"1", "true", "yes", "on"}:
@@ -3028,6 +3485,17 @@ def _tesslite_builtin_payload() -> Tuple[
                 continue
             bigrams[prev] = {str(ch): float(val) for ch, val in mapping.items() if isinstance(val, (int, float))}
     return glyphs, ambiguous, categories, dictionary, bigrams
+
+
+def _tesslite_env_signature() -> str:
+    path = os.environ.get("ZOCR_TESS_UNICHARSET", "")
+    if not path:
+        return "-"
+    try:
+        st = os.stat(path)
+        return f"{path}:{int(st.st_mtime)}:{st.st_size}"
+    except Exception:
+        return f"{path}:missing"
 
 
 def _tesslite_effective_source() -> Tuple[bool, str, bool]:
@@ -3166,6 +3634,8 @@ def _feature_source(*names: str) -> str:
 
 
 def get_toy_feature_status() -> Dict[str, Any]:
+    """Return a snapshot of the active toy OCR feature knobs."""
+
     status: Dict[str, Any] = {}
 
     conf_cfg = _confidence_boost_cfg_from_env()
@@ -3800,8 +4270,8 @@ _TOTAL_LABEL_HINTS = [
     "合計", "総計", "総額", "小計", "税込合計", "税込総額", "請求額", "ご請求額", "支払金額", "合算", "合計金額"
 ]
 _TOTAL_PREFIXES = ["total", "subtotal", "balance", "amountdue", "dueamount", "grandtotal", "amountpayable", "合計", "小計", "総額", "請求"]
-_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?")
-_NUMERIC_SANITIZE_RX = re.compile(r"[^0-9.+-]")
+_NUMERIC_RX = re.compile(r"[+\-]?\d[\d,]*(?:\.\d+)?%?")
+_NUMERIC_HEADER_INFERRED_LAST = 0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -3890,255 +4360,12 @@ def _pytesseract_call(label: str, func: Callable[..., Any], *args, **kwargs):
 
 
 # --- Toy OCR knobs ----------------------------------------------------------
-_TOY_SWEEPS = max(1, int(os.environ.get("ZOCR_TOY_SWEEPS", "5")))
-_FORCE_NUMERIC = _env_flag("ZOCR_FORCE_NUMERIC", True)
+_TOY_SWEEPS = int(_INITIAL_TOY_SWEEP_LIMIT)
+_FORCE_NUMERIC = _env_flag(
+    "ZOCR_COERCE_NUMERIC",
+    _env_flag("ZOCR_FORCE_NUMERIC", True),
+)
 _LAST_EXPORT_STATS: Dict[str, Any] = {}
-
-
-@dataclass
-class MotionPriorCfg:
-    enabled: bool = False
-    sigma_px: float = 8.0
-    cutoff_sigma: float = 2.5
-    accept_ratio: float = 0.5
-
-
-@dataclass
-class _BlankSkipConfig:
-    enabled: bool = False
-    dark_threshold: int = 210
-    min_dark_pixels: int = 8
-    min_dark_ratio: float = 0.002
-    min_area: int = 36
-
-
-@dataclass
-class _ConfidenceBoostConfig:
-    enabled: bool = True
-    target: float = 0.82
-    min_input: float = 0.35
-
-
-@dataclass
-class _LexicalBoostConfig(_ConfidenceBoostConfig):
-    min_quality: float = 0.85
-
-
-@dataclass
-class _ExportSweepTracker:
-    prev_y: Dict[Tuple[str, int, int], List[float]] = field(default_factory=dict)
-
-    def get(self, doc_id: str, page_index: int, table_index: int) -> Optional[List[float]]:
-        return self.prev_y.get((doc_id, page_index, table_index))
-
-    def put(
-        self,
-        doc_id: str,
-        page_index: int,
-        table_index: int,
-        y_keys: Sequence[float],
-    ) -> None:
-        self.prev_y[(doc_id, page_index, table_index)] = [float(y) for y in y_keys]
-
-
-_EXPORT_SWEEP_TRACKER = _ExportSweepTracker()
-
-
-def _motion_prior_cfg_from_env() -> MotionPriorCfg:
-    cfg = MotionPriorCfg(enabled=_env_flag("ZOCR_EXPORT_MOTION_PRIOR", True))
-    if cfg.enabled:
-        sigma = _env_float("ZOCR_EXPORT_MOTION_SIGMA", cfg.sigma_px)
-        cutoff = _env_float("ZOCR_EXPORT_MOTION_CUTOFF", cfg.cutoff_sigma)
-        accept = _env_float("ZOCR_EXPORT_MOTION_ACCEPT", cfg.accept_ratio)
-        cfg.sigma_px = max(0.5, float(sigma))
-        cfg.cutoff_sigma = max(0.1, float(cutoff))
-        cfg.accept_ratio = float(max(0.0, min(1.0, accept)))
-    return cfg
-
-
-def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
-    cfg = _BlankSkipConfig(enabled=_env_flag("ZOCR_EXPORT_SKIP_BLANK", True))
-    if not cfg.enabled:
-        return cfg
-    thr = _env_int("ZOCR_EXPORT_BLANK_THRESHOLD", cfg.dark_threshold)
-    if thr is not None:
-        cfg.dark_threshold = int(max(1, min(255, thr)))
-    min_px = _env_int("ZOCR_EXPORT_BLANK_MIN_PIXELS", cfg.min_dark_pixels)
-    if min_px is not None:
-        cfg.min_dark_pixels = int(max(1, min_px))
-    min_ratio = _env_float("ZOCR_EXPORT_BLANK_MIN_RATIO", cfg.min_dark_ratio)
-    if isinstance(min_ratio, (int, float)):
-        cfg.min_dark_ratio = float(max(0.0, min(0.1, min_ratio)))
-    min_area = _env_int("ZOCR_EXPORT_BLANK_MIN_AREA", cfg.min_area)
-    if min_area is not None:
-        cfg.min_area = int(max(1, min_area))
-    return cfg
-
-
-def _confidence_boost_cfg_from_env() -> _ConfidenceBoostConfig:
-    cfg = _ConfidenceBoostConfig()
-    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_NUMERIC", True)
-    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_TARGET", cfg.target))))
-    cfg.min_input = float(max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_MIN_INPUT", cfg.min_input))))
-    return cfg
-
-
-def _lexical_boost_cfg_from_env() -> _LexicalBoostConfig:
-    cfg = _LexicalBoostConfig()
-    cfg.enabled = _env_flag("ZOCR_CONF_BOOST_LEXICAL", True)
-    cfg.target = float(max(0.0, min(1.0, _env_float("ZOCR_CONF_BOOST_LEXICAL_TARGET", cfg.target))))
-    cfg.min_input = float(
-        max(0.0, min(cfg.target, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_INPUT", cfg.min_input)))
-    )
-    cfg.min_quality = float(
-        max(0.0, min(1.5, _env_float("ZOCR_CONF_BOOST_LEXICAL_MIN_QUALITY", cfg.min_quality)))
-    )
-    return cfg
-
-
-def _apply_confidence_boost(
-    conf: Optional[float], cfg: _ConfidenceBoostConfig
-) -> Tuple[Optional[float], float]:
-    if conf is None or not cfg.enabled:
-        return conf, 0.0
-    base = _normalize_confidence(conf)
-    if base >= cfg.target or base < cfg.min_input:
-        return base, 0.0
-    boosted = float(max(base, cfg.target))
-    return boosted, boosted - base
-
-
-def _confidence_boost_reason(payload: Optional[Dict[str, Any]]) -> str:
-    if not payload:
-        return ""
-    for key in ("amount", "subtotal", "tax_amount", "unit_price", "qty", "tax_rate"):
-        if key in payload:
-            return key
-    return ""
-
-
-def _lexical_confidence_reason(
-    text: Optional[str],
-    lexical_diag: Dict[str, Any],
-    min_quality: float,
-    quality: float,
-) -> str:
-    if not text or quality < min_quality:
-        return ""
-    canonical = (lexical_diag.get("canonical") or "").strip()
-    if canonical:
-        hint = _LEXICAL_CONF_CANONICAL_HINTS.get(canonical)
-        if hint:
-            return f"lexical:{hint}"
-    normalized_jp = _normalize_japanese_token(text)
-    if normalized_jp:
-        hint = _LEXICAL_CONF_JP_HINTS.get(normalized_jp)
-        if hint:
-            return f"lexical:{hint}"
-    jp_reason = lexical_diag.get("jp_hint_reason")
-    if lexical_diag.get("jp_hint") and jp_reason:
-        return f"lexical:jp_{jp_reason}"
-    return ""
-
-
-def _should_skip_blank_crop(img: "Image.Image", cfg: _BlankSkipConfig) -> bool:
-    if not cfg.enabled:
-        return False
-    try:
-        w, h = img.size
-    except Exception:
-        return False
-    area = max(1, int(w) * int(h))
-    if area < cfg.min_area:
-        return False
-    try:
-        gray = img.convert("L")
-        hist = gray.histogram()
-    except Exception:
-        return False
-    if not hist:
-        return False
-    thr = max(1, min(256, int(cfg.dark_threshold)))
-    dark = int(sum(hist[:thr]))
-    if dark < cfg.min_dark_pixels:
-        return True
-    ratio = dark / float(area)
-    if ratio <= cfg.min_dark_ratio:
-        return True
-    return False
-
-
-def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
-    mids: List[float] = []
-    for top, bottom in row_bands:
-        try:
-            mid = (float(top) + float(bottom)) * 0.5
-        except Exception:
-            continue
-        if math.isfinite(mid):
-            mids.append(mid)
-    return mids
-
-
-def _reseed_row_bands_with_prior(
-    prev_keys: Sequence[float],
-    row_bands: Sequence[Tuple[int, int]],
-) -> Tuple[List[Tuple[int, int]], List[Tuple[float, float]]]:
-    if not prev_keys or not row_bands:
-        return list(row_bands), []
-    mids = _row_band_midpoints(row_bands)
-    if not mids:
-        return list(row_bands), []
-    ordered = sorted(((mid, idx) for idx, mid in enumerate(mids)), key=lambda item: item[0])
-    ordered_mids = [mid for mid, _ in ordered]
-    used = [False] * len(ordered)
-    matches: List[Tuple[float, float]] = []
-    reseed_indices: List[int] = []
-    for prev_val in prev_keys:
-        pos = bisect.bisect_left(ordered_mids, prev_val)
-        best_idx = None
-        best_dist = float("inf")
-        for offset in (pos - 1, pos, pos + 1):
-            if 0 <= offset < len(ordered) and not used[offset]:
-                cand_mid, cand_idx = ordered[offset]
-                dist = abs(cand_mid - prev_val)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = offset
-        if best_idx is None:
-            continue
-        used[best_idx] = True
-        cand_mid, cand_idx = ordered[best_idx]
-        matches.append((cand_mid, float(prev_val)))
-        reseed_indices.append(cand_idx)
-    for offset, (_, idx) in enumerate(ordered):
-        if not used[offset]:
-            reseed_indices.append(idx)
-    reseeded = [row_bands[idx] for idx in reseed_indices]
-    return reseeded, matches
-
-
-def _apply_motion_prior_to_bands(
-    prev_keys: Optional[Sequence[float]],
-    row_bands: List[Tuple[int, int]],
-    cfg: MotionPriorCfg,
-) -> Tuple[List[Tuple[int, int]], bool]:
-    if not cfg.enabled or not prev_keys or not row_bands:
-        return row_bands, False
-    reseeded, matches = _reseed_row_bands_with_prior(prev_keys, row_bands)
-    if not reseeded:
-        return row_bands, False
-    sigma = max(1e-3, float(cfg.sigma_px))
-    cutoff = float(cfg.cutoff_sigma) * sigma
-    inside = 0
-    total = len(matches)
-    for cand_mid, prev_val in matches:
-        if abs(cand_mid - prev_val) <= cutoff:
-            inside += 1
-    actual_ratio = inside / float(total or 1)
-    if actual_ratio >= cfg.accept_ratio:
-        return reseeded, True
-    return row_bands, False
 
 
 def toy_runtime_config() -> Dict[str, Any]:
@@ -4146,6 +4373,7 @@ def toy_runtime_config() -> Dict[str, Any]:
 
     return {
         "threshold_sweeps": int(_TOY_SWEEPS),
+        "glyph_variant_limit": int(_GLYPH_VARIANT_LIMIT),
         "force_numeric": bool(_FORCE_NUMERIC),
     }
 
@@ -4162,7 +4390,7 @@ def configure_toy_runtime(
     """Update toy OCR runtime knobs at runtime."""
 
     updates: Dict[str, Any] = {}
-    global _TOY_SWEEPS, _FORCE_NUMERIC
+    global _TOY_SWEEPS, _FORCE_NUMERIC, _GLYPH_VARIANT_LIMIT
     if sweeps is not None:
         try:
             new_sweeps = max(1, int(sweeps))
@@ -4170,6 +4398,7 @@ def configure_toy_runtime(
             new_sweeps = _TOY_SWEEPS
         if new_sweeps != _TOY_SWEEPS:
             _TOY_SWEEPS = new_sweeps
+            _GLYPH_VARIANT_LIMIT = int(max(1, new_sweeps))
             updates["threshold_sweeps"] = new_sweeps
     if force_numeric is not None:
         new_flag = bool(force_numeric)
@@ -4177,72 +4406,54 @@ def configure_toy_runtime(
             _FORCE_NUMERIC = new_flag
             updates["force_numeric"] = new_flag
     return updates
-
-
 _NUMERIC_HEADER_KIND = [
     ("qty", re.compile(r"(数量|数|個|台数|件数|口数|本数|点数|qty|q'?ty|quantity)", re.I)),
     ("unit_price", re.compile(r"(単価|unit\s*price|price|unit\s*cost)", re.I)),
+    ("subtotal", re.compile(r"(小計|subtotal)", re.I)),
     (
         "amount",
         re.compile(
-            r"(金額|見積金額|御見積金額|御見積合計|合計金額|合計|総計|計|税込|税別|小計|amount|total|subtotal|balance)",
+            r"(金額|見積金額|御見積金額|御見積合計|合計金額|合計|総計|計|税込|税別|総額|amount|total|grand\s*total|balance|amount\s*due|total\s*due)",
             re.I,
         ),
     ),
+    ("tax_amount", re.compile(r"(税額|消費税額|tax\s*amount|vat\s*amount|gst\s*amount)", re.I)),
     ("tax_rate", re.compile(r"(税率|消費税率|税%|tax%|tax(\s*rate)?|vat|gst)", re.I)),
 ]
 
-_NUMERIC_HEADER_INFERRED_LAST = 0
+_FULLWIDTH_NUMBERS = str.maketrans(
+    {
+        "０": "0",
+        "１": "1",
+        "２": "2",
+        "３": "3",
+        "４": "4",
+        "５": "5",
+        "６": "6",
+        "７": "7",
+        "８": "8",
+        "９": "9",
+        "．": ".",
+        "，": ",",
+        "－": "-",
+        "＋": "+",
+        "％": "%",
+    }
+)
+_NUMERIC_SANITIZE_RX = re.compile(r"[^0-9.+-]")
 
 
-def _canonicalize_header_label(label: str) -> str:
-    text = unicodedata.normalize("NFKC", str(label or ""))
-    text = text.strip().lower()
-    text = text.replace("：", ":").replace("　", " ")
-    return re.sub(r"\s+", " ", text)
-
-
-def _header_variants_for_numeric(label: str) -> List[str]:
-    base = _canonicalize_header_label(label)
-    variants: List[str] = []
-    if not base:
-        return variants
-
-    def _add(val: str) -> None:
-        val = val.strip()
-        if val and val not in variants:
-            variants.append(val)
-
-    _add(base)
-    _add(base.replace(" ", ""))
-    honorific = base.lstrip("御お")
-    _add(honorific)
-    no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", base)
-    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
-    _add(no_brackets)
-    simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", base)
-    simplified = re.sub(r"\s+", " ", simplified).strip()
-    _add(simplified)
-    _add(simplified.replace(" ", ""))
-    for token in re.split(r"[/｜\|・,、]", base):
-        token = token.strip()
-        if not token:
-            continue
-        _add(token)
-        _add(token.replace(" ", ""))
-    return variants
-
-
-def _normalize_numeric_bits(text: str, kind: str) -> Tuple[str, Optional[float], Optional[str]]:
-    work = (text or "").strip()
-    if not work:
+def _normalize_numeric_bits(text: Any, kind: str) -> Tuple[str, Optional[float], Optional[bool]]:
+    raw = "" if text is None else str(text)
+    raw = raw.strip()
+    if not raw:
         return "", None, None
-    work = work.replace("，", ",").replace("．", ".")
+    work = raw.translate(_FULLWIDTH_NUMBERS)
+    work = work.replace("円", "").replace("￥", "").replace("¥", "").replace("$", "")
+    work = work.replace(",", "")
+    work = work.replace("，", "").replace("．", ".")
+    work = work.replace("％", "%")
     neg = False
-    if work.endswith("円"):
-        work = work[:-1]
-    if work.startswith("円"):
-        work = work[1:]
     if work.startswith("(") and work.endswith(")"):
         neg = True
         work = work[1:-1]
@@ -4294,6 +4505,44 @@ def _coerce_numeric_filters(kind: Optional[str], text: str) -> Tuple[str, Dict[s
     return result_text, payload
 
 
+def _canonicalize_header_label(label: str) -> str:
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = text.strip().lower()
+    text = text.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", " ", text)
+
+
+def _header_variants_for_numeric(label: str) -> List[str]:
+    base = _canonicalize_header_label(label)
+    variants: List[str] = []
+    if not base:
+        return variants
+
+    def _add(val: str) -> None:
+        val = val.strip()
+        if val and val not in variants:
+            variants.append(val)
+
+    _add(base)
+    _add(base.replace(" ", ""))
+    honorific = base.lstrip("御お")
+    _add(honorific)
+    no_brackets = re.sub(r"[\(（\[［【].*?[\)）\]］】]", "", base)
+    no_brackets = re.sub(r"\s+", " ", no_brackets).strip()
+    _add(no_brackets)
+    simplified = re.sub(r"[\-:：／/\\()（）\[\]{}<>«»《》【】「」『』]", "", base)
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+    _add(simplified)
+    _add(simplified.replace(" ", ""))
+    for token in re.split(r"[/｜\|・,、]", base):
+        token = token.strip()
+        if not token:
+            continue
+        _add(token)
+        _add(token.replace(" ", ""))
+    return variants
+
+
 def _infer_numeric_kinds_from_values(
     grid_text: Sequence[Sequence[str]],
     kinds: List[Optional[str]],
@@ -4308,7 +4557,7 @@ def _infer_numeric_kinds_from_values(
         kinds.extend([None] * (num_cols - len(kinds)))
     currency_rx = re.compile(r"[¥￥円＄$元]")
     for c in range(num_cols):
-        if kinds[c]:
+        if c < len(kinds) and kinds[c]:
             continue
         total = 0
         numeric_hits = 0
@@ -4370,9 +4619,9 @@ def _numeric_header_kinds(
         for header in headers:
             kind: Optional[str] = None
             for variant in _header_variants_for_numeric(header) or [""]:
-                for key, rx in _NUMERIC_HEADER_KIND:
+                for candidate, rx in _NUMERIC_HEADER_KIND:
                     if variant and rx.search(variant):
-                        kind = key
+                        kind = candidate
                         break
                 if kind:
                     break
@@ -4404,36 +4653,17 @@ def _enforce_numeric_by_headers(headers: Sequence[str], grid_text: Sequence[Sequ
             grid_text[r][:] = row
 
 
-_DATE_FULLWIDTH = str.maketrans(
-    {
-        "０": "0",
-        "１": "1",
-        "２": "2",
-        "３": "3",
-        "４": "4",
-        "５": "5",
-        "６": "6",
-        "７": "7",
-        "８": "8",
-        "９": "9",
-        "－": "-",
-        "．": ".",
-        "／": "/",
-        "年": "年",
-        "月": "月",
-        "日": "日",
-    }
-)
-
 _DATE_ROLE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     (
         "due",
         (
             "due date",
             "payment due",
+            "due on",
             "due",
             "支払期限",
             "支払期日",
+            "支払日",
             "期日",
             "納期",
         ),
@@ -4447,6 +4677,8 @@ _DATE_ROLE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
             "請求日",
             "発行日",
             "作成日",
+            "交付日",
+            "売上日",
         ),
     ),
     (
@@ -4457,6 +4689,8 @@ _DATE_ROLE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
             "delivery date",
             "利用日",
             "作業日",
+            "搭乗日",
+            "乗車日",
         ),
     ),
 ]
@@ -4538,7 +4772,7 @@ def _normalize_date_value(text: str) -> Optional[Tuple[str, str]]:
     norm = str(text).strip()
     if not norm:
         return None
-    norm = norm.translate(_DATE_FULLWIDTH)
+    norm = norm.translate(_FULLWIDTH_NUMBERS)
     compact = norm.replace(" ", "").replace("　", "")
 
     def _format(year: int, month: int, day: Optional[int]) -> Optional[Tuple[str, str]]:
@@ -4693,7 +4927,7 @@ _SCHEMA_SEMANTIC_SYNONYMS: Dict[str, Tuple[str, ...]] = {
         "amount",
         "total",
         "lineamount",
-        "linetotal",
+        "lineTotal",
         "金額",
         "合計",
         "総計",
@@ -4925,6 +5159,7 @@ def _semantic_item_qty_schema(grid_text: Sequence[Sequence[str]]) -> Optional[Li
         elif key == "amount":
             score = profile.get("currency_ratio", 0.0) * 1.2 + profile.get("numeric_ratio", 0.0) * 0.6
         score += bonuses[idx].get(key, 0.0)
+        # prefer columns closer to the right for amount but left for item
         if key == "item":
             score -= idx * 0.02
         elif key == "amount":
@@ -6870,29 +7105,150 @@ def export_jsonl_with_ocr(doc_json_path: str,
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     page_lookup: Dict[int, str] = {}
+    page_lookup_order: List[str] = []
     default_image_path: Optional[str]
+    temp_dirs_to_cleanup: List[str] = []
+
+    def _expand_single_source(candidate: str) -> Optional[List[str]]:
+        if not isinstance(candidate, str):
+            return None
+        cand = candidate.strip()
+        if not cand:
+            return None
+        matched: List[str] = []
+        has_glob = any(ch in cand for ch in "*?[]")
+        globbed = []
+        if has_glob:
+            globbed = sorted(glob.glob(cand))
+        for entry in (globbed or [cand]):
+            if not entry:
+                continue
+            entry_norm = entry
+            if not os.path.isabs(entry_norm):
+                entry_norm = os.path.abspath(entry_norm)
+            if os.path.isdir(entry_norm):
+                try:
+                    for fn in sorted(os.listdir(entry_norm)):
+                        ext = os.path.splitext(fn)[1].lower()
+                        if ext in _page_exts:
+                            matched.append(os.path.join(entry_norm, fn))
+                except Exception:
+                    continue
+                continue
+            ext = os.path.splitext(entry_norm)[1].lower()
+            if ext == ".pdf" and os.path.exists(entry_norm):
+                try:
+                    pdf_pages = pdf_to_images_via_poppler(entry_norm)
+                except Exception as exc:
+                    print(f"[WARN] [Export] failed to rasterize PDF {entry_norm}: {exc}")
+                    continue
+                if pdf_pages:
+                    tmpdir = os.path.dirname(pdf_pages[0])
+                    if os.path.basename(tmpdir).startswith(("zocr_pdf_", "zocr_pdfium_")):
+                        temp_dirs_to_cleanup.append(tmpdir)
+                    matched.extend(pdf_pages)
+                continue
+            if ext in _page_exts and os.path.exists(entry_norm):
+                matched.append(entry_norm)
+        return matched or None
+
+    def _sequence_from_sources(items: Sequence[str]) -> List[str]:
+        seq: List[str] = []
+        seen_seq: Set[str] = set()
+        for raw in items:
+            if not isinstance(raw, str):
+                continue
+            expanded = _expand_single_source(raw)
+            candidates = expanded if expanded else [raw]
+            for cand in candidates:
+                if not isinstance(cand, str):
+                    continue
+                token = cand.strip()
+                if not token:
+                    continue
+                if token not in seen_seq:
+                    seen_seq.add(token)
+                    seq.append(token)
+        return seq
+
     if isinstance(source_images, str):
-        default_image_path = source_images
+        expanded = _expand_single_source(source_images)
+        if expanded:
+            seq = expanded
+            page_lookup = {i: path for i, path in enumerate(seq)}
+            page_lookup_order = list(seq)
+            default_image_path = seq[0] if seq else None
+        else:
+            default_image_path = source_images
+            page_lookup_order = [source_images]
     elif isinstance(source_images, Mapping):
+        ordered_items: List[Tuple[int, str]] = []
         for key, value in source_images.items():
             try:
                 idx = int(key)
             except (TypeError, ValueError):
                 continue
             if isinstance(value, str):
+                ordered_items.append((idx, value))
+        if ordered_items:
+            ordered_items.sort(key=lambda kv: kv[0])
+            for idx, value in ordered_items:
                 page_lookup[idx] = value
+            page_lookup_order = [value for _, value in ordered_items]
         default_image_path = page_lookup.get(min(page_lookup.keys())) if page_lookup else None
     else:
-        seq = [p for p in source_images if isinstance(p, str)]
+        seq = _sequence_from_sources(list(source_images))
         page_lookup = {i: path for i, path in enumerate(seq)}
+        page_lookup_order = list(seq)
         default_image_path = seq[0] if seq else None
+    doc_dir = os.path.dirname(os.path.abspath(doc_json_path))
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    _page_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+    doc_image_inventory: Optional[Dict[str, List[str]]] = None
 
-    motion_cfg = _motion_prior_cfg_from_env()
-    sweep_tracker = _EXPORT_SWEEP_TRACKER
-    motion_applied = 0
-    motion_rejected = 0
+    def _ensure_doc_inventory() -> Dict[str, List[str]]:
+        nonlocal doc_image_inventory
+        if doc_image_inventory is not None:
+            return doc_image_inventory
+        inventory: Dict[str, List[str]] = defaultdict(list)
+        search_roots: deque[Tuple[str, int]] = deque()
+        seen_dirs: Set[str] = set()
+        base_root = os.path.abspath(doc_dir) if doc_dir else os.getcwd()
+        search_roots.append((base_root, 0))
+        preferred_subdirs = [
+            "pages",
+            "images",
+            "imgs",
+            "page_images",
+            "input_pages",
+            "inputs",
+        ]
+        for sub in preferred_subdirs:
+            subdir = os.path.join(base_root, sub)
+            if os.path.isdir(subdir):
+                search_roots.append((os.path.abspath(subdir), 1))
+        max_depth = 2
+        while search_roots:
+            current, depth = search_roots.popleft()
+            if current in seen_dirs:
+                continue
+            seen_dirs.add(current)
+            try:
+                entries = os.listdir(current)
+            except Exception:
+                continue
+            for name in entries:
+                full = os.path.join(current, name)
+                if os.path.isdir(full):
+                    if depth < max_depth:
+                        search_roots.append((full, depth + 1))
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in _page_exts:
+                    inventory[name.lower()].append(full)
+        doc_image_inventory = inventory
+        return doc_image_inventory
 
     progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
     log_progress = progress_flag not in {"", "0", "false", "no"}
@@ -6919,8 +7275,22 @@ def export_jsonl_with_ocr(doc_json_path: str,
     cells_done = 0
     t0 = time.time()
     stop_due_to_limit = False
+    motion_cfg = _motion_prior_cfg_from_env()
+    sweep_tracker = _EXPORT_SWEEP_TRACKER
+    motion_applied = 0
+    motion_rejected = 0
+    motion_sigma_samples: List[float] = []
+    motion_window_samples: List[float] = []
+    motion_auto_estimated = 0
+    motion_prior_attempts: List[Dict[str, Any]] = []
     guard_ms = _parse_env_int("ZOCR_EXPORT_GUARD_MS", 0, 0)
     guard_timeouts = 0
+    doc_identifier = str(
+        doc.get("doc_id")
+        or doc.get("document_id")
+        or doc.get("id")
+        or os.path.splitext(os.path.basename(doc_json_path))[0]
+    )
     blank_cfg = _blank_skip_cfg_from_env()
     blank_skipped = 0
     confidence_boost_cfg = _confidence_boost_cfg_from_env()
@@ -6933,6 +7303,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
     lexical_boost_reasons: Dict[str, int] = defaultdict(int)
     lexical_quality_sum = 0.0
     lexical_quality_samples = 0
+    prior_cache_seed: Optional[List[float]] = None
+    prior_cache_hits = 0
+    prior_cache_writes = 0
     schema_tables = 0
     schema_noise_columns = 0
     schema_rows_adjusted = 0
@@ -6963,13 +7336,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
     seg_col_candidates_initial = 0
     seg_col_candidates_final = 0
     seg_rows_with_candidates = 0
-
-    doc_identifier = str(
-        doc.get("doc_id")
-        or doc.get("document_id")
-        or doc.get("id")
-        or os.path.splitext(os.path.basename(doc_json_path))[0]
-    )
+    if motion_cfg.enabled:
+        cached = _load_prior_cache_ykeys(motion_cfg.table_signature, motion_cfg.cache_dir)
+        if cached:
+            prior_cache_seed = list(cached)
+            prior_cache_hits += 1
 
     pages = doc.get("pages") if isinstance(doc, dict) else None
     if not isinstance(pages, list):
@@ -7002,26 +7373,103 @@ def export_jsonl_with_ocr(doc_json_path: str,
             seg_col_candidates_final += _safe_int(col_diag.get("candidates_final"))
             seg_rows_with_candidates += _safe_int(col_diag.get("rows_with_candidates"))
 
-    def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
+    missing_page_images: List[Dict[str, Any]] = []
+
+    def _candidate_paths(
+        path: Optional[str],
+        index: Optional[int],
+        fallback_index: Optional[int],
+    ) -> List[str]:
         ordered: List[str] = []
         seen: Set[str] = set()
-        for cand in (path, page_lookup.get(index) if index is not None else None, default_image_path):
-            if isinstance(cand, str) and cand and cand not in seen:
+        base_names: Set[str] = set()
+
+        def _remember_basename(candidate: Optional[str]) -> None:
+            if not isinstance(candidate, str):
+                return
+            cand = candidate.strip()
+            if not cand:
+                return
+            base = os.path.basename(cand)
+            if base:
+                base_names.add(base.lower())
+
+        def _add_candidate(candidate: Optional[str]) -> None:
+            if not isinstance(candidate, str):
+                return
+            cand = candidate.strip()
+            if not cand:
+                return
+            if cand not in seen:
                 seen.add(cand)
                 ordered.append(cand)
+                _remember_basename(cand)
+            if not os.path.isabs(cand):
+                resolved = os.path.abspath(os.path.join(doc_dir, cand))
+                if resolved not in seen:
+                    seen.add(resolved)
+                    ordered.append(resolved)
+                    _remember_basename(resolved)
+
+        def _index_candidates(primary: Optional[int], fallback: Optional[int]) -> List[int]:
+            values: List[int] = []
+            for raw in (primary, fallback):
+                if raw is None:
+                    continue
+                try:
+                    idx_val = int(raw)
+                except Exception:
+                    continue
+                if idx_val not in values:
+                    values.append(idx_val)
+            if isinstance(primary, int):
+                alias = primary - 1
+                if alias >= 0 and alias not in values:
+                    values.append(alias)
+            return values
+
+        _add_candidate(path)
+        for idx_val in _index_candidates(index, fallback_index):
+            _add_candidate(page_lookup.get(idx_val))
+            if 0 <= idx_val < len(page_lookup_order):
+                _add_candidate(page_lookup_order[idx_val])
+        _add_candidate(default_image_path)
+
+        if base_names:
+            inventory = _ensure_doc_inventory()
+            for base in base_names:
+                for fallback in inventory.get(base, []):
+                    _add_candidate(fallback)
         return ordered
 
-    def _load_page_image(path: Optional[str], index: Optional[int]) -> Optional["Image.Image"]:
-        for target in _candidate_paths(path, index):
+    def _load_page_image(
+        path: Optional[str],
+        index: Optional[int],
+        fallback_index: Optional[int],
+    ) -> Optional["Image.Image"]:
+        tried: List[str] = []
+        last_error: Optional[str] = None
+        for target in _candidate_paths(path, index, fallback_index):
+            tried.append(target)
             if target in image_cache:
                 return image_cache[target]
             try:
                 with Image.open(target) as img:
                     loaded = img.convert("RGB")
             except Exception:
+                last_error = f"failed to open {target}"
                 continue
             image_cache[target] = loaded
             return loaded
+        missing_entry: Dict[str, Any] = {
+            "index": int(index) if isinstance(index, int) else None,
+            "fallback": int(fallback_index) if isinstance(fallback_index, int) else None,
+        }
+        if tried:
+            missing_entry["candidates"] = tried[:6]
+        if last_error:
+            missing_entry["error"] = last_error
+        missing_page_images.append(missing_entry)
         return None
 
     count = 0
@@ -7080,11 +7528,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 lookup_idx = pidx
             else:
                 lookup_idx = enum_idx
-            page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
-            page_image = _load_page_image(page_image_path, lookup_idx)
+            page_image = _load_page_image(page_image_path, lookup_idx, enum_idx)
             if page_image is None:
                 continue
             page_w, page_h = page_image.size
+            page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
             tables = p.get("tables", []) if isinstance(p, dict) else []
             for ti, t in enumerate(tables):
                 if stop_due_to_limit:
@@ -7093,11 +7541,6 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     continue
                 tables_processed += 1
                 table_guarded = False
-                guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
-                guard_triggered = False
-                prev_keys: Optional[List[float]] = None
-                if motion_cfg.enabled:
-                    prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
                 x1,y1,x2,y2 = t["bbox"]
                 dbg = t.get("dbg", {})
                 col_bounds = dbg.get("col_bounds", [0, (x2-x1)//2, x2-x1])
@@ -7123,8 +7566,28 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         yt = int(y1 + (y2-y1)*r/R)
                         yb = int(y1 + (y2-y1)*(r+1)/R)
                         row_bands.append((yt, yb))
+                row_heights = [int(max(1, band[1] - band[0])) for band in row_bands]
+                prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
+                if not prev_keys and prior_cache_seed:
+                    prev_keys = list(prior_cache_seed)
+                motion_entry_stats: Dict[str, Any] = {}
                 if motion_cfg.enabled:
-                    row_bands_prior, applied = _apply_motion_prior_to_bands(prev_keys, row_bands, motion_cfg)
+                    row_bands_prior, applied, motion_entry_stats = _apply_motion_prior_to_bands(
+                        prev_keys,
+                        row_bands,
+                        motion_cfg,
+                        row_heights=row_heights,
+                    )
+                    if motion_entry_stats:
+                        motion_prior_attempts.append(motion_entry_stats)
+                        sigma_val = motion_entry_stats.get("sigma_px")
+                        window_val = motion_entry_stats.get("window_px")
+                        if isinstance(sigma_val, (int, float)):
+                            motion_sigma_samples.append(float(sigma_val))
+                        if isinstance(window_val, (int, float)):
+                            motion_window_samples.append(float(window_val))
+                        if motion_entry_stats.get("auto_sigma"):
+                            motion_auto_estimated += 1
                     if applied:
                         row_bands = row_bands_prior
                         motion_applied += 1
@@ -7145,6 +7608,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
                 col_charset_hints: List[Optional[str]] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
+                guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
+                guard_triggered = False
                 for r in range(R):
                     if guard_deadline and time.time() >= guard_deadline:
                         guard_triggered = True
@@ -7189,7 +7654,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     if r == 0 and not col_charset_hints:
                         headers_sample = grid_text[0] if grid_text else []
                         col_charset_hints = _column_charset_hints(headers_sample)
-                    if guard_triggered or stop_due_to_limit:
+                    if stop_due_to_limit:
                         break
                 if guard_triggered:
                     guard_timeouts += 1
@@ -7201,12 +7666,20 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 if stop_due_to_limit:
                     break
                 if motion_cfg.enabled:
+                    mids = _row_band_midpoints(row_bands)
                     sweep_tracker.put(
                         doc_identifier,
                         page_index_int,
                         ti,
-                        _row_band_midpoints(row_bands),
+                        mids,
                     )
+                    if _store_prior_cache_ykeys(
+                        motion_cfg.table_signature,
+                        motion_cfg.cache_dir,
+                        mids,
+                    ):
+                        prior_cache_writes += 1
+                        prior_cache_seed = list(mids)
                 schema_adjust = _rectify_item_qty_amount_schema(grid_text, grid_conf, col_bounds)
                 if schema_adjust:
                     grid_text, grid_conf, col_bounds, schema_meta = schema_adjust
@@ -7341,8 +7814,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 boost_marker = (
                                     f"{boost_marker},{lexical_reason}" if boost_marker else lexical_reason
                                 )
-                        # build search/synthesis
                         row_texts = grid_text[r]
+                        # build search/synthesis
                         ctx_line = _context_line_from_row(headers, row_texts) if contextual and r>0 else txt
                         kws = _keywords_from_row(row_texts) if contextual and r>0 else []
                         low_conf = (conf is not None and conf < ocr_min_conf)
@@ -7372,6 +7845,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         }
                         if table_guarded:
                             filters["guard_timeout"] = True
+                        if col_kind:
+                            filters["numeric_header_kind"] = col_kind
                         if r in footer_rows:
                             filters["row_role"] = "footer"
                         note = fallback_notes.get((r, c))
@@ -7477,6 +7952,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 break
         if log_progress:
             print(f"[Export] done: {count} records", flush=True)
+    if missing_page_images:
+        sample = missing_page_images[: min(3, len(missing_page_images))]
+        print(
+            f"[WARN] [Export] missing page bitmaps for {len(missing_page_images)} pages",
+            f"examples={sample}",
+            flush=True,
+        )
     signals_path = out_jsonl_path + ".signals.json"
     learn_path = out_jsonl_path + ".learning.jsonl"
     summary_payload: Dict[str, Any] = {
@@ -7489,6 +7971,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "high_surprisal_ratio": float(surprisal_samples / float(max(1, count))),
         "review_ratio": float(len(learning_signals) / float(max(1, count))),
     }
+    if missing_page_images:
+        summary_payload["missing_pages"] = int(len(missing_page_images))
     if surprisal_threshold > 0.0:
         summary_payload["surprisal_threshold"] = float(surprisal_threshold)
     try:
@@ -7575,6 +8059,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "timeout_ms": int(guard_ms),
             "timeouts": int(guard_timeouts),
         }
+    if missing_page_images:
+        export_stats["missing_pages"] = {
+            "count": int(len(missing_page_images)),
+            "samples": missing_page_images[: min(3, len(missing_page_images))],
+        }
     if schema_tables:
         export_stats["schema_alignment"] = {
             "tables": int(schema_tables),
@@ -7621,15 +8110,47 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "rows_with_candidates_mean": round(seg_rows_with_candidates * inv_tables, 3),
         }
     if motion_cfg.enabled:
+        sigma_summary = None
+        if motion_sigma_samples:
+            sigma_summary = {
+                "median": float(median(motion_sigma_samples)),
+                "min": float(min(motion_sigma_samples)),
+                "max": float(max(motion_sigma_samples)),
+                "count": len(motion_sigma_samples),
+            }
+        window_summary = None
+        if motion_window_samples:
+            window_summary = {
+                "median": float(median(motion_window_samples)),
+                "min": float(min(motion_window_samples)),
+                "max": float(max(motion_window_samples)),
+                "count": len(motion_window_samples),
+            }
         export_stats["motion_prior"] = {
             "sigma_px": float(motion_cfg.sigma_px),
             "cutoff_sigma": float(motion_cfg.cutoff_sigma),
             "accept_ratio": float(motion_cfg.accept_ratio),
+            "k_sigma_window": float(motion_cfg.k_sigma_window),
             "applied": int(motion_applied),
             "rejected": int(motion_rejected),
+            "auto_estimated": int(motion_auto_estimated),
+            "bandit_action": motion_cfg.bandit_action,
+            "table_signature": motion_cfg.table_signature,
+            "sigma_summary": sigma_summary,
+            "window_summary": window_summary,
+            "cache": {
+                "hits": int(prior_cache_hits),
+                "writes": int(prior_cache_writes),
+            },
+            "attempts": len(motion_prior_attempts),
         }
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
+    for tmpdir in temp_dirs_to_cleanup:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
     return count
 
 
@@ -7731,6 +8252,10 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
         return summary
 
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    use_ext_variants = (
+        os.environ.get("ZOCR_EXPORT_EXT_VARIANTS", "0") == "1"
+        and ocr_engine in ("tess", "easyocr")
+    )
 
     focus_plan, focus_filters = _prepare_reanalysis_focus(focus)
     focus_stats = {"matched": 0, "skipped": 0} if focus_filters else None
@@ -7903,8 +8428,9 @@ def reanalyze_learning_jsonl(learning_jsonl_path: str,
                     _merge_variant(txt_c, conf_c, "contrast_1.2")
                 except Exception:
                     pass
-                for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
-                    _merge_variant(txt_ext, conf_ext, transform_ext)
+                if use_ext_variants:
+                    for txt_ext, conf_ext, transform_ext in _collect_external_ocr_variants(crop):
+                        _merge_variant(txt_ext, conf_ext, transform_ext)
                 seen_ambiguous: Set[str] = set()
                 for candidate in _ambiguous_variants(observed_text) + _ambiguous_variants(base_text):
                     if not candidate or candidate in seen_ambiguous:
@@ -8424,6 +8950,15 @@ def cli_export(args):
         source_images = [p for p in args.input if isinstance(p, str)]
     else:
         source_images = src
+    runtime_overrides: Dict[str, Any] = {}
+    sweeps = getattr(args, "toy_sweeps", None)
+    if sweeps is not None and sweeps > 0:
+        runtime_overrides["sweeps"] = sweeps
+    force_numeric = getattr(args, "force_numeric", None)
+    if force_numeric is not None:
+        runtime_overrides["force_numeric"] = force_numeric
+    if runtime_overrides:
+        configure_toy_runtime(**runtime_overrides)
     n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
     print("Exported", n, "records to", out_jsonl)
 
@@ -8454,6 +8989,26 @@ def _patch_cli_for_export_and_search(parser):
     def add_common(sp):
         sp.add_argument("--out", type=str, default="out_consensus")
         sp.add_argument("-i","--input", nargs="*", default=[])
+        sp.add_argument(
+            "--toy-sweeps",
+            type=int,
+            default=None,
+            help="Clamp toy OCR threshold sweeps (overrides ZOCR_TOY_SWEEPS)",
+        )
+        group = sp.add_mutually_exclusive_group()
+        group.add_argument(
+            "--force-numeric",
+            dest="force_numeric",
+            action="store_true",
+            help="Force numeric coercion based on headers",
+        )
+        group.add_argument(
+            "--no-force-numeric",
+            dest="force_numeric",
+            action="store_false",
+            help="Disable numeric coercion",
+        )
+        sp.set_defaults(force_numeric=None)
     sp = sub.add_parser("export", help="Export JSONL with toy OCR + contextual lines")
     add_common(sp); sp.set_defaults(func=cli_export)
     sp = sub.add_parser("index", help="Build local BM25 index from exported JSONL")
@@ -11028,14 +11583,26 @@ Outputs are consolidated under a single outdir.
 """
 
 import os, sys, json, time, traceback, argparse, random, platform, hashlib, subprocess, importlib, re, glob, shutil, math, fnmatch
-from datetime import datetime
 from pathlib import Path
+from collections import Counter, defaultdict
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set, Sequence, TypedDict
 try:
     from typing import Literal  # py39+
-except ImportError:  # pragma: no cover
+except ImportError:  # pragma: no cover - fallback for very old Python
     from typing_extensions import Literal  # type: ignore
 from html import escape
+
+from .prior import PriorBandit, normalize_headers_to_signature, decide_success
+from ..utils.json_utils import json_ready as _json_ready
+from ..diff import (
+    DiffAssistPlanner,
+    SemanticDiffer,
+    build_handoff_bundle,
+    render_html as diff_render_html,
+    render_markdown as diff_render_markdown,
+    render_unified as diff_render_unified,
+)
 
 try:
     from PIL import Image  # type: ignore
@@ -11071,20 +11638,6 @@ def _call(stage, **kw):
             fn(**kw)
         except Exception as e:
             print(f"[PLUGIN:{stage}] {fn.__name__} -> {e}")
-
-def _json_ready(obj: Any):
-    if isinstance(obj, dict):
-        return {k: _json_ready(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_ready(v) for v in obj]
-    if isinstance(obj, set):
-        return [_json_ready(v) for v in obj]
-    if _np is not None:
-        if isinstance(obj, _np.generic):  # type: ignore[attr-defined]
-            return obj.item()
-        if isinstance(obj, _np.ndarray):  # type: ignore[attr-defined]
-            return obj.tolist()
-    return obj
 
 _STAGE_TRACE_SINK: Optional[List[Dict[str, Any]]] = None
 
@@ -11218,6 +11771,78 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "page", "pages", "document", "documents", "doc"}
 
 
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
+    """Run semantic diff between two pipeline outputs."""
+
+    a_cells = a_dir / "rag" / "cells.jsonl"
+    b_cells = b_dir / "rag" / "cells.jsonl"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    a_sections = a_dir / "rag" / "sections.jsonl"
+    b_sections = b_dir / "rag" / "sections.jsonl"
+
+    differ = SemanticDiffer()
+    planner = DiffAssistPlanner()
+    result = differ.compare_bundle(a_cells, b_cells, a_sections, b_sections)
+    assist_plan = planner.plan(result["events"])
+    result["assist_plan"] = assist_plan
+
+    events_path = out_dir / "events.json"
+    diff_path = out_dir / "changes.diff"
+    html_path = out_dir / "report.html"
+    plan_path = out_dir / "assist_plan.json"
+    agentic_path = out_dir / "agentic_requests.json"
+    markdown_path = out_dir / "report.md"
+
+    diff_text = diff_render_unified(result["events"])
+    markdown_text = diff_render_markdown(
+        result["events"],
+        result.get("summary"),
+        title="ZOCR Semantic Diff",
+    )
+    events_path.write_text(_json_dumps(result), encoding="utf-8")
+    diff_path.write_text(diff_text, encoding="utf-8")
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+    diff_render_html(result["events"], html_path)
+    plan_path.write_text(_json_dumps(assist_plan), encoding="utf-8")
+    agentic_path.write_text(
+        _json_dumps(assist_plan.get("agentic_requests", [])),
+        encoding="utf-8",
+    )
+
+    handoff = build_handoff_bundle(
+        mode="semantic",
+        source={
+            "cells_a": str(a_cells),
+            "cells_b": str(b_cells),
+            "sections_a": str(a_sections) if a_sections.exists() else None,
+            "sections_b": str(b_sections) if b_sections.exists() else None,
+        },
+        summary=result.get("summary"),
+        events=result["events"],
+        diff_text=diff_text,
+        markdown_text=markdown_text,
+        assist_plan=assist_plan,
+        artifacts={
+            "events_json": str(events_path),
+            "diff_text_path": str(diff_path),
+            "html_report_path": str(html_path),
+            "markdown_report_path": str(markdown_path),
+            "assist_plan": str(plan_path),
+            "agentic_requests": str(agentic_path),
+        },
+    )
+    (out_dir / "handoff_bundle.json").write_text(
+        _json_dumps(handoff),
+        encoding="utf-8",
+    )
+    return result
+
+
 class IntentPayload(TypedDict, total=False):
     action: str
     priority: Literal["low", "medium", "high"]
@@ -11287,6 +11912,19 @@ _INPUT_ENUM_PATH_EXCLUDES: Tuple[str, ...] = (
     "**/debug*/*",
     "**/views_cells/*",
 )
+
+_AUTOCALIB_DEFAULT_SAMPLES = 3
+_AUTOTUNE_DEFAULT_TRIALS = 6
+
+
+def _positive_cli_value(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        intval = int(value)
+    except Exception:
+        return None
+    return intval if intval > 0 else None
 
 
 def _discover_demo_input_targets() -> List[str]:
@@ -11383,6 +12021,12 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
             if poppler_path
             else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
         }
+    pdf_diag = diag.get("pdf_raster")
+    if isinstance(pdf_diag, dict):
+        for backend in ("poppler_pdftoppm", "pypdfium2"):
+            entry = pdf_diag.get(backend)
+            if isinstance(entry, dict):
+                diag[backend] = dict(entry)
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
     numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
@@ -11583,6 +12227,11 @@ def _save_episode_index(outdir: str, payload: Dict[str, Any]) -> None:
         print(f"[WARN] episode index write failed: {exc}")
 
 
+def _current_episode_id() -> Optional[str]:
+    eid = _EPISODE_CONTEXT.get("id")
+    return str(eid) if eid else None
+
+
 def _begin_episode(outdir: str) -> Optional[Dict[str, Any]]:
     if not outdir:
         return None
@@ -11619,6 +12268,10 @@ def _begin_episode(outdir: str) -> Optional[Dict[str, Any]]:
     return {"id": episode_id, "parent": parent, "path": ep_dir}
 
 
+def _episode_artifact_path(outdir: str, episode_id: str, filename: str) -> str:
+    return os.path.join(_episodes_root(outdir), episode_id, filename)
+
+
 def _finalize_episode(outdir: str, summary: Dict[str, Any]) -> None:
     info = summary.get("episode") or {}
     if not info.get("id"):
@@ -11626,7 +12279,9 @@ def _finalize_episode(outdir: str, summary: Dict[str, Any]) -> None:
     episode_id = str(info.get("id") or "").strip()
     if not episode_id:
         return
-    ep_dir = info.get("path") or os.path.join(_episodes_root(outdir), episode_id)
+    ep_dir = info.get("path") or _episode_artifact_path(outdir, episode_id, "")
+    if not ep_dir:
+        ep_dir = _episode_artifact_path(outdir, episode_id, "")
     ensure_dir(ep_dir)
     artifacts: Dict[str, str] = {}
 
@@ -11658,32 +12313,32 @@ def _finalize_episode(outdir: str, summary: Dict[str, Any]) -> None:
 
     stage_trace = summary.get("stage_trace")
     if stage_trace:
-        path = os.path.join(ep_dir, "stage_trace.json")
+        stage_path = os.path.join(ep_dir, "stage_trace.json")
         try:
-            with open(path, "w", encoding="utf-8") as fw:
+            with open(stage_path, "w", encoding="utf-8") as fw:
                 json.dump(_json_ready(stage_trace), fw, ensure_ascii=False, indent=2)
-            artifacts["stage_trace.json"] = _rel(path)
+            artifacts["stage_trace.json"] = _rel(stage_path)
         except Exception as exc:
             print(f"[WARN] episode stage trace write failed: {exc}")
 
-    toy_delta = (summary.get("toy_memory") or {}).get("delta_run")
+    toy_delta = ((summary.get("toy_memory") or {}).get("delta_run"))
     if toy_delta:
-        path = os.path.join(ep_dir, "toy_memory_delta.json")
+        toy_path = os.path.join(ep_dir, "toy_memory_delta.json")
         try:
-            with open(path, "w", encoding="utf-8") as fw:
+            with open(toy_path, "w", encoding="utf-8") as fw:
                 json.dump(_json_ready(toy_delta), fw, ensure_ascii=False, indent=2)
-            artifacts["toy_memory_delta.json"] = _rel(path)
+            artifacts["toy_memory_delta.json"] = _rel(toy_path)
         except Exception as exc:
             print(f"[WARN] episode toy delta write failed: {exc}")
 
     for key in ("learning_hotspots", "selective_reanalysis_plan", "hotspot_gallery"):
         if not summary.get(key):
             continue
-        snap_path = os.path.join(ep_dir, f"{key}.json")
+        path = os.path.join(ep_dir, f"{key}.json")
         try:
-            with open(snap_path, "w", encoding="utf-8") as fw:
+            with open(path, "w", encoding="utf-8") as fw:
                 json.dump(_json_ready(summary.get(key)), fw, ensure_ascii=False, indent=2)
-            artifacts[f"{key}.json"] = _rel(snap_path)
+            artifacts[f"{key}.json"] = _rel(path)
         except Exception as exc:
             print(f"[WARN] episode {key} snapshot failed: {exc}")
 
@@ -11913,7 +12568,9 @@ def _render_hotspots_section(summary: Dict[str, Any]) -> str:
                 )
             parts.append("</div>")
         if gallery.get("story"):
-            parts.append(f"<p class=\"muted\"><a href=\"{escape(str(gallery['story']))}\">gallery notes</a></p>")
+            parts.append(
+                f"<p class=\"muted\"><a href=\"{escape(str(gallery['story']))}\">gallery notes</a></p>"
+            )
     parts.append("</section>")
     return "".join(parts)
 
@@ -12194,6 +12851,7 @@ def _derive_insights(summary: Dict[str, Any]) -> List[str]:
 
 
 def _dedupe_insights_and_queries(summary: Dict[str, Any]) -> None:
+    """Remove RAG suggested queries that duplicate existing insights."""
     insights = summary.get("insights")
     queries = summary.get("rag_suggested_queries")
     if not insights or not queries:
@@ -12253,6 +12911,64 @@ def _derive_rag_bundle_status(
     if issues:
         status["issues"] = issues
     return status
+
+
+def _signature_state_path(outdir: str) -> str:
+    return os.path.join(outdir, "table_signature.json")
+
+
+def _load_saved_signature(outdir: str) -> Tuple[Optional[str], Optional[List[str]]]:
+    path = _signature_state_path(outdir)
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None, None
+    signature = payload.get("signature") if isinstance(payload, dict) else None
+    headers = payload.get("headers") if isinstance(payload, dict) else None
+    if isinstance(signature, str):
+        sig_val = signature
+    else:
+        sig_val = None
+    header_list = headers if isinstance(headers, list) else None
+    return sig_val, header_list
+
+
+def _save_signature(outdir: str, signature: str, headers: Optional[List[str]]) -> None:
+    payload = {
+        "signature": signature,
+        "headers": headers,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    path = _signature_state_path(outdir)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _extract_headers_from_jsonl(jsonl_path: str) -> Optional[List[str]]:
+    if not os.path.exists(jsonl_path):
+        return None
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                headers = rec.get("headers") if isinstance(rec, dict) else None
+                if isinstance(headers, list) and headers:
+                    return [str(h) for h in headers]
+    except Exception:
+        return None
+    return None
 
 def _generate_report(
     outdir: str,
@@ -12599,20 +13315,6 @@ def _collect_pages(
     pages.sort(key=lambda p: str(p).lower())
     return pages
 
-
-def _dedup_pages_list(items: List[str], require_exists: bool) -> List[str]:
-    filtered: List[str] = []
-    seen_paths: Set[str] = set()
-    for page in items:
-        norm = os.path.abspath(page)
-        if norm in seen_paths:
-            continue
-        if require_exists and not os.path.exists(page):
-            continue
-        seen_paths.add(norm)
-        filtered.append(page)
-    return filtered
-
 def _load_profile(outdir: str, domain_hint: Optional[str]) -> Dict[str, Any]:
     prof_path = os.path.join(outdir, "auto_profile.json")
     try:
@@ -12710,7 +13412,7 @@ def _analyze_learning_hotspots(learning_jsonl_path: Optional[str], max_samples: 
                 entry["score"] += score
                 entry["count"] += 1
                 if conf is not None:
-                    entry.setdefault("avg_conf", 0.0)
+                    entry.setdefault("avg_conf" , 0.0)
                     entry["avg_conf"] = ((entry.get("avg_conf") or 0.0) * (entry["count"] - 1) + conf) / max(1, entry["count"])
                 if reasons:
                     existing = entry.setdefault("reasons", set())
@@ -12737,7 +13439,7 @@ def _analyze_learning_hotspots(learning_jsonl_path: Optional[str], max_samples: 
 
     hot_tables = _rank(table_stats, 6)
     hot_rows = _rank(row_stats, 8)
-    trace_rank = sorted(trace_scores.items(), key=lambda item: (-float(item[1].get("score") or 0.0), item[1].get("count", 0)))[:24]
+    trace_rank = sorted(trace_scores.items(), key=lambda item: (-float(item[1].get("score") or 0.0), item[1].get("count", 0)),)[:24]
     hot_cells: List[Dict[str, Any]] = []
     for trace, payload in trace_rank:
         cell_entry = {
@@ -12777,11 +13479,17 @@ def _selective_focus_from_hotspots(
 ) -> Optional[Dict[str, Any]]:
     if not trace_scores and not row_stats and not table_stats:
         return None
-    trace_order = sorted(trace_scores.items(), key=lambda item: (-float(item[1].get("score") or 0.0), item[1].get("count", 0)))
+    trace_order = sorted(
+        trace_scores.items(), key=lambda item: (-float(item[1].get("score") or 0.0), item[1].get("count", 0))
+    )
     trace_ids = [trace for trace, _ in trace_order[:max_traces] if trace]
-    row_order = sorted(row_stats.items(), key=lambda item: (-float(item[1].get("score") or 0.0), -float(item[1].get("count") or 0)))
+    row_order = sorted(
+        row_stats.items(), key=lambda item: (-float(item[1].get("score") or 0.0), -float(item[1].get("count") or 0))
+    )
     row_keys = [row for row, _ in row_order[:16]]
-    table_order = sorted(table_stats.items(), key=lambda item: (-float(item[1].get("score") or 0.0), -float(item[1].get("count") or 0)))
+    table_order = sorted(
+        table_stats.items(), key=lambda item: (-float(item[1].get("score") or 0.0), -float(item[1].get("count") or 0))
+    )
     table_keys = [table for table, _ in table_order[:10]]
     reasons = [name for name, _ in reason_counts.most_common(6)]
     if not trace_ids and not row_keys and not table_keys:
@@ -13307,7 +14015,6 @@ def _canonical_advisor_action(name: Optional[str]) -> Optional[str]:
 
 def _parse_advisor_suggestions(text: Optional[str], payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     actions: Set[str] = set()
-
     def _push(action: Optional[str]) -> None:
         if action:
             actions.add(action)
@@ -13953,7 +14660,6 @@ def _apply_rag_feedback(
             except Exception as exc:
                 info["error"] = str(exc)
     actions: Set[str] = set()
-
     def _push_action(name: Optional[str]) -> None:
         if not name:
             return
@@ -14334,7 +15040,7 @@ def _enforce_default_toy_feature_flags(
     motion_prior_enabled: Optional[bool] = None,
     tesslite_status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Ensure the core toy enhancements stay enabled without manual env knobs."""
+    """Ensure core toy OCR helpers are enabled without manual env wiring."""
 
     def _ensure_truthy_env(name: str, default_value: str = "1") -> Tuple[bool, str]:
         source = "env"
@@ -14343,7 +15049,7 @@ def _enforce_default_toy_feature_flags(
             source = "default"
         return _env_truthy(name, True), source
 
-    status: Dict[str, Any] = {}
+    feature_status: Dict[str, Any] = {}
 
     conf_enabled, conf_source = _ensure_truthy_env("ZOCR_CONF_BOOST_NUMERIC")
     lex_enabled, lex_source = _ensure_truthy_env("ZOCR_CONF_BOOST_LEXICAL")
@@ -14353,27 +15059,31 @@ def _enforce_default_toy_feature_flags(
         os.environ["ZOCR_NGRAM_EMA_ALPHA"] = "0.05"
         alpha_source = "default"
     try:
-        alpha = float(os.environ.get("ZOCR_NGRAM_EMA_ALPHA", "0.05") or 0.05)
+        alpha_value = float(os.environ.get("ZOCR_NGRAM_EMA_ALPHA", "0.05") or 0.05)
     except Exception:
-        alpha = 0.05
+        alpha_value = 0.05
+    snapshot_fn = getattr(zocr_onefile_consensus, "get_toy_feature_status", None)
+    if callable(snapshot_fn):
+        try:
+            snapshot = snapshot_fn()
+            if isinstance(snapshot, dict):
+                feature_status.update(snapshot)
+        except Exception:
+            feature_status = {}
 
-    snapshot = get_toy_feature_status()
-    if isinstance(snapshot, dict):
-        status.update(snapshot)
-
-    confidence_entry = status.setdefault("confidence_boost", {})
+    confidence_entry = feature_status.setdefault("confidence_boost", {})
     confidence_entry.setdefault("enabled", conf_enabled)
     confidence_entry.setdefault("source", conf_source)
 
-    lexical_entry = status.setdefault("lexical_boost", {})
+    lexical_entry = feature_status.setdefault("lexical_boost", {})
     lexical_entry.setdefault("enabled", lex_enabled)
     lexical_entry.setdefault("source", lex_source)
 
-    ngram_entry = status.setdefault("ngram_ema", {})
-    ngram_entry.setdefault("alpha", alpha)
+    ngram_entry = feature_status.setdefault("ngram_ema", {})
+    ngram_entry.setdefault("alpha", alpha_value)
     ngram_entry.setdefault("source", alpha_source)
 
-    motion_entry = dict(status.get("motion_prior", {}))
+    motion_entry = dict(feature_status.get("motion_prior", {}))
     if motion_prior_enabled is not None:
         motion_entry["enabled"] = bool(motion_prior_enabled)
         motion_entry["source"] = "cli"
@@ -14383,41 +15093,50 @@ def _enforce_default_toy_feature_flags(
             "source",
             "env" if os.environ.get("ZOCR_EXPORT_MOTION_PRIOR") is not None else "default",
         )
-    status["motion_prior"] = motion_entry
+    feature_status["motion_prior"] = motion_entry
 
-    blank_entry = status.setdefault("blank_skip", {})
-    blank_entry.setdefault(
-        "source",
-        "env"
-        if any(
-            os.environ.get(key) is not None
-            for key in (
-                "ZOCR_EXPORT_SKIP_BLANK",
-                "ZOCR_EXPORT_BLANK_THRESHOLD",
-                "ZOCR_EXPORT_BLANK_MIN_PIXELS",
-                "ZOCR_EXPORT_BLANK_MIN_RATIO",
-                "ZOCR_EXPORT_BLANK_MIN_AREA",
+    blank_entry = feature_status.setdefault("blank_skip", {})
+    if "source" not in blank_entry:
+        blank_entry["source"] = (
+            "env"
+            if any(
+                os.environ.get(key) is not None
+                for key in (
+                    "ZOCR_EXPORT_SKIP_BLANK",
+                    "ZOCR_EXPORT_BLANK_THRESHOLD",
+                    "ZOCR_EXPORT_BLANK_MIN_PIXELS",
+                    "ZOCR_EXPORT_BLANK_MIN_RATIO",
+                    "ZOCR_EXPORT_BLANK_MIN_AREA",
+                )
             )
+            else "default"
         )
-        else "default",
-    )
 
     if tesslite_status:
-        status["tesslite"] = dict(tesslite_status)
+        feature_status["tesslite"] = dict(tesslite_status)
     else:
-        status.setdefault("tesslite", {"enabled": False, "source": "none"})
+        feature_status.setdefault("tesslite", {"enabled": False, "source": "none"})
 
-    if "pytesseract" not in status:
-        status["pytesseract"] = {
+    if "pytesseract" not in feature_status:
+        feature_status["pytesseract"] = {
             "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", True),
             "source": "env" if os.environ.get("ZOCR_ALLOW_PYTESSERACT") else "default",
         }
 
-    status["hotspot_detection"] = {"enabled": True, "mode": "learning_hotspots"}
-    status["view_generation"] = {"enabled": True, "mode": "microscope_xray"}
-    status["intent_simulations"] = {"enabled": True, "mode": "auto_profile"}
+    feature_status["hotspot_detection"] = {
+        "enabled": True,
+        "mode": "learning_hotspots",
+    }
+    feature_status["view_generation"] = {
+        "enabled": True,
+        "mode": "microscope_xray",
+    }
+    feature_status["intent_simulations"] = {
+        "enabled": True,
+        "mode": "auto_profile",
+    }
 
-    return status
+    return feature_status
 
 
 def _patched_run_full_pipeline(
@@ -14455,6 +15174,8 @@ def _patched_run_full_pipeline(
     blank_min_area: Optional[int] = None,
     allow_pytesseract: Optional[bool] = None,
     tess_unicharset: Optional[str] = None,
+    autocalib_samples: Optional[int] = None,
+    autotune_trials: Optional[int] = None,
     dry_run: bool = False,
     topdir_only: bool = False,
     max_pages: Optional[int] = None,
@@ -14511,6 +15232,7 @@ def _patched_run_full_pipeline(
         debug_cells = debug_cells_per_page_val > 0
     os.environ["ZOCR_EXPORT_DEBUG_CELLS"] = "1" if debug_cells else "0"
     os.environ["ZOCR_EXPORT_DEBUG_CELLS_PER_PAGE"] = str(debug_cells_per_page_val)
+
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
     _set_stage_trace_sink(stage_trace)
@@ -14539,6 +15261,19 @@ def _patched_run_full_pipeline(
         zocr_onefile_consensus.reset_toy_recognition_stats()
 
     demo_requested = len(inputs) == 1 and inputs[0].lower() == "demo"
+
+    def _dedup_pages_list(items: List[str], require_exists: bool) -> List[str]:
+        filtered: List[str] = []
+        seen_paths: Set[str] = set()
+        for page in items:
+            norm = os.path.abspath(page)
+            if norm in seen_paths:
+                continue
+            if require_exists and not os.path.exists(page):
+                continue
+            seen_paths.add(norm)
+            filtered.append(page)
+        return filtered
 
     if demo_requested:
         real_demo_targets = []
@@ -14588,7 +15323,93 @@ def _patched_run_full_pipeline(
 
     page_images = {idx: page for idx, page in enumerate(pages)}
 
-    pipe = zocr_onefile_consensus.Pipeline({"table": {}, "bench_iterations": 1, "eval": False})
+    table_params: Dict[str, Any] = {}
+    table_autocalib_status: Optional[Dict[str, Any]] = None
+    table_autotune_status: Optional[Dict[str, Any]] = None
+
+    autocalib_count = _positive_cli_value(autocalib_samples)
+    autotune_count = _positive_cli_value(autotune_trials)
+
+    if autocalib_count:
+        def _run_autocalib_stage() -> Dict[str, Any]:
+            status: Dict[str, Any] = {"samples": int(autocalib_count)}
+            updates: Dict[str, Any] = {}
+            auto_calib_fn = getattr(zocr_onefile_consensus, "auto_calibrate_params", None)
+            if not callable(auto_calib_fn):
+                status["status"] = "unavailable"
+                return {"status": status, "updates": updates}
+            try:
+                calib_cfg = auto_calib_fn(pages, autocalib_count) or {}
+            except Exception as exc:  # pragma: no cover - defensive log path
+                print(f"[WARN] Auto-calibration failed: {exc}")
+                status["status"] = "error"
+                status["error"] = str(exc)
+                return {"status": status, "updates": updates}
+            if isinstance(calib_cfg, dict) and calib_cfg:
+                updates = calib_cfg
+                status["status"] = "applied"
+                status["keys"] = sorted(calib_cfg.keys())
+            else:
+                status["status"] = "no_change"
+            return {"status": status, "updates": updates}
+
+        calib_stage = _safe_step(f"AutoCalib ({autocalib_count})", _run_autocalib_stage)
+        payload = calib_stage.get("out") if isinstance(calib_stage, dict) else None
+        if isinstance(payload, dict):
+            status = payload.get("status")
+            updates = payload.get("updates")
+            if isinstance(status, dict):
+                table_autocalib_status = status
+            if isinstance(updates, dict) and updates:
+                table_params.update(updates)
+        elif isinstance(calib_stage, dict) and calib_stage.get("ok") is False:
+            # Surface failures in the summary even if the stage wrapper swallowed the exception
+            table_autocalib_status = {
+                "status": "error",
+                "error": calib_stage.get("error") or "AutoCalib failed",
+            }
+
+    if autotune_count:
+        def _run_autotune_stage() -> Dict[str, Any]:
+            status: Dict[str, Any] = {"trials": int(autotune_count)}
+            updates: Dict[str, Any] = {}
+            autotune_fn = getattr(zocr_onefile_consensus, "autotune_params", None)
+            if not callable(autotune_fn):
+                status["status"] = "unavailable"
+                return {"status": status, "updates": updates}
+            try:
+                base_for_tune = table_params.copy()
+                tuned_cfg = autotune_fn(pages, base_for_tune, trials=autotune_count) or {}
+            except Exception as exc:  # pragma: no cover - defensive log path
+                print(f"[WARN] Autotune failed: {exc}")
+                status["status"] = "error"
+                status["error"] = str(exc)
+                return {"status": status, "updates": updates}
+            if isinstance(tuned_cfg, dict) and tuned_cfg:
+                updates = tuned_cfg
+                status["status"] = "applied"
+                status["keys"] = sorted(tuned_cfg.keys())
+            else:
+                status["status"] = "no_change"
+            return {"status": status, "updates": updates}
+
+        tune_stage = _safe_step(f"AutoTune ({autotune_count})", _run_autotune_stage)
+        payload = tune_stage.get("out") if isinstance(tune_stage, dict) else None
+        if isinstance(payload, dict):
+            status = payload.get("status")
+            updates = payload.get("updates")
+            if isinstance(status, dict):
+                table_autotune_status = status
+            if isinstance(updates, dict) and updates:
+                table_params.update(updates)
+        elif isinstance(tune_stage, dict) and tune_stage.get("ok") is False:
+            table_autotune_status = {
+                "status": "error",
+                "error": tune_stage.get("error") or "AutoTune failed",
+            }
+
+    pipe_cfg = {"table": table_params, "bench_iterations": 1, "eval": False}
+    pipe = zocr_onefile_consensus.Pipeline(pipe_cfg)
 
     doc_json_path = os.path.join(outdir, "doc.zocr.json")
     jsonl_path = os.path.join(outdir, "doc.contextual.jsonl")
@@ -14738,10 +15559,64 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
 
     tesslite_cfg = {
         "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
-    }
+                    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    if any(tesslite_cfg.values()):
+        sig_fn = getattr(zocr_onefile_consensus, "_tesslite_env_signature", None)
+        signature = sig_fn() if callable(sig_fn) else None
+        tesslite_summary = {k: v for k, v in tesslite_cfg.items() if v}
+        tesslite_summary["signature"] = signature
+        tesslite_summary["enabled"] = True
+        summary["tesslite"] = tesslite_summary
+    else:
+        summary["tesslite"] = {"enabled": False}
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
     tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
     if callable(tesslite_status_fn):
         summary["tesslite"] = tesslite_status_fn()
@@ -14757,6 +15632,321 @@ def _patched_run_full_pipeline(
     )
     if toy_feature_defaults:
         summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
+
+    if table_params:
+        summary["table_params"] = _json_ready(table_params)
+    if table_autocalib_status:
+        summary["table_autocalib"] = _json_ready(table_autocalib_status)
+    if table_autotune_status:
+        summary["table_autotune"] = _json_ready(table_autotune_status)
+
+    tesslite_cfg = {
+        "unicharset": os.environ.get("ZOCR_TESS_UNICHARSET") or None,
+                    }
+    tesslite_status_fn = getattr(zocr_onefile_consensus, "get_tesslite_status", None)
+    if callable(tesslite_status_fn):
+        summary["tesslite"] = tesslite_status_fn()
+    else:
+        summary["tesslite"] = {
+            "enabled": any(tesslite_cfg.values()),
+            **{k: v for k, v in tesslite_cfg.items() if v},
+        }
+
+    toy_feature_defaults = _enforce_default_toy_feature_flags(
+        motion_prior_enabled=motion_prior,
+        tesslite_status=summary.get("tesslite"),
+    )
+    if toy_feature_defaults:
+        summary["toy_feature_defaults"] = _json_ready(toy_feature_defaults)
+    bandit: Optional[PriorBandit] = None
+    bandit_action: Optional[str] = None
+    bandit_signature: Optional[str] = None
+    bandit_headers: Optional[List[str]] = None
 
     episode_info = _begin_episode(outdir)
     if episode_info:
@@ -14867,10 +16057,52 @@ def _patched_run_full_pipeline(
         os.environ.setdefault("ZOCR_EXPORT_PROGRESS", "1")
         os.environ.setdefault("ZOCR_EXPORT_LOG_EVERY", "100")
         os.environ.setdefault("ZOCR_EXPORT_SKIP_BLANK", "1")
-        if not os.environ.get("ZOCR_TEMPLATE_CACHE"):
-            template_cache_path = os.path.join(outdir, "toy_template_cache.json")
-            os.environ["ZOCR_TEMPLATE_CACHE"] = template_cache_path
-            summary.setdefault("toy_templates", {})["cache"] = template_cache_path
+        if isinstance(export_ocr_engine, str) and export_ocr_engine.lower().startswith("toy"):
+            saved_sig, saved_headers = _load_saved_signature(outdir)
+            cached_headers = _extract_headers_from_jsonl(jsonl_path)
+            headers_source = None
+            candidate_headers = None
+            if cached_headers:
+                candidate_headers = cached_headers
+                headers_source = "contextual_jsonl"
+            elif saved_headers:
+                candidate_headers = saved_headers
+                headers_source = "signature_cache"
+            if candidate_headers is None:
+                fallback_tokens: List[str] = []
+                domain_token = prof.get("domain") or domain_hint
+                if domain_token:
+                    fallback_tokens.append(str(domain_token))
+                if not fallback_tokens and inputs:
+                    fallback_tokens.append(os.path.splitext(os.path.basename(inputs[0]))[0])
+                if not fallback_tokens:
+                    fallback_tokens.append("unknown")
+                candidate_headers = fallback_tokens
+                headers_source = "fallback"
+            bandit_headers = candidate_headers
+            bandit_signature = normalize_headers_to_signature(bandit_headers)
+            bandit_state_path = os.path.join(outdir, "bandit_state.json")
+            bandit = PriorBandit(bandit_state_path)
+            bandit_action = bandit.decide(bandit_signature)
+            os.environ["ZOCR_USE_PRIOR"] = "1" if bandit_action == "WITH_PRIOR" else "0"
+            os.environ["ZOCR_PRIOR_ACTION"] = bandit_action
+            os.environ.setdefault("ZOCR_PRIOR_SIGMA", "auto")
+            os.environ.setdefault("ZOCR_K_SIGMA_WINDOW", "2.5")
+            prior_cache_dir = os.path.join(outdir, ".prior_cache")
+            ensure_dir(prior_cache_dir)
+            os.environ["ZOCR_PRIOR_CACHE"] = prior_cache_dir
+            os.environ["ZOCR_TABLE_SIGNATURE"] = bandit_signature
+            if not os.environ.get("ZOCR_TEMPLATE_CACHE"):
+                template_cache_path = os.path.join(outdir, "toy_template_cache.json")
+                os.environ["ZOCR_TEMPLATE_CACHE"] = template_cache_path
+                summary.setdefault("toy_templates", {})["cache"] = template_cache_path
+            summary["prior_bandit"] = {
+                "signature": bandit_signature,
+                "action": bandit_action,
+                "headers_preview": bandit_headers[:8] if bandit_headers else None,
+                "headers_source": headers_source,
+                "state": bandit_state_path,
+            }
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
@@ -14891,8 +16123,17 @@ def _patched_run_full_pipeline(
                 export_stats = export_stats_fn()
             except Exception:
                 export_stats = None
-            if export_stats:
-                summary["export_stats"] = _json_ready(export_stats)
+        if export_stats:
+            summary["export_stats"] = _json_ready(export_stats)
+        new_headers = _extract_headers_from_jsonl(jsonl_path)
+        if new_headers:
+            final_sig = normalize_headers_to_signature(new_headers)
+            bandit_headers = new_headers
+            bandit_signature = final_sig
+            _save_signature(outdir, final_sig, new_headers)
+            prior_meta = summary.setdefault("prior_bandit", {})
+            prior_meta["final_signature"] = final_sig
+            prior_meta["headers_preview"] = new_headers[:8]
     _call("post_export", jsonl=jsonl_path, outdir=outdir)
     export_signals = _load_export_signals(jsonl_path)
     if export_signals:
@@ -15033,6 +16274,7 @@ def _patched_run_full_pipeline(
             avg_delta = float(cache_summary.get("avg_confidence_delta") or 0.0)
             metric = (improved, avg_delta)
             if cache_summary.get("toy_self_correction") and level_cfg:
+                # ensure we persist the effective config used
                 run_record["effective_config"] = cache_summary.get("toy_self_correction")
             if improved > 0 and stop_on_improvement:
                 selected_summary = cache_summary
@@ -15333,6 +16575,7 @@ def _patched_run_full_pipeline(
             intent_runs.append("reanalyze_learning")
     if intent_runs:
         summary["intent_runs"] = intent_runs
+
     advisor_actions_applied: List[str] = []
     advisor_runs: List[str] = []
     rag_feedback_actions_applied: List[str] = []
@@ -15545,12 +16788,12 @@ def _patched_run_full_pipeline(
         summary["toy_memory"]["recognition"] = _json_ready(
             zocr_onefile_consensus.toy_recognition_stats(reset=True)
         )
-
-    toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
-    summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
     if profile_guard:
         summary["profile_guard"] = profile_guard.report()
 
+    toy_memory_saved = zocr_onefile_consensus.save_toy_memory(toy_memory_path)
+    summary["toy_memory"]["save"] = _json_ready(toy_memory_saved)
+
     repro_signature = _build_repro_signature(
         inputs,
         page_images,
@@ -15596,54 +16839,20 @@ def _patched_run_full_pipeline(
         }
         if stage_trace_console:
             _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
+
+    if bandit and bandit_signature and bandit_action:
+        try:
+            success_flag = decide_success(summary)
+            bandit.update(bandit_signature, bandit_action, bool(success_flag))
+            bandit.save()
+            prior_meta = summary.setdefault("prior_bandit", {})
+            prior_meta["signature"] = bandit_signature
+            prior_meta["action"] = bandit_action
+            prior_meta["success"] = bool(success_flag)
+        except Exception as exc:
+            print(f"[WARN] bandit update skipped: {exc}")
 
     _finalize_episode(outdir, summary)
-
-    repro_signature = _build_repro_signature(
-        inputs,
-        page_images,
-        prof,
-        toy_runtime_snapshot,
-        export_ocr_engine,
-        toy_runtime_overrides,
-    )
-    summary["repro_signature"] = _json_ready(repro_signature)
-    sig_path, ingest_info = _write_repro_signature(outdir, repro_signature, ingest_signature)
-    if sig_path:
-        summary["repro_signature_path"] = sig_path
-    if ingest_info:
-        summary["repro_ingest"] = _json_ready(ingest_info)
-
-    advisor_path = _write_advice_packet(outdir, summary)
-    if advisor_path:
-        summary["advisor_prompt"] = advisor_path
-    if advisor_ingest:
-        summary["advisor_ingest"] = _json_ready(advisor_ingest)
-        if advisor_ingest.get("status") == "ok":
-            preview = advisor_ingest.get("preview") or ""
-            _record_rag_conversation(
-                {
-                    "role": "advisor",
-                    "kind": "response",
-                    "source": advisor_ingest.get("path"),
-                    "actions": advisor_ingest.get("actions"),
-                    "note": preview[:400],
-                }
-            )
-
-    if stage_trace:
-        total_ms = sum(float(entry.get("elapsed_ms") or 0.0) for entry in stage_trace)
-        failures = sum(1 for entry in stage_trace if entry.get("ok") is False)
-        slowest = max(stage_trace, key=lambda e: float(e.get("elapsed_ms") or 0.0)) if stage_trace else None
-        summary["stage_trace"] = _json_ready(stage_trace)
-        summary["stage_stats"] = {
-            "count": len(stage_trace),
-            "failures": failures,
-            "total_elapsed_ms": total_ms,
-            "slowest": {"name": slowest.get("name"), "elapsed_ms": slowest.get("elapsed_ms")} if slowest else None,
-        }
-        if stage_trace_console:
-            _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
@@ -15741,8 +16950,6 @@ def main():
     ap = argparse.ArgumentParser("ZOCR All-in-one Orchestrator")
     ap.add_argument("-i","--input", nargs="+", default=["demo"], help="images or PDFs; use 'demo' for synthetic invoice")
     ap.add_argument("--outdir", default="out_allinone")
-    ap.add_argument("--dpi", type=int, default=200)
-    ap.add_argument("--domain", default=None)
     ap.add_argument(
         "--dry-run",
         action="store_true",
@@ -15765,6 +16972,8 @@ def main():
         default=0,
         help="Hard cap for exported cells (0 = unlimited)",
     )
+    ap.add_argument("--dpi", type=int, default=200)
+    ap.add_argument("--domain", default=None)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--no-tune", action="store_true")
     ap.add_argument("--tune-budget", type=int, default=20)
@@ -15784,6 +16993,30 @@ def main():
         type=int,
         default=None,
         help="Upper bound for toy OCR threshold sweeps (defaults to env/auto)",
+    )
+    ap.add_argument(
+        "--autocalib",
+        nargs="?",
+        type=int,
+        const=_AUTOCALIB_DEFAULT_SAMPLES,
+        default=None,
+        metavar="N",
+        help=(
+            "Auto-calibrate table detection using N sample pages (default %(const)s when "
+            "no explicit value is supplied). Pass 0 or omit to skip."
+        ),
+    )
+    ap.add_argument(
+        "--autotune",
+        nargs="?",
+        type=int,
+        const=_AUTOTUNE_DEFAULT_TRIALS,
+        default=None,
+        metavar="N",
+        help=(
+            "Run the unsupervised table autotuner for N trials (default %(const)s when the "
+            "flag is value-less). Pass 0 or omit to disable."
+        ),
     )
     ap.add_argument(
         "--force-numeric-by-header",
@@ -15871,25 +17104,6 @@ def main():
         help="Minimum crop area required before blank skip applies",
     )
     ap.add_argument(
-        "--debug-cells",
-        dest="debug_cells",
-        action="store_true",
-        default=None,
-        help="Enable per-cell microscope/xray dumps",
-    )
-    ap.add_argument(
-        "--no-debug-cells",
-        dest="debug_cells",
-        action="store_false",
-        help="Disable per-cell microscope/xray dumps",
-    )
-    ap.add_argument(
-        "--debug-cells-per-page",
-        type=int,
-        default=None,
-        help="Max number of debug cell crops to emit per page (0 = disable)",
-    )
-    ap.add_argument(
         "--allow-pytesseract",
         dest="allow_pytesseract",
         action="store_true",
@@ -15907,6 +17121,25 @@ def main():
         "--tess-unicharset",
         default=None,
         help="Path to a Tesseract-style unicharset file for toy lexical gating",
+    )
+    ap.add_argument(
+        "--debug-cells",
+        dest="debug_cells",
+        action="store_true",
+        default=None,
+        help="Enable per-cell microscope/xray dumps",
+    )
+    ap.add_argument(
+        "--no-debug-cells",
+        dest="debug_cells",
+        action="store_false",
+        help="Disable per-cell microscope/xray dumps",
+    )
+    ap.add_argument(
+        "--debug-cells-per-page",
+        type=int,
+        default=None,
+        help="Max number of debug cell crops to emit per page (0 = disable)",
     )
     ap.add_argument(
         "--print-stage-trace",
@@ -15978,6 +17211,8 @@ def main():
             blank_min_area=args.blank_min_area,
             allow_pytesseract=args.allow_pytesseract,
             tess_unicharset=args.tess_unicharset,
+            autocalib_samples=args.autocalib,
+            autotune_trials=args.autotune,
             dry_run=args.dry_run,
             topdir_only=args.topdir_only,
             max_pages=max_pages_budget,
