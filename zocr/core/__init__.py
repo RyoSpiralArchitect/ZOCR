@@ -1,3 +1,2 @@
-"""Multi-domain core module wrapper."""
-from . import zocr_core
-__all__ = ["zocr_core"]
+"""Public API for the multi-domain core."""
+from .zocr_core import *  # noqa: F401,F403
