@@ -1392,6 +1392,13 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     return html, (dbg if want_dbg else {})
 
 # ----------------- PDF raster -----------------
+@dataclass
+class _PdfInspection:
+    page_count: int
+    max_width_pt: float
+    max_height_pt: float
+
+
 def _pdf_parallel_workers(page_count: int) -> int:
     if page_count <= 1:
         return 1
@@ -1421,10 +1428,120 @@ def _pdf_chunk_ranges(page_count: int, workers: int) -> List[Tuple[int, int]]:
     return ranges
 
 
-def _pdfium_render_linear(doc: Any, tmpdir: str, scale: float) -> List[str]:
+def _pdf_inspect_with_doc(doc: Any, sample_pages: Optional[int] = None) -> _PdfInspection:
+    page_count = len(doc)
+    if page_count <= 0:
+        return _PdfInspection(0, 0.0, 0.0)
+    limit = sample_pages
+    if limit is None:
+        limit = max(1, _env_int_local("ZOCR_PDF_INSPECT_PAGES", 12))
+    limit = min(limit, page_count)
+    max_w = 0.0
+    max_h = 0.0
+    for idx in range(limit):
+        page = doc[idx]
+        try:
+            try:
+                w, h = page.get_size()  # type: ignore[attr-defined]
+            except Exception:
+                w = h = 0.0
+        finally:
+            page.close()
+        max_w = max(max_w, float(w or 0.0))
+        max_h = max(max_h, float(h or 0.0))
+    return _PdfInspection(page_count, max_w, max_h)
+
+
+def _pdf_inspect_via_pdfinfo(pdf_path: str) -> Optional[_PdfInspection]:
+    exe = shutil.which("pdfinfo")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, pdf_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    pages = 0
+    max_w = 0.0
+    max_h = 0.0
+    for line in proc.stdout.splitlines():
+        norm = line.strip().lower()
+        if norm.startswith("pages:") and pages <= 0:
+            try:
+                pages = int(line.split(":", 1)[1].strip().split()[0])
+            except Exception:
+                pages = 0
+        elif "page size" in norm:
+            nums = re.findall(r"([0-9]+(?:\\.[0-9]+)?)", line)
+            if len(nums) >= 2:
+                try:
+                    w = float(nums[0])
+                    h = float(nums[1])
+                except Exception:
+                    continue
+                max_w = max(max_w, w)
+                max_h = max(max_h, h)
+    if pages <= 0:
+        return None
+    if max_w <= 0.0:
+        max_w = 612.0
+    if max_h <= 0.0:
+        max_h = 792.0
+    return _PdfInspection(pages, max_w, max_h)
+
+
+def _pdf_lazy_inspection(pdf_path: str) -> Optional[_PdfInspection]:
+    try:
+        import pypdfium2  # type: ignore
+
+        doc = pypdfium2.PdfDocument(pdf_path)
+    except Exception:
+        return _pdf_inspect_via_pdfinfo(pdf_path)
+    try:
+        return _pdf_inspect_with_doc(doc)
+    finally:
+        doc.close()
+
+
+def _pdf_resolve_raster_plan(
+    base_dpi: int, inspection: Optional[_PdfInspection]
+) -> Tuple[int, Optional[int]]:
+    dpi = max(1, base_dpi or 200)
+    min_dpi = max(72, _env_int_local("ZOCR_PDF_MIN_DPI", 120))
+    budget = max(0, _env_int_local("ZOCR_PDF_PIXEL_BUDGET", 320_000_000))
+    if inspection and budget > 0 and dpi > 0:
+        width_pt = inspection.max_width_pt or 612.0
+        height_pt = inspection.max_height_pt or 792.0
+        width_px = (width_pt / 72.0) * dpi
+        height_px = (height_pt / 72.0) * dpi
+        per_page = max(width_px * height_px, 1.0)
+        total_pixels = per_page * max(1, inspection.page_count)
+        if total_pixels > budget:
+            scale = math.sqrt(budget / total_pixels)
+            dpi = max(min_dpi, int(dpi * scale))
+    limit = max(0, _env_int_local("ZOCR_PDF_MAX_PAGES", 0))
+    if limit <= 0:
+        page_limit: Optional[int] = None
+    else:
+        page_limit = limit
+        if inspection:
+            page_limit = min(page_limit, inspection.page_count)
+    return dpi, page_limit
+
+
+def _pdfium_render_linear(
+    doc: Any, tmpdir: str, scale: float, limit: Optional[int]
+) -> List[str]:
+    total = len(doc) if limit is None else min(limit, len(doc))
     out_paths: List[str] = []
     try:
-        for i in range(len(doc)):
+        for i in range(total):
             page = doc[i]
             try:
                 bitmap = page.render(scale=scale)
@@ -1479,7 +1596,7 @@ def _pdfium_render_parallel(pdf_path: str, page_count: int, tmpdir: str, scale: 
         import pypdfium2
 
         doc = pypdfium2.PdfDocument(pdf_path)
-        return _pdfium_render_linear(doc, tmpdir, scale)
+        return _pdfium_render_linear(doc, tmpdir, scale, page_count)
     ordered.sort(key=lambda item: item[0])
     return [path for _, path in ordered]
 
@@ -1494,24 +1611,34 @@ def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
         ) from exc
 
     tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
-    scale = float(dpi) / 72.0 if dpi else 1.0
     doc = pypdfium2.PdfDocument(pdf_path)
-    page_count = len(doc)
-    if page_count <= 0:
+    inspection = _pdf_inspect_with_doc(doc)
+    effective_dpi, page_limit = _pdf_resolve_raster_plan(dpi, inspection)
+    scale = float(effective_dpi) / 72.0 if effective_dpi else 1.0
+    target_pages = inspection.page_count
+    if page_limit is not None:
+        target_pages = min(target_pages, page_limit)
+    if target_pages <= 0:
         doc.close()
         return []
-    workers = _pdf_parallel_workers(page_count)
+    workers = _pdf_parallel_workers(target_pages)
     if workers <= 1:
-        return _pdfium_render_linear(doc, tmpdir, scale)
+        return _pdfium_render_linear(doc, tmpdir, scale, target_pages)
     doc.close()
-    return _pdfium_render_parallel(pdf_path, page_count, tmpdir, scale, workers)
+    return _pdfium_render_parallel(pdf_path, target_pages, tmpdir, scale, workers)
 
 
 def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
     exe=shutil.which("pdftoppm")
     if exe:
+        inspection = _pdf_lazy_inspection(pdf_path)
+        effective_dpi, page_limit = _pdf_resolve_raster_plan(dpi, inspection)
         tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
-        subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        cmd=[exe,"-r",str(effective_dpi),"-png"]
+        if page_limit is not None:
+            cmd += ["-f","1","-l",str(page_limit)]
+        cmd += [pdf_path,out_prefix]
+        subprocess.run(cmd,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
     return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
