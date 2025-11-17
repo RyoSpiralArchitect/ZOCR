@@ -13,7 +13,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib, concurrent.futures
 from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
@@ -1392,19 +1392,37 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     return html, (dbg if want_dbg else {})
 
 # ----------------- PDF raster -----------------
-def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
-    try:
-        import pypdfium2
-    except ImportError as exc:
-        raise RuntimeError(
-            "pdftoppm not found and pypdfium2 is unavailable; install poppler-utils "
-            "or `pip install pypdfium2` to rasterize PDFs"
-        ) from exc
+def _pdf_parallel_workers(page_count: int) -> int:
+    if page_count <= 1:
+        return 1
+    min_pages = max(2, _env_int_local("ZOCR_PDF_PARALLEL_MIN_PAGES", 6))
+    if page_count < min_pages:
+        return 1
+    forced = _env_int_local("ZOCR_PDF_WORKERS", 0)
+    if forced > 0:
+        return max(1, min(forced, page_count))
+    cpu = os.cpu_count() or 1
+    if cpu <= 2:
+        return 1
+    default = min(4, cpu - 1)
+    return max(1, min(default, page_count))
 
-    tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
-    doc = pypdfium2.PdfDocument(pdf_path)
+
+def _pdf_chunk_ranges(page_count: int, workers: int) -> List[Tuple[int, int]]:
+    if workers <= 1 or page_count <= 0:
+        return [(0, page_count)]
+    chunk = max(1, math.ceil(page_count / workers))
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    while start < page_count:
+        end = min(page_count, start + chunk)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _pdfium_render_linear(doc: Any, tmpdir: str, scale: float) -> List[str]:
     out_paths: List[str] = []
-    scale = float(dpi) / 72.0 if dpi else 1.0
     try:
         for i in range(len(doc)):
             page = doc[i]
@@ -1419,6 +1437,74 @@ def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
     finally:
         doc.close()
     return out_paths
+
+
+def _render_pdf_chunk_task(args: Tuple[str, Tuple[int, int], float, str]) -> List[Tuple[int, str]]:
+    pdf_path, bounds, scale, tmpdir = args
+    start, end = bounds
+    import pypdfium2
+
+    doc = pypdfium2.PdfDocument(pdf_path)
+    out: List[Tuple[int, str]] = []
+    try:
+        for idx in range(start, min(end, len(doc))):
+            page = doc[idx]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            path = os.path.join(tmpdir, f"page-{idx+1:04d}.png")
+            im.convert("RGB").save(path, format="PNG")
+            out.append((idx, path))
+    finally:
+        doc.close()
+    return out
+
+
+def _pdfium_render_parallel(pdf_path: str, page_count: int, tmpdir: str, scale: float, workers: int) -> List[str]:
+    ranges = _pdf_chunk_ranges(page_count, workers)
+    tasks = []
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for bounds in ranges:
+                if bounds[0] >= bounds[1]:
+                    continue
+                tasks.append(pool.submit(_render_pdf_chunk_task, (pdf_path, bounds, scale, tmpdir)))
+            ordered: List[Tuple[int, str]] = []
+            for fut in concurrent.futures.as_completed(tasks):
+                ordered.extend(fut.result())
+    except Exception:
+        # Fallback to linear rendering if parallel execution fails for any reason.
+        import pypdfium2
+
+        doc = pypdfium2.PdfDocument(pdf_path)
+        return _pdfium_render_linear(doc, tmpdir, scale)
+    ordered.sort(key=lambda item: item[0])
+    return [path for _, path in ordered]
+
+
+def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise RuntimeError(
+            "pdftoppm not found and pypdfium2 is unavailable; install poppler-utils "
+            "or `pip install pypdfium2` to rasterize PDFs"
+        ) from exc
+
+    tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
+    scale = float(dpi) / 72.0 if dpi else 1.0
+    doc = pypdfium2.PdfDocument(pdf_path)
+    page_count = len(doc)
+    if page_count <= 0:
+        doc.close()
+        return []
+    workers = _pdf_parallel_workers(page_count)
+    if workers <= 1:
+        return _pdfium_render_linear(doc, tmpdir, scale)
+    doc.close()
+    return _pdfium_render_parallel(pdf_path, page_count, tmpdir, scale, workers)
 
 
 def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
