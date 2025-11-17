@@ -28,6 +28,9 @@ zocr_allinone_merged_plus.py     # legacy single-file bundle (same features)
 ```bash
 # 1. 依存関係 / Dependencies / Dépendances
 python -m pip install numpy pillow tqdm numba
+# PDF を扱う場合は以下のいずれかを追加:
+#   • macOS/Linux: brew/apt 等で poppler-utils (pdftoppm) を入れる
+#   • もしくは `python -m pip install pypdfium2`
 
 # 2. サンプル入力（任意） / Optional sample input / Entrée d'exemple optionnelle
 #   → Put your PDFs/PNGs under samples/demo_inputs/ (or keep it empty to use the synthetic demo)
@@ -198,6 +201,29 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[EN]** The same bundled dictionary powers the toy OCR, consensus exporter, and the `zocr.core` retrieval boosts, so no part of the stack expects external wordlists/bigram JSON anymore.
 - **[FR]** Ce dictionnaire embarqué alimente aussi bien le Toy OCR que l’exporteur consensus et le noyau `zocr.core`, supprimant toute dépendance aux dictionnaires/bigrammes externes.
 - `ZOCR_TESS_DOMAIN` または CLI の `--domain` / パイプラインの domain 設定を指定すると、Toy OCR の内蔵辞書が該当ドメインのキーワード集合に切り替わります。プロファイルや自動判別で domain が確定するとパイプライン側で `ZOCR_TESS_DOMAIN` も自動更新されます。
+
+## PDF レンダリング最適化 / PDF rasterization knobs / Optimisations PDF
+- **[JA]** Poppler (`pdftoppm`) が見つからない場合でも、`pypdfium2` がインストールされていれば自動でフォールバックして PDF を PNG に変換します。両方揃っている環境では Poppler が優先されますが、失敗時は即座に pdfium へ切り替わります。
+- **[EN]** When Poppler (`pdftoppm`) is missing, the pipeline now falls back to `pypdfium2` automatically, so PDFs can be rasterized without any system packages. If both are available Poppler is used first, with pdfium acting as the safety net.
+- **[FR]** Si Poppler (`pdftoppm`) est absent, `pypdfium2` prend automatiquement le relais afin de rasteriser les PDF sans dépendance système. Lorsque les deux sont présents, Poppler reste prioritaire et pdfium sert de filet de sécurité.
+- **[JA]** 6 ページ以上の PDF では pdfium 側がデフォルトで並列レンダリング（最大 4 ワーカー、CPU 数に応じて自動調整）を行い、ページ枚数に比例して高速化します。
+- **[EN]** For PDFs with ≥6 pages the pdfium path renders pages in parallel (up to four workers by default, auto-tuned to your CPU) which dramatically shortens the raster stage.
+- **[FR]** Pour les PDF de 6 pages ou plus, la voie pdfium effectue le rendu en parallèle (jusqu’à quatre workers selon le CPU), accélérant nettement l’étape de rasterisation.
+- `ZOCR_PDF_WORKERS` を設定するとワーカー数を固定できます（例: `ZOCR_PDF_WORKERS=2 python -m zocr run ...`）。`ZOCR_PDF_PARALLEL_MIN_PAGES` で並列化を開始する閾値も調整可能です。
+- Set `ZOCR_PDF_WORKERS` to clamp the worker count (e.g. `ZOCR_PDF_WORKERS=2 python -m zocr run ...`). Use `ZOCR_PDF_PARALLEL_MIN_PAGES` to raise/lower the page-count threshold.
+- Fixez `ZOCR_PDF_WORKERS` pour imposer un nombre précis de workers (ex. `ZOCR_PDF_WORKERS=2 python -m zocr run ...`). Le seuil d’activation peut être ajusté via `ZOCR_PDF_PARALLEL_MIN_PAGES`.
+- **[JA]** 長大・ビジュアル密度の高い PDF ではページサイズとページ数から推定したピクセル総量に応じて DPI を自動で下げ、PNG 量産を避けつつ表の精度を維持します。
+- **[EN]** For extremely long or highly visual PDFs the rasterizer now lowers the DPI when the projected pixel budget would explode, cutting down the PNG explosion without sacrificing table fidelity.
+- **[FR]** Sur les PDF volumineux ou riches en visuels, la rasterisation réduit automatiquement le DPI si le budget de pixels estimé devient excessif, limitant le nombre de PNG tout en conservant la lisibilité des tableaux.
+- `ZOCR_PDF_PIXEL_BUDGET` でピクセル上限（既定 3.2e8）を、`ZOCR_PDF_MIN_DPI` で自動縮小時の下限 DPI（既定 120）を変更できます。`ZOCR_PDF_MAX_PAGES` を設定するとレンダリングするページ数そのものを頭打ちでき、`ZOCR_PDF_INSPECT_PAGES` はページサイズ見積りに使うサンプル枚数を制御します。
+- Tune the limits via `ZOCR_PDF_PIXEL_BUDGET` (default 3.2e8 pixels) and `ZOCR_PDF_MIN_DPI` (default 120 DPI when throttling kicks in). Set `ZOCR_PDF_MAX_PAGES` to hard-cap the number of rendered pages, and adjust the sampling window with `ZOCR_PDF_INSPECT_PAGES` if you want to inspect more/less pages before estimating sizes.
+- Ajustez `ZOCR_PDF_PIXEL_BUDGET` (3,2e8 pixels par défaut) et `ZOCR_PDF_MIN_DPI` (120 DPI mini lorsque la réduction s’active). `ZOCR_PDF_MAX_PAGES` plafonne le nombre de pages rasterisées et `ZOCR_PDF_INSPECT_PAGES` contrôle combien de pages sont échantillonnées pour estimer les dimensions.
+- **[JA]** `ZOCR_PDF_MIN_DPI_FLOOR`（既定 72）でハード下限を決め、ソフト下限 (`ZOCR_PDF_MIN_DPI`) が高すぎてピクセル予算を守れない場合でも強制的に DPI を下げられます。
+- **[EN]** Use `ZOCR_PDF_MIN_DPI_FLOOR` (default 72) to define the absolute minimum DPI so the rasterizer can still respect the pixel budget even when the soft minimum is higher.
+- **[FR]** `ZOCR_PDF_MIN_DPI_FLOOR` (72 par défaut) fixe le plancher absolu, garantissant le respect du budget de pixels même si la borne souple (`ZOCR_PDF_MIN_DPI`) est trop élevée.
+- **[JA]** `--snapshot` を付けると `ZOCR_PIPELINE_SNAPSHOT=1` が自動セットされ、`ZOCR_PDF_SNAPSHOT_DPI_PCT`（既定 80%）、`ZOCR_PDF_SNAPSHOT_PIXEL_BUDGET`（既定 2.2e8）、`ZOCR_PDF_SNAPSHOT_MAX_PAGES`（既定無制限）でスナップショット専用の DPI/ピクセル/ページ制限を細かく制御できます。
+- **[EN]** When you run with `--snapshot` the orchestrator now sets `ZOCR_PIPELINE_SNAPSHOT=1`, enabling snapshot-specific knobs: `ZOCR_PDF_SNAPSHOT_DPI_PCT` (default 80 %), `ZOCR_PDF_SNAPSHOT_PIXEL_BUDGET` (default 2.2e8), and `ZOCR_PDF_SNAPSHOT_MAX_PAGES` (disabled by default) to throttle DPI, total pixels, or page count just for traced runs.
+- **[FR]** Avec `--snapshot`, l’orchestrateur active `ZOCR_PIPELINE_SNAPSHOT=1`, ce qui permet d’appliquer des limites dédiées (`ZOCR_PDF_SNAPSHOT_DPI_PCT`=80 % par défaut, `ZOCR_PDF_SNAPSHOT_PIXEL_BUDGET`=2,2e8, `ZOCR_PDF_SNAPSHOT_MAX_PAGES` désactivé) pour réduire le DPI, le volume de pixels ou le nombre de pages uniquement durant les captures.
 - **[EN]** Set `ZOCR_TESS_DOMAIN` (or pass `--domain` to the consensus CLI / orchestrator) to clamp the bundled lexicon to a specific domain keyword set. The pipeline writes this env var automatically whenever its profile or autodetector selects a domain.
 - **[FR]** Utilisez `ZOCR_TESS_DOMAIN` (ou l’option `--domain` côté CLI/pipe) pour restreindre le dictionnaire embarqué au jeu de mots-clés d’un domaine. L’orchestrateur met à jour cette variable dès qu’un domaine est choisi par le profil ou la détection automatique.
 - **[JA]** 追加指定なしでもリポジトリ同梱の tesslite セット（JP/EN インボイス語彙）が自動で読み込まれます。`--tess-*` / `ZOCR_TESS_*` を指定すると上書きされ、`ZOCR_TESSLITE_DISABLE_BUILTIN=1` で無効化できます。<br>**[EN]** A bundled tesslite glyph/dictionary set now loads automatically—override it with `--tess-*` / `ZOCR_TESS_*` or disable via `ZOCR_TESSLITE_DISABLE_BUILTIN=1`. <br>**[FR]** Un jeu tesslite intégré est actif par défaut ; remplacez-le via `--tess-*` / `ZOCR_TESS_*` ou désactivez-le avec `ZOCR_TESSLITE_DISABLE_BUILTIN=1`.

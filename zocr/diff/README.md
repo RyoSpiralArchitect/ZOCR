@@ -88,6 +88,9 @@ python -m zocr.diff \
 - **[JA]** 行の追加・削除も監視し、置換以外の差分（例：費目が 1 行だけ増えた請求書）でも該当金額の Δ/率を抽出します。
 - **[EN]** Inserted/deleted lines are covered alongside replacements, so a newly added fee line still yields the precise Δ/relative delta.
 - **[FR]** Les lignes ajoutées/supprimées sont également prises en compte, ce qui permet d’extraire Δ/variation même quand une seule ligne vient s’ajouter.
+- **[JA]** `--simple_text_a` / `_b` にファイル名のみを渡した場合でも `./input_sample` / `samples/demo_inputs`（および plural 変種）を自動で走査し、最初に見つかったテキストを差分対象として使うため、`python -m zocr.diff --simple_text_a memo_v1.txt ...` のようなショートカットが機能します。
+- **[EN]** Passing just bare filenames to `--simple_text_a` / `_b` now triggers an auto-search across `./input_sample`, `samples/demo_inputs`, and their plural variants, so shortcuts such as `python -m zocr.diff --simple_text_a memo_v1.txt ...` work out of the box.
+- **[FR]** En ne fournissant que le nom de fichier à `--simple_text_a` / `_b`, la CLI parcourt automatiquement `./input_sample`, `samples/demo_inputs` (et variantes), ce qui permet d’exécuter directement `python -m zocr.diff --simple_text_a memo_v1.txt ...`.
 - **[JA]** simple 入力にも `cells.jsonl` と同様にディレクトリを渡せ、`rag/bundle.md` → `bundle.md` → `preview.md` → `.txt` の順に探索するため、ToyOCR/ZOCR の RAG 出力フォルダを指すだけで比較が走ります。
 - **[EN]** Like the semantic inputs, the simple mode accepts run directories: the resolver scans `rag/bundle.md`, `bundle.md`, `preview.md`, then `.txt` variants so pointing at a ToyOCR/ZOCR run folder is enough.
 - **[FR]** À l’instar des entrées sémantiques, le mode léger accepte un dossier d’exécution : il y cherche successivement `rag/bundle.md`, `bundle.md`, `preview.md` puis les variantes `.txt`, ce qui suffit pour comparer un dossier ToyOCR/ZOCR tel quel.

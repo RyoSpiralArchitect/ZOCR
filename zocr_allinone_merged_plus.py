@@ -88,7 +88,7 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit, difflib
+import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, atexit, difflib, concurrent.futures
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -1418,12 +1418,271 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     return html, (dbg if want_dbg else {})
 
 # ----------------- PDF raster -----------------
+@dataclass
+class _PdfInspection:
+    page_count: int
+    max_width_pt: float
+    max_height_pt: float
+
+
+def _pdf_parallel_workers(page_count: int) -> int:
+    if page_count <= 1:
+        return 1
+    min_pages = max(2, _env_int_local("ZOCR_PDF_PARALLEL_MIN_PAGES", 6))
+    if page_count < min_pages:
+        return 1
+    forced = _env_int_local("ZOCR_PDF_WORKERS", 0)
+    if forced > 0:
+        return max(1, min(forced, page_count))
+    cpu = os.cpu_count() or 1
+    if cpu <= 2:
+        return 1
+    default = min(4, cpu - 1)
+    return max(1, min(default, page_count))
+
+
+def _pdf_chunk_ranges(page_count: int, workers: int) -> List[Tuple[int, int]]:
+    if workers <= 1 or page_count <= 0:
+        return [(0, page_count)]
+    chunk = max(1, math.ceil(page_count / workers))
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    while start < page_count:
+        end = min(page_count, start + chunk)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _pdf_inspect_with_doc(doc: Any, sample_pages: Optional[int] = None) -> _PdfInspection:
+    page_count = len(doc)
+    if page_count <= 0:
+        return _PdfInspection(0, 0.0, 0.0)
+    limit = sample_pages
+    if limit is None:
+        limit = max(1, _env_int_local("ZOCR_PDF_INSPECT_PAGES", 12))
+    limit = min(limit, page_count)
+    max_w = 0.0
+    max_h = 0.0
+    for idx in range(limit):
+        page = doc[idx]
+        try:
+            try:
+                w, h = page.get_size()  # type: ignore[attr-defined]
+            except Exception:
+                w = h = 0.0
+        finally:
+            page.close()
+        max_w = max(max_w, float(w or 0.0))
+        max_h = max(max_h, float(h or 0.0))
+    return _PdfInspection(page_count, max_w, max_h)
+
+
+def _pdf_inspect_via_pdfinfo(pdf_path: str) -> Optional[_PdfInspection]:
+    exe = shutil.which("pdfinfo")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, pdf_path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    pages = 0
+    max_w = 0.0
+    max_h = 0.0
+    for line in proc.stdout.splitlines():
+        norm = line.strip().lower()
+        if norm.startswith("pages:") and pages <= 0:
+            try:
+                pages = int(line.split(":", 1)[1].strip().split()[0])
+            except Exception:
+                pages = 0
+        elif "page size" in norm:
+            nums = re.findall(r"([0-9]+(?:\\.[0-9]+)?)", line)
+            if len(nums) >= 2:
+                try:
+                    w = float(nums[0])
+                    h = float(nums[1])
+                except Exception:
+                    continue
+                max_w = max(max_w, w)
+                max_h = max(max_h, h)
+    if pages <= 0:
+        return None
+    if max_w <= 0.0:
+        max_w = 612.0
+    if max_h <= 0.0:
+        max_h = 792.0
+    return _PdfInspection(pages, max_w, max_h)
+
+
+def _pdf_lazy_inspection(pdf_path: str) -> Optional[_PdfInspection]:
+    try:
+        import pypdfium2  # type: ignore
+
+        doc = pypdfium2.PdfDocument(pdf_path)
+    except Exception:
+        return _pdf_inspect_via_pdfinfo(pdf_path)
+    try:
+        return _pdf_inspect_with_doc(doc)
+    finally:
+        doc.close()
+
+
+def _pdf_resolve_raster_plan(
+    base_dpi: int, inspection: Optional[_PdfInspection]
+) -> Tuple[int, Optional[int]]:
+    dpi = max(1, base_dpi or 200)
+    snapshot_mode = _env_truthy_local("ZOCR_PIPELINE_SNAPSHOT", False)
+    if snapshot_mode:
+        snapshot_pct = _env_int_local("ZOCR_PDF_SNAPSHOT_DPI_PCT", 80)
+        if 0 < snapshot_pct < 100:
+            dpi = max(1, int(dpi * (snapshot_pct / 100.0)))
+    hard_floor = max(48, _env_int_local("ZOCR_PDF_MIN_DPI_FLOOR", 72))
+    soft_min = max(hard_floor, _env_int_local("ZOCR_PDF_MIN_DPI", 120))
+    budget = max(0, _env_int_local("ZOCR_PDF_PIXEL_BUDGET", 320_000_000))
+    if snapshot_mode:
+        snap_budget = max(0, _env_int_local("ZOCR_PDF_SNAPSHOT_PIXEL_BUDGET", 220_000_000))
+        if snap_budget > 0:
+            budget = snap_budget if budget <= 0 else min(budget, snap_budget)
+    ideal_dpi = dpi
+    if inspection and budget > 0 and dpi > 0:
+        width_pt = inspection.max_width_pt or 612.0
+        height_pt = inspection.max_height_pt or 792.0
+        width_px = (width_pt / 72.0) * dpi
+        height_px = (height_pt / 72.0) * dpi
+        per_page = max(width_px * height_px, 1.0)
+        total_pixels = per_page * max(1, inspection.page_count)
+        if total_pixels > budget:
+            scale = math.sqrt(budget / total_pixels)
+            ideal_dpi = max(1, int(max(1.0, dpi) * scale))
+    if ideal_dpi < soft_min:
+        dpi = max(hard_floor, ideal_dpi)
+    else:
+        dpi = max(soft_min, min(dpi, ideal_dpi))
+    limit = max(0, _env_int_local("ZOCR_PDF_MAX_PAGES", 0))
+    if snapshot_mode and limit <= 0:
+        limit = max(0, _env_int_local("ZOCR_PDF_SNAPSHOT_MAX_PAGES", 0))
+    if limit <= 0:
+        page_limit: Optional[int] = None
+    else:
+        page_limit = limit
+        if inspection:
+            page_limit = min(page_limit, inspection.page_count)
+    return dpi, page_limit
+
+
+def _pdfium_render_linear(
+    doc: Any, tmpdir: str, scale: float, limit: Optional[int]
+) -> List[str]:
+    total = len(doc) if limit is None else min(limit, len(doc))
+    out_paths: List[str] = []
+    try:
+        for i in range(total):
+            page = doc[i]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            page_path = os.path.join(tmpdir, f"page-{i+1:04d}.png")
+            im.convert("RGB").save(page_path, format="PNG")
+            out_paths.append(page_path)
+    finally:
+        doc.close()
+    return out_paths
+
+
+def _render_pdf_chunk_task(args: Tuple[str, Tuple[int, int], float, str]) -> List[Tuple[int, str]]:
+    pdf_path, bounds, scale, tmpdir = args
+    start, end = bounds
+    import pypdfium2
+
+    doc = pypdfium2.PdfDocument(pdf_path)
+    out: List[Tuple[int, str]] = []
+    try:
+        for idx in range(start, min(end, len(doc))):
+            page = doc[idx]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            path = os.path.join(tmpdir, f"page-{idx+1:04d}.png")
+            im.convert("RGB").save(path, format="PNG")
+            out.append((idx, path))
+    finally:
+        doc.close()
+    return out
+
+
+def _pdfium_render_parallel(pdf_path: str, page_count: int, tmpdir: str, scale: float, workers: int) -> List[str]:
+    ranges = _pdf_chunk_ranges(page_count, workers)
+    tasks = []
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for bounds in ranges:
+                if bounds[0] >= bounds[1]:
+                    continue
+                tasks.append(pool.submit(_render_pdf_chunk_task, (pdf_path, bounds, scale, tmpdir)))
+            ordered: List[Tuple[int, str]] = []
+            for fut in concurrent.futures.as_completed(tasks):
+                ordered.extend(fut.result())
+    except Exception:
+        import pypdfium2
+
+        doc = pypdfium2.PdfDocument(pdf_path)
+        return _pdfium_render_linear(doc, tmpdir, scale, page_count)
+    ordered.sort(key=lambda item: item[0])
+    return [path for _, path in ordered]
+
+
+def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise RuntimeError(
+            "pdftoppm not found and pypdfium2 is unavailable; install poppler-utils "
+            "or `pip install pypdfium2` to rasterize PDFs"
+        ) from exc
+
+    tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
+    doc = pypdfium2.PdfDocument(pdf_path)
+    inspection = _pdf_inspect_with_doc(doc)
+    effective_dpi, page_limit = _pdf_resolve_raster_plan(dpi, inspection)
+    scale = float(effective_dpi) / 72.0 if effective_dpi else 1.0
+    target_pages = inspection.page_count
+    if page_limit is not None:
+        target_pages = min(target_pages, page_limit)
+    if target_pages <= 0:
+        doc.close()
+        return []
+    workers = _pdf_parallel_workers(target_pages)
+    if workers <= 1:
+        return _pdfium_render_linear(doc, tmpdir, scale, target_pages)
+    doc.close()
+    return _pdfium_render_parallel(pdf_path, target_pages, tmpdir, scale, workers)
+
+
 def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
     exe=shutil.which("pdftoppm")
-    if not exe: raise RuntimeError("pdftoppm not found; install poppler-utils")
-    tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
-    subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    if exe:
+        inspection = _pdf_lazy_inspection(pdf_path)
+        effective_dpi, page_limit = _pdf_resolve_raster_plan(dpi, inspection)
+        tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
+        cmd=[exe,"-r",str(effective_dpi),"-png"]
+        if page_limit is not None:
+            cmd += ["-f","1","-l",str(page_limit)]
+        cmd += [pdf_path,out_prefix]
+        subprocess.run(cmd,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
 # ----------------- Pipeline + Metrics -----------------
 def _rows_cols_from_html(html: str) -> Tuple[int,int]:
@@ -8214,16 +8473,25 @@ from functools import lru_cache
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
+_HAS_NUMBA_PARALLEL = False
 try:
     from numba import njit, prange
-    from numba import atomic
     _HAS_NUMBA = True
+    try:
+        from numba import atomic as _numba_atomic
+        atomic = _numba_atomic
+        _HAS_NUMBA_PARALLEL = True
+    except Exception:
+        atomic = None
 except Exception:
     def njit(*a, **k):
         def deco(f): return f
         return deco
     def prange(n):
         return range(n)
+    atomic = None
+
+if atomic is None:
     class _AtomicStub:
         @staticmethod
         def add(arr, idx, val):
@@ -9441,23 +9709,26 @@ def build_index(jsonl: str, out_pkl: str):
                 df[tid]+=1
         return df
 
-    @njit(parallel=True, cache=True)
-    def _compute_df_parallel(arr_unique, lengths, V):
-        n=arr_unique.shape[0]
-        df=np.zeros(V, dtype=np.int64)
-        for i in prange(n):
-            L=lengths[i]
-            for j in range(L):
-                tid=arr_unique[i,j]
-                if tid<0:
-                    break
-                atomic.add(df, tid, 1)
-        return df
+    if _HAS_NUMBA_PARALLEL:
+        @njit(parallel=True, cache=True)
+        def _compute_df_parallel(arr_unique, lengths, V):
+            n=arr_unique.shape[0]
+            df=np.zeros(V, dtype=np.int64)
+            for i in prange(n):
+                L=lengths[i]
+                for j in range(L):
+                    tid=arr_unique[i,j]
+                    if tid<0:
+                        break
+                    atomic.add(df, tid, 1)
+            return df
+    else:
+        _compute_df_parallel = None  # type: ignore
 
     df=None
     if _HAS_NUMBA:
         try:
-            if V <= 200000:
+            if _HAS_NUMBA_PARALLEL and V <= 200000 and _compute_df_parallel is not None:
                 df=_compute_df_parallel(arr_unique, uniq_lengths, V)
             else:
                 df=_compute_df(arr_unique, uniq_lengths, V)
@@ -11058,13 +11329,22 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     diag["poppler_pdftoppm"] = {
         "status": "available" if poppler_path else "missing",
         "path": poppler_path,
-        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+        "hint": None
+        if poppler_path
+        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
     }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
+    if numba_enabled:
+        detail = "Numba acceleration active"
+        if not numba_parallel:
+            detail += " (atomic.add unavailable; DF reduction running serially)"
+    else:
+        detail = "Falling back to pure Python BM25 scoring"
     diag["numba"] = {
         "status": "enabled" if numba_enabled else "python-fallback",
-        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+        "detail": detail,
     }
 
     libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
@@ -14195,7 +14475,10 @@ def _patched_run_full_pipeline(
         pass
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
     if snapshot:
+        os.environ["ZOCR_PIPELINE_SNAPSHOT"] = "1"
         _write_pipeline_meta(outdir, seed)
+    else:
+        os.environ.pop("ZOCR_PIPELINE_SNAPSHOT", None)
 
     ok = _read_ok_steps(outdir) if resume else set()
 

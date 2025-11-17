@@ -76,6 +76,35 @@ _SIMPLE_TEXT_CANDIDATES = (
     ("", "preview.txt"),
 )
 
+_SIMPLE_TEXT_HINT_DIRS = (
+    "input_sample",
+    "input_samples",
+    "samples/input_sample",
+    "samples/input_samples",
+    "samples/demo_inputs",
+)
+
+
+def _resolve_simple_text_from_hints(value: str) -> Optional[Path]:
+    """Look under known sample directories when the user passes only a filename."""
+
+    bare = Path(value)
+    if bare.is_absolute():
+        return None
+    seen = set()
+    repo_root = Path(__file__).resolve().parents[2]
+    for base in (Path.cwd(), repo_root):
+        for rel in _SIMPLE_TEXT_HINT_DIRS:
+            candidate_root = (base / rel).resolve()
+            key = str(candidate_root).lower()
+            if key in seen or not candidate_root.exists():
+                continue
+            seen.add(key)
+            candidate = candidate_root / value
+            if candidate.exists():
+                return candidate
+    return None
+
 
 def _resolve_simple_text_path(value: str, label: str) -> Path:
     """Resolve quick-differ inputs from either files or run directories."""
@@ -92,6 +121,9 @@ def _resolve_simple_text_path(value: str, label: str) -> Path:
             f"Could not locate a markdown/text file under '{value}'. "
             "Looked for bundle.md/preview.md (optionally under rag/)."
         )
+    hint = _resolve_simple_text_from_hints(value)
+    if hint:
+        return hint
     raise FileNotFoundError(f"{label} path '{value}' does not exist")
 
 
@@ -125,12 +157,18 @@ def main() -> None:
     ap.add_argument(
         "--simple_text_a",
         default=None,
-        help="plain-text document A (or a run dir with rag/bundle.md) for the quick differ",
+        help=(
+            "plain-text document A (or a run dir with rag/bundle.md) for the quick differ; "
+            "bare filenames are also resolved under ./input_sample or samples/demo_inputs"
+        ),
     )
     ap.add_argument(
         "--simple_text_b",
         default=None,
-        help="plain-text document B (or a run dir with rag/bundle.md) for the quick differ",
+        help=(
+            "plain-text document B (or a run dir with rag/bundle.md) for the quick differ; "
+            "bare filenames are also resolved under ./input_sample or samples/demo_inputs"
+        ),
     )
     ap.add_argument(
         "--simple_diff_out",
