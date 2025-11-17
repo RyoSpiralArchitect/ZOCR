@@ -36,6 +36,11 @@ from PIL import Image, ImageOps
 import numpy as np
 from functools import lru_cache
 
+try:  # pragma: no cover - optional shared resources
+    from zocr.resources.domain_dictionary import all_domain_keywords as _core_all_domain_keywords  # type: ignore
+except Exception:  # pragma: no cover - optional shared resources
+    _core_all_domain_keywords = None  # type: ignore
+
 # -------------------- Numeric header hints --------------------
 _NUMERIC_HEADER_HINTS = {
     "qty": "qty",
@@ -564,7 +569,7 @@ def infer_row_fields(swin: str) -> Dict[str, Any]:
     return out
 
 # Domain keywords for boosts
-DOMAIN_KW = {
+_STATIC_DOMAIN_KW = {
     "invoice": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求",0.4),("登録",0.3),("住所",0.3),("単価",0.3),("数量",0.3)],
     "invoice_jp_v2": [("合計",1.0),("金額",0.9),("消費税",0.8),("小計",0.6),("請求日",0.5),("発行日",0.4)],
     "invoice_en": [("invoice",1.0),("total",0.9),("amount",0.85),("tax",0.7),("due",0.5),("bill",0.4)],
@@ -682,29 +687,90 @@ for _dom_conf in DOMAIN_DEFAULTS.values():
 
 _DOMAIN_ALIAS = {
     "invoice": "invoice_jp_v2",
+    "invoice_ja": "invoice_jp_v2",
+    "invoice_en": "invoice_en",
     "contract": "contract_jp_v2",
     "delivery": "delivery_jp",
     "estimate": "estimate_jp",
     "receipt": "receipt_jp",
     "bank_statement": "bank_statement_en",
+    "bank_statement_ja": "bank_statement_jp",
+    "bank_statement_en": "bank_statement_en",
     "utility_bill": "utility_bill_en",
+    "utility_bill_ja": "utility_bill_jp",
+    "utility_bill_en": "utility_bill_en",
     "insurance_claim": "insurance_claim_en",
+    "insurance_claim_ja": "insurance_claim_jp",
+    "insurance_claim_en": "insurance_claim_en",
     "tax_form": "tax_form_en",
+    "tax_form_ja": "tax_form_jp",
+    "tax_form_en": "tax_form_en",
     "tax_return": "tax_form_en",
     "payslip": "payslip_en",
+    "payslip_ja": "payslip_jp",
+    "payslip_en": "payslip_en",
     "rental_agreement": "rental_agreement_en",
+    "rental_agreement_ja": "rental_agreement_jp",
+    "rental_agreement_en": "rental_agreement_en",
     "lease_contract": "rental_agreement_en",
     "loan_statement": "loan_statement_en",
+    "loan_statement_ja": "loan_statement_jp",
+    "loan_statement_en": "loan_statement_en",
     "loan_summary": "loan_statement_en",
     "travel_itinerary": "travel_itinerary_en",
+    "travel_itinerary_ja": "travel_itinerary_jp",
+    "travel_itinerary_en": "travel_itinerary_en",
     "travel_plan": "travel_itinerary_en",
     "medical_bill": "medical_bill_en",
+    "medical_bill_ja": "medical_bill_jp",
+    "medical_bill_en": "medical_bill_en",
     "medical_invoice": "medical_bill_en",
     "customs_declaration": "customs_declaration_en",
+    "customs_declaration_ja": "customs_declaration_en",
+    "customs_declaration_en": "customs_declaration_en",
     "customs_form": "customs_declaration_en",
     "grant_application": "grant_application_en",
-    "boarding_pass": "boarding_pass_en"
+    "grant_application_ja": "grant_application_en",
+    "grant_application_en": "grant_application_en",
+    "boarding_pass": "boarding_pass_en",
+    "boarding_pass_ja": "boarding_pass_en",
+    "boarding_pass_en": "boarding_pass_en",
+    "purchase_order_ja": "purchase_order",
+    "purchase_order_en": "purchase_order",
+    "shipping_notice_ja": "shipping_notice",
+    "shipping_notice_en": "shipping_notice",
+    "expense_report_ja": "expense",
+    "expense_report_en": "expense",
 }
+
+
+def _build_domain_kw() -> Dict[str, List[Tuple[str, float]]]:
+    base: Dict[str, List[Tuple[str, float]]] = {
+        dom: list(entries) for dom, entries in _STATIC_DOMAIN_KW.items()
+    }
+    if _core_all_domain_keywords is None:
+        return base
+    try:
+        mapping = _core_all_domain_keywords()
+    except Exception:
+        return base
+    for token, words in mapping.items():
+        if not words:
+            continue
+        target = token if token in base else _DOMAIN_ALIAS.get(token)
+        if not target or target not in base:
+            continue
+        seen = {kw for kw, _ in base[target]}
+        for word in sorted(words):
+            if word in seen:
+                continue
+            weight = 0.45 if len(word) <= 3 else 0.35 if len(word) <= 6 else 0.25
+            base[target].append((word, weight))
+            seen.add(word)
+    return base
+
+
+DOMAIN_KW = _build_domain_kw()
 
 _DOMAIN_HEADER_SIGNALS: Dict[str, List[Tuple[str, float]]] = {
     "invoice_jp_v2": [

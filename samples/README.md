@@ -33,9 +33,9 @@ Tous les exemples résident désormais dans `samples/demo_inputs/`; le domaine s
 | 出荷案内 / Shipping notice | `shipping_notice` | 出荷案内, 納品書, 出荷日, 配送業者, 追跡番号 | shipping notice, shipment, tracking, carrier, ship date |
 | 経費精算 / Expense report | `expense_report` | 経費精算書, 申請日, 立替, 交通費, 領収書, 承認者 | expense report, reimbursement, category, receipt, approver |
 
-> ℹ️ キーワードは `zocr.resources.domain_dictionary` にも収録され、Toy OCR の組込み辞書として利用されます。
-The keyword lists above feed into `zocr.resources.domain_dictionary`, which powers the bundled toy OCR lexicon.
-Les listes de mots-clés ci-dessus alimentent `zocr.resources.domain_dictionary`, utilisé par le dictionnaire embarqué.
+> ℹ️ キーワードは `zocr.resources.domain_dictionary` にも収録され、Toy OCR／consensus exporter／`zocr.core` の組込み辞書として利用されます。
+The keyword lists above feed into `zocr.resources.domain_dictionary`, which now drives the bundled toy OCR lexicon, the consensus exporter, and the `zocr.core` boosts—no external wordlists are required.
+Les listes de mots-clés ci-dessus alimentent `zocr.resources.domain_dictionary`, utilisé par le Toy OCR, l’exportateur consensus et les boosts `zocr.core`, sans dictionnaires externes.
 
 `--domain`（またはパイプライン側の domain 設定）を指定すると、そのドメインのキーワード辞書が toy OCR の lexicon に適用されます。
 Passing `--domain` (or configuring the pipeline domain) forces the toy OCR lexicon to load that domain's keyword bundle.
