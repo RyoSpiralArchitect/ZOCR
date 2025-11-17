@@ -1392,12 +1392,42 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     return html, (dbg if want_dbg else {})
 
 # ----------------- PDF raster -----------------
+def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise RuntimeError(
+            "pdftoppm not found and pypdfium2 is unavailable; install poppler-utils "
+            "or `pip install pypdfium2` to rasterize PDFs"
+        ) from exc
+
+    tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
+    doc = pypdfium2.PdfDocument(pdf_path)
+    out_paths: List[str] = []
+    scale = float(dpi) / 72.0 if dpi else 1.0
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            page_path = os.path.join(tmpdir, f"page-{i+1:04d}.png")
+            im.convert("RGB").save(page_path, format="PNG")
+            out_paths.append(page_path)
+    finally:
+        doc.close()
+    return out_paths
+
+
 def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
     exe=shutil.which("pdftoppm")
-    if not exe: raise RuntimeError("pdftoppm not found; install poppler-utils")
-    tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
-    subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    if exe:
+        tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
+        subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
 # ----------------- Pipeline + Metrics -----------------
 def _rows_cols_from_html(html: str) -> Tuple[int,int]:

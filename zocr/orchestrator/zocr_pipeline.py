@@ -436,7 +436,9 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     diag["poppler_pdftoppm"] = {
         "status": "available" if poppler_path else "missing",
         "path": poppler_path,
-        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+        "hint": None
+        if poppler_path
+        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
     }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
