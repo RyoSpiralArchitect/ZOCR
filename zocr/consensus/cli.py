@@ -1,0 +1,374 @@
+"""Standalone CLI entrypoints for the consensus runtime."""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+from .local_search import build_local_index, query_local
+from .runtime import (
+    Pipeline,
+    auto_calibrate_params,
+    autotune_params,
+    configure_toy_runtime,
+    ensure_dir,
+    export_jsonl_with_ocr,
+    pdf_to_images_via_poppler,
+)
+
+__all__ = [
+    "_AUTOCALIB_DEFAULT_SAMPLES",
+    "_AUTOTUNE_DEFAULT_TRIALS",
+    "_DEMO_INPUT_SUFFIXES",
+    "_discover_demo_inputs_for_consensus",
+    "_dedup_input_paths",
+    "_positive_cli_value",
+    "_patch_cli_for_export_and_search",
+    "cli_export",
+    "cli_index",
+    "cli_query",
+    "main",
+]
+
+_AUTOCALIB_DEFAULT_SAMPLES = 3
+_AUTOTUNE_DEFAULT_TRIALS = 6
+
+_DEMO_INPUT_SUFFIXES: Tuple[str, ...] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".gif",
+    ".pdf",
+)
+
+
+def _discover_demo_inputs_for_consensus() -> List[str]:
+    """Locate demo input files for the standalone consensus CLI."""
+
+    env_override = os.environ.get("ZOCR_DEMO_INPUTS")
+    candidate_roots: List[Path] = []
+    seen_candidates: Set[str] = set()
+
+    def _add_candidate(path: Path) -> None:
+        try:
+            resolved = path if path.is_absolute() else (Path.cwd() / path)
+            resolved = resolved.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen_candidates:
+            return
+        seen_candidates.add(key)
+        if resolved.exists():
+            candidate_roots.append(resolved)
+
+    if env_override:
+        for chunk in env_override.split(os.pathsep):
+            chunk = chunk.strip()
+            if chunk:
+                _add_candidate(Path(chunk))
+
+    here = Path(__file__).resolve()
+    repo_root = here.parents[2] if len(here.parents) >= 3 else here.parent
+    search_roots = [Path.cwd(), repo_root]
+    rel_candidates = [
+        Path("samples/demo_inputs"),
+        Path("samples/input_demo"),
+        Path("demo_inputs"),
+        Path("input_demo"),
+    ]
+
+    for root in search_roots:
+        for rel in rel_candidates:
+            _add_candidate(root / rel)
+
+    files: List[str] = []
+    seen_files: Set[str] = set()
+
+    def _add_file(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen_files:
+            return
+        if resolved.is_file() and resolved.suffix.lower() in _DEMO_INPUT_SUFFIXES:
+            seen_files.add(key)
+            files.append(key)
+
+    for candidate in candidate_roots:
+        if candidate.is_file():
+            _add_file(candidate)
+        elif candidate.is_dir():
+            for entry in candidate.rglob("*"):
+                if entry.is_file() and entry.suffix.lower() in _DEMO_INPUT_SUFFIXES:
+                    _add_file(entry)
+
+    return files
+
+
+def _dedup_input_paths(paths: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for path in paths:
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        result.append(path)
+    return result
+
+
+def _positive_cli_value(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    return value if value > 0 else None
+
+
+def cli_export(args):
+    # Determine source image for current run
+    # If --demo used earlier, try demo_inv.png; else use first input
+    out_dir = args.out
+    src = None
+    if args.input:
+        src = args.input[0]
+    else:
+        cand = os.path.join(out_dir, "demo_inv.png")
+        src = cand if os.path.exists(cand) else None
+    if not src:
+        print("No source image found for export.")
+        return
+    jpath = os.path.join(out_dir, "doc.zocr.json")
+    if not os.path.exists(jpath):
+        print("doc.zocr.json not found in", out_dir)
+        return
+    out_jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
+    source_images: Union[str, Sequence[str]]
+    if len(args.input) > 1:
+        source_images = [p for p in args.input if isinstance(p, str)]
+    else:
+        source_images = src
+    runtime_overrides: Dict[str, Any] = {}
+    sweeps = getattr(args, "toy_sweeps", None)
+    if sweeps is not None and sweeps > 0:
+        runtime_overrides["sweeps"] = sweeps
+    force_numeric = getattr(args, "force_numeric", None)
+    if force_numeric is not None:
+        runtime_overrides["force_numeric"] = force_numeric
+    if runtime_overrides:
+        configure_toy_runtime(**runtime_overrides)
+    n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
+    print("Exported", n, "records to", out_jsonl)
+
+
+def cli_index(args):
+    jsonl = os.path.join(args.out, "doc.contextual.jsonl")
+    if not os.path.exists(jsonl):
+        print("contextual JSONL not found:", jsonl)
+        return
+    pkl = os.path.join(args.out, "bm25.pkl")
+    build_local_index(jsonl, pkl)
+    print("Wrote local index:", pkl)
+
+
+def cli_query(args):
+    out_dir = args.out
+    jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
+    pkl = os.path.join(out_dir, "bm25.pkl")
+    if not (os.path.exists(jsonl) and os.path.exists(pkl)):
+        print("Missing JSONL or index:", jsonl, pkl)
+        return
+    merged = query_local(
+        jsonl,
+        pkl,
+        text_query=args.query or "",
+        image_query_path=(args.image_query or None),
+        topk=args.topk,
+    )
+    # Print concise results
+    for i, r in enumerate(merged, 1):
+        ob = r["obj"]
+        print(
+            f"{i:2d}. score={r['score']:.4f} page={ob.get('page')} row={ob.get('row')} "
+            f"col={ob.get('col')} text='{(ob.get('text') or '')[:40]}' bbox={ob.get('bbox')}"
+        )
+
+
+def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    sub = parser.add_subparsers(dest="cmd")
+
+    def add_common(sp):
+        sp.add_argument("--out", type=str, default="out_consensus")
+        sp.add_argument("-i", "--input", nargs="*", default=[])
+        sp.add_argument(
+            "--toy-sweeps",
+            type=int,
+            default=None,
+            help="Clamp toy OCR threshold sweeps (overrides ZOCR_TOY_SWEEPS)",
+        )
+        group = sp.add_mutually_exclusive_group()
+        group.add_argument(
+            "--force-numeric",
+            dest="force_numeric",
+            action="store_true",
+            help="Force numeric coercion based on headers",
+        )
+        group.add_argument(
+            "--no-force-numeric",
+            dest="force_numeric",
+            action="store_false",
+            help="Disable numeric coercion",
+        )
+        sp.set_defaults(force_numeric=None)
+
+    sp = sub.add_parser("export", help="Export JSONL with toy OCR + contextual lines")
+    add_common(sp)
+    sp.set_defaults(func=cli_export)
+
+    sp = sub.add_parser("index", help="Build local BM25 index from exported JSONL")
+    add_common(sp)
+    sp.set_defaults(func=cli_index)
+
+    sp = sub.add_parser("query", help="Query local index (RRF with optional image)")
+    sp.add_argument("--query", type=str, default="")
+    sp.add_argument("--image-query", type=str, default="")
+    sp.add_argument("--topk", type=int, default=10)
+    add_common(sp)
+    sp.set_defaults(func=cli_query)
+    return parser
+
+
+def main():
+    p = argparse.ArgumentParser(description="Z‑OCR one‑file (Consensus + MM RAG)")
+    p.add_argument("-i", "--input", nargs="*", default=[], help="Images or PDF")
+    p.add_argument("--out", default="out_consensus")
+    p.add_argument("--dpi", type=int, default=200)
+    p.add_argument("--demo", action="store_true")
+    p.add_argument(
+        "--domain",
+        default=None,
+        help="Domain keyword profile for the toy OCR lexicon (e.g. invoice, medical_bill)",
+    )
+    p.add_argument("--bench-iterations", type=int, default=20)
+    # CC params
+    p.add_argument("--cc-k", type=int, default=31)
+    p.add_argument("--cc-c", type=float, default=10.0)
+    p.add_argument("--cc-min-area", type=int, default=32)
+    p.add_argument("--dp-lambda-factor", type=float, default=2.2)
+    p.add_argument("--shape-lambda", type=float, default=4.0)
+    p.add_argument("--lambda-alpha", type=float, default=0.7)
+    p.add_argument("--iou-thr", type=float, default=0.35)
+    p.add_argument("--iou-sigma", type=float, default=0.10)
+    p.add_argument("--baseline-segs", type=int, default=4)
+    p.add_argument("--baseline-thr-factor", type=float, default=0.7)
+    p.add_argument("--baseline-sigma-factor", type=float, default=0.15)
+    p.add_argument("--wx", type=int, default=0)
+    p.add_argument("--wy", type=int, default=0)
+    p.add_argument("--consensus-thr", type=float, default=0.5)
+    p.add_argument("--ambiguous-low", type=float, default=0.35)
+    p.add_argument("--ambiguous-high", type=float, default=0.65)
+    # auto
+    p.add_argument(
+        "--autocalib",
+        nargs="?",
+        type=int,
+        const=_AUTOCALIB_DEFAULT_SAMPLES,
+        default=None,
+        metavar="N",
+        help=(
+            "Auto-calibrate CC params using N sample pages (default %(const)s when "
+            "the flag is provided without a value). Pass 0 or omit the flag to disable."
+        ),
+    )
+    p.add_argument(
+        "--autotune",
+        nargs="?",
+        type=int,
+        const=_AUTOTUNE_DEFAULT_TRIALS,
+        default=None,
+        metavar="N",
+        help=(
+            "Run the unsupervised autotuner for N trials (default %(const)s when the "
+            "flag has no explicit value). Pass 0 or omit to skip autotuning."
+        ),
+    )
+    _patch_cli_for_export_and_search(p)
+    args = p.parse_args()
+    if args.domain is not None:
+        dom = args.domain.strip()
+        if not dom or dom.lower() in {"", "auto", "default"}:
+            os.environ.pop("ZOCR_TESS_DOMAIN", None)
+        else:
+            os.environ["ZOCR_TESS_DOMAIN"] = dom
+    ensure_dir(args.out)
+    # subcommands (export/index/query) do not require re-running OCR
+    if args.cmd:
+        args.func(args)
+        return
+    if args.demo:
+        demo_inputs = _discover_demo_inputs_for_consensus()
+        if not demo_inputs:
+            p.error(
+                "`--demo` requested but no sample inputs were found. "
+                "Place demo files under samples/demo_inputs/ or samples/input_demo/."
+            )
+        pages: List[str] = []
+        for it in demo_inputs:
+            ext = os.path.splitext(it)[1].lower()
+            if ext == ".pdf":
+                pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
+            else:
+                pages.append(it)
+        pages = _dedup_input_paths(pages)
+        annos = [None] * len(pages)
+    else:
+        if not args.input:
+            p.error("No input. Use --demo or -i.")
+        pages = []
+        for it in args.input:
+            ext = os.path.splitext(it)[1].lower()
+            if ext == ".pdf":
+                pages += pdf_to_images_via_poppler(it, dpi=args.dpi)
+            else:
+                pages.append(it)
+        pages = _dedup_input_paths(pages)
+        annos = [None] * len(pages)
+    tab_cfg = {
+        "k": args.cc_k,
+        "c": args.cc_c,
+        "min_area": args.cc_min_area,
+        "dp_lambda_factor": args.dp_lambda_factor,
+        "shape_lambda": args.shape_lambda,
+        "lambda_alpha": args.lambda_alpha,
+        "wx": args.wx,
+        "wy": args.wy,
+        "iou_thr": args.iou_thr,
+        "iou_sigma": args.iou_sigma,
+        "baseline_segs": args.baseline_segs,
+        "baseline_thr_factor": args.baseline_thr_factor,
+        "baseline_sigma_factor": args.baseline_sigma_factor,
+        "consensus_thr": args.consensus_thr,
+        "ambiguous_low": args.ambiguous_low,
+        "ambiguous_high": args.ambiguous_high,
+    }
+    autocalib_samples = _positive_cli_value(args.autocalib)
+    autotune_trials = _positive_cli_value(args.autotune)
+    if autocalib_samples:
+        tab_cfg.update(auto_calibrate_params(pages, autocalib_samples))
+    if autotune_trials:
+        tab_cfg.update(autotune_params(pages, tab_cfg, trials=autotune_trials))
+    cfg = {"table": tab_cfg, "bench_iterations": args.bench_iterations, "eval": True}
+    pipe = Pipeline(cfg)
+    res, out_json = pipe.run("doc", pages, args.out, annos)
+    print("Wrote:", out_json)
+    print("Wrote:", os.path.join(args.out, "metrics_by_table.csv"))
+    print("Wrote:", os.path.join(args.out, "metrics_aggregate.csv"))
+
+
+if __name__ == "__main__":
+    main()
