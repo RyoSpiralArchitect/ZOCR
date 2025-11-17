@@ -1418,12 +1418,42 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     return html, (dbg if want_dbg else {})
 
 # ----------------- PDF raster -----------------
+def _pdf_to_images_via_pdfium(pdf_path: str, dpi: int = 200) -> List[str]:
+    try:
+        import pypdfium2
+    except ImportError as exc:
+        raise RuntimeError(
+            "pdftoppm not found and pypdfium2 is unavailable; install poppler-utils "
+            "or `pip install pypdfium2` to rasterize PDFs"
+        ) from exc
+
+    tmpdir = tempfile.mkdtemp(prefix="zocr_pdfium_")
+    doc = pypdfium2.PdfDocument(pdf_path)
+    out_paths: List[str] = []
+    scale = float(dpi) / 72.0 if dpi else 1.0
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                bitmap = page.render(scale=scale)
+                im = bitmap.to_pil()
+            finally:
+                page.close()
+            page_path = os.path.join(tmpdir, f"page-{i+1:04d}.png")
+            im.convert("RGB").save(page_path, format="PNG")
+            out_paths.append(page_path)
+    finally:
+        doc.close()
+    return out_paths
+
+
 def pdf_to_images_via_poppler(pdf_path: str, dpi: int=200) -> List[str]:
     exe=shutil.which("pdftoppm")
-    if not exe: raise RuntimeError("pdftoppm not found; install poppler-utils")
-    tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
-    subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    if exe:
+        tmpdir=tempfile.mkdtemp(prefix="zocr_pdf_"); out_prefix=os.path.join(tmpdir,"page")
+        subprocess.run([exe,"-r",str(dpi),"-png",pdf_path,out_prefix],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        return [os.path.join(tmpdir,fn) for fn in sorted(os.listdir(tmpdir)) if fn.lower().endswith(".png")]
+    return _pdf_to_images_via_pdfium(pdf_path, dpi=dpi)
 
 # ----------------- Pipeline + Metrics -----------------
 def _rows_cols_from_html(html: str) -> Tuple[int,int]:
@@ -8214,16 +8244,25 @@ from functools import lru_cache
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
+_HAS_NUMBA_PARALLEL = False
 try:
     from numba import njit, prange
-    from numba import atomic
     _HAS_NUMBA = True
+    try:
+        from numba import atomic as _numba_atomic
+        atomic = _numba_atomic
+        _HAS_NUMBA_PARALLEL = True
+    except Exception:
+        atomic = None
 except Exception:
     def njit(*a, **k):
         def deco(f): return f
         return deco
     def prange(n):
         return range(n)
+    atomic = None
+
+if atomic is None:
     class _AtomicStub:
         @staticmethod
         def add(arr, idx, val):
@@ -9441,23 +9480,26 @@ def build_index(jsonl: str, out_pkl: str):
                 df[tid]+=1
         return df
 
-    @njit(parallel=True, cache=True)
-    def _compute_df_parallel(arr_unique, lengths, V):
-        n=arr_unique.shape[0]
-        df=np.zeros(V, dtype=np.int64)
-        for i in prange(n):
-            L=lengths[i]
-            for j in range(L):
-                tid=arr_unique[i,j]
-                if tid<0:
-                    break
-                atomic.add(df, tid, 1)
-        return df
+    if _HAS_NUMBA_PARALLEL:
+        @njit(parallel=True, cache=True)
+        def _compute_df_parallel(arr_unique, lengths, V):
+            n=arr_unique.shape[0]
+            df=np.zeros(V, dtype=np.int64)
+            for i in prange(n):
+                L=lengths[i]
+                for j in range(L):
+                    tid=arr_unique[i,j]
+                    if tid<0:
+                        break
+                    atomic.add(df, tid, 1)
+            return df
+    else:
+        _compute_df_parallel = None  # type: ignore
 
     df=None
     if _HAS_NUMBA:
         try:
-            if V <= 200000:
+            if _HAS_NUMBA_PARALLEL and V <= 200000 and _compute_df_parallel is not None:
                 df=_compute_df_parallel(arr_unique, uniq_lengths, V)
             else:
                 df=_compute_df(arr_unique, uniq_lengths, V)
@@ -11058,13 +11100,22 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     diag["poppler_pdftoppm"] = {
         "status": "available" if poppler_path else "missing",
         "path": poppler_path,
-        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+        "hint": None
+        if poppler_path
+        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
     }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
+    if numba_enabled:
+        detail = "Numba acceleration active"
+        if not numba_parallel:
+            detail += " (atomic.add unavailable; DF reduction running serially)"
+    else:
+        detail = "Falling back to pure Python BM25 scoring"
     diag["numba"] = {
         "status": "enabled" if numba_enabled else "python-fallback",
-        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+        "detail": detail,
     }
 
     libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)

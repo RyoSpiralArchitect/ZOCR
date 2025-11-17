@@ -436,13 +436,22 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     diag["poppler_pdftoppm"] = {
         "status": "available" if poppler_path else "missing",
         "path": poppler_path,
-        "hint": None if poppler_path else "Install poppler-utils (pdftoppm) for multi-page PDF rasterisation",
+        "hint": None
+        if poppler_path
+        else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
     }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
+    if numba_enabled:
+        detail = "Numba acceleration active"
+        if not numba_parallel:
+            detail += " (atomic.add unavailable; DF reduction running serially)"
+    else:
+        detail = "Falling back to pure Python BM25 scoring"
     diag["numba"] = {
         "status": "enabled" if numba_enabled else "python-fallback",
-        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+        "detail": detail,
     }
 
     libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
