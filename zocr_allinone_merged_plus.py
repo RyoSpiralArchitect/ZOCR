@@ -8244,16 +8244,25 @@ from functools import lru_cache
 
 # -------------------- Optional NUMBA --------------------
 _HAS_NUMBA = False
+_HAS_NUMBA_PARALLEL = False
 try:
     from numba import njit, prange
-    from numba import atomic
     _HAS_NUMBA = True
+    try:
+        from numba import atomic as _numba_atomic
+        atomic = _numba_atomic
+        _HAS_NUMBA_PARALLEL = True
+    except Exception:
+        atomic = None
 except Exception:
     def njit(*a, **k):
         def deco(f): return f
         return deco
     def prange(n):
         return range(n)
+    atomic = None
+
+if atomic is None:
     class _AtomicStub:
         @staticmethod
         def add(arr, idx, val):
@@ -9471,23 +9480,26 @@ def build_index(jsonl: str, out_pkl: str):
                 df[tid]+=1
         return df
 
-    @njit(parallel=True, cache=True)
-    def _compute_df_parallel(arr_unique, lengths, V):
-        n=arr_unique.shape[0]
-        df=np.zeros(V, dtype=np.int64)
-        for i in prange(n):
-            L=lengths[i]
-            for j in range(L):
-                tid=arr_unique[i,j]
-                if tid<0:
-                    break
-                atomic.add(df, tid, 1)
-        return df
+    if _HAS_NUMBA_PARALLEL:
+        @njit(parallel=True, cache=True)
+        def _compute_df_parallel(arr_unique, lengths, V):
+            n=arr_unique.shape[0]
+            df=np.zeros(V, dtype=np.int64)
+            for i in prange(n):
+                L=lengths[i]
+                for j in range(L):
+                    tid=arr_unique[i,j]
+                    if tid<0:
+                        break
+                    atomic.add(df, tid, 1)
+            return df
+    else:
+        _compute_df_parallel = None  # type: ignore
 
     df=None
     if _HAS_NUMBA:
         try:
-            if V <= 200000:
+            if _HAS_NUMBA_PARALLEL and V <= 200000 and _compute_df_parallel is not None:
                 df=_compute_df_parallel(arr_unique, uniq_lengths, V)
             else:
                 df=_compute_df(arr_unique, uniq_lengths, V)
@@ -11094,9 +11106,16 @@ def _collect_dependency_diagnostics() -> Dict[str, Any]:
     }
 
     numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
+    numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
+    if numba_enabled:
+        detail = "Numba acceleration active"
+        if not numba_parallel:
+            detail += " (atomic.add unavailable; DF reduction running serially)"
+    else:
+        detail = "Falling back to pure Python BM25 scoring"
     diag["numba"] = {
         "status": "enabled" if numba_enabled else "python-fallback",
-        "detail": "Numba acceleration active" if numba_enabled else "Falling back to pure Python BM25 scoring",
+        "detail": detail,
     }
 
     libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
