@@ -6736,24 +6736,79 @@ def export_jsonl_with_ocr(doc_json_path: str,
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     page_lookup: Dict[int, str] = {}
+    page_lookup_order: List[str] = []
     default_image_path: Optional[str]
     if isinstance(source_images, str):
         default_image_path = source_images
+        page_lookup_order = [source_images]
     elif isinstance(source_images, Mapping):
+        ordered_items: List[Tuple[int, str]] = []
         for key, value in source_images.items():
             try:
                 idx = int(key)
             except (TypeError, ValueError):
                 continue
             if isinstance(value, str):
+                ordered_items.append((idx, value))
+        if ordered_items:
+            ordered_items.sort(key=lambda kv: kv[0])
+            for idx, value in ordered_items:
                 page_lookup[idx] = value
+            page_lookup_order = [value for _, value in ordered_items]
         default_image_path = page_lookup.get(min(page_lookup.keys())) if page_lookup else None
     else:
         seq = [p for p in source_images if isinstance(p, str)]
         page_lookup = {i: path for i, path in enumerate(seq)}
+        page_lookup_order = list(seq)
         default_image_path = seq[0] if seq else None
+    doc_dir = os.path.dirname(os.path.abspath(doc_json_path))
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    _page_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+    doc_image_inventory: Optional[Dict[str, List[str]]] = None
+
+    def _ensure_doc_inventory() -> Dict[str, List[str]]:
+        nonlocal doc_image_inventory
+        if doc_image_inventory is not None:
+            return doc_image_inventory
+        inventory: Dict[str, List[str]] = defaultdict(list)
+        search_roots: deque[Tuple[str, int]] = deque()
+        seen_dirs: Set[str] = set()
+        base_root = os.path.abspath(doc_dir) if doc_dir else os.getcwd()
+        search_roots.append((base_root, 0))
+        preferred_subdirs = [
+            "pages",
+            "images",
+            "imgs",
+            "page_images",
+            "input_pages",
+            "inputs",
+        ]
+        for sub in preferred_subdirs:
+            subdir = os.path.join(base_root, sub)
+            if os.path.isdir(subdir):
+                search_roots.append((os.path.abspath(subdir), 1))
+        max_depth = 2
+        while search_roots:
+            current, depth = search_roots.popleft()
+            if current in seen_dirs:
+                continue
+            seen_dirs.add(current)
+            try:
+                entries = os.listdir(current)
+            except Exception:
+                continue
+            for name in entries:
+                full = os.path.join(current, name)
+                if os.path.isdir(full):
+                    if depth < max_depth:
+                        search_roots.append((full, depth + 1))
+                    continue
+                ext = os.path.splitext(name)[1].lower()
+                if ext in _page_exts:
+                    inventory[name.lower()].append(full)
+        doc_image_inventory = inventory
+        return doc_image_inventory
 
     progress_flag = os.environ.get("ZOCR_EXPORT_PROGRESS", "0").strip().lower()
     log_progress = progress_flag not in {"", "0", "false", "no"}
@@ -6878,17 +6933,79 @@ def export_jsonl_with_ocr(doc_json_path: str,
             seg_col_candidates_final += _safe_int(col_diag.get("candidates_final"))
             seg_rows_with_candidates += _safe_int(col_diag.get("rows_with_candidates"))
 
-    def _candidate_paths(path: Optional[str], index: Optional[int]) -> List[str]:
+    def _candidate_paths(
+        path: Optional[str],
+        index: Optional[int],
+        fallback_index: Optional[int],
+    ) -> List[str]:
         ordered: List[str] = []
         seen: Set[str] = set()
-        for cand in (path, page_lookup.get(index) if index is not None else None, default_image_path):
-            if isinstance(cand, str) and cand and cand not in seen:
+        base_names: Set[str] = set()
+
+        def _remember_basename(candidate: Optional[str]) -> None:
+            if not isinstance(candidate, str):
+                return
+            cand = candidate.strip()
+            if not cand:
+                return
+            base = os.path.basename(cand)
+            if base:
+                base_names.add(base.lower())
+
+        def _add_candidate(candidate: Optional[str]) -> None:
+            if not isinstance(candidate, str):
+                return
+            cand = candidate.strip()
+            if not cand:
+                return
+            if cand not in seen:
                 seen.add(cand)
                 ordered.append(cand)
+                _remember_basename(cand)
+            if not os.path.isabs(cand):
+                resolved = os.path.abspath(os.path.join(doc_dir, cand))
+                if resolved not in seen:
+                    seen.add(resolved)
+                    ordered.append(resolved)
+                    _remember_basename(resolved)
+
+        def _index_candidates(primary: Optional[int], fallback: Optional[int]) -> List[int]:
+            values: List[int] = []
+            for raw in (primary, fallback):
+                if raw is None:
+                    continue
+                try:
+                    idx_val = int(raw)
+                except Exception:
+                    continue
+                if idx_val not in values:
+                    values.append(idx_val)
+            if isinstance(primary, int):
+                alias = primary - 1
+                if alias >= 0 and alias not in values:
+                    values.append(alias)
+            return values
+
+        _add_candidate(path)
+        for idx_val in _index_candidates(index, fallback_index):
+            _add_candidate(page_lookup.get(idx_val))
+            if 0 <= idx_val < len(page_lookup_order):
+                _add_candidate(page_lookup_order[idx_val])
+        _add_candidate(default_image_path)
+
+        if base_names:
+            inventory = _ensure_doc_inventory()
+            for base in base_names:
+                for fallback in inventory.get(base, []):
+                    _add_candidate(fallback)
         return ordered
 
-    def _load_page_image(path: Optional[str], index: Optional[int]) -> Optional["Image.Image"]:
-        for target in _candidate_paths(path, index):
+    def _load_page_image(
+        path: Optional[str],
+        index: Optional[int],
+        fallback_index: Optional[int],
+    ) -> Optional["Image.Image"]:
+        for target in _candidate_paths(path, index, fallback_index):
             if target in image_cache:
                 return image_cache[target]
             try:
@@ -6956,7 +7073,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 lookup_idx = pidx
             else:
                 lookup_idx = enum_idx
-            page_image = _load_page_image(page_image_path, lookup_idx)
+            page_image = _load_page_image(page_image_path, lookup_idx, enum_idx)
             if page_image is None:
                 continue
             page_w, page_h = page_image.size
