@@ -53,6 +53,20 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _np = None  # type: ignore
 
+class _MissingModuleProxy:
+    """Minimal proxy that surfaces the original import error on access."""
+
+    def __init__(self, label: str, error: Exception):
+        self.__name__ = label
+        self._error = error
+
+    def __getattr__(self, name: str):  # pragma: no cover - triggered only when missing deps
+        raise AttributeError(f"{self.__name__} is unavailable: {self._error}") from self._error
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<Missing module {self.__name__}: {self._error}>"
+
+
 try:
     from ..consensus.local_search import (
         load_local_index as _consensus_load_local_index,
