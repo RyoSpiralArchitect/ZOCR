@@ -14,6 +14,8 @@ from .columns import (
     _dp_means_1d,
     _btree_partition,
     _btree_column_centers,
+    _find_projection_valleys,
+    _align_row_band_centers,
     _vertical_vote_boundaries,
     _smooth_per_column,
 )
@@ -32,6 +34,8 @@ __all__ = [
     "_dp_means_1d",
     "_btree_partition",
     "_btree_column_centers",
+    "_find_projection_valleys",
+    "_align_row_band_centers",
     "_vertical_vote_boundaries",
     "_smooth_per_column",
 ]
