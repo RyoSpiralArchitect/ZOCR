@@ -7,7 +7,10 @@ import pickle
 import re
 from typing import Any, Dict, List, Sequence, Tuple, Union
 
-from PIL import Image
+try:  # pragma: no cover - optional dependency when local search is disabled
+    from PIL import Image  # type: ignore
+except Exception:  # pragma: no cover
+    Image = None  # type: ignore
 
 __all__ = [
     "_tokenize",
@@ -78,6 +81,8 @@ def _bm25_query(ix, q: str, k1: float = 1.2, b: float = 0.75, topk: int = 20):
 
 def _img_embed64_from_bbox(ob: Dict[str, Any], down: int = 16):
     # downsample region to tiny vector
+    if Image is None:
+        raise RuntimeError("Pillow is required for image search helpers")
     p = ob.get("image_path")
     if not p or not os.path.exists(p):
         return None
@@ -102,6 +107,8 @@ def _cos(a, b):
 
 def _img_search(jsonl_path: str, query_img_path: str, topk: int = 20):
     # image query: downscale query img to vector, compare cosine
+    if Image is None:
+        return []
     import numpy as _np
 
     q_im = Image.open(query_img_path)
