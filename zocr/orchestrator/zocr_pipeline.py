@@ -22,6 +22,12 @@ try:
 except ImportError:  # pragma: no cover - fallback for very old Python
     from typing_extensions import Literal  # type: ignore
 
+from .instrumentation import (
+    compute_stage_stats,
+    print_stage_trace_console,
+    record_stage_trace,
+    set_stage_trace_sink,
+)
 from .prior import PriorBandit, normalize_headers_to_signature, decide_success
 from .reporting import (
     generate_report,
@@ -103,8 +109,6 @@ def _call(stage, **kw):
         except Exception as e:
             print(f"[PLUGIN:{stage}] {fn.__name__} -> {e}")
 
-_STAGE_TRACE_SINK: Optional[List[Dict[str, Any]]] = None
-
 
 def _env_truthy(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -113,122 +117,11 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
-def _set_stage_trace_sink(sink: Optional[List[Dict[str, Any]]]) -> None:
-    global _STAGE_TRACE_SINK
-    _STAGE_TRACE_SINK = sink
-
-
-def _stage_output_preview(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, dict):
-        interesting = (
-            "path",
-            "paths",
-            "count",
-            "records",
-            "pages",
-            "tables",
-            "cells",
-            "reason",
-            "summary",
-            "output",
-            "metrics",
-        )
-        preview: Dict[str, Any] = {}
-        for key in interesting:
-            if key in value:
-                preview[key] = value[key]
-        if preview:
-            return _json_ready(preview)
-        if len(value) <= 4:
-            return _json_ready(value)
-        return f"{len(value)} keys"
-    if isinstance(value, (list, tuple, set)):
-        seq = list(value)
-        if not seq:
-            return []
-        if len(seq) <= 4 and all(isinstance(item, (bool, int, float, str)) for item in seq):
-            return seq
-        return f"{len(seq)} items"
-    return str(type(value).__name__)
-
-
-def _record_stage_trace(rec: Dict[str, Any]) -> None:
-    if _STAGE_TRACE_SINK is None:
-        return
-    snapshot: Dict[str, Any] = {
-        "name": rec.get("name"),
-        "elapsed_ms": float(rec.get("elapsed_ms") or 0.0),
-    }
-    if rec.get("ok") is None:
-        snapshot["ok"] = None
-    else:
-        snapshot["ok"] = bool(rec.get("ok"))
-    if rec.get("error"):
-        snapshot["error"] = rec.get("error")
-    preview = _stage_output_preview(rec.get("out"))
-    if preview is not None:
-        snapshot["out"] = preview
-    _STAGE_TRACE_SINK.append(snapshot)
-
-
-def _summarize_stage_preview(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (bool, int, float)):
-        return str(value)
-    if isinstance(value, str):
-        return value if len(value) <= 80 else value[:77] + "..."
-    if isinstance(value, dict):
-        items: List[str] = []
-        for idx, (key, val) in enumerate(value.items()):
-            if idx >= 3:
-                items.append("…")
-                break
-            items.append(f"{key}={val}")
-        return ", ".join(items)
-    if isinstance(value, (list, tuple, set)):
-        seq = list(value)
-        if not seq:
-            return ""
-        snippet = ", ".join(str(item) for item in seq[:3])
-        if len(seq) > 3:
-            snippet += ", …"
-        return snippet
-    return str(value)
-
-
-def _print_stage_trace_console(stage_trace: List[Dict[str, Any]], stats: Optional[Dict[str, Any]] = None) -> None:
-    if not stage_trace:
-        return
-    print("\n[Stage Trace]")
-    header = f"{'Stage':<28} {'OK':<4} {'Elapsed (ms)':>12}  Details"
-    print(header)
-    print("-" * len(header))
-    for entry in stage_trace:
-        name = (entry.get("name") or "?")
-        ok_val = entry.get("ok")
-        status = "ok" if ok_val is True else ("fail" if ok_val is False else "…")
-        elapsed = float(entry.get("elapsed_ms") or 0.0)
-        detail = _summarize_stage_preview(entry.get("out"))
-        if entry.get("error"):
-            err = str(entry.get("error"))
-            detail = f"{detail} | {err}" if detail else err
-        if len(detail) > 96:
-            detail = detail[:93] + "..."
-        print(f"{name:<28.28} {status:<4} {elapsed:>12.1f}  {detail}")
-    if stats:
-        total = float(stats.get("total_elapsed_ms") or 0.0)
-        fail = stats.get("failures")
-        count = stats.get("count")
-        print("-" * len(header))
-        print(f"Total stages: {count}, failures: {fail}, elapsed: {total:.1f} ms")
-        slowest = stats.get("slowest") if isinstance(stats, dict) else None
-        if isinstance(slowest, dict) and slowest.get("name"):
-            print(f"Slowest: {slowest.get('name')} ({slowest.get('elapsed_ms')} ms)")
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -1253,14 +1146,14 @@ def _safe_step(name, fn, *a, **kw):
         dt = (time.perf_counter() - t0) * 1000.0
         print(f"[OK]   {name} ({dt:.1f} ms)")
         result = {"ok": True, "elapsed_ms": dt, "out": out, "name": name}
-        _record_stage_trace(result)
+        record_stage_trace(result)
         return result
     except Exception as e:
         dt = (time.perf_counter() - t0) * 1000.0
         print(f"[FAIL] {name} ({dt:.1f} ms): {type(e).__name__}: {e}")
         traceback.print_exc()
         result = {"ok": False, "elapsed_ms": dt, "error": f"{type(e).__name__}: {e}", "name": name}
-        _record_stage_trace(result)
+        record_stage_trace(result)
         return result
 
 def _sha256(p):
@@ -3326,7 +3219,7 @@ def _patched_run_full_pipeline(
 
     ensure_dir(outdir)
     stage_trace: List[Dict[str, Any]] = []
-    _set_stage_trace_sink(stage_trace)
+    set_stage_trace_sink(stage_trace)
     stage_trace_console = _env_truthy("ZOCR_STAGE_TRACE_CONSOLE", False)
     if print_stage_trace is not None:
         stage_trace_console = bool(print_stage_trace)
@@ -4918,18 +4811,12 @@ def _patched_run_full_pipeline(
             )
 
     if stage_trace:
-        total_ms = sum(float(entry.get("elapsed_ms") or 0.0) for entry in stage_trace)
-        failures = sum(1 for entry in stage_trace if entry.get("ok") is False)
-        slowest = max(stage_trace, key=lambda e: float(e.get("elapsed_ms") or 0.0)) if stage_trace else None
         summary["stage_trace"] = _json_ready(stage_trace)
-        summary["stage_stats"] = {
-            "count": len(stage_trace),
-            "failures": failures,
-            "total_elapsed_ms": total_ms,
-            "slowest": {"name": slowest.get("name"), "elapsed_ms": slowest.get("elapsed_ms")} if slowest else None,
-        }
-        if stage_trace_console:
-            _print_stage_trace_console(stage_trace, summary.get("stage_stats"))
+        stats = compute_stage_stats(stage_trace)
+        if stats:
+            summary["stage_stats"] = stats
+            if stage_trace_console:
+                print_stage_trace_console(stage_trace, stats)
 
     if bandit and bandit_signature and bandit_action:
         try:
@@ -4951,7 +4838,7 @@ def _patched_run_full_pipeline(
         generate_report(outdir, dest=report_path, summary=summary, history=history_records, meta=read_meta(outdir))
     except Exception as e:
         print("Report generation skipped:", e)
-    _set_stage_trace_sink(None)
+    set_stage_trace_sink(None)
     return summary
 
 run_full_pipeline = _patched_run_full_pipeline
