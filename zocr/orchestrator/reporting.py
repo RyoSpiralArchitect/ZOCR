@@ -178,6 +178,39 @@ def _render_hotspots_section(summary: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _render_local_index_section(summary: Dict[str, Any]) -> str:
+    stats = summary.get("local_index_stats") if isinstance(summary, dict) else None
+    title = "ローカル検索インデックス / Local index / Index local"
+    if isinstance(stats, dict) and stats:
+        order = [
+            "index_path",
+            "document_count",
+            "vocab_size",
+            "avg_doc_len",
+            "median_doc_len",
+            "p95_doc_len",
+            "max_doc_len",
+            "jsonl_path",
+            "stale",
+            "source_path",
+            "source_missing",
+            "created_at",
+            "version",
+            "error",
+        ]
+        table = _render_table(stats, title, order)
+        if table:
+            return table
+    index_path = summary.get("index") if isinstance(summary, dict) else None
+    if index_path:
+        body = "<p class=\"muted\">(no stats recorded; index at <code>{}</code>)</p>".format(
+            escape(str(index_path))
+        )
+    else:
+        body = "<p class=\"muted\">(no local index generated)</p>"
+    return f"<section><h2>{escape(title)}</h2>{body}</section>"
+
+
 def _default_styles() -> str:
     return """
     body { font-family: 'Inter', 'Segoe UI', 'Hiragino Sans', sans-serif; margin: 2rem; background: #0d1117; color: #e6edf3; }
@@ -280,6 +313,7 @@ def _render_document(
     tune_html = _render_table(summary.get("tune"), "自動調整 / Tuning / Ajustement") if summary.get("tune") else ""
     learn_html = _render_table(summary.get("learn"), "学習 / Learning / Apprentissage") if summary.get("learn") else ""
     hotspot_html = _render_hotspots_section(summary)
+    index_html = _render_local_index_section(summary)
     history_html = _render_history_table(history)
 
     stats_text = []
@@ -321,6 +355,7 @@ def _render_document(
   {stats_block}
   {info_table}
   {core_table}
+  {index_html}
   {monitor_html}
   {tune_html}
   {learn_html}

@@ -68,6 +68,29 @@ class _MissingModuleProxy:
 
 
 try:
+    from ..consensus.local_search import (
+        load_local_index as _consensus_load_local_index,
+        summarize_local_index as _consensus_summarize_local_index,
+    )
+except Exception:  # pragma: no cover - local search is optional
+    _consensus_load_local_index = None  # type: ignore
+    _consensus_summarize_local_index = None  # type: ignore
+
+class _MissingModuleProxy:
+    """Minimal proxy that surfaces the original import error on access."""
+
+    def __init__(self, label: str, error: Exception):
+        self.__name__ = label
+        self._error = error
+
+    def __getattr__(self, name: str):  # pragma: no cover - triggered only when missing deps
+        raise AttributeError(f"{self.__name__} is unavailable: {self._error}") from self._error
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<Missing module {self.__name__}: {self._error}>"
+
+
+try:
     from ..consensus import zocr_consensus as zocr_onefile_consensus  # type: ignore
     _CONSENSUS_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:
@@ -4671,6 +4694,27 @@ def _patched_run_full_pipeline(
             "total_elapsed_ms": total_elapsed,
         }
     summary["dependencies"] = _dependency_snapshot()
+    index_stats: Optional[Dict[str, Any]] = None
+    index_path = summary.get("index")
+    if index_path:
+        if _consensus_load_local_index and _consensus_summarize_local_index:
+            if os.path.exists(index_path):
+                try:
+                    ix = _consensus_load_local_index(index_path)
+                    index_stats = _consensus_summarize_local_index(ix)
+                    jsonl_ref = summary.get("contextual_jsonl")
+                    if jsonl_ref:
+                        index_stats["jsonl_path"] = jsonl_ref
+                        index_stats["stale"] = bool(ix.is_stale(jsonl_ref))
+                    index_stats["index_path"] = index_path
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    index_stats = {"index_path": index_path, "error": str(exc)}
+            else:
+                index_stats = {"index_path": index_path, "error": "missing index file"}
+        else:
+            index_stats = {"index_path": index_path, "error": "local search helpers unavailable"}
+    if index_stats:
+        summary["local_index_stats"] = index_stats
     summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path

@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Tuple
 
 try:  # pragma: no cover - optional dependency when local search is disabled
@@ -19,7 +20,10 @@ __all__ = [
     "LocalDocument",
     "LocalIndex",
     "LocalSearchResult",
+    "clear_local_index_cache",
+    "describe_local_index",
     "ensure_local_index",
+    "summarize_local_index",
     "_tokenize",
     "_bm25_build",
     "_bm25_query",
@@ -31,6 +35,59 @@ __all__ = [
     "load_local_index",
     "query_local",
 ]
+
+
+_INDEX_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _cache_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def _cache_get(path: Path) -> LocalIndex | None:
+    key = _cache_key(path)
+    entry = _INDEX_CACHE.get(key)
+    if not entry:
+        return None
+    try:
+        stat = path.resolve().stat()
+    except OSError:
+        _INDEX_CACHE.pop(key, None)
+        return None
+    mtime = entry.get("mtime")
+    size = entry.get("size")
+    if (mtime is not None and abs(stat.st_mtime - float(mtime)) > 1e-6) or (
+        size is not None and int(size) != stat.st_size
+    ):
+        _INDEX_CACHE.pop(key, None)
+        return None
+    cached = entry.get("index")
+    return cached if isinstance(cached, LocalIndex) else None
+
+
+def _cache_set(path: Path, index: "LocalIndex") -> None:
+    try:
+        stat = path.resolve().stat()
+    except OSError:
+        return
+    _INDEX_CACHE[_cache_key(path)] = {
+        "index": index,
+        "mtime": stat.st_mtime,
+        "size": stat.st_size,
+    }
+
+
+def clear_local_index_cache(path: str | os.PathLike[str] | None = None) -> None:
+    """Drop cached :class:`LocalIndex` entries (optionally for ``path`` only)."""
+
+    if path is None:
+        _INDEX_CACHE.clear()
+        return
+    key = _cache_key(Path(path))
+    _INDEX_CACHE.pop(key, None)
 
 
 def _utc_timestamp() -> str:
@@ -91,6 +148,7 @@ class LocalIndex:
     def save(self, path: Path) -> None:
         with path.open("wb") as fw:
             pickle.dump(self.serialize(), fw)
+        _cache_set(Path(path), self)
 
     def is_stale(self, jsonl_path: str | os.PathLike[str]) -> bool:
         """Return ``True`` when the backing JSONL changed since the index was built."""
@@ -163,6 +221,17 @@ class LocalIndex:
             if "D" in payload:
                 return cls.from_legacy(payload)
         raise TypeError("Unsupported index payload; rebuild the local index.")
+
+    @property
+    def vocab_size(self) -> int:
+        """Return the observed vocabulary size."""
+
+        return len(self.df)
+
+    def stats(self) -> Dict[str, Any]:
+        """Convenience wrapper for :func:`summarize_local_index`."""
+
+        return summarize_local_index(self)
 
 
 @dataclass
@@ -343,13 +412,20 @@ def build_local_index(jsonl_path: str | os.PathLike[str], out_pkl: str | os.Path
     return ix
 
 
-def load_local_index(pkl_path: str | os.PathLike[str]) -> LocalIndex:
+def load_local_index(pkl_path: str | os.PathLike[str], *, use_cache: bool = True) -> LocalIndex:
     """Load a serialized local index with a helpful error message."""
 
     path = Path(pkl_path)
+    if use_cache:
+        cached = _cache_get(path)
+        if cached is not None:
+            return cached
     with path.open("rb") as f:
         payload = pickle.load(f)
-    return LocalIndex.ensure(payload)
+    index = LocalIndex.ensure(payload)
+    if use_cache:
+        _cache_set(path, index)
+    return index
 
 
 def ensure_local_index(
@@ -358,6 +434,7 @@ def ensure_local_index(
     *,
     rebuild: bool = False,
     rebuild_on_stale: bool = True,
+    use_cache: bool = True,
 ) -> Tuple[LocalIndex, bool]:
     """Return a :class:`LocalIndex` and flag when it was rebuilt."""
 
@@ -368,7 +445,7 @@ def ensure_local_index(
         ix = build_local_index(jsonl, pkl)
         rebuilt = True
     else:
-        ix = load_local_index(pkl)
+        ix = load_local_index(pkl, use_cache=use_cache)
         if rebuild_on_stale and ix.is_stale(jsonl):
             ix = build_local_index(jsonl, pkl)
             rebuilt = True
@@ -386,18 +463,89 @@ def query_local(
     rebuild: bool = False,
     rebuild_on_stale: bool = True,
     index: LocalIndex | None = None,
+    use_cache: bool = True,
 ):
     """Query the contextual search index with optional auto-(re)builds."""
 
     if index is None:
         if autobuild:
             index, _ = ensure_local_index(
-                jsonl_path, pkl_path, rebuild=rebuild, rebuild_on_stale=rebuild_on_stale
+                jsonl_path,
+                pkl_path,
+                rebuild=rebuild,
+                rebuild_on_stale=rebuild_on_stale,
+                use_cache=use_cache,
             )
         else:
-            index = load_local_index(pkl_path)
+            index = load_local_index(pkl_path, use_cache=use_cache)
     bm = _bm25_query(index, text_query or "", topk=topk)
     im = _img_search(jsonl_path, image_query_path, topk=topk) if image_query_path else []
     merged = _rrf_merge(bm, im, k=60, topk=topk)
     return [result.as_mapping() for result in merged]
+
+
+def summarize_local_index(index: LocalIndex) -> Dict[str, Any]:
+    """Return descriptive statistics for ``index``."""
+
+    lengths = [max(0, int(doc.length)) for doc in index.documents]
+    stats: Dict[str, Any] = {
+        "document_count": len(index.documents),
+        "total_docs": int(index.total_docs),
+        "avg_doc_len": float(index.avg_doc_len or 0.0),
+        "vocab_size": index.vocab_size,
+        "version": int(index.version),
+        "created_at": index.created_at,
+        "source_path": index.source_path,
+        "source_mtime": index.source_mtime,
+        "source_bytes": index.source_bytes,
+    }
+    if lengths:
+        ordered = sorted(lengths)
+        stats.update(
+            min_doc_len=int(ordered[0]),
+            max_doc_len=int(ordered[-1]),
+            median_doc_len=float(median(ordered)),
+            mean_doc_len=float(mean(lengths)),
+        )
+
+        def _percentile(q: float) -> float:
+            if not ordered:
+                return 0.0
+            if len(ordered) == 1:
+                return float(ordered[0])
+            import math
+
+            rank = (len(ordered) - 1) * q
+            low = int(math.floor(rank))
+            high = int(math.ceil(rank))
+            if low == high:
+                return float(ordered[low])
+            weight = rank - low
+            return float(ordered[low] * (1 - weight) + ordered[high] * weight)
+
+        stats["p95_doc_len"] = float(_percentile(0.95))
+    stats["source_missing"] = bool(
+        stats.get("source_path") and not Path(str(stats["source_path"])).exists()
+    )
+    return stats
+
+
+def describe_local_index(
+    pkl_path: str | os.PathLike[str],
+    jsonl_path: str | os.PathLike[str] | None = None,
+    *,
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """Load ``pkl_path`` and return :func:`summarize_local_index` with file metadata."""
+
+    ix = load_local_index(pkl_path, use_cache=use_cache)
+    stats = summarize_local_index(ix)
+    stats["index_path"] = str(Path(pkl_path))
+    if jsonl_path is not None:
+        stats["jsonl_path"] = str(Path(jsonl_path))
+        try:
+            stats["stale"] = bool(ix.is_stale(jsonl_path))
+        except Exception:
+            stats["stale"] = None
+    return stats
 

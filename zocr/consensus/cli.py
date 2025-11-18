@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from .local_search import build_local_index, ensure_local_index, query_local
+from .local_search import (
+    build_local_index,
+    describe_local_index,
+    ensure_local_index,
+    query_local,
+)
 from .runtime import (
     Pipeline,
     auto_calibrate_params,
@@ -27,6 +33,7 @@ __all__ = [
     "_patch_cli_for_export_and_search",
     "cli_export",
     "cli_index",
+    "cli_stats",
     "cli_query",
     "main",
 ]
@@ -176,6 +183,49 @@ def cli_index(args):
     print(f"Wrote local index with {index.total_docs} records -> {pkl}")
 
 
+def cli_stats(args):
+    out_dir = args.out
+    jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
+    pkl = os.path.join(out_dir, "bm25.pkl")
+    if not os.path.exists(pkl):
+        print("Missing BM25 index:", pkl)
+        return
+    stats = describe_local_index(pkl, jsonl_path=jsonl if os.path.exists(jsonl) else None)
+    if args.json:
+        print(json.dumps(stats, ensure_ascii=False, indent=2))
+        return
+    print(f"Index path: {stats.get('index_path')}")
+    if stats.get("jsonl_path"):
+        print(f"Contextual JSONL: {stats.get('jsonl_path')}")
+    doc_count = stats.get("document_count")
+    vocab = stats.get("vocab_size")
+    avg_len = stats.get("avg_doc_len")
+    print(
+        "Documents: {doc_count}  |  Vocabulary: {vocab}  |  Avg length: {avg:.1f}".format(
+            doc_count=doc_count if doc_count is not None else "?",
+            vocab=vocab if vocab is not None else "?",
+            avg=float(avg_len or 0.0),
+        )
+    )
+    if stats.get("median_doc_len") is not None:
+        print(
+            "Median length: {med:.1f}  |  P95 length: {p95:.1f}  |  Max length: {mx}".format(
+                med=float(stats.get("median_doc_len") or 0.0),
+                p95=float(stats.get("p95_doc_len") or 0.0),
+                mx=int(stats.get("max_doc_len") or 0),
+            )
+        )
+    created = stats.get("created_at")
+    if created:
+        print("Built at:", created)
+    if stats.get("source_path"):
+        stale_flag = stats.get("stale")
+        stale_txt = " (stale vs JSONL)" if stale_flag else ""
+        print(f"Source: {stats['source_path']}{stale_txt}")
+    if stats.get("source_missing"):
+        print("⚠️  Source JSONL no longer exists; rebuild recommended.")
+
+
 def cli_query(args):
     out_dir = args.out
     jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
@@ -238,6 +288,11 @@ def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argpars
     sp = sub.add_parser("index", help="Build local BM25 index from exported JSONL")
     add_common(sp)
     sp.set_defaults(func=cli_index)
+
+    sp = sub.add_parser("stats", help="Inspect cached BM25 metadata")
+    sp.add_argument("--json", action="store_true", help="Emit JSON stats instead of text")
+    add_common(sp)
+    sp.set_defaults(func=cli_stats)
 
     sp = sub.add_parser("query", help="Query local index (RRF with optional image)")
     sp.add_argument("--query", type=str, default="")
