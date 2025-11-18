@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from .local_search import build_local_index, query_local
+from .local_search import build_local_index, ensure_local_index, query_local
 from .runtime import (
     Pipeline,
     auto_calibrate_params,
@@ -172,23 +172,28 @@ def cli_index(args):
         print("contextual JSONL not found:", jsonl)
         return
     pkl = os.path.join(args.out, "bm25.pkl")
-    build_local_index(jsonl, pkl)
-    print("Wrote local index:", pkl)
+    index = build_local_index(jsonl, pkl)
+    print(f"Wrote local index with {index.total_docs} records -> {pkl}")
 
 
 def cli_query(args):
     out_dir = args.out
     jsonl = os.path.join(out_dir, "doc.contextual.jsonl")
     pkl = os.path.join(out_dir, "bm25.pkl")
-    if not (os.path.exists(jsonl) and os.path.exists(pkl)):
-        print("Missing JSONL or index:", jsonl, pkl)
+    if not os.path.exists(jsonl):
+        print("Missing contextual JSONL:", jsonl)
         return
+    index, rebuilt = ensure_local_index(jsonl, pkl)
+    if rebuilt:
+        print("Rebuilt BM25 index from contextual JSONL.")
     merged = query_local(
         jsonl,
         pkl,
         text_query=args.query or "",
         image_query_path=(args.image_query or None),
         topk=args.topk,
+        autobuild=False,
+        index=index,
     )
     # Print concise results
     for i, r in enumerate(merged, 1):
