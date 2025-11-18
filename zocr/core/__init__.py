@@ -1,2 +1,13 @@
-"""Public API for the multi-domain core."""
-from .zocr_core import *  # noqa: F401,F403
+"""Core package shim keeping ``__init__`` minimal."""
+
+from . import _surface as _surface
+
+__all__ = _surface.__all__
+
+
+def __getattr__(name: str):
+    return getattr(_surface, name)
+
+
+def __dir__() -> list[str]:
+    return _surface.__dir__()

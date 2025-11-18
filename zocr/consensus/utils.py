@@ -1,4 +1,4 @@
-"""Light-weight helpers shared by ecore modules."""
+"""Light-weight helpers shared by consensus runtime primitives."""
 from __future__ import annotations
 
 from typing import TypeVar
