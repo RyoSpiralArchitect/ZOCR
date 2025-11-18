@@ -44,15 +44,43 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _np = None  # type: ignore
 
+class _MissingModuleProxy:
+    """Minimal proxy that surfaces the original import error on access."""
+
+    def __init__(self, label: str, error: Exception):
+        self.__name__ = label
+        self._error = error
+
+    def __getattr__(self, name: str):  # pragma: no cover - triggered only when missing deps
+        raise AttributeError(f"{self.__name__} is unavailable: {self._error}") from self._error
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<Missing module {self.__name__}: {self._error}>"
+
+
 try:
     from ..consensus import zocr_consensus as zocr_onefile_consensus  # type: ignore
-except Exception:
-    import zocr_onefile_consensus  # type: ignore
+    _CONSENSUS_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:
+    try:
+        import zocr_onefile_consensus  # type: ignore
+    except Exception:
+        _CONSENSUS_IMPORT_ERROR = exc
+        zocr_onefile_consensus = _MissingModuleProxy("zocr_onefile_consensus", exc)  # type: ignore
+    else:
+        _CONSENSUS_IMPORT_ERROR = None
 
 try:
     from ..core import zocr_core as zocr_multidomain_core  # type: ignore
-except Exception:
-    import zocr_multidomain_core  # type: ignore
+    _CORE_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:
+    try:
+        import zocr_multidomain_core  # type: ignore
+    except Exception:
+        _CORE_IMPORT_ERROR = exc
+        zocr_multidomain_core = _MissingModuleProxy("zocr_multidomain_core", exc)  # type: ignore
+    else:
+        _CORE_IMPORT_ERROR = None
 
 if __name__.startswith("zocr."):
     sys.modules.setdefault("zocr_pipeline_allinone", sys.modules[__name__])
@@ -5298,7 +5326,7 @@ run_full_pipeline = _patched_run_full_pipeline
 # ---------------- CLI ----------------
 def main():
     argv = sys.argv[1:]
-    if argv and argv[0] in {"history", "summary", "plugins", "report", "diagnose"}:
+    if argv and argv[0] in {"history", "summary", "plugins", "report", "diagnose", "inspect"}:
         cmd = argv[0]
         rest = argv[1:]
         if cmd == "history":
@@ -5372,6 +5400,57 @@ def main():
                         for sub_key in ("path", "version", "detail", "hint"):
                             if info.get(sub_key):
                                 print(f"     {sub_key}: {info[sub_key]}")
+            return
+        if cmd == "inspect":
+            ip = argparse.ArgumentParser("ZOCR stack inspection")
+            ip.add_argument("--json", action="store_true", help="emit structured JSON instead of text output")
+            ip.add_argument(
+                "--modules",
+                nargs="*",
+                choices=["consensus", "core", "pipeline"],
+                default=[],
+                help="limit the report to these sections",
+            )
+            ip.add_argument(
+                "--exports",
+                action="store_true",
+                help="include per-module __all__ exports in the report",
+            )
+            iargs = ip.parse_args(rest)
+            from .stack_inspector import describe_full_stack, format_stack_report
+
+            stack_summary = describe_full_stack(
+                pipeline_module=sys.modules.get(__name__),
+                consensus_module=zocr_onefile_consensus,
+                core_module=zocr_multidomain_core,
+                include_exports=iargs.exports,
+            )
+            sections = iargs.modules or None
+            import_errors = {}
+            if '_CONSENSUS_IMPORT_ERROR' in globals() and _CONSENSUS_IMPORT_ERROR:
+                import_errors["consensus"] = str(_CONSENSUS_IMPORT_ERROR)
+            if '_CORE_IMPORT_ERROR' in globals() and _CORE_IMPORT_ERROR:
+                import_errors["core"] = str(_CORE_IMPORT_ERROR)
+            if iargs.json:
+                payload = stack_summary
+                if sections is not None:
+                    payload = {key: stack_summary.get(key) for key in sections if key in stack_summary}
+                if import_errors:
+                    payload = dict(payload)
+                    payload["import_errors"] = import_errors
+                print(json.dumps(_json_ready(payload), ensure_ascii=False, indent=2))
+            else:
+                if import_errors:
+                    print("[WARN] Some modules failed to import:")
+                    for key, msg in import_errors.items():
+                        print(f" - {key}: {msg}")
+                print(
+                    format_stack_report(
+                        stack_summary,
+                        include_exports=iargs.exports,
+                        sections=sections,
+                    )
+                )
             return
 
     if argv and argv[0] == "run":
