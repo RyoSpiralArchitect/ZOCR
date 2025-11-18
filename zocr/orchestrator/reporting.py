@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from .history import load_history, read_meta, read_summary
 
+DEFAULT_PAGE_TITLE = "ZOCR Pipeline Report / パイプラインレポート / Rapport"
+
 __all__ = ["ReportContext", "generate_report"]
 
 
@@ -202,7 +204,11 @@ def _default_styles() -> str:
     """
 
 
-def _render_document(ctx: ReportContext) -> str:
+def _render_document(
+    ctx: ReportContext, *, styles: Optional[str] = None, title: str = DEFAULT_PAGE_TITLE
+) -> str:
+    """Render the complete HTML document for a :class:`ReportContext`."""
+
     summary = ctx.summary
     history = ctx.trimmed_history()
     stats = summary.get("history_stats") or {}
@@ -300,15 +306,17 @@ def _render_document(ctx: ReportContext) -> str:
             "<details><summary>pip freeze</summary><pre>" + escape(pip_lines + extra) + "</pre></details>"
         )
 
+    css = styles or _default_styles()
+    page_title = title or DEFAULT_PAGE_TITLE
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\">
-  <title>ZOCR Report</title>
-  <style>{_default_styles()}</style>
+  <title>{escape(page_title)}</title>
+  <style>{css}</style>
 </head>
 <body>
-  <h1>ZOCR Pipeline Report / パイプラインレポート / Rapport</h1>
+  <h1>{escape(page_title)}</h1>
   <p>outdir: <code>{escape(os.path.abspath(ctx.outdir))}</code></p>
   {stats_block}
   {info_table}
@@ -343,8 +351,19 @@ def generate_report(
     history: Optional[List[Dict[str, Any]]] = None,
     meta: Optional[Dict[str, Any]] = None,
     limit: Optional[int] = 50,
+    *,
+    title: Optional[str] = None,
+    styles: Optional[str] = None,
 ) -> str:
-    """Render the HTML pipeline report and return the destination path."""
+    """Render the HTML pipeline report and return the destination path.
+
+    Parameters
+    ----------
+    title:
+        Optional heading used for both the document title and hero header.
+    styles:
+        Optional CSS override; falls back to the bundled dark theme when omitted.
+    """
 
     summary = summary or read_summary(outdir)
     history = history or load_history(outdir)
@@ -360,7 +379,7 @@ def generate_report(
         meta=meta or {},
         limit=limit,
     )
-    document = _render_document(ctx)
+    document = _render_document(ctx, styles=styles, title=title or DEFAULT_PAGE_TITLE)
     with open(dest, "w", encoding="utf-8") as fw:
         fw.write(document)
     return dest

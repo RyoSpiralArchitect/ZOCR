@@ -22,6 +22,8 @@ __all__ = [
 
 
 def _dp_means_1d(points, lam, iters: int = 3):
+    """Cluster 1-D points with a greedy DP-means heuristic."""
+
     if not points:
         return []
     centers = [float(points[0])]
@@ -41,6 +43,8 @@ def _dp_means_1d(points, lam, iters: int = 3):
 
 
 def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -> List[List[float]]:
+    """Recursively partition sorted values into buckets of similar density."""
+
     ordered = sorted(float(v) for v in values if math.isfinite(v))
     if not ordered:
         return []
@@ -65,6 +69,8 @@ def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -
 
 
 def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_depth: int = 5) -> List[float]:
+    """Return deduplicated centers from the adaptive bucket partitioning."""
+
     buckets = _btree_partition(points, min_bucket=max(1, min_bucket), max_depth=max(1, max_depth))
     centers: List[float] = []
     for bucket in buckets:
@@ -82,6 +88,8 @@ def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_dept
 
 
 def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: int) -> List[int]:
+    """Locate valley indices in a smoothed projection histogram."""
+
     if values.size <= 2:
         return []
     valleys: List[int] = []
@@ -101,6 +109,8 @@ def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: in
 def _align_row_band_centers(
     row_bands: List[Tuple[int, int]], height: int, med_h: float
 ) -> List[Tuple[int, int]]:
+    """Nudge band centers onto a smoother grid for downstream merging."""
+
     if len(row_bands) <= 1:
         return row_bands
     centers = [0.5 * (y0 + y1) for (y0, y1) in row_bands]
@@ -167,6 +177,8 @@ def _smooth_per_column(
     *,
     thomas_solver: Optional[Callable[["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"], "np.ndarray"]] = None,
 ) -> List[int]:
+    """Project row-wise column candidates to a smooth global solution."""
+
     if not has_numpy():
         return [0, W]
     import numpy as np
