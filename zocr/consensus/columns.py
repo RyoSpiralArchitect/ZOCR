@@ -3,14 +3,12 @@ from __future__ import annotations
 
 import math
 from statistics import median
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
-try:  # pragma: no cover - numpy is optional
+from .utils import clamp, has_numpy
+
+if TYPE_CHECKING:  # pragma: no cover
     import numpy as np
-except Exception:  # pragma: no cover - fallback when numpy is unavailable
-    np = None  # type: ignore
-
-from .utils import clamp
 
 __all__ = [
     "_dp_means_1d",
@@ -24,6 +22,8 @@ __all__ = [
 
 
 def _dp_means_1d(points, lam, iters: int = 3):
+    """Cluster 1-D points with a greedy DP-means heuristic."""
+
     if not points:
         return []
     centers = [float(points[0])]
@@ -43,6 +43,8 @@ def _dp_means_1d(points, lam, iters: int = 3):
 
 
 def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -> List[List[float]]:
+    """Recursively partition sorted values into buckets of similar density."""
+
     ordered = sorted(float(v) for v in values if math.isfinite(v))
     if not ordered:
         return []
@@ -67,6 +69,8 @@ def _btree_partition(values: Sequence[float], min_bucket: int, max_depth: int) -
 
 
 def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_depth: int = 5) -> List[float]:
+    """Return deduplicated centers from the adaptive bucket partitioning."""
+
     buckets = _btree_partition(points, min_bucket=max(1, min_bucket), max_depth=max(1, max_depth))
     centers: List[float] = []
     for bucket in buckets:
@@ -84,6 +88,8 @@ def _btree_column_centers(points: Sequence[float], min_bucket: int = 6, max_dept
 
 
 def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: int) -> List[int]:
+    """Locate valley indices in a smoothed projection histogram."""
+
     if values.size <= 2:
         return []
     valleys: List[int] = []
@@ -103,6 +109,8 @@ def _find_projection_valleys(values: "np.ndarray", threshold: float, min_gap: in
 def _align_row_band_centers(
     row_bands: List[Tuple[int, int]], height: int, med_h: float
 ) -> List[Tuple[int, int]]:
+    """Nudge band centers onto a smoother grid for downstream merging."""
+
     if len(row_bands) <= 1:
         return row_bands
     centers = [0.5 * (y0 + y1) for (y0, y1) in row_bands]
@@ -128,8 +136,12 @@ def _align_row_band_centers(
 def _vertical_vote_boundaries(
     binary: "np.ndarray", max_candidates: int = 16, min_gap: int = 6
 ) -> List[int]:
-    if np is None:
+    """Return likely vertical column separators from a binary mask."""
+
+    if not has_numpy():
         return []
+    import numpy as np
+
     try:
         arr = np.asarray(binary, dtype=np.uint8)
     except Exception:
@@ -165,8 +177,11 @@ def _smooth_per_column(
     *,
     thomas_solver: Optional[Callable[["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"], "np.ndarray"]] = None,
 ) -> List[int]:
-    if np is None:
+    """Project row-wise column candidates to a smooth global solution."""
+
+    if not has_numpy():
         return [0, W]
+    import numpy as np
     R = len(candidates_by_row)
     if R == 0:
         return [0, W]
@@ -204,16 +219,7 @@ def _smooth_per_column(
             if thomas_solver is not None:
                 x = thomas_solver(a, b, c, x)
             else:
-                cp = c.copy()
-                bp = b.copy()
-                dp = x.copy()
-                for i in range(1, n):
-                    m = a[i - 1] / bp[i - 1]
-                    bp[i] -= m * cp[i - 1]
-                    dp[i] -= m * dp[i - 1]
-                x[-1] = dp[-1] / bp[-1]
-                for i in range(n - 2, -1, -1):
-                    x[i] = (dp[i] - cp[i] * x[i + 1]) / bp[i]
+                x = _thomas_solve(a, b, c, x)
         return x.tolist()
 
     rows_smoothed = []
@@ -233,3 +239,18 @@ def _smooth_per_column(
         cleaned.append(min(W, max(0, x)))
     cleaned[-1] = W
     return cleaned
+
+
+def _thomas_solve(a, b, c, d):
+    """Solve a tridiagonal system using the Thomas algorithm."""
+    cp = c.copy()
+    bp = b.copy()
+    dp = d.copy()
+    for i in range(1, len(d)):
+        m = a[i - 1] / bp[i - 1]
+        bp[i] -= m * cp[i - 1]
+        dp[i] -= m * dp[i - 1]
+    d[-1] = dp[-1] / bp[-1]
+    for i in range(len(d) - 2, -1, -1):
+        d[i] = (dp[i] - cp[i] * d[i + 1]) / bp[i]
+    return d
