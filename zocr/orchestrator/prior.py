@@ -1,12 +1,21 @@
+"""Adaptive prior controller shared by the orchestrator pipeline."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 from dataclasses import dataclass
+from random import betavariate
 from statistics import median
 from typing import Any, Dict, List, Optional
-from random import betavariate
+
+__all__ = [
+    "PriorDecision",
+    "PriorBandit",
+    "normalize_headers_to_signature",
+    "estimate_sigma_px",
+    "decide_success",
+]
 
 
 @dataclass

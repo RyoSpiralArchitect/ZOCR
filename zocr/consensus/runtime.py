@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - optional dependency
     _PYTESS_ERR = None  # type: ignore
 from html.parser import HTMLParser
 
-from .ecore import (
+from .runtime_primitives import (
     _apply_italic_guard,
     _binarize_pure,
     _btree_column_centers,
@@ -65,8 +65,8 @@ from .ecore import (
     _smooth_per_column,
     _vertical_vote_boundaries,
     clamp,
+    _align_row_band_centers,
 )
-from .ecore.columns import _align_row_band_centers
 
 
 def _env_truthy_local(name: str, default: bool = False) -> bool:
