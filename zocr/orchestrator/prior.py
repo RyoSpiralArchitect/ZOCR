@@ -4,9 +4,9 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from random import betavariate
 from statistics import median
 from typing import Any, Dict, List, Optional
-from random import betavariate
 
 
 @dataclass
