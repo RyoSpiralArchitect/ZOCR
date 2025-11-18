@@ -5,7 +5,9 @@ import json
 import os
 import pickle
 import re
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List
 
 try:  # pragma: no cover - optional dependency when local search is disabled
     from PIL import Image  # type: ignore
@@ -13,6 +15,7 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore
 
 __all__ = [
+    "LocalSearchResult",
     "_tokenize",
     "_bm25_build",
     "_bm25_query",
@@ -21,8 +24,21 @@ __all__ = [
     "_img_search",
     "_rrf_merge",
     "build_local_index",
+    "load_local_index",
     "query_local",
 ]
+
+
+@dataclass
+class LocalSearchResult:
+    """Structured representation of a single local search hit."""
+
+    score: float
+    obj: Dict[str, Any]
+    source: str
+
+    def as_mapping(self) -> Dict[str, Any]:
+        return {"score": float(self.score), "obj": self.obj, "source": self.source}
 
 
 def _tokenize(s: str) -> List[str]:
@@ -31,7 +47,7 @@ def _tokenize(s: str) -> List[str]:
     return [t for t in s.split() if t]
 
 
-def _bm25_build(jsonl_path: str):
+def _bm25_build(jsonl_path: str | os.PathLike[str]):
     import math
 
     D = []
@@ -133,7 +149,7 @@ def _img_search(jsonl_path: str, query_img_path: str, topk: int = 20):
     return scores[:topk]
 
 
-def _rrf_merge(listA, listB, k: int = 60, topk: int = 10):
+def _rrf_merge(listA, listB, k: int = 60, topk: int = 10) -> List[LocalSearchResult]:
     # listA: [(score, doc)], listB: [(score, doc or (idx,doc))]
     rank: Dict[str, Dict[str, Any]] = {}
 
@@ -146,16 +162,31 @@ def _rrf_merge(listA, listB, k: int = 60, topk: int = 10):
 
     add_list(listA, is_img=False)
     add_list(listB, is_img=True)
-    merged = list(rank.values())
-    merged.sort(key=lambda x: -x["score"])
+    merged = [
+        LocalSearchResult(score=float(entry["score"]), obj=entry["obj"], source="fusion")
+        for entry in rank.values()
+    ]
+    merged.sort(key=lambda x: -x.score)
     return merged[:topk]
 
 
-def build_local_index(jsonl_path: str, out_pkl: str):
+def build_local_index(jsonl_path: str | os.PathLike[str], out_pkl: str | os.PathLike[str]):
+    """Build and persist the BM25 index for contextual search."""
+
     ix = _bm25_build(jsonl_path)
-    with open(out_pkl, "wb") as f:
+    out_path = Path(out_pkl)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as f:
         pickle.dump(ix, f)
     return ix
+
+
+def load_local_index(pkl_path: str | os.PathLike[str]):
+    """Load a serialized local index with a helpful error message."""
+
+    path = Path(pkl_path)
+    with path.open("rb") as f:
+        return pickle.load(f)
 
 
 def query_local(
@@ -165,10 +196,9 @@ def query_local(
     image_query_path: str | None = None,
     topk: int = 10,
 ):
-    with open(pkl_path, "rb") as f:
-        ix = pickle.load(f)
+    ix = load_local_index(pkl_path)
     bm = _bm25_query(ix, text_query or "", topk=topk)
     im = _img_search(jsonl_path, image_query_path, topk=topk) if image_query_path else []
     merged = _rrf_merge(bm, im, k=60, topk=topk)
-    return merged
+    return [result.as_mapping() for result in merged]
 

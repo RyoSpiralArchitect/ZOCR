@@ -1,25 +1,23 @@
 """Connected-component helpers for consensus runtime consumers."""
 from __future__ import annotations
 
-from typing import List, Tuple
-
-try:  # pragma: no cover - numpy is optional
-    import numpy as np
-except Exception:  # pragma: no cover - fallback when numpy is unavailable
-    np = None  # type: ignore
+from typing import List, Sequence, Tuple
 
 __all__ = ["_rle_runs", "_cc_label_rle"]
 
 
-def _rle_runs(binary: "np.ndarray"):
-    H, W = binary.shape
+def _rle_runs(binary: Sequence[Sequence[int]]):
+    """Yield run-length encoded spans for each row of ``binary``."""
+
+    H = len(binary)
     runs_by_row = []
     for y in range(H):
         row = binary[y]
+        width = len(row)
         runs = []
         in_run = False
         start = 0
-        for x in range(W):
+        for x in range(width):
             v = row[x]
             if v and not in_run:
                 in_run = True
@@ -28,12 +26,14 @@ def _rle_runs(binary: "np.ndarray"):
                 runs.append((start, x))
                 in_run = False
         if in_run:
-            runs.append((start, W))
+            runs.append((start, width))
         runs_by_row.append(runs)
     return runs_by_row
 
 
-def _cc_label_rle(binary: "np.ndarray"):
+def _cc_label_rle(binary: Sequence[Sequence[int]]):
+    """Return bounding boxes for connected components via RLE linking."""
+
     runs_by_row = _rle_runs(binary)
     parent = []
     bbox = []

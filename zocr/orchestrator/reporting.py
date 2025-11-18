@@ -4,83 +4,30 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from html import escape
 from typing import Any, Dict, List, Optional
 
-__all__ = [
-    "load_history",
-    "print_history",
-    "read_summary",
-    "read_meta",
-    "generate_report",
-]
+from .history import load_history, read_meta, read_summary
+
+__all__ = ["ReportContext", "generate_report"]
 
 
-def load_history(outdir: str) -> List[Dict[str, Any]]:
-    """Load pipeline history records from ``pipeline_history.jsonl`` if present."""
+@dataclass
+class ReportContext:
+    """Bundle the report inputs so rendering helpers stay side-effect free."""
 
-    path = os.path.join(outdir, "pipeline_history.jsonl")
-    records: List[Dict[str, Any]] = []
-    if not os.path.exists(path):
-        return records
-    with open(path, "r", encoding="utf-8") as fr:
-        for line in fr:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except Exception:
-                continue
-    return records
+    outdir: str
+    dest: str
+    summary: Dict[str, Any]
+    history: List[Dict[str, Any]]
+    meta: Dict[str, Any]
+    limit: Optional[int] = 50
 
-
-def print_history(records: List[Dict[str, Any]], limit: Optional[int] = None) -> None:
-    """Pretty-print a subset of history records to stdout."""
-
-    if limit is not None and limit > 0:
-        records = records[-limit:]
-    if not records:
-        print("(no history)")
-        return
-    w_step = max(4, max(len(str(r.get("name") or r.get("step"))) for r in records))
-    w_status = 7
-    header = f"{'timestamp':<20}  {'step':<{w_step}}  {'status':<{w_status}}  elapsed_ms  note"
-    print(header)
-    print("-" * len(header))
-    for rec in records:
-        ts = rec.get("ts", "-")
-        step = rec.get("name") or rec.get("step") or "?"
-        status = "OK" if rec.get("ok") else ("FAIL" if rec.get("ok") is False else "-")
-        elapsed = rec.get("elapsed_ms")
-        note = rec.get("error") or ""
-        if rec.get("out") and status == "OK" and not isinstance(rec["out"], (str, int, float)):
-            if isinstance(rec["out"], dict) and rec["out"].get("path"):
-                note = rec["out"]["path"]
-        print(f"{ts:<20}  {step:<{w_step}}  {status:<{w_status}}  {elapsed!s:<10}  {note}")
-
-
-def read_summary(outdir: str) -> Dict[str, Any]:
-    """Read the consolidated ``pipeline_summary.json`` from disk."""
-
-    path = os.path.join(outdir, "pipeline_summary.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    with open(path, "r", encoding="utf-8") as fr:
-        return json.load(fr)
-
-
-def read_meta(outdir: str) -> Optional[Dict[str, Any]]:
-    """Read the optional snapshot metadata file if it exists."""
-
-    path = os.path.join(outdir, "pipeline_meta.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as fr:
-            return json.load(fr)
-    except Exception:
-        return None
+    def trimmed_history(self) -> List[Dict[str, Any]]:
+        if self.limit is not None and self.limit > 0 and len(self.history) > self.limit:
+            return self.history[-self.limit :]
+        return self.history
 
 
 def _render_value(value: Any) -> str:
@@ -229,33 +176,8 @@ def _render_hotspots_section(summary: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def generate_report(
-    outdir: str,
-    dest: Optional[str] = None,
-    summary: Optional[Dict[str, Any]] = None,
-    history: Optional[List[Dict[str, Any]]] = None,
-    meta: Optional[Dict[str, Any]] = None,
-    limit: Optional[int] = 50,
-) -> str:
-    """Render the HTML pipeline report and return the destination path."""
-
-    summary = summary or read_summary(outdir)
-    history = history or load_history(outdir)
-    meta = meta if meta is not None else read_meta(outdir)
-    if limit is not None and limit > 0 and len(history) > limit:
-        history = history[-limit:]
-    dest = dest or os.path.join(outdir, "pipeline_report.html")
-    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
-
-    stats = summary.get("history_stats") or {}
-    total_ms = stats.get("total_elapsed_ms")
-    ok_count = stats.get("ok")
-    fail_count = stats.get("fail")
-    total_s = None
-    if isinstance(total_ms, (int, float)):
-        total_s = total_ms / 1000.0
-
-    css = """
+def _default_styles() -> str:
+    return """
     body { font-family: 'Inter', 'Segoe UI', 'Hiragino Sans', sans-serif; margin: 2rem; background: #0d1117; color: #e6edf3; }
     a { color: #9cdcfe; }
     h1, h2, h3 { color: #58a6ff; }
@@ -279,19 +201,29 @@ def generate_report(
     footer { margin-top: 3rem; font-size: 0.85rem; opacity: 0.7; }
     """
 
+
+def _render_document(ctx: ReportContext) -> str:
+    summary = ctx.summary
+    history = ctx.trimmed_history()
+    stats = summary.get("history_stats") or {}
+    total_ms = stats.get("total_elapsed_ms")
+    ok_count = stats.get("ok")
+    fail_count = stats.get("fail")
+    total_s = total_ms / 1000.0 if isinstance(total_ms, (int, float)) else None
+
+    meta = ctx.meta or {}
     meta_table = _render_table(
-        meta or {},
+        meta,
         "環境 / Environment / Environnement",
         ["seed", "python", "platform", "env", "versions"],
     ) if meta else "<p class=\"muted\">(no snapshot metadata — run with --snapshot)</p>"
 
-    dep_table = ""
     deps = summary.get("dependencies") if isinstance(summary, dict) else None
-    if isinstance(deps, dict) and deps:
-        dep_table = _render_table(
-            deps,
-            "依存診断 / Dependency Check / Diagnostic",
-        )
+    dep_table = (
+        _render_table(deps, "依存診断 / Dependency Check / Diagnostic")
+        if isinstance(deps, dict) and deps
+        else ""
+    )
 
     core_table = _render_table(
         {
@@ -331,8 +263,9 @@ def generate_report(
             names = ", ".join(escape(str(fn)) for fn in fns) or "–"
             plugin_rows.append(f"<tr><th scope=\"row\">{escape(stage)}</th><td>{names}</td></tr>")
         plugin_html = (
-            "<section><h2>プラグイン / Plugins / Extensions</h2><table class=\"kv\">" +
-            "".join(plugin_rows) + "</table></section>"
+            "<section><h2>プラグイン / Plugins / Extensions</h2><table class=\"kv\">"
+            + "".join(plugin_rows)
+            + "</table></section>"
         )
     else:
         plugin_html = "<section><h2>プラグイン / Plugins / Extensions</h2><p class=\"muted\">(no plugins registered)</p></section>"
@@ -341,7 +274,6 @@ def generate_report(
     tune_html = _render_table(summary.get("tune"), "自動調整 / Tuning / Ajustement") if summary.get("tune") else ""
     learn_html = _render_table(summary.get("learn"), "学習 / Learning / Apprentissage") if summary.get("learn") else ""
     hotspot_html = _render_hotspots_section(summary)
-
     history_html = _render_history_table(history)
 
     stats_text = []
@@ -359,7 +291,7 @@ def generate_report(
     stats_block = "<p class=\"muted\">" + " ・ ".join(stats_text) + "</p>" if stats_text else ""
 
     pip_html = ""
-    if meta and meta.get("pip_freeze"):
+    if meta.get("pip_freeze"):
         pip_lines = "\n".join(meta["pip_freeze"][:200])
         extra = ""
         if len(meta["pip_freeze"]) > 200:
@@ -368,16 +300,16 @@ def generate_report(
             "<details><summary>pip freeze</summary><pre>" + escape(pip_lines + extra) + "</pre></details>"
         )
 
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\">
   <title>ZOCR Report</title>
-  <style>{css}</style>
+  <style>{_default_styles()}</style>
 </head>
 <body>
   <h1>ZOCR Pipeline Report / パイプラインレポート / Rapport</h1>
-  <p>outdir: <code>{escape(os.path.abspath(outdir))}</code></p>
+  <p>outdir: <code>{escape(os.path.abspath(ctx.outdir))}</code></p>
   {stats_block}
   {info_table}
   {core_table}
@@ -403,6 +335,32 @@ def generate_report(
 </html>
 """
 
+
+def generate_report(
+    outdir: str,
+    dest: Optional[str] = None,
+    summary: Optional[Dict[str, Any]] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = 50,
+) -> str:
+    """Render the HTML pipeline report and return the destination path."""
+
+    summary = summary or read_summary(outdir)
+    history = history or load_history(outdir)
+    meta = meta if meta is not None else read_meta(outdir)
+    dest = dest or os.path.join(outdir, "pipeline_report.html")
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+
+    ctx = ReportContext(
+        outdir=outdir,
+        dest=dest,
+        summary=summary,
+        history=history,
+        meta=meta or {},
+        limit=limit,
+    )
+    document = _render_document(ctx)
     with open(dest, "w", encoding="utf-8") as fw:
-        fw.write(html)
+        fw.write(document)
     return dest

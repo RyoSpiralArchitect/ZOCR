@@ -22,20 +22,17 @@ try:
 except ImportError:  # pragma: no cover - fallback for very old Python
     from typing_extensions import Literal  # type: ignore
 
+from .dependencies import collect_dependency_diagnostics
 from .instrumentation import (
     compute_stage_stats,
     print_stage_trace_console,
     record_stage_trace,
     set_stage_trace_sink,
 )
+from .plugins import PLUGINS, call_stage, describe_plugins, register_stage
 from .prior import PriorBandit, normalize_headers_to_signature, decide_success
-from .reporting import (
-    generate_report,
-    load_history,
-    print_history,
-    read_meta,
-    read_summary,
-)
+from .history import load_history, print_history, read_meta, read_summary
+from .reporting import generate_report
 from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
     DiffAssistPlanner,
@@ -94,20 +91,26 @@ except Exception as exc:
     else:
         _CORE_IMPORT_ERROR = None
 
+def _dependency_snapshot() -> Dict[str, Any]:
+    """Return optional dependency diagnostics with best-effort modules."""
+
+    consensus_module = (
+        None if isinstance(zocr_onefile_consensus, _MissingModuleProxy) else zocr_onefile_consensus
+    )
+    core_module = (
+        None if isinstance(zocr_multidomain_core, _MissingModuleProxy) else zocr_multidomain_core
+    )
+    return collect_dependency_diagnostics(
+        consensus_module=consensus_module,
+        core_module=core_module,
+        numpy_module=_np,
+    )
+
 if __name__.startswith("zocr."):
     sys.modules.setdefault("zocr_pipeline_allinone", sys.modules[__name__])
 
-PLUGINS = {}
-def register(stage):
-    def deco(fn):
-        PLUGINS.setdefault(stage, []).append(fn); return fn
-    return deco
-def _call(stage, **kw):
-    for fn in PLUGINS.get(stage, []):
-        try:
-            fn(**kw)
-        except Exception as e:
-            print(f"[PLUGIN:{stage}] {fn.__name__} -> {e}")
+register = register_stage
+_call = call_stage
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -116,12 +119,6 @@ def _env_truthy(name: str, default: bool = False) -> bool:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
-
-def _env_truthy(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -353,81 +350,6 @@ def _default_toy_sweeps() -> int:
         return max(1, int(raw)) if raw is not None else 5
     except Exception:
         return 5
-
-
-def _collect_dependency_diagnostics() -> Dict[str, Any]:
-    """Summarise optional dependencies so operators can self-check the environment."""
-    diag: Dict[str, Any] = {}
-
-    detect_pdf_backends = getattr(zocr_onefile_consensus, "detect_pdf_raster_backends", None)
-    if callable(detect_pdf_backends):
-        try:
-            diag["pdf_raster"] = detect_pdf_backends()
-        except Exception:
-            pass
-    if "pdf_raster" not in diag:
-        poppler_path = shutil.which("pdftoppm")
-        diag["pdf_raster"] = {
-            "status": "ready" if poppler_path else "missing",
-            "active": "poppler_pdftoppm" if poppler_path else None,
-            "poppler_pdftoppm": {
-                "status": "available" if poppler_path else "missing",
-                "path": poppler_path,
-            },
-            "hint": None
-            if poppler_path
-            else "Install poppler-utils (pdftoppm) or `pip install pypdfium2` for multi-page PDF rasterisation",
-        }
-    pdf_diag = diag.get("pdf_raster")
-    if isinstance(pdf_diag, dict):
-        for backend in ("poppler_pdftoppm", "pypdfium2"):
-            entry = pdf_diag.get(backend)
-            if isinstance(entry, dict):
-                diag[backend] = dict(entry)
-
-    numba_enabled = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA", False))
-    numba_parallel = bool(getattr(zocr_multidomain_core, "_HAS_NUMBA_PARALLEL", False))
-    if numba_enabled:
-        detail = "Numba acceleration active"
-        if not numba_parallel:
-            detail += " (atomic.add unavailable; DF reduction running serially)"
-    else:
-        detail = "Falling back to pure Python BM25 scoring"
-    diag["numba"] = {
-        "status": "enabled" if numba_enabled else "python-fallback",
-        "detail": detail,
-    }
-
-    libc_path = getattr(zocr_multidomain_core, "_LIBC_PATH", None)
-    diag["c_extensions"] = {
-        "status": "loaded" if libc_path else "python-fallback",
-        "path": libc_path,
-        "detail": "Custom SIMD/Thomas/rle helpers" if libc_path else "Using pure Python/NumPy helpers",
-    }
-
-    numpy_version = None
-    if _np is not None:
-        try:
-            numpy_version = getattr(_np, "__version__", None)
-        except Exception:
-            numpy_version = None
-    diag["numpy"] = {
-        "status": "available" if _np is not None else "missing",
-        "version": numpy_version,
-    }
-
-    try:
-        import PIL  # type: ignore
-
-        pillow_version = getattr(PIL, "__version__", None)
-    except Exception:
-        pillow_version = None
-    diag["pillow"] = {
-        "status": "available" if pillow_version else "unknown",
-        "version": pillow_version,
-    }
-
-    return diag
 
 
 def _is_auto_domain(value: Optional[str]) -> bool:
@@ -4736,8 +4658,7 @@ def _patched_run_full_pipeline(
         )
 
     if PLUGINS:
-        summary["plugins"] = {stage: [getattr(fn, "__name__", str(fn)) for fn in fns]
-                               for stage, fns in PLUGINS.items()}
+        summary["plugins"] = describe_plugins()
 
     history_records = load_history(outdir)
     if history_records:
@@ -4749,7 +4670,7 @@ def _patched_run_full_pipeline(
             "fail": fail_count,
             "total_elapsed_ms": total_elapsed,
         }
-    summary["dependencies"] = _collect_dependency_diagnostics()
+    summary["dependencies"] = _dependency_snapshot()
     summary["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_path = os.path.join(outdir, "pipeline_report.html")
     summary["report_html"] = report_path
@@ -4907,7 +4828,7 @@ def main():
             dp = argparse.ArgumentParser("ZOCR dependency diagnostics")
             dp.add_argument("--json", action="store_true", help="emit structured JSON instead of a table")
             dargs = dp.parse_args(rest)
-            diag = _collect_dependency_diagnostics()
+            diag = _dependency_snapshot()
             if dargs.json:
                 print(json.dumps(_json_ready(diag), ensure_ascii=False, indent=2))
             else:

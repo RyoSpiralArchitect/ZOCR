@@ -1,12 +1,12 @@
 """Image binarization helpers extracted from the consensus runtime."""
 from __future__ import annotations
 
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
-try:  # pragma: no cover - numpy is optional at runtime
+from .utils import has_numpy, require_numpy
+
+if TYPE_CHECKING:  # pragma: no cover - imported only for typing purposes
     import numpy as np
-except Exception:  # pragma: no cover - fallback when numpy is unavailable
-    np = None  # type: ignore
 
 
 __all__ = [
@@ -20,8 +20,9 @@ __all__ = [
 
 
 def _box_mean(gray, k: int = 31):
-    if np is None:
-        raise RuntimeError("NumPy required")
+    """Return the local mean inside a ``k`` sized box for each pixel."""
+
+    np = require_numpy("_box_mean")
     k = max(3, int(k))
     k |= 1
     r = k // 2
@@ -41,13 +42,20 @@ def _box_mean(gray, k: int = 31):
 
 
 def _binarize_pure(gray, k: int = 31, c: int = 10):
+    """Apply adaptive binarization using a box mean and threshold offset."""
+
+    np = require_numpy("_binarize_pure")
     m = _box_mean(gray, k)
     return (gray < (m - c)).astype(np.uint8) * 255
 
 
 def _estimate_slant_slope(binary: "np.ndarray") -> float:
-    if np is None:
+    """Return a coarse italic slant slope estimate in radians."""
+
+    if not has_numpy():
         return 0.0
+    import numpy as np
+
     try:
         coords = np.argwhere(np.asarray(binary, dtype=np.uint8) > 0)
     except Exception:
@@ -68,8 +76,9 @@ def _estimate_slant_slope(binary: "np.ndarray") -> float:
 
 
 def _shear_rows_binary(binary01: "np.ndarray", slope: float) -> "np.ndarray":
-    if np is None:
-        raise RuntimeError("NumPy required")
+    """Shear a binary mask by ``slope`` to compensate italic skew."""
+
+    np = require_numpy("_shear_rows_binary")
     arr = (np.asarray(binary01, dtype=np.uint8) > 0).astype(np.uint8)
     H, W = arr.shape
     out = np.zeros_like(arr)
@@ -89,8 +98,9 @@ def _shear_rows_binary(binary01: "np.ndarray", slope: float) -> "np.ndarray":
 
 
 def _suppress_diagonal_bridges(binary01: "np.ndarray") -> "np.ndarray":
-    if np is None:
-        raise RuntimeError("NumPy required")
+    """Remove single-pixel diagonal bridges that join components."""
+
+    np = require_numpy("_suppress_diagonal_bridges")
     arr = (np.asarray(binary01, dtype=np.uint8) > 0).astype(np.uint8)
     if arr.size == 0:
         return arr
@@ -114,8 +124,11 @@ def _suppress_diagonal_bridges(binary01: "np.ndarray") -> "np.ndarray":
 
 
 def _apply_italic_guard(binary: "np.ndarray") -> "np.ndarray":
-    if np is None:
+    """Harden slanted strokes by combining the original and deskewed mask."""
+
+    if not has_numpy():
         return binary
+    import numpy as np
     arr = (np.asarray(binary, dtype=np.uint8) > 0).astype(np.uint8)
     arr = _suppress_diagonal_bridges(arr)
     slope = _estimate_slant_slope(arr)
