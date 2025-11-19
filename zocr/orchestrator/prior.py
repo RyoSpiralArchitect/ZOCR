@@ -1,12 +1,21 @@
+"""Adaptive prior controller shared by the orchestrator pipeline."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 from dataclasses import dataclass
+from random import betavariate
 from statistics import median
 from typing import Any, Dict, List, Optional
-from random import betavariate
+
+__all__ = [
+    "PriorDecision",
+    "PriorBandit",
+    "normalize_headers_to_signature",
+    "estimate_sigma_px",
+    "decide_success",
+]
 
 
 @dataclass
@@ -39,6 +48,8 @@ class PriorBandit:
         return bucket[action]
 
     def decide(self, signature: str) -> str:
+        """Sample an action for ``signature`` using Thompson Sampling."""
+
         weights: Dict[str, float] = {}
         for action in ("WITH_PRIOR", "NO_PRIOR"):
             ab = self._get(signature, action)
@@ -46,6 +57,8 @@ class PriorBandit:
         return max(weights, key=weights.get)
 
     def update(self, signature: str, action: str, success: bool) -> None:
+        """Update posterior counts for ``signature`` after observing ``success``."""
+
         ab = self._get(signature, action)
         key = "a" if success else "b"
         ab[key] = float(ab.get(key, 1.0) + 1.0)
