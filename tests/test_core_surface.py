@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
+import sys
 
 
 def test_core_surface_exposes_compat_module() -> None:
@@ -78,3 +80,14 @@ def test_core_surface_all_stays_in_sync_with_exports() -> None:
     }
 
     assert expected == set(core.__all__)
+
+
+def test_core_package_can_run_as_module() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "zocr.core", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "ZOCR Multi-domain Core" in result.stdout
