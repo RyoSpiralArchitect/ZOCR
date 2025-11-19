@@ -7,7 +7,9 @@ import pickle
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
+from .._compat import optional_numpy
+
+np = optional_numpy(__name__)
 try:  # pragma: no cover - optional dependency
     from PIL import Image
 except Exception:  # pragma: no cover - fallback stub
