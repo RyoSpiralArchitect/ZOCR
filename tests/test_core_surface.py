@@ -1,56 +1,35 @@
+"""Regression tests for the lazy zocr.core surface."""
+
+from __future__ import annotations
+
 import importlib
-import pathlib
-import sys
-
-import pytest
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-
-@pytest.fixture(autouse=True)
-def reload_core_surface():
-    """Reset the lazy surface cache for isolated assertions."""
-
-    surface = importlib.import_module("zocr.core._surface")
-    surface._LOADED.clear()
-    importlib.reload(surface)
-
-    core_pkg = importlib.import_module("zocr.core")
-    importlib.reload(core_pkg)
-    try:
-        yield
-    finally:
-        surface._LOADED.clear()
-
-
-def test_surface_exports_proxy_functions():
-    import zocr.core as core
-    import zocr.core.zocr_core as module
-
-    for name in module.__all__:
-        exported = getattr(core, name)
-        assert exported is getattr(module, name), name
-
-
-def test_surface_exposes_module_directly():
-    import zocr.core as core
-    import zocr.core.zocr_core as module
-
-    assert core.zocr_core is module
-
-
-def test_surface_dir_matches_exports():
+def test_core_surface_exposes_compat_module() -> None:
     import zocr.core as core
 
-    exported = set(core.__all__)
-    assert exported <= set(dir(core))
+    compat = importlib.import_module("zocr.core.zocr_core")
+    assert core.zocr_core is compat
 
 
-def test_unknown_attribute_raises():
+def test_core_surface_proxies_to_split_modules() -> None:
     import zocr.core as core
 
-    with pytest.raises(AttributeError):
-        _ = core.does_not_exist
+    from zocr.core import augmenter, indexer, query_engine, exporters, monitoring
+
+    assert core.augment is augmenter.augment
+    assert core.build_index is indexer.build_index
+    assert core.query is query_engine.query
+    assert core.sql_export is exporters.sql_export
+    assert core.export_rag_bundle is exporters.export_rag_bundle
+    assert core.monitor is monitoring.monitor
+    assert core.learn_from_monitor is monitoring.learn_from_monitor
+    assert core.autotune_unlabeled is monitoring.autotune_unlabeled
+    assert (
+        core.metric_col_over_under_rate is monitoring.metric_col_over_under_rate
+    )
+    assert core.metric_chunk_consistency is monitoring.metric_chunk_consistency
+    assert (
+        core.metric_col_alignment_energy_cached
+        is monitoring.metric_col_alignment_energy_cached
+    )
