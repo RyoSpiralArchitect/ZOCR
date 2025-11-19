@@ -6,6 +6,7 @@ from importlib import import_module
 from typing import Any, Dict
 
 __all__ = [
+    "zocr_core",
     "augment",
     "build_index",
     "query",
@@ -20,7 +21,7 @@ __all__ = [
     "main",
 ]
 
-_ATTR_SET = set(__all__)
+_PROXIED_ATTRS = set(__all__) - {"zocr_core"}
 _LOADED: Dict[str, Any] = {}
 
 
@@ -33,8 +34,10 @@ def _load_core() -> Any:
 
 
 def __getattr__(name: str) -> Any:
-    if name in _ATTR_SET:
-        module = _load_core()
+    module = _load_core()
+    if name == "zocr_core":
+        return module
+    if name in _PROXIED_ATTRS:
         return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
