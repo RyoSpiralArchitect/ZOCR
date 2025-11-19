@@ -3,32 +3,7 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any, Dict, Tuple
-
-__all__ = [
-    "zocr_core",
-    "augment",
-    "build_index",
-    "query",
-    "sql_export",
-    "export_rag_bundle",
-    "monitor",
-    "learn_from_monitor",
-    "autotune_unlabeled",
-    "metric_col_over_under_rate",
-    "metric_chunk_consistency",
-    "metric_col_alignment_energy_cached",
-    "main",
-    "augmenter",
-    "base",
-    "domains",
-    "exporters",
-    "indexer",
-    "monitoring",
-    "numba_support",
-    "query_engine",
-    "tokenization",
-]
+from typing import TYPE_CHECKING, Any, Dict, Tuple
 
 _ATTR_TO_MODULE_ATTR: Dict[str, Tuple[str, str]] = {
     "augment": (".augmenter", "augment"),
@@ -60,7 +35,35 @@ _MODULE_EXPORTS: Dict[str, str] = {
     "tokenization": ".tokenization",
 }
 
+__all__ = ["zocr_core", *_ATTR_TO_MODULE_ATTR.keys(), *_MODULE_EXPORTS.keys()]
+
 _LOADED: Dict[str, Any] = {}
+
+if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
+    from . import (
+        augmenter,
+        base,
+        domains,
+        exporters,
+        indexer,
+        monitoring,
+        numba_support,
+        query_engine,
+        tokenization,
+    )
+    from .augmenter import augment
+    from .indexer import build_index
+    from .monitoring import (
+        autotune_unlabeled,
+        learn_from_monitor,
+        metric_chunk_consistency,
+        metric_col_alignment_energy_cached,
+        metric_col_over_under_rate,
+        monitor,
+    )
+    from .query_engine import query
+    from .exporters import export_rag_bundle, sql_export
+    from .zocr_core import main
 
 
 def _load_module(module_spec: str) -> Any:

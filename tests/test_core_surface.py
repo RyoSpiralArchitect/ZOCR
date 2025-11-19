@@ -33,3 +33,48 @@ def test_core_surface_proxies_to_split_modules() -> None:
         core.metric_col_alignment_energy_cached
         is monitoring.metric_col_alignment_energy_cached
     )
+
+
+def test_core_surface_exposes_split_modules() -> None:
+    import zocr.core as core
+
+    assert core.augmenter is importlib.import_module("zocr.core.augmenter")
+    assert core.base is importlib.import_module("zocr.core.base")
+    assert core.domains is importlib.import_module("zocr.core.domains")
+    assert core.exporters is importlib.import_module("zocr.core.exporters")
+    assert core.indexer is importlib.import_module("zocr.core.indexer")
+    assert core.monitoring is importlib.import_module("zocr.core.monitoring")
+    assert core.numba_support is importlib.import_module("zocr.core.numba_support")
+    assert core.query_engine is importlib.import_module("zocr.core.query_engine")
+    assert core.tokenization is importlib.import_module("zocr.core.tokenization")
+
+
+def test_core_surface_all_stays_in_sync_with_exports() -> None:
+    import zocr.core as core
+
+    expected = {
+        "zocr_core",
+        "augment",
+        "build_index",
+        "query",
+        "sql_export",
+        "export_rag_bundle",
+        "monitor",
+        "learn_from_monitor",
+        "autotune_unlabeled",
+        "metric_col_over_under_rate",
+        "metric_chunk_consistency",
+        "metric_col_alignment_energy_cached",
+        "main",
+        "augmenter",
+        "base",
+        "domains",
+        "exporters",
+        "indexer",
+        "monitoring",
+        "numba_support",
+        "query_engine",
+        "tokenization",
+    }
+
+    assert expected == set(core.__all__)
