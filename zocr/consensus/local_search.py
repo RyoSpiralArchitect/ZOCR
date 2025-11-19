@@ -102,9 +102,30 @@ class LocalDocument:
     tokens: List[str]
     raw: Dict[str, Any]
     length: int
+    _term_freq: Dict[str, int] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self.tokens = [str(t) for t in self.tokens]
+        self.raw = dict(self.raw or {})
+        if isinstance(self.length, (int, float)):
+            self.length = int(self.length)
+        else:
+            self.length = len(self.tokens)
+        if self.length <= 0:
+            self.length = len(self.tokens)
 
     def as_payload(self) -> Dict[str, Any]:
         return {"id": self.doc_id, "len": self.length, "toks": self.tokens, "raw": self.raw}
+
+    def term_frequency(self) -> Dict[str, int]:
+        """Return a cached term-frequency map for this document."""
+
+        if not self._term_freq and self.tokens:
+            freq: Dict[str, int] = {}
+            for token in self.tokens:
+                freq[token] = freq.get(token, 0) + 1
+            self._term_freq = freq
+        return self._term_freq
 
     @classmethod
     def from_payload(cls, payload: Dict[str, Any]) -> "LocalDocument":
@@ -305,9 +326,7 @@ def _bm25_query(
     for doc in index.documents:
         if doc.length == 0:
             continue
-        tf: Dict[str, int] = {}
-        for t in doc.tokens:
-            tf[t] = tf.get(t, 0) + 1
+        tf = doc.term_frequency()
         s = 0.0
         for t in q_toks:
             df_t = df.get(t)
