@@ -11,6 +11,7 @@ _ATTR_TO_MODULE_ATTR: Dict[str, Tuple[str, str]] = {
     "query": (".query_engine", "query"),
     "sql_export": (".exporters", "sql_export"),
     "export_rag_bundle": (".exporters", "export_rag_bundle"),
+    "embed_jsonl": (".embedders", "embed_jsonl"),
     "monitor": (".monitoring", "monitor"),
     "learn_from_monitor": (".monitoring", "learn_from_monitor"),
     "autotune_unlabeled": (".monitoring", "autotune_unlabeled"),
@@ -27,6 +28,7 @@ _MODULE_EXPORTS: Dict[str, str] = {
     "augmenter": ".augmenter",
     "base": ".base",
     "domains": ".domains",
+    "embedders": ".embedders",
     "exporters": ".exporters",
     "indexer": ".indexer",
     "monitoring": ".monitoring",
@@ -44,6 +46,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         augmenter,
         base,
         domains,
+        embedders,
         exporters,
         indexer,
         monitoring,
@@ -53,6 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
     )
     from .augmenter import augment
     from .indexer import build_index
+    from .embedders import embed_jsonl
     from .monitoring import (
         autotune_unlabeled,
         learn_from_monitor,

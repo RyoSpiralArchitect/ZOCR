@@ -10,6 +10,7 @@ __all__ = [
     "augment",
     "build_index",
     "query",
+    "embed_jsonl",
     "sql_export",
     "export_rag_bundle",
     "monitor",
@@ -36,6 +37,12 @@ def build_index(*args, **kwargs):
 
 def query(*args, **kwargs):
     from .query_engine import query as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def embed_jsonl(*args, **kwargs):
+    from .embedders import embed_jsonl as _impl
 
     return _impl(*args, **kwargs)
 
@@ -116,6 +123,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--w-sym", type=float, default=0.45)
     sp.add_argument("--domain", default="invoice")
 
+    sp = sub.add_parser("embed")
+    sp.add_argument("--jsonl", required=True)
+    sp.add_argument("--out", default=None)
+    sp.add_argument("--model", default=os.environ.get("ZOCR_EMBED_MODEL"))
+    sp.add_argument("--text-field", default="text")
+    sp.add_argument("--batch-size", type=int, default=32)
+    sp.add_argument("--no-normalize", action="store_true")
+
     sp = sub.add_parser("sql")
     sp.add_argument("--jsonl", required=True)
     sp.add_argument("--outdir", required=True)
@@ -186,6 +201,19 @@ def main(argv: Optional[list[str]] = None) -> None:
                 f"sym={scores.get('symbolic', 0):.2f} amt={filters.get('amount')} date={filters.get('date')} "
                 f"text='{(ob.get('text') or '')[:60]}'"
             )
+        return
+    if args.cmd == "embed":
+        if not args.model:
+            raise SystemExit("Please pass --model or set ZOCR_EMBED_MODEL")
+        out_path = embed_jsonl(
+            args.jsonl,
+            args.out,
+            args.model,
+            text_field=args.text_field,
+            batch_size=args.batch_size,
+            normalize=not args.no_normalize,
+        )
+        print(out_path)
         return
     if args.cmd == "sql":
         paths = sql_export(args.jsonl, args.outdir, args.prefix)
