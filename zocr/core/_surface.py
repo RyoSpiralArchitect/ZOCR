@@ -9,6 +9,7 @@ _ATTR_TO_MODULE_ATTR: Dict[str, Tuple[str, str]] = {
     "augment": (".augmenter", "augment"),
     "build_index": (".indexer", "build_index"),
     "query": (".query_engine", "query"),
+    "hybrid_query": (".query_engine", "hybrid_query"),
     "sql_export": (".exporters", "sql_export"),
     "export_rag_bundle": (".exporters", "export_rag_bundle"),
     "monitor": (".monitoring", "monitor"),

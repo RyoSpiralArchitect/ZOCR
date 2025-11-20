@@ -5,6 +5,8 @@
 - **[EN]** The repo focuses on the modular `zocr/` package (`consensus`, `core`, `orchestrator`) that chains OCR → augmentation → indexing → monitoring → tuning → reporting. The legacy `zocr_allinone_merged_plus.py` remains as a drop-in backup.
 - **[FR]** Le paquet modulaire `zocr/` (`consensus`, `core`, `orchestrator`) relie OCR → augmentation → indexation → surveillance → réglage → rapport via une seule commande. Le fichier unique `zocr_allinone_merged_plus.py` est conservé pour compatibilité.
 
+> Structure-aware RAG blueprint: see [`docs/hybrid_rag_zocr.md`](docs/hybrid_rag_zocr.md) for a minimal design that injects Z-OCR semantic tags into hybrid retrieval.
+
 ## レイアウト / Layout / Structure
 ```
 zocr/
