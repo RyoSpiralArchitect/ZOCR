@@ -18,12 +18,21 @@ import json
 import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from zocr.orchestrator import zocr_pipeline
 
-__all__ = ["IngestRequest", "IngestResult", "QueryResult", "ingest_job", "query_job"]
+__all__ = [
+    "IngestRequest",
+    "IngestResult",
+    "QueryResult",
+    "ingest_job",
+    "query_job",
+    "ingest_response_payload_v0",
+    "query_response_payload_v0",
+]
 
 
 @dataclass
@@ -67,6 +76,7 @@ class QueryResult:
     answer: Dict[str, str]
     artifacts: Dict[str, Any]
     provenance: List[Dict[str, str]]
+    flags: Dict[str, Any]
     status: str
 
 
@@ -113,7 +123,7 @@ def ingest_job(request: IngestRequest) -> IngestResult:
             resume=request.resume,
             **request.pipeline_kwargs,
         )
-        status = "succeeded"
+        status = "completed"
         error = None
     except Exception as exc:  # pragma: no cover - surfaced to caller
         summary = None
@@ -200,7 +210,7 @@ def query_job(
     }
 
     artifacts: Dict[str, Any] = {
-        "tables": [manifest_summary.get("table_meta")],
+        "tables": [],
         "charts": [],
         "sources": {
             "manifest": _existing(manifest_path),
@@ -208,10 +218,12 @@ def query_job(
             "doc_jsonl": _existing(job_dir / "doc.mm.jsonl"),
             "sql_dir": _existing(job_dir / "sql"),
         },
-        "metadata": {"pipeline_summary": pipeline_summary},
+        "metadata": {"pipeline_summary": pipeline_summary, "manifest": manifest},
     }
 
     provenance = _provenance_from_manifest(manifest)
+
+    flags = {"facts_insufficient": not bool(manifest)}
 
     return QueryResult(
         job_id=job_id,
@@ -221,5 +233,49 @@ def query_job(
         answer=answer,
         artifacts=artifacts,
         provenance=provenance,
+        flags=flags,
         status=status,
     )
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ingest_response_payload_v0(result: IngestResult) -> Dict[str, Any]:
+    """Map an ``IngestResult`` to the canonical v0 response schema."""
+
+    payload: Dict[str, Any] = {
+        "job_id": result.job_id,
+        "tenant_id": result.tenant_id,
+        "status": result.status,
+        "created_at": _iso_now(),
+    }
+
+    if result.summary is not None:
+        payload["summary"] = result.summary
+        estimated = None
+        if isinstance(result.summary, dict):
+            estimated = result.summary.get("page_count") or result.summary.get("pages")
+        if estimated is not None:
+            payload["estimated_pages"] = estimated
+    if result.error:
+        payload["error"] = result.error
+
+    return payload
+
+
+def query_response_payload_v0(result: QueryResult) -> Dict[str, Any]:
+    """Map a ``QueryResult`` to the canonical v0 response schema."""
+
+    tables = result.artifacts.get("tables") or []
+    charts = result.artifacts.get("charts") or []
+    provenance = result.provenance or []
+    flags = result.flags or {}
+
+    return {
+        "answer": result.answer,
+        "artifacts": {"tables": tables, "charts": charts},
+        "provenance": provenance,
+        "flags": flags,
+    }
