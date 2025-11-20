@@ -265,6 +265,8 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `export_rag_bundle` が Markdown ダイジェスト、セル JSONL、テーブル別セクション、推奨クエリを `rag/manifest.json` にまとめます。
 - サマリー (`summary` サブコマンド) から `rag_markdown` や `rag_suggested_queries` を取得し、下流エージェントに渡せます。
 - `post_rag` フックでカスタム転送やストレージ連携を差し込めます。
+- **Embedding / 埋め込み** — RAG マニフェストには既定で AWS Bedrock Titan の埋め込みプラン（`amazon.titan-embed-text-v2`）を明記します。
+  地域や制約に合わせてモデル名を差し替えるだけで、RAG ワーカーはそのまま Bedrock へ投げられます。
 - **[JA]** 各セルは `trace`（`doc=...;page=...;row=...`）と `<fact trace="...">text</fact>` を保持し、`rag_trace_schema` / `rag_fact_tag_example` で下流 LLM へ「出典必須」のプロンプトを構築できます。
 - **[EN]** Each cell now ships with a `trace` string (`doc=...;page=...;row=...`) plus an immutable `<fact trace="...">…</fact>` tag so RAG/LLM stacks can demand provenance; see `rag_trace_schema` and `rag_fact_tag_example` in the summary.
 - **[FR]** Chaque cellule fournit désormais une `trace` (`doc=...;page=...;row=...`) et une balise `<fact trace="...">…</fact>` pour imposer la provenance côté LLM ; consultez `rag_trace_schema` et `rag_fact_tag_example` dans le résumé.
