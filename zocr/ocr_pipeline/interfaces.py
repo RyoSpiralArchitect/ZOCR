@@ -61,3 +61,8 @@ class OcrPipeline(Protocol):
     def process(self, page: PageInput) -> DocumentOutput:
         ...
 
+
+class DocumentOcrPipeline(Protocol):
+    def process(self, document: DocumentInput) -> List[DocumentOutput]:
+        ...
+

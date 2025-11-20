@@ -3,6 +3,7 @@
 from .input_handler import BasicInputHandler
 from .interfaces import (
     Aggregator,
+    DocumentOcrPipeline,
     InputHandler,
     OcrPipeline,
     RegionClassifier,
@@ -27,7 +28,7 @@ from .models import (
     TableExtractionResult,
     TextOcrResult,
 )
-from .pipeline import OcrPipeline
+from .pipeline import DocumentPipeline, OcrPipeline
 from .tesseract import TesseractTextOCR
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "BasicInputHandler",
     "BoundingBox",
     "ClassifiedRegion",
+    "DocumentOcrPipeline",
     "DocumentInput",
     "DocumentMetadata",
     "DocumentOutput",
@@ -48,6 +50,7 @@ __all__ = [
     "MockTextOCR",
     "MockVLLM",
     "OcrPipeline",
+    "DocumentPipeline",
     "PageInput",
     "RegionClassifier",
     "RegionOutput",
