@@ -1,10 +1,21 @@
 """Modular OCR pipeline scaffolding."""
 
-from .interfaces import Aggregator, OcrPipeline, RegionClassifier, Segmenter, TableExtractor, TextOCR, VLLM
-from .mocks import MockAggregator, MockRegionClassifier, MockSegmenter, MockTableExtractor, MockTextOCR, MockVLLM
+from .input_handler import BasicInputHandler
+from .interfaces import (
+    Aggregator,
+    InputHandler,
+    OcrPipeline,
+    RegionClassifier,
+    Segmenter,
+    TableExtractor,
+    TextOCR,
+    VLLM,
+)
+from .mocks import MockAggregator, MockInputHandler, MockRegionClassifier, MockSegmenter, MockTableExtractor, MockTextOCR, MockVLLM
 from .models import (
     BoundingBox,
     ClassifiedRegion,
+    DocumentInput,
     DocumentMetadata,
     DocumentOutput,
     ImageCaptionResult,
@@ -21,12 +32,16 @@ from .tesseract import TesseractTextOCR
 
 __all__ = [
     "Aggregator",
+    "BasicInputHandler",
     "BoundingBox",
     "ClassifiedRegion",
+    "DocumentInput",
     "DocumentMetadata",
     "DocumentOutput",
     "ImageCaptionResult",
+    "InputHandler",
     "MockAggregator",
+    "MockInputHandler",
     "MockRegionClassifier",
     "MockSegmenter",
     "MockTableExtractor",
