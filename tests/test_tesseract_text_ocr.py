@@ -56,4 +56,3 @@ def test_tesseract_text_ocr_requires_image_crop():
     ocr = TesseractTextOCR()
     with pytest.raises(ValueError):
         ocr.run(region)
-

@@ -16,8 +16,6 @@ from pytesseract import Output
 
 from .interfaces import TextOCR
 from .models import BoundingBox, ClassifiedRegion, RegionType, TextOcrResult, WordInfo
-
-
 class TesseractTextOCR(TextOCR):
     """Run OCR on text regions using pytesseract.
 
