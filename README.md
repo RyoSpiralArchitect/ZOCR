@@ -61,6 +61,7 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 | `python -m zocr pipeline …` | **JA:** `run` と同義、旧来オプション保持。<br>**EN:** Alias of `run`, keeps legacy flags.<br>**FR:** Alias de `run`, conserve les options historiques. |
 | `python -m zocr consensus …` | **JA:** OCR/テーブル復元 CLI（デモ・エクスポート）。<br>**EN:** Consensus/table reconstruction CLI.<br>**FR:** CLI pour la reconstruction de tableaux. |
 | `python -m zocr core …` | **JA:** マルチモーダルコア（augment/index/query/sql/monitor）。<br>**EN:** Multi-domain core (augment/index/query/sql/monitor).<br>**FR:** Noyau multi-domaine (augment/index/query/sql/monitor). |
+| `python -m zocr simple …` | **JA:** 軽量なモジュラー OCR（シンプル/モック部品）。<br>**EN:** Lightweight modular OCR using the simple or mock stack.<br>**FR:** OCR modulaire léger avec composants simples ou mocks. |
 
 ## CLI フラグ / CLI Flags / Options CLI
 | Flag | 説明 / Description / Description |
@@ -95,6 +96,15 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `plugins [--stage post_rag]` — 登録済みプラグインを列挙 / list registered hooks / lister les hooks enregistrés。
 - `report --outdir out_invoice --open` — 三言語 HTML ダッシュボード生成 / build trilingual HTML dashboard / générer un tableau de bord HTML trilingue。
 - `diagnose [--json]` — 依存関係の自己診断（Poppler/Numba/C拡張など）/ dependency self-check for Poppler/Numba/C helpers / autodiagnostic des dépendances (Poppler/Numba/extensions C).
+
+### 軽量モジュラー OCR / Lightweight modular OCR / OCR modulaire léger
+```bash
+# 本番デフォルトのシンプル構成（Tesseract + 幾何学ベースの分類）
+python -m zocr simple --images samples/demo_inputs/invoice_page.png --out out_simple.json
+
+# 依存関係を避けたいときはモック部品に切り替え可能
+python -m zocr simple --images samples/demo_inputs/invoice_page.png --out out_mock.json --use-mocks
+```
 
 ## 仕組み / Mechanics / Fonctionnement
 1. **OCR & Consensus** — `zocr.consensus.zocr_consensus` がレイアウト解析とセル信頼度計算を実行。

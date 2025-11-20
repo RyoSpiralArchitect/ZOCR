@@ -15,6 +15,7 @@ _COMMAND_TO_MODULE = {
     "consensus": "zocr.consensus.zocr_consensus",
     "cc": "zocr.consensus.zocr_consensus",
     "core": "zocr.core.zocr_core",
+    "simple": "zocr.ocr_pipeline.cli",
 }
 
 _DEFAULT_COMMAND = "pipeline"
@@ -30,6 +31,7 @@ def _print_help() -> None:
           pipeline | run      Execute the end-to-end orchestrator (default)
           consensus | cc      Access the consensus/table reconstruction CLI
           core                Access the multi-domain core CLI (augment/index/query/...)
+          simple              Run the lightweight modular OCR pipeline
           help                Show this message
 
         Examples:
