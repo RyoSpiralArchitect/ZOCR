@@ -10,7 +10,9 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-import numpy as np
+from .._compat import optional_numpy
+
+np = optional_numpy(__name__)
 
 from .base import (
     _normalize_text,
