@@ -3069,11 +3069,10 @@ def _enforce_default_toy_feature_flags(
     else:
         feature_status.setdefault("tesslite", {"enabled": False, "source": "none"})
 
-    if "pytesseract" not in feature_status:
-        feature_status["pytesseract"] = {
-            "allowed": _env_truthy("ZOCR_ALLOW_PYTESSERACT", True),
-            "source": "env" if os.environ.get("ZOCR_ALLOW_PYTESSERACT") else "default",
-        }
+    feature_status["pytesseract"] = {
+        "allowed": True,
+        "source": "default",
+    }
 
     feature_status["hotspot_detection"] = {
         "enabled": True,
@@ -3124,7 +3123,6 @@ def _patched_run_full_pipeline(
     blank_min_pixels: Optional[int] = None,
     blank_min_ratio: Optional[float] = None,
     blank_min_area: Optional[int] = None,
-    allow_pytesseract: Optional[bool] = None,
     tess_unicharset: Optional[str] = None,
     autocalib_samples: Optional[int] = None,
     autotune_trials: Optional[int] = None,
@@ -3166,10 +3164,6 @@ def _patched_run_full_pipeline(
         os.environ["ZOCR_EXPORT_BLANK_MIN_RATIO"] = str(float(blank_min_ratio))
     if blank_min_area is not None:
         os.environ["ZOCR_EXPORT_BLANK_MIN_AREA"] = str(int(blank_min_area))
-    if allow_pytesseract is True:
-        os.environ["ZOCR_ALLOW_PYTESSERACT"] = "1"
-    elif allow_pytesseract is False:
-        os.environ["ZOCR_ALLOW_PYTESSERACT"] = "0"
     tess_unicharset = _validate_file_if_supplied(tess_unicharset, "--tess-unicharset")
     if tess_unicharset is not None:
         os.environ["ZOCR_TESS_UNICHARSET"] = tess_unicharset
@@ -5121,20 +5115,6 @@ def main():
         help="Minimum crop area required before blank skip applies",
     )
     ap.add_argument(
-        "--allow-pytesseract",
-        dest="allow_pytesseract",
-        action="store_true",
-        default=None,
-        help="Explicitly allow pytesseract variants (enabled by default unless --no-allow-pytesseract or ZOCR_ALLOW_PYTESSERACT=0 is set)",
-    )
-    ap.add_argument(
-        "--no-allow-pytesseract",
-        dest="allow_pytesseract",
-        action="store_false",
-        default=None,
-        help="Force-disable pytesseract even when the environment would otherwise allow it",
-    )
-    ap.add_argument(
         "--tess-unicharset",
         default=None,
         help="Path to a Tesseract-style unicharset file for toy lexical gating",
@@ -5226,7 +5206,6 @@ def main():
             blank_min_pixels=args.blank_min_pixels,
             blank_min_ratio=args.blank_min_ratio,
             blank_min_area=args.blank_min_area,
-            allow_pytesseract=args.allow_pytesseract,
             tess_unicharset=args.tess_unicharset,
             autocalib_samples=args.autocalib,
             autotune_trials=args.autotune,
