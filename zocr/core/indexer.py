@@ -6,7 +6,9 @@ import math
 import pickle
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
+from .._compat import optional_numpy
+
+np = optional_numpy(__name__)
 
 from .numba_support import HAS_NUMBA, HAS_NUMBA_PARALLEL, atomic, njit, prange
 from .tokenization import tokenize_jp
