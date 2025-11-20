@@ -22,6 +22,7 @@ def test_core_surface_proxies_to_split_modules() -> None:
     assert core.augment is augmenter.augment
     assert core.build_index is indexer.build_index
     assert core.query is query_engine.query
+    assert core.hybrid_query is query_engine.hybrid_query
     assert core.sql_export is exporters.sql_export
     assert core.export_rag_bundle is exporters.export_rag_bundle
     assert core.monitor is monitoring.monitor
@@ -59,6 +60,7 @@ def test_core_surface_all_stays_in_sync_with_exports() -> None:
         "augment",
         "build_index",
         "query",
+        "hybrid_query",
         "sql_export",
         "export_rag_bundle",
         "monitor",
