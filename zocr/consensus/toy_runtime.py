@@ -1821,8 +1821,8 @@ def get_toy_feature_status() -> Dict[str, Any]:
     status["tesslite"] = get_tesslite_status()
 
     status["pytesseract"] = {
-        "allowed": _pytesseract_allowed(),
-        "source": _feature_source("ZOCR_ALLOW_PYTESSERACT"),
+        "allowed": True,
+        "source": "default",
     }
 
     flush_raw = os.environ.get("ZOCR_EXPORT_FLUSH_EVERY")
@@ -2443,13 +2443,6 @@ def _pytesseract_env_kwargs() -> Dict[str, Any]:
 _PYTESS_ENV_KWARGS = _pytesseract_env_kwargs()
 _PYTESS_ENV_SUPPORTED = True
 _PYTESS_TIMEOUT_WARNED = False
-
-
-def _pytesseract_allowed() -> bool:
-    raw = os.environ.get("ZOCR_ALLOW_PYTESSERACT")
-    if raw is None:
-        return True
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _note_pytesseract_exception(label: str, exc: Exception) -> None:
@@ -4991,12 +4984,7 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
     elif engine_key in ("toy", "mock", "demo"):
         runner = toy_ocr_text_from_cell
     elif engine_key.startswith("tess"):
-        if not _pytesseract_allowed():
-            if cache_key not in _OCR_BACKEND_WARNED:
-                print("[WARN] pytesseract disabled by ZOCR_ALLOW_PYTESSERACT=0; using toy OCR", flush=True)
-                _OCR_BACKEND_WARNED.add(cache_key)
-            runner = toy_ocr_text_from_cell
-        elif pytesseract is None or _PYTESS_OUTPUT is None:
+        if pytesseract is None or _PYTESS_OUTPUT is None:
             if cache_key not in _OCR_BACKEND_WARNED:
                 print("[WARN] pytesseract not available; falling back to toy OCR")
                 _OCR_BACKEND_WARNED.add(cache_key)

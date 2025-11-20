@@ -143,6 +143,10 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `doc.zocr.json` — OCR & consensus の主 JSON。
 - `doc.mm.jsonl` — マルチモーダル JSONL（RAG / BM25 共用）。
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
+- **[JA/EN]** `python -m zocr.core embed --jsonl rag/cells.jsonl --model <path>` で (EC2 で同期した SentenceTransformer などの) 埋め込み
+  を `.embedded.jsonl` に付与できます。Bedrock など AWS サービス経由なら `--provider bedrock --model <modelId> --aws-region <region>`
+  で同じ JSONL にベクトルを付与できます / Attach embeddings from a local SentenceTransformer (e.g., your EC2-resynced model)
+  with `.embedded.jsonl` output for downstream RAG; switch to `--provider bedrock --model <modelId> --aws-region <region>` to call AWS services.
 - `agentic_requests.json` — Agentic RAG 用の diff 依頼バンドル（差分画像/説明向けプロンプト） / Agentic RAG request bundle for diff overlays + narratives / Bundle Agentic RAG (prompts pour images diff & explications).
 - `sql/` — `sql_export` で生成される CSV とスキーマ（`trace` 列で doc/page/table/row/col を Excel から参照可能）。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
@@ -242,8 +246,6 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - **[JA]** セル輸出用のガード (`ZOCR_EXPORT_GUARD_MS` / `--export-guard-ms`) は既定で無効になりました。値を指定した場合も処理済みセルは `guard_timeout` フラグ付きで JSONL に残るため、長大テーブルでも途中結果が失われません。
 - **[EN]** The per-table export guard (`ZOCR_EXPORT_GUARD_MS` / `--export-guard-ms`) is now opt-in. Leave it unset to let slow tables finish; if you do set a limit the exporter still writes whatever cells were processed and tags them with `guard_timeout` for downstream review.
 - **[FR]** La garde d’export par table (`ZOCR_EXPORT_GUARD_MS` / `--export-guard-ms`) est désactivée par défaut. Fixez-la uniquement si vous souhaitez un plafond temporel ; même en cas de dépassement, les cellules déjà traitées sont écrites avec l’étiquette `guard_timeout` pour faciliter les revues.
-- `ZOCR_ALLOW_PYTESSERACT=0` もしくは `--no-allow-pytesseract` を指定すると外部 pytesseract 呼び出しを完全停止できます（既定は許可で、`--allow-pytesseract` / `ZOCR_ALLOW_PYTESSERACT=1` は明示的な上書きとして残しています）。
-- Set `ZOCR_ALLOW_PYTESSERACT=0` or pass `--no-allow-pytesseract` to fully disable pytesseract; it is now allowed by default, and `--allow-pytesseract` / `ZOCR_ALLOW_PYTESSERACT=1` remain as explicit opt-ins if you need to override other settings.
 - Export 時の行バンド再シード（motion prior）は既定で常時有効になりました。`--no-motion-prior` や `ZOCR_EXPORT_MOTION_PRIOR=0` で無効化できます。<br>**[EN]** Motion-prior reseeding between toy export sweeps is now enabled by default; opt out via `--no-motion-prior` or `ZOCR_EXPORT_MOTION_PRIOR=0`. <br>**[FR]** Le motion prior est désormais actif par défaut ; utilisez `--no-motion-prior` ou `ZOCR_EXPORT_MOTION_PRIOR=0` pour revenir à l’exploration exhaustive.
 - `ZOCR_EXPORT_PROGRESS=1` と `ZOCR_EXPORT_LOG_EVERY=100`（任意）でセル処理数の進捗ログを標準出力に流し、長大なグリッドでも固まって見えません。
 - `ZOCR_EXPORT_MAX_CELLS` を指定すると巨大テーブルをサンプリングできます。進捗ログ有効時は `last_export_stats()` / `pipeline_summary.json` にページ数・セル数・数値強制件数・処理秒数が残ります。
