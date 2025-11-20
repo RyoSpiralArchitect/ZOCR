@@ -12,7 +12,15 @@ from .interfaces import (
     TextOCR,
     VLLM,
 )
-from .mocks import MockAggregator, MockInputHandler, MockRegionClassifier, MockSegmenter, MockTableExtractor, MockTextOCR, MockVLLM
+from .mocks import (
+    MockAggregator,
+    MockInputHandler,
+    MockRegionClassifier,
+    MockSegmenter,
+    MockTableExtractor,
+    MockTextOCR,
+    MockVLLM,
+)
 from .models import (
     BoundingBox,
     ClassifiedRegion,
@@ -29,6 +37,13 @@ from .models import (
     TextOcrResult,
 )
 from .pipeline import DocumentPipeline, OcrPipeline
+from .simple import (
+    AspectRatioRegionClassifier,
+    DummyTableExtractor,
+    DummyVLLM,
+    FullPageSegmenter,
+    SimpleAggregator,
+)
 from .tesseract import TesseractTextOCR
 
 __all__ = [
@@ -49,6 +64,11 @@ __all__ = [
     "MockTableExtractor",
     "MockTextOCR",
     "MockVLLM",
+    "FullPageSegmenter",
+    "AspectRatioRegionClassifier",
+    "SimpleAggregator",
+    "DummyVLLM",
+    "DummyTableExtractor",
     "OcrPipeline",
     "DocumentPipeline",
     "PageInput",
@@ -65,4 +85,3 @@ __all__ = [
     "TextOcrResult",
     "VLLM",
 ]
-
