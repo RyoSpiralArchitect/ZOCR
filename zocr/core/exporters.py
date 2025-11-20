@@ -148,6 +148,8 @@ def export_rag_bundle(
     domain: Optional[str] = None,
     summary: Optional[Dict[str, Any]] = None,
     limit_per_section: int = 40,
+    embedding_provider: str = "aws_bedrock",
+    embedding_model: str = "amazon.titan-embed-text-v2",
 ) -> Dict[str, Any]:
     if not os.path.exists(jsonl):
         raise FileNotFoundError(jsonl)
@@ -203,6 +205,25 @@ def export_rag_bundle(
     with open(tables_path, "w", encoding="utf-8") as fw:
         json.dump(table_manifest, fw, ensure_ascii=False, indent=2)
 
+    trace_schema = {
+        "label": "doc=<str>;page=<int>;table=<int>;row=<int>;col=<int>",
+        "fields": {
+            "doc_id": "Document identifier, if provided",
+            "page": "1-indexed page number where the cell originated",
+            "table_index": "0-indexed table identifier or null for non-tabular cells",
+            "row": "0-indexed row index within the table",
+            "col": "0-indexed column index within the table",
+            "bbox": "Bounding box [x1, y1, x2, y2] in pixel coordinates",
+        },
+    }
+    sample_trace = _build_trace(None, 1, 0, 0, 0, [0, 0, 10, 10])[1]
+    fact_tag_example = _fact_tag("amount=12,000", sample_trace, lang=list(languages)[0] if languages else None)
+    embedding = {
+        "provider": embedding_provider,
+        "model": embedding_model,
+        "note": "Preferred RAG embedding target; swap model for region-specific Bedrock deployments as needed.",
+    }
+
     manifest = {
         "cells": cells_path,
         "sections": sections_path,
@@ -212,6 +233,11 @@ def export_rag_bundle(
         "languages": sorted(languages),
         "summary": summary,
         "cells_written": cells_written,
+        "page_sections": len(sections),
+        "table_sections": len(tables),
+        "trace_schema": trace_schema,
+        "fact_tag_example": fact_tag_example,
+        "embedding": embedding,
     }
     with open(manifest_path, "w", encoding="utf-8") as fw:
         json.dump(manifest, fw, ensure_ascii=False, indent=2)
@@ -230,6 +256,17 @@ def export_rag_bundle(
         "cells": cells_path,
         "sections": sections_path,
         "tables": tables_path,
+        "tables_json": tables_path,
         "manifest": manifest_path,
+        "bundle_dir": outdir,
         "markdown": markdown_path,
+        "cell_count": cells_written,
+        "table_sections": len(tables),
+        "page_sections": len(sections),
+        "doc_ids": list(doc_ids),
+        "languages": sorted(languages),
+        "suggested_queries": suggested,
+        "trace_schema": trace_schema,
+        "fact_tag_example": fact_tag_example,
+        "embedding": embedding,
     }
