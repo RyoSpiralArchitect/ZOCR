@@ -127,9 +127,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--jsonl", required=True)
     sp.add_argument("--out", default=None)
     sp.add_argument("--model", default=os.environ.get("ZOCR_EMBED_MODEL"))
+    sp.add_argument("--provider", default=os.environ.get("ZOCR_EMBED_PROVIDER", "sentence-transformers"))
     sp.add_argument("--text-field", default="text")
     sp.add_argument("--batch-size", type=int, default=32)
     sp.add_argument("--no-normalize", action="store_true")
+    sp.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE"))
+    sp.add_argument("--aws-region", default=os.environ.get("AWS_REGION"))
+    sp.add_argument("--aws-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL"))
 
     sp = sub.add_parser("sql")
     sp.add_argument("--jsonl", required=True)
@@ -212,6 +216,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             text_field=args.text_field,
             batch_size=args.batch_size,
             normalize=not args.no_normalize,
+            provider=args.provider,
+            aws_profile=args.aws_profile,
+            aws_region=args.aws_region,
+            aws_endpoint_url=args.aws_endpoint_url,
         )
         print(out_path)
         return

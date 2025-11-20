@@ -144,8 +144,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 - `doc.mm.jsonl` — マルチモーダル JSONL（RAG / BM25 共用）。
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
 - **[JA/EN]** `python -m zocr.core embed --jsonl rag/cells.jsonl --model <path>` で (EC2 で同期した SentenceTransformer などの) 埋め込み
-  を `.embedded.jsonl` に付与できます / Attach embeddings from a local SentenceTransformer (e.g., your EC2-resynced model)
-  with `.embedded.jsonl` output for downstream RAG.
+  を `.embedded.jsonl` に付与できます。Bedrock など AWS サービス経由なら `--provider bedrock --model <modelId> --aws-region <region>`
+  で同じ JSONL にベクトルを付与できます / Attach embeddings from a local SentenceTransformer (e.g., your EC2-resynced model)
+  with `.embedded.jsonl` output for downstream RAG; switch to `--provider bedrock --model <modelId> --aws-region <region>` to call AWS services.
 - `agentic_requests.json` — Agentic RAG 用の diff 依頼バンドル（差分画像/説明向けプロンプト） / Agentic RAG request bundle for diff overlays + narratives / Bundle Agentic RAG (prompts pour images diff & explications).
 - `sql/` — `sql_export` で生成される CSV とスキーマ（`trace` 列で doc/page/table/row/col を Excel から参照可能）。
 - `views/` — マイクロスコープ 4 分割＋X-Ray オーバーレイ。
