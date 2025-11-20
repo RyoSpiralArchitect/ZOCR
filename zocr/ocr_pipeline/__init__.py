@@ -17,6 +17,7 @@ from .models import (
     TextOcrResult,
 )
 from .pipeline import OcrPipeline
+from .tesseract import TesseractTextOCR
 
 __all__ = [
     "Aggregator",
@@ -41,6 +42,7 @@ __all__ = [
     "TableData",
     "TableExtractionResult",
     "TableExtractor",
+    "TesseractTextOCR",
     "TextOCR",
     "TextOcrResult",
     "VLLM",

@@ -55,6 +55,7 @@ class ClassifiedRegion(BaseModel):
     classification: RegionType
     confidence: float = Field(..., ge=0.0, le=1.0)
     reading_order: Optional[int] = Field(None, ge=0)
+    image_crop: Optional[object] = None
 
 
 class WordInfo(BaseModel):

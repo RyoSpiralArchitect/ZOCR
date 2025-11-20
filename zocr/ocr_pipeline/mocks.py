@@ -52,6 +52,7 @@ class MockRegionClassifier(RegionClassifier):
             classification=classification,
             confidence=region.confidence,
             reading_order=region.reading_order,
+            image_crop=region.image_crop,
         )
 
 
