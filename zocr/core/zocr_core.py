@@ -90,7 +90,7 @@ def autotune_unlabeled(*args, **kwargs):
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser("ZOCR Multi-domain Core")
-    sub = parser.add_subparsers(dest="cmd")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("augment")
     sp.add_argument("--jsonl", required=True)
