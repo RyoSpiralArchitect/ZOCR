@@ -20,19 +20,41 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+from jsonschema import Draft202012Validator
 
 from zocr.orchestrator import zocr_pipeline
+from zocr.api_spec import (
+    INGEST_REQUEST_SCHEMA_V0,
+    QUERY_REQUEST_SCHEMA_V0,
+    render_user_prompt_analysis_v0,
+)
 
 __all__ = [
+    "FileSpec",
     "IngestRequest",
     "IngestResult",
+    "QueryRequest",
     "QueryResult",
     "ingest_job",
     "query_job",
     "ingest_response_payload_v0",
     "query_response_payload_v0",
+    "validate_ingest_request_payload",
+    "validate_query_request_payload",
+    "render_user_prompt_analysis_v0",
 ]
+
+
+@dataclass
+class FileSpec:
+    """Descriptor for an input file provided to ingestion."""
+
+    id: str
+    uri: str
+    kind: str = "auto"
+    tags: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -40,7 +62,7 @@ class IngestRequest:
     """Parameters controlling an ingestion job."""
 
     tenant_id: str
-    files: Iterable[str]
+    files: Iterable[Union[str, Dict[str, Any], FileSpec]]
     domain_hint: Optional[str] = None
     job_id: Optional[str] = None
     out_root: str = "episodes"
@@ -50,6 +72,19 @@ class IngestRequest:
 
     def resolved_job_id(self) -> str:
         return self.job_id or f"episode_{uuid.uuid4().hex[:12]}"
+
+
+@dataclass
+class QueryRequest:
+    """Parameters for querying an existing job."""
+
+    tenant_id: str
+    job_id: str
+    conversation_id: Optional[str] = None
+    query: str = ""
+    language: str = "ja"
+    mode: str = "analysis"
+    base_dir: str = "episodes"
 
 
 @dataclass
@@ -84,6 +119,29 @@ def _existing(path: Path) -> Optional[str]:
     return str(path) if path.exists() else None
 
 
+def _normalize_files(files: Iterable[Union[str, Dict[str, Any], FileSpec]]) -> List[FileSpec]:
+    normalized: List[FileSpec] = []
+    for idx, item in enumerate(files):
+        if isinstance(item, FileSpec):
+            normalized.append(item)
+            continue
+        if isinstance(item, str):
+            normalized.append(FileSpec(id=os.path.basename(item) or f"file_{idx}", uri=item))
+            continue
+        if isinstance(item, dict):
+            normalized.append(
+                FileSpec(
+                    id=str(item.get("id") or f"file_{idx}"),
+                    uri=str(item.get("uri")),
+                    kind=str(item.get("kind", "auto")),
+                    tags=list(item.get("tags", [])),
+                )
+            )
+            continue
+        raise TypeError(f"Unsupported file descriptor: {item!r}")
+    return normalized
+
+
 def ingest_job(request: IngestRequest) -> IngestResult:
     """Run the orchestrator and expose canonical artifact paths.
 
@@ -96,6 +154,9 @@ def ingest_job(request: IngestRequest) -> IngestResult:
     job_id = request.resolved_job_id()
     outdir = Path(request.out_root) / job_id
     os.makedirs(outdir, exist_ok=True)
+
+    files = _normalize_files(request.files)
+    pipeline_inputs = [fs.uri for fs in files]
 
     artifact_paths = {
         "pipeline_summary": str(outdir / "pipeline_summary.json"),
@@ -117,7 +178,7 @@ def ingest_job(request: IngestRequest) -> IngestResult:
 
     try:
         summary = zocr_pipeline.run_full_pipeline(
-            list(request.files),
+            pipeline_inputs,
             str(outdir),
             domain_hint=request.domain_hint,
             resume=request.resume,
@@ -236,6 +297,18 @@ def query_job(
         flags=flags,
         status=status,
     )
+
+
+def validate_ingest_request_payload(payload: Dict[str, Any]) -> None:
+    """Validate a payload against the canonical ingest request schema."""
+
+    Draft202012Validator(INGEST_REQUEST_SCHEMA_V0).validate(payload)
+
+
+def validate_query_request_payload(payload: Dict[str, Any]) -> None:
+    """Validate a payload against the canonical query request schema."""
+
+    Draft202012Validator(QUERY_REQUEST_SCHEMA_V0).validate(payload)
 
 
 def _iso_now() -> str:

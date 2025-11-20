@@ -9,7 +9,7 @@ highlight the canonical v0 shape.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Optional
 
 __all__ = [
     "INGEST_REQUEST_SCHEMA_V0",
@@ -18,6 +18,7 @@ __all__ = [
     "QUERY_RESPONSE_SCHEMA_V0",
     "SYSTEM_PROMPT_ANALYSIS_V0",
     "USER_PROMPT_ANALYSIS_TEMPLATE_V0",
+    "render_user_prompt_analysis_v0",
     "get_api_schemas_v0",
     "get_prompt_templates_v0",
 ]
@@ -276,6 +277,69 @@ Table: {{title}}
 FLAGS:
 - facts_insufficient: {{true_or_false}}
 """
+
+
+def _render_markdown_table(table: Dict[str, Any]) -> str:
+    columns: List[str] = table.get("columns") or []
+    rows: Iterable[Iterable[Any]] = table.get("rows") or []
+    if not columns:
+        return ""
+
+    header = "| " + " | ".join(columns) + " |"
+    divider = "| " + " | ".join(["---"] * len(columns)) + " |"
+    body_lines: List[str] = []
+    for row in rows:
+        cells = ["" if cell is None else str(cell) for cell in row]
+        body_lines.append("| " + " | ".join(cells) + " |")
+    body = "\n".join(body_lines)
+    return "\n".join([header, divider, body]) if body_lines else "\n".join([header, divider])
+
+
+def render_user_prompt_analysis_v0(
+    *,
+    query: str,
+    facts: Optional[Iterable[Dict[str, Any]]] = None,
+    tables: Optional[Iterable[Dict[str, Any]]] = None,
+    flags: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render the user message for analysis mode based on the canonical template."""
+
+    facts_list = list(facts or [])
+    tables_list = list(tables or [])
+    flags = flags or {}
+    facts_lines = [
+        f"- [trace={fact.get('trace','')}] {fact.get('text') or fact.get('fact_text') or ''}"
+        for fact in facts_list
+    ]
+
+    tables_blocks: List[str] = []
+    for table in tables_list:
+        title = table.get("title") or table.get("id") or "Table"
+        rendered = _render_markdown_table(table)
+        block_lines = [f"Table: {title}"]
+        if rendered:
+            block_lines.append(rendered)
+        tables_blocks.append("\n".join(block_lines))
+
+    flags_lines = [
+        f"- facts_insufficient: {bool(flags.get('facts_insufficient'))}"
+    ]
+
+    sections = [
+        "QUESTION:",
+        query,
+        "",
+        "FACTS:",
+        "\n".join(facts_lines) if facts_lines else "(none)",
+        "",
+        "TABLES:",
+        "\n\n".join(tables_blocks) if tables_blocks else "(none)",
+        "",
+        "FLAGS:",
+        "\n".join(flags_lines),
+    ]
+
+    return "\n".join(sections)
 
 
 def get_api_schemas_v0() -> Dict[str, Dict[str, Any]]:

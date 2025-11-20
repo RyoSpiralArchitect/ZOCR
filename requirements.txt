@@ -1,3 +1,4 @@
 pydantic>=1.10,<3
 pillow>=9.0
 pytesseract>=0.3.10
+jsonschema>=4.21.1
