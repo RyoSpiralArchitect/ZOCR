@@ -1624,9 +1624,56 @@ def _tesslite_env_signature() -> str:
         return f"{path}:missing"
 
 
+def _tesslite_extra_dictionary_paths() -> List[str]:
+    raw = os.environ.get("ZOCR_TESS_EXTRA_DICT") or os.environ.get(
+        "ZOCR_TESS_EXTRA_DICTIONARIES"
+    )
+    if not raw:
+        return []
+    paths: List[str] = []
+    for token in raw.split(os.pathsep):
+        trimmed = token.strip()
+        if trimmed:
+            paths.append(trimmed)
+    return paths
+
+
+def _tesslite_extra_dictionary_signature() -> str:
+    entries: List[str] = []
+    for path in _tesslite_extra_dictionary_paths():
+        try:
+            st = os.stat(path)
+            entries.append(f"{path}:{int(st.st_mtime)}:{st.st_size}")
+        except Exception:
+            entries.append(f"{path}:missing")
+    if not entries:
+        return ""
+    return "|extra_dict:" + ",".join(entries)
+
+
+def _load_dictionary_words(paths: Sequence[str]) -> Set[str]:
+    words: Set[str] = set()
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    token = line.strip()
+                    if not token:
+                        continue
+                    if " " in token:
+                        for part in token.split():
+                            if part:
+                                words.add(part)
+                        continue
+                    words.add(token)
+        except Exception:
+            continue
+    return words
+
+
 def _tesslite_effective_source() -> Tuple[bool, str, bool]:
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
-    suffix = _tesslite_domain_signature()
+    suffix = _tesslite_domain_signature() + _tesslite_extra_dictionary_signature()
     if unichar:
         return True, f"{_tesslite_env_signature()}{suffix}", False
     if _tesslite_builtin_available():
@@ -1721,6 +1768,12 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
     if domain_subset:
         dictionary = set(domain_subset)
         bigrams = _build_bigrams_from_words(dictionary)
+    extra_words = _load_dictionary_words(_tesslite_extra_dictionary_paths())
+    if extra_words:
+        dictionary.update(extra_words)
+        merged = _build_bigrams_from_words(dictionary) if dictionary else {}
+        if merged:
+            bigrams = merged
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
