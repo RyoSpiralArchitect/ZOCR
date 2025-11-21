@@ -8,6 +8,7 @@ about confidence and positioning.
 """
 from __future__ import annotations
 
+import os
 from statistics import mean
 from typing import List
 
@@ -16,6 +17,15 @@ from pytesseract import Output
 
 from .interfaces import TextOCR
 from .models import BoundingBox, ClassifiedRegion, RegionType, TextOcrResult, WordInfo
+
+
+def _pytesseract_allowed() -> bool:
+    raw = os.environ.get("ZOCR_ALLOW_PYTESSERACT")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 class TesseractTextOCR(TextOCR):
     """Run OCR on text regions using pytesseract.
 
@@ -30,6 +40,10 @@ class TesseractTextOCR(TextOCR):
     """
 
     def __init__(self, lang: str = "eng", oem: int = 3, psm: int = 6, extra_config: str = "") -> None:
+        if not _pytesseract_allowed():
+            raise RuntimeError(
+                "pytesseract is disabled by ZOCR_ALLOW_PYTESSERACT; set it to 1/true to enable"
+            )
         self.lang = lang
         base_config = f"--oem {oem} --psm {psm}"
         self.config = f"{base_config} {extra_config}".strip()
