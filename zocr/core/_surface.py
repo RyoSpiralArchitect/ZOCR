@@ -62,7 +62,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         metric_col_over_under_rate,
         monitor,
     )
-    from .query_engine import query
+    from .query_engine import hybrid_query, query
     from .exporters import export_rag_bundle, sql_export
     from .zocr_core import main
 

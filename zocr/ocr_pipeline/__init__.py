@@ -44,6 +44,7 @@ from .simple import (
     FullPageSegmenter,
     SimpleAggregator,
 )
+from .hybrid import ToyRuntimeTextOCR, TwoStageTextOCR
 from .tesseract import TesseractTextOCR
 
 __all__ = [
@@ -69,6 +70,8 @@ __all__ = [
     "SimpleAggregator",
     "DummyVLLM",
     "DummyTableExtractor",
+    "ToyRuntimeTextOCR",
+    "TwoStageTextOCR",
     "OcrPipeline",
     "DocumentPipeline",
     "PageInput",

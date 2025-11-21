@@ -83,6 +83,7 @@ class TextOcrResult(BaseModel):
     text: str
     confidence: float = Field(..., ge=0.0, le=1.0)
     language: Optional[str] = None
+    engine: Optional[str] = None
     words: Optional[List[WordInfo]] = None
 
 

@@ -109,8 +109,14 @@ def _cosine_sim(a: Optional[Iterable[float]], b: Optional[Iterable[float]]) -> f
 def _zone_match_score(zone: Optional[str], zone_filter: Optional[str]) -> float:
     if not zone or not zone_filter:
         return 0.0
+    normalized_filter = zone_filter
+    if "\\\\" in normalized_filter:
+        try:
+            normalized_filter = normalized_filter.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            normalized_filter = zone_filter
     try:
-        return 1.0 if re.match(zone_filter, zone) else 0.0
+        return 1.0 if re.match(normalized_filter, zone) else 0.0
     except re.error:
         return 0.0
 
@@ -249,7 +255,7 @@ def query(
         if t in vocab:
             q_ids.append(vocab[t])
     q_arr = np.array(q_ids, dtype=np.int32) if q_ids else np.array([-1], dtype=np.int32)
-    results: List[Tuple[float, Dict[str, Any]]] = []
+    results: List[Tuple[float, Dict[str, Any], int]] = []
     for i, doc_ids in enumerate(ix["docs_tokens"]):
         di = np.array(doc_ids + [-1], dtype=np.int32)
         dl = len(doc_ids)
@@ -341,7 +347,7 @@ def hybrid_query(
             q_ids.append(vocab[t])
     q_arr = np.array(q_ids, dtype=np.int32) if q_ids else np.array([-1], dtype=np.int32)
 
-    results: List[Tuple[float, Dict[str, Any]]] = []
+    results: List[Tuple[float, Dict[str, Any], int]] = []
     for i, doc_ids in enumerate(ix["docs_tokens"]):
         di = np.array(doc_ids + [-1], dtype=np.int32)
         dl = len(doc_ids)
@@ -406,7 +412,7 @@ def hybrid_query(
             "penalty": float(conf_penalty),
         }
         enriched["meta"] = enriched_meta
-        results.append((float(score), enriched))
+        results.append((float(score), enriched, i))
 
-    results.sort(key=lambda x: -x[0])
-    return results[:topk]
+    results.sort(key=lambda x: (-round(x[0], 3), x[2]))
+    return [(score, doc) for score, doc, _ in results[:topk]]
