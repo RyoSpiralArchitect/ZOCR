@@ -106,6 +106,7 @@ hits = hybrid_query(
 ```
 
 It applies the same scoring recipe described above, boosting zone/header matches, honoring structural filters, respecting top-level/meta filters (e.g., ``doc_id``/``page``), and penalizing low OCR/structure confidence when those signals are present in the Z-OCR tag envelope.
+Metadata filters accept scalars, collections, regex patterns (``re:<pat>``), or callables if you need to gate candidates with custom predicates.
 
 ## Evaluation tips
 - **Cell QA:** ask for values present only in specific rows; measure exact match and wrong-row rate.

@@ -174,7 +174,9 @@ def _passes_filters(obj: Dict[str, Any], filters: Dict[str, Any]) -> bool:
 
     Supports equality checks for scalar values as well as membership checks when
     the filter value is a list/tuple/set. A string filter starting with ``"re:"``
-    is treated as a regex pattern anchored at the start of the field.
+    is treated as a regex pattern anchored at the start of the field. Callables
+    are also allowed and are invoked with the candidate value; any falsy return
+    (or raised exception) causes the object to be rejected.
     """
 
     for key, expected in (filters or {}).items():
@@ -187,6 +189,15 @@ def _passes_filters(obj: Dict[str, Any], filters: Dict[str, Any]) -> bool:
 
         if actual is None:
             return False
+
+        # Predicate filter: callable(expected)
+        if callable(expected):
+            try:
+                if not expected(actual):
+                    return False
+            except Exception:
+                return False
+            continue
 
         # Regex filter: re:<pattern>
         if isinstance(expected, str) and expected.startswith("re:"):

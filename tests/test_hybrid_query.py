@@ -140,3 +140,21 @@ def test_hybrid_query_hard_filters_metadata(tmp_path):
     assert filtered
     assert all(doc["doc_id"] == "docB" for _, doc in filtered)
     assert all(doc["page"] == 2 for _, doc in filtered)
+
+
+def test_hybrid_query_accepts_callable_filters(tmp_path):
+    jsonl_path = _write_sample(tmp_path)
+    index_path = tmp_path / "ix.pkl"
+    build_index(str(jsonl_path), str(index_path))
+
+    filtered = hybrid_query(
+        str(index_path),
+        str(jsonl_path),
+        q_text="amount total",
+        filters={"confidence": lambda c: c and c.get("ocr", 0) < 0.9},
+        topk=3,
+    )
+
+    assert filtered
+    assert len(filtered) == 1
+    assert filtered[0][1]["region_id"] == "tbl#1.row#2.col#amount_total"
