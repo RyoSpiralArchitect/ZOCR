@@ -6,12 +6,18 @@ from typing import List, Protocol
 from .models import (
     ClassifiedRegion,
     DocumentOutput,
+    DocumentInput,
     ImageCaptionResult,
     PageInput,
     SegmentedRegion,
     TableExtractionResult,
     TextOcrResult,
 )
+
+
+class InputHandler(Protocol):
+    def load(self, document: DocumentInput) -> List[PageInput]:
+        ...
 
 
 class Segmenter(Protocol):
@@ -53,5 +59,10 @@ class Aggregator(Protocol):
 
 class OcrPipeline(Protocol):
     def process(self, page: PageInput) -> DocumentOutput:
+        ...
+
+
+class DocumentOcrPipeline(Protocol):
+    def process(self, document: DocumentInput) -> List[DocumentOutput]:
         ...
 

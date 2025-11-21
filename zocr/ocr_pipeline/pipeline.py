@@ -4,8 +4,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from .interfaces import Aggregator, OcrPipeline as OcrPipelineProtocol, RegionClassifier, Segmenter, TableExtractor, TextOCR, VLLM
-from .models import ClassifiedRegion, DocumentOutput, PageInput, RegionType, SegmentedRegion
+from .interfaces import (
+    Aggregator,
+    DocumentOcrPipeline,
+    InputHandler,
+    OcrPipeline as OcrPipelineProtocol,
+    RegionClassifier,
+    Segmenter,
+    TableExtractor,
+    TextOCR,
+    VLLM,
+)
+from .models import ClassifiedRegion, DocumentInput, DocumentOutput, PageInput, RegionType, SegmentedRegion
 
 
 @dataclass
@@ -42,4 +52,14 @@ class OcrPipeline(OcrPipelineProtocol):
             image_results=image_results,
             table_results=table_results,
         )
+
+
+@dataclass
+class DocumentPipeline(DocumentOcrPipeline):
+    input_handler: InputHandler
+    page_pipeline: OcrPipeline
+
+    def process(self, document: DocumentInput) -> List[DocumentOutput]:
+        pages = self.input_handler.load(document)
+        return [self.page_pipeline.process(page) for page in pages]
 

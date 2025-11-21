@@ -31,6 +31,20 @@ class PageInput(BaseModel):
     dpi: Optional[int] = Field(None, ge=1)
 
 
+class DocumentInput(BaseModel):
+    """Input source before page-level processing.
+
+    The handler accepts either an explicit list of page images or a
+    file path. PDF files are expanded to per-page images, while image
+    files are treated as a single-page document.
+    """
+
+    document_id: str
+    file_path: Optional[str] = None
+    images: Optional[List[object]] = None
+    dpi: Optional[int] = Field(None, ge=1)
+
+
 class RegionType(str, Enum):
     TEXT = "text"
     IMAGE = "image"

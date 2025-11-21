@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from .interfaces import Aggregator, RegionClassifier, Segmenter, TableExtractor, TextOCR, VLLM
+from .interfaces import Aggregator, InputHandler, RegionClassifier, Segmenter, TableExtractor, TextOCR, VLLM
 from .models import (
     BoundingBox,
     ClassifiedRegion,
+    DocumentInput,
     DocumentMetadata,
     DocumentOutput,
     ImageCaptionResult,
@@ -54,6 +55,27 @@ class MockRegionClassifier(RegionClassifier):
             reading_order=region.reading_order,
             image_crop=region.image_crop,
         )
+
+
+class MockInputHandler(InputHandler):
+    def __init__(self) -> None:
+        self.calls: List[DocumentInput] = []
+
+    def load(self, document: DocumentInput) -> List[PageInput]:
+        self.calls.append(document)
+        images = document.images or []
+        if not images:
+            raise ValueError("MockInputHandler requires images in DocumentInput")
+
+        return [
+            PageInput(
+                document_id=document.document_id,
+                page_number=idx + 1,
+                image=image,
+                dpi=document.dpi,
+            )
+            for idx, image in enumerate(images)
+        ]
 
 
 class MockTextOCR(TextOCR):
