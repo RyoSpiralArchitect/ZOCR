@@ -1797,9 +1797,17 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
         glyphs, ambiguous, categories = _load_unicharset(unichar_path)
         dictionary = set(built_dictionary)
         bigrams = {prev: dict(mapping) for prev, mapping in built_bigrams.items()}
+
+    rebuild_bigrams = False
     domain_subset = _tesslite_domain_keywords()
     if domain_subset:
-        dictionary = set(domain_subset)
+        dictionary.update(domain_subset)
+        rebuild_bigrams = True
+    extra_words = _load_dictionary_words(_tesslite_extra_dictionary_paths())
+    if extra_words:
+        dictionary.update(extra_words)
+        rebuild_bigrams = True
+    if rebuild_bigrams:
         bigrams = _build_bigrams_from_words(dictionary)
     extra_words = _load_dictionary_words(_tesslite_extra_dictionary_paths())
     if extra_words:
