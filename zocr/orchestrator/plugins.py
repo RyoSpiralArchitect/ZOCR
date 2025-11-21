@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Simple plugin registry for the pipeline orchestrator."""
 
 from __future__ import annotations

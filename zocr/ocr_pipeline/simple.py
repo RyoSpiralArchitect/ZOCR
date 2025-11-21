@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Minimal built-in implementations for the OCR pipeline.
 
 These classes are intentionally lightweight so the pipeline can run without

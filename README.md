@@ -1,4 +1,9 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2024 ZOCR contributors -->
+
 # Z-OCR Suite / Z-OCR スイート / Suite Z-OCR
+
+[![License: AGPL v3 or later](https://img.shields.io/badge/License-AGPL_v3-orange.svg)](LICENSE.txt)
 
 ## 概要 / Overview / Aperçu
 - **[JA]** `zocr/` パッケージ（`consensus`, `core`, `orchestrator`）を中心に、OCR→拡張→インデックス→監視→調整→レポートまでをワンコマンドで連結します。`zocr_allinone_merged_plus.py` は互換レガシーとして同梱します。

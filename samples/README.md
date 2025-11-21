@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2024 ZOCR contributors -->
+
 # Samples / サンプル / Exemples
 
 `samples/demo_inputs/` に PDF や PNG を配置すると、`--input demo` でこれらの実ファイルをデモ素材として処理します。

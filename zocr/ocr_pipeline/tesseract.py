@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Text OCR implementation backed by pytesseract.
 
 This module provides a production-ready implementation of the ``TextOCR``
@@ -74,6 +77,7 @@ class TesseractTextOCR(TextOCR):
             text=text_content,
             confidence=overall_conf,
             language=self.lang,
+            engine="tesseract",
             words=words if words else None,
         )
 

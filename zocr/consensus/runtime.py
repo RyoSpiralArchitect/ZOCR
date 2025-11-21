@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 # -*- coding: utf-8 -*-
 """
 Z‑OCR one‑file (Consensus)

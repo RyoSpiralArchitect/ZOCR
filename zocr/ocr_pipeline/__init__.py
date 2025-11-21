@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Modular OCR pipeline scaffolding."""
 
 from .input_handler import BasicInputHandler
@@ -44,6 +47,7 @@ from .simple import (
     FullPageSegmenter,
     SimpleAggregator,
 )
+from .hybrid import ToyRuntimeTextOCR, TwoStageTextOCR
 from .tesseract import TesseractTextOCR
 
 __all__ = [
@@ -69,6 +73,8 @@ __all__ = [
     "SimpleAggregator",
     "DummyVLLM",
     "DummyTableExtractor",
+    "ToyRuntimeTextOCR",
+    "TwoStageTextOCR",
     "OcrPipeline",
     "DocumentPipeline",
     "PageInput",

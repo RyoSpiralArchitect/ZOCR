@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Compatibility shim exposing the multi-module core API."""
 from __future__ import annotations
 

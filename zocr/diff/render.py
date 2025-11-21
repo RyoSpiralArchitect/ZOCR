@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 # -*- coding: utf-8 -*-
 """Rendering helpers for semantic diff output."""
 from __future__ import annotations

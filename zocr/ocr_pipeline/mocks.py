@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Mock implementations of OCR pipeline components for testing."""
 from __future__ import annotations
 
@@ -89,6 +92,7 @@ class MockTextOCR(TextOCR):
             text=f"text content for {region.region_id}",
             confidence=0.95,
             language="en",
+            engine="mock",
         )
 
 

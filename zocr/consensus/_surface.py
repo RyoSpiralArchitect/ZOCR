@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Public surface for the consensus OCR stack.
 
 This module houses the lazily-loaded exports so that ``zocr.consensus``'s

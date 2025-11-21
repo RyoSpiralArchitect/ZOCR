@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 # -*- coding: utf-8 -*-
 """Aggregations and derived metrics for diff events."""
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 from .assist import DiffAssistPlanner
 from .differ import SemanticDiffer
 from .handoff import build_handoff_bundle

@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2024 ZOCR contributors -->
+
 # Hybrid RAG with Z-OCR semantics
 
 This note outlines how to implement a structure-aware Retrieval-Augmented Generation (RAG) pipeline that uses Z-OCR tags so the retriever and reader reason over document layout as well as text.

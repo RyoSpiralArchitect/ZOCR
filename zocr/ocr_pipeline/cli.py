@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Command-line entry for the lightweight OCR pipeline.
 
 This CLI is intended for quick local runs or EC2 workflows where the
@@ -31,6 +34,8 @@ from . import (
     MockVLLM,
     SimpleAggregator,
     TesseractTextOCR,
+    ToyRuntimeTextOCR,
+    TwoStageTextOCR,
 )
 from .pipeline import OcrPipeline
 
@@ -42,7 +47,11 @@ def _load_images(paths: Iterable[str]) -> List[Image.Image]:
 def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
     segmenter = MockSegmenter() if use_mocks else FullPageSegmenter()
     classifier = MockRegionClassifier() if use_mocks else AspectRatioRegionClassifier()
-    text_ocr = MockTextOCR() if use_mocks else TesseractTextOCR()
+    text_ocr = (
+        MockTextOCR()
+        if use_mocks
+        else TwoStageTextOCR(primary=ToyRuntimeTextOCR(), fallback=TesseractTextOCR())
+    )
     vllm = MockVLLM() if use_mocks else DummyVLLM()
     table_extractor = MockTableExtractor() if use_mocks else DummyTableExtractor()
     aggregator = MockAggregator() if use_mocks else SimpleAggregator()

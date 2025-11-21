@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Public surface for the multi-module core package."""
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ _ATTR_TO_MODULE_ATTR: Dict[str, Tuple[str, str]] = {
     "augment": (".augmenter", "augment"),
     "build_index": (".indexer", "build_index"),
     "query": (".query_engine", "query"),
+    "hybrid_query": (".query_engine", "hybrid_query"),
     "sql_export": (".exporters", "sql_export"),
     "export_rag_bundle": (".exporters", "export_rag_bundle"),
     "embed_jsonl": (".embedders", "embed_jsonl"),
@@ -65,7 +69,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         metric_col_over_under_rate,
         monitor,
     )
-    from .query_engine import query
+    from .query_engine import hybrid_query, query
     from .exporters import export_rag_bundle, sql_export
     from .zocr_core import main
 

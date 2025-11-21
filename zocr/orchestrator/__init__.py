@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Pipeline orchestrator wrapper.
 
 This module intentionally avoids importing ``zocr_pipeline`` at module import

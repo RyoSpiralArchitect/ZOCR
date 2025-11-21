@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Export helpers for SQL and RAG bundles."""
 from __future__ import annotations
 

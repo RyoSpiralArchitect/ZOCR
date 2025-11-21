@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Execution-core helpers shared across the consensus runtime stack."""
 from .utils import clamp
 from .binarization import (

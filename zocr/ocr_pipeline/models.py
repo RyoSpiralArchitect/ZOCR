@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024 ZOCR contributors
+
 """Data models for the modular OCR pipeline.
 
 These models keep inputs and outputs explicit across each component of the
@@ -83,6 +86,7 @@ class TextOcrResult(BaseModel):
     text: str
     confidence: float = Field(..., ge=0.0, le=1.0)
     language: Optional[str] = None
+    engine: Optional[str] = None
     words: Optional[List[WordInfo]] = None
 
 
