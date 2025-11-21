@@ -1624,9 +1624,56 @@ def _tesslite_env_signature() -> str:
         return f"{path}:missing"
 
 
+def _tesslite_extra_dictionary_paths() -> List[str]:
+    raw = os.environ.get("ZOCR_TESS_EXTRA_DICT") or os.environ.get(
+        "ZOCR_TESS_EXTRA_DICTIONARIES"
+    )
+    if not raw:
+        return []
+    paths: List[str] = []
+    for token in raw.split(os.pathsep):
+        trimmed = token.strip()
+        if trimmed:
+            paths.append(trimmed)
+    return paths
+
+
+def _tesslite_extra_dictionary_signature() -> str:
+    entries: List[str] = []
+    for path in _tesslite_extra_dictionary_paths():
+        try:
+            st = os.stat(path)
+            entries.append(f"{path}:{int(st.st_mtime)}:{st.st_size}")
+        except Exception:
+            entries.append(f"{path}:missing")
+    if not entries:
+        return ""
+    return "|extra_dict:" + ",".join(entries)
+
+
+def _load_dictionary_words(paths: Sequence[str]) -> Set[str]:
+    words: Set[str] = set()
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    token = line.strip()
+                    if not token:
+                        continue
+                    if " " in token:
+                        for part in token.split():
+                            if part:
+                                words.add(part)
+                        continue
+                    words.add(token)
+        except Exception:
+            continue
+    return words
+
+
 def _tesslite_effective_source() -> Tuple[bool, str, bool]:
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
-    suffix = _tesslite_domain_signature()
+    suffix = _tesslite_domain_signature() + _tesslite_extra_dictionary_signature()
     if unichar:
         return True, f"{_tesslite_env_signature()}{suffix}", False
     if _tesslite_builtin_available():
@@ -1698,6 +1745,39 @@ def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
     return table
 
 
+def _seed_ngrams_from_words(words: Set[str]) -> None:
+    """Prime the in-memory N-gram tables from a word lexicon."""
+
+    for word in words:
+        prev = "\0"
+        for ch in word:
+            _NGRAM_COUNTS[prev][ch] += 1.0
+            _NGRAM_TOTALS[prev] += 1.0
+            prev = ch
+        _NGRAM_COUNTS[prev]["\0"] += 1.0
+        _NGRAM_TOTALS[prev] += 1.0
+
+
+_EXTRA_LEXICON_SIGNATURE: Optional[str] = None
+
+
+def _seed_external_wordlists_once() -> None:
+    """Merge optional domain/extra wordlists into toy N-grams lazily."""
+
+    global _EXTRA_LEXICON_SIGNATURE
+    signature = _tesslite_domain_signature() + _tesslite_extra_dictionary_signature()
+    if signature == _EXTRA_LEXICON_SIGNATURE:
+        return
+    words: Set[str] = set()
+    domain_subset = _tesslite_domain_keywords()
+    if domain_subset:
+        words.update(domain_subset)
+    words.update(_load_dictionary_words(_tesslite_extra_dictionary_paths()))
+    if words:
+        _seed_ngrams_from_words(words)
+    _EXTRA_LEXICON_SIGNATURE = signature
+
+
 def _get_tesslite_model() -> Optional[_TessLiteModel]:
     global _TESSLITE_MODEL, _TESSLITE_MODEL_SIG, _TESSLITE_LAST_SOURCE
     enabled, signature, use_builtin = _tesslite_effective_source()
@@ -1721,6 +1801,12 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
     if domain_subset:
         dictionary = set(domain_subset)
         bigrams = _build_bigrams_from_words(dictionary)
+    extra_words = _load_dictionary_words(_tesslite_extra_dictionary_paths())
+    if extra_words:
+        dictionary.update(extra_words)
+        merged = _build_bigrams_from_words(dictionary) if dictionary else {}
+        if merged:
+            bigrams = merged
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
@@ -1741,13 +1827,34 @@ def get_tesslite_status() -> Dict[str, Any]:
     enabled, signature, use_builtin = _tesslite_effective_source()
     unichar = os.environ.get("ZOCR_TESS_UNICHARSET") or None
     source = "builtin" if use_builtin else ("custom_unicharset" if enabled else "none")
+    has_extra = bool(_tesslite_extra_dictionary_paths())
+    domain_tok = _tesslite_domain_token()
+
+    wordlist_desc: Optional[str]
+    bigram_desc: Optional[str]
+    if not enabled:
+        wordlist_desc = None
+        bigram_desc = None
+    elif use_builtin:
+        wordlist_desc = "builtin"
+        bigram_desc = "builtin"
+    else:
+        wordlist_desc = "custom"
+        bigram_desc = "custom"
+    if domain_tok and wordlist_desc:
+        wordlist_desc = f"{wordlist_desc}+domain"
+        bigram_desc = f"{bigram_desc}+domain" if bigram_desc else None
+    if has_extra and wordlist_desc:
+        wordlist_desc = f"{wordlist_desc}+extra"
+        bigram_desc = f"{bigram_desc}+extra" if bigram_desc else None
+
     return {
         "enabled": bool(enabled),
         "signature": signature or None,
         "source": source,
         "unicharset": unichar if unichar else ("builtin" if use_builtin else None),
-        "wordlist": "builtin" if enabled else None,
-        "bigram_json": "builtin" if enabled else None,
+        "wordlist": wordlist_desc,
+        "bigram_json": bigram_desc,
         "domain": _tesslite_domain_token(),
     }
 
@@ -2212,6 +2319,8 @@ def _toy_text_quality(text: str) -> Tuple[float, Dict[str, float]]:
     return quality, diag
 
 def _ngram_probability(prev: str, ch: str) -> float:
+    _seed_external_wordlists_once()
+
     counts = _NGRAM_COUNTS.get(prev)
     totals = _NGRAM_TOTALS.get(prev, 0)
     if counts and totals:
