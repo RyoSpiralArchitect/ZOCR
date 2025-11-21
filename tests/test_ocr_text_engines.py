@@ -19,6 +19,7 @@ from zocr.ocr_pipeline.models import ClassifiedRegion, TextOcrResult
 class DummyTextOCR:
     text: str
     confidence: float
+    engine: str = "dummy"
 
     calls: int = 0
 
@@ -29,6 +30,7 @@ class DummyTextOCR:
             text=self.text,
             confidence=self.confidence,
             language="dummy",
+            engine=self.engine,
         )
 
 
@@ -46,36 +48,39 @@ def _region() -> ClassifiedRegion:
 
 def test_two_stage_text_ocr_uses_fallback_on_low_confidence():
     primary = DummyTextOCR(text="", confidence=0.2)
-    fallback = DummyTextOCR(text="fallback text", confidence=0.9)
+    fallback = DummyTextOCR(text="fallback text", confidence=0.9, engine="fallback")
     hybrid = TwoStageTextOCR(primary=primary, fallback=fallback, min_primary_confidence=0.5)
 
     result = hybrid.run(_region())
 
     assert result.text == "fallback text"
+    assert result.engine == "fallback"
     assert primary.calls == 1
     assert fallback.calls == 1
 
 
 def test_two_stage_text_ocr_keeps_primary_when_confident():
-    primary = DummyTextOCR(text="primary text", confidence=0.95)
-    fallback = DummyTextOCR(text="secondary", confidence=0.4)
+    primary = DummyTextOCR(text="primary text", confidence=0.95, engine="primary")
+    fallback = DummyTextOCR(text="secondary", confidence=0.4, engine="secondary")
     hybrid = TwoStageTextOCR(primary=primary, fallback=fallback, min_primary_confidence=0.5)
 
     result = hybrid.run(_region())
 
     assert result.text == "primary text"
+    assert result.engine == "primary"
     assert primary.calls == 1
     assert fallback.calls == 0
 
 
 def test_two_stage_text_ocr_retains_primary_when_fallback_empty():
-    primary = DummyTextOCR(text="low", confidence=0.2)
-    fallback = DummyTextOCR(text="   ", confidence=0.8)
+    primary = DummyTextOCR(text="low", confidence=0.2, engine="primary")
+    fallback = DummyTextOCR(text="   ", confidence=0.8, engine="secondary")
     hybrid = TwoStageTextOCR(primary=primary, fallback=fallback, min_primary_confidence=0.5)
 
     result = hybrid.run(_region())
 
     assert result.text == "low"
+    assert result.engine == "primary"
     assert primary.calls == 1
     assert fallback.calls == 1
 
@@ -92,6 +97,7 @@ def test_toy_runtime_wrapper_invokes_toy_runner(monkeypatch):
 
     assert result.text == "toy"
     assert result.confidence == 0.7
+    assert result.engine == "toy_runtime"
     assert "image" in calls
 
 
