@@ -216,6 +216,9 @@ python -m zocr simple --images samples/demo_inputs/invoice_page.png --out out_mo
 - **[JA]** 同じ `zocr.resources.domain_dictionary` を consensus exporter や `zocr.core` のキーワードブーストも共有するため、外部辞書や bigram JSON を取り込む想定はスタック全体で廃止しました。
 - **[EN]** The same bundled dictionary powers the toy OCR, consensus exporter, and the `zocr.core` retrieval boosts, so no part of the stack expects external wordlists/bigram JSON anymore.
 - **[FR]** Ce dictionnaire embarqué alimente aussi bien le Toy OCR que l’exporteur consensus et le noyau `zocr.core`, supprimant toute dépendance aux dictionnaires/bigrammes externes.
+- **[JA]** それでも独自ワードリストを併用したい場合は、改行区切りのテキストファイルパスを `ZOCR_TESS_EXTRA_DICT`（複数はパスセパレータ区切り）に渡すと toy/tesslite の辞書と bigram が合成されます。
+- **[EN]** If you still need a private wordlist, point `ZOCR_TESS_EXTRA_DICT` to one or more newline-delimited files (use your OS path separator to list multiples) and the toy/tesslite dictionary + bigrams will merge them in.
+- **[FR]** Si vous devez malgré tout fusionner un lexique maison, indiquez un ou plusieurs fichiers texte (mots séparés par retour à la ligne) via `ZOCR_TESS_EXTRA_DICT` — le dictionnaire et les bigrammes toy/tesslite les intégreront.
 - `ZOCR_TESS_DOMAIN` または CLI の `--domain` / パイプラインの domain 設定を指定すると、Toy OCR の内蔵辞書が該当ドメインのキーワード集合に切り替わります。プロファイルや自動判別で domain が確定するとパイプライン側で `ZOCR_TESS_DOMAIN` も自動更新されます。
 
 ## PDF レンダリング最適化 / PDF rasterization knobs / Optimisations PDF
