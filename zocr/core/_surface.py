@@ -9,10 +9,8 @@ _ATTR_TO_MODULE_ATTR: Dict[str, Tuple[str, str]] = {
     "augment": (".augmenter", "augment"),
     "build_index": (".indexer", "build_index"),
     "query": (".query_engine", "query"),
-    "hybrid_query": (".query_engine", "hybrid_query"),
     "sql_export": (".exporters", "sql_export"),
     "export_rag_bundle": (".exporters", "export_rag_bundle"),
-    "embed_jsonl": (".embedders", "embed_jsonl"),
     "monitor": (".monitoring", "monitor"),
     "learn_from_monitor": (".monitoring", "learn_from_monitor"),
     "autotune_unlabeled": (".monitoring", "autotune_unlabeled"),
@@ -29,7 +27,6 @@ _MODULE_EXPORTS: Dict[str, str] = {
     "augmenter": ".augmenter",
     "base": ".base",
     "domains": ".domains",
-    "embedders": ".embedders",
     "exporters": ".exporters",
     "indexer": ".indexer",
     "monitoring": ".monitoring",
@@ -47,7 +44,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         augmenter,
         base,
         domains,
-        embedders,
         exporters,
         indexer,
         monitoring,
@@ -57,7 +53,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
     )
     from .augmenter import augment
     from .indexer import build_index
-    from .embedders import embed_jsonl
     from .monitoring import (
         autotune_unlabeled,
         learn_from_monitor,
@@ -66,7 +61,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         metric_col_over_under_rate,
         monitor,
     )
-    from .query_engine import hybrid_query, query
+    from .query_engine import query
     from .exporters import export_rag_bundle, sql_export
     from .zocr_core import main
 
