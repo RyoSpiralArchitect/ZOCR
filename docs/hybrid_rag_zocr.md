@@ -101,12 +101,10 @@ hits = hybrid_query(
     q_text="unit price and total",
     zone_filter=r"table\\.body.*",
     boosts={"header_norm": ["unit_price", "amount_total"]},
-    filters={"doc_id": "AI_テスト用_部品表1.pdf", "page": {3, 4}},
 )
 ```
 
-It applies the same scoring recipe described above, boosting zone/header matches, honoring structural filters, respecting top-level/meta filters (e.g., ``doc_id``/``page``), and penalizing low OCR/structure confidence when those signals are present in the Z-OCR tag envelope.
-Metadata filters accept scalars, collections, regex patterns (``re:<pat>``), or callables if you need to gate candidates with custom predicates.
+It applies the same scoring recipe described above, boosting zone/header matches, honoring structural filters, and penalizing low OCR/structure confidence when those signals are present in the Z-OCR tag envelope.
 
 ## Evaluation tips
 - **Cell QA:** ask for values present only in specific rows; measure exact match and wrong-row rate.
