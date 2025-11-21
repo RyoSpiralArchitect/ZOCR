@@ -169,6 +169,58 @@ def _struct_filter(struct: Dict[str, Any], struct_filters: Dict[str, Any]) -> bo
     return True
 
 
+def _passes_filters(obj: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    """Check top-level/meta fields against caller-provided filters.
+
+    Supports equality checks for scalar values as well as membership checks when
+    the filter value is a list/tuple/set. A string filter starting with ``"re:"``
+    is treated as a regex pattern anchored at the start of the field. Callables
+    are also allowed and are invoked with the candidate value; any falsy return
+    (or raised exception) causes the object to be rejected.
+    """
+
+    for key, expected in (filters or {}).items():
+        if key in (None, "trace"):
+            continue
+
+        actual = obj.get(key)
+        if actual is None:
+            actual = (obj.get("meta") or {}).get(key)
+
+        if actual is None:
+            return False
+
+        # Predicate filter: callable(expected)
+        if callable(expected):
+            try:
+                if not expected(actual):
+                    return False
+            except Exception:
+                return False
+            continue
+
+        # Regex filter: re:<pattern>
+        if isinstance(expected, str) and expected.startswith("re:"):
+            try:
+                if not re.match(expected[3:], str(actual)):
+                    return False
+            except re.error:
+                return False
+            continue
+
+        # Membership filter
+        if isinstance(expected, (list, tuple, set)):
+            if actual not in expected:
+                return False
+            continue
+
+        # Scalar equality (including dicts)
+        if expected is not None and actual != expected:
+            return False
+
+    return True
+
+
 def query(
     index_pkl: str,
     jsonl: str,
@@ -303,6 +355,9 @@ def hybrid_query(
         meta = dict(ob.get("meta") or {})
         struct = dict(ob.get("struct") or meta.get("struct") or {})
         zone = ob.get("zone") or meta.get("zone") or ""
+
+        if filters and not _passes_filters(ob, filters):
+            continue
 
         if zone_filter and not _zone_match_score(zone, zone_filter):
             # Hard filter by zone when explicitly requested.

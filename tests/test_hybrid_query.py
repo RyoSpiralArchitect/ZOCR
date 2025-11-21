@@ -56,6 +56,23 @@ def _write_sample(tmp_path: Path) -> Path:
             "confidence": {"ocr": 0.99, "structure": 0.9},
             "meta": {},
         },
+        {
+            "doc_id": "docB",
+            "page": 2,
+            "text": "Unit price PN-777",
+            "search_unit": "Unit price",
+            "zone": "table.body.row",
+            "region_id": "tbl#9.row#1.col#unit_price",
+            "struct": {
+                "table_id": "tbl#9",
+                "row": 1,
+                "col": "unit_price",
+                "header_norm": "unit_price",
+                "row_key": {"part_no": "PN-777"},
+            },
+            "confidence": {"ocr": 0.97, "structure": 0.95},
+            "meta": {"filters": {"amount": 45}},
+        },
     ]
     jsonl_path = tmp_path / "cells.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:
@@ -105,3 +122,39 @@ def test_hybrid_query_applies_struct_filters_and_penalty(tmp_path):
     _, doc = filtered[0]
     assert doc["struct"]["row"] == 2
     assert doc["meta"]["retrieval_scores"]["penalty"] > 0.0
+
+
+def test_hybrid_query_hard_filters_metadata(tmp_path):
+    jsonl_path = _write_sample(tmp_path)
+    index_path = tmp_path / "ix.pkl"
+    build_index(str(jsonl_path), str(index_path))
+
+    filtered = hybrid_query(
+        str(index_path),
+        str(jsonl_path),
+        q_text="unit price",
+        filters={"doc_id": "docB", "page": {2, 3}},
+        topk=5,
+    )
+
+    assert filtered
+    assert all(doc["doc_id"] == "docB" for _, doc in filtered)
+    assert all(doc["page"] == 2 for _, doc in filtered)
+
+
+def test_hybrid_query_accepts_callable_filters(tmp_path):
+    jsonl_path = _write_sample(tmp_path)
+    index_path = tmp_path / "ix.pkl"
+    build_index(str(jsonl_path), str(index_path))
+
+    filtered = hybrid_query(
+        str(index_path),
+        str(jsonl_path),
+        q_text="amount total",
+        filters={"confidence": lambda c: c and c.get("ocr", 0) < 0.9},
+        topk=3,
+    )
+
+    assert filtered
+    assert len(filtered) == 1
+    assert filtered[0][1]["region_id"] == "tbl#1.row#2.col#amount_total"
