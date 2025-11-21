@@ -56,3 +56,11 @@ def test_tesseract_text_ocr_requires_image_crop():
     ocr = TesseractTextOCR()
     with pytest.raises(ValueError):
         ocr.run(region)
+
+
+def test_tesseract_text_ocr_respects_env_toggle(monkeypatch):
+    monkeypatch.setenv("ZOCR_ALLOW_PYTESSERACT", "0")
+
+    with pytest.raises(RuntimeError):
+        TesseractTextOCR()
+

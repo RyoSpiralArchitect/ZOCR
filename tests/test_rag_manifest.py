@@ -28,6 +28,12 @@ def test_export_rag_bundle_embeds_bedrock_plan(tmp_path):
 
     assert result["embedding"]["provider"] == "aws_bedrock"
     assert result["embedding"]["model"] == "amazon.titan-embed-text-v2"
+    assert "hint" in result["embedding"] and result["embedding"]["hint"]
+    assert result["embedding"]["hint"]["payload_key"] == "inputText"
+    assert result["embedding"]["hint"]["cli_example"]["command"][0:2] == [
+        "aws",
+        "bedrock-runtime",
+    ]
     assert manifest["embedding"] == result["embedding"]
 
     assert result["cell_count"] == 1

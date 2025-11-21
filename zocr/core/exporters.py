@@ -142,6 +142,40 @@ def _fact_tag(text: str, trace_label: str, lang: Optional[str]) -> str:
     return f"<fact {attrs}>{body}</fact>"
 
 
+def _bedrock_embedding_hint(model: str) -> Dict[str, Any]:
+    cli_body = '{"inputText": "hello world"}'
+    return {
+        "region_env": "AWS_REGION",
+        "payload_key": "inputText",
+        "content_type": "application/json",
+        "accept": "application/json",
+        "cli_example": {
+            "command": [
+                "aws",
+                "bedrock-runtime",
+                "invoke-model",
+                "--region",
+                "${AWS_REGION}",
+                "--model-id",
+                model,
+                "--body",
+                cli_body,
+            ],
+            "body": cli_body,
+        },
+        "python_example": """
+import json, os
+import boto3
+
+client = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+payload = {"inputText": "hello world"}
+res = client.invoke_model(modelId="%(model)s", body=json.dumps(payload))
+vector = json.loads(res["body"].read())["embedding"]
+"""
+        % {"model": model},
+    }
+
+
 def export_rag_bundle(
     jsonl: str,
     outdir: str,
@@ -223,6 +257,8 @@ def export_rag_bundle(
         "model": embedding_model,
         "note": "Preferred RAG embedding target; swap model for region-specific Bedrock deployments as needed.",
     }
+    if embedding_provider == "aws_bedrock":
+        embedding["hint"] = _bedrock_embedding_hint(embedding_model)
 
     manifest = {
         "cells": cells_path,
