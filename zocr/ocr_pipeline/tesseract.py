@@ -74,6 +74,7 @@ class TesseractTextOCR(TextOCR):
             text=text_content,
             confidence=overall_conf,
             language=self.lang,
+            engine="tesseract",
             words=words if words else None,
         )
 

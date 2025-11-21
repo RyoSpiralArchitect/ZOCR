@@ -89,6 +89,7 @@ class MockTextOCR(TextOCR):
             text=f"text content for {region.region_id}",
             confidence=0.95,
             language="en",
+            engine="mock",
         )
 
 
