@@ -45,7 +45,6 @@ class ToyRuntimeTextOCR(TextOCR):
             text=text,
             confidence=float(confidence or 0.0),
             language="toy",
-            engine="toy_runtime",
         )
 
 
