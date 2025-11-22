@@ -153,6 +153,7 @@ python -m zocr simple --images samples/demo_inputs/invoice_page.png --out out_mo
 - `doc.zocr.json` — OCR & consensus の主 JSON。
 - `doc.mm.jsonl` — マルチモーダル JSONL（RAG / BM25 共用）。
 - `rag/` — `export_rag_bundle` によるセル/テーブル/Markdown/マニフェスト。
+- `rag/trace.prov.jsonld` — PROV-O 互換の系譜バンドル。`doc.mm.jsonl` → `rag/cells.jsonl` → `sections` / `tables` → `manifest` の派生関係と生成アクティビティを追跡できます。
 - **[JA/EN]** `python -m zocr.core embed --jsonl rag/cells.jsonl --model <path>` で (EC2 で同期した SentenceTransformer などの) 埋め込み
   を `.embedded.jsonl` に付与できます。Bedrock など AWS サービス経由なら `--provider bedrock --model <modelId> --aws-region <region>`
   で同じ JSONL にベクトルを付与できます / Attach embeddings from a local SentenceTransformer (e.g., your EC2-resynced model)

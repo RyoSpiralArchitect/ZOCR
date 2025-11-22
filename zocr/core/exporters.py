@@ -2,13 +2,30 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .domains import DOMAIN_ALIAS, DOMAIN_SUGGESTED_QUERIES
 
 __all__ = ["sql_export", "export_rag_bundle", "_build_trace", "_fact_tag"]
+
+
+def _sha256(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as fr:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: fr.read(8192), b""):
+                digest.update(chunk)
+            return digest.hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def _prov_time() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def sql_export(jsonl: str, outdir: str, prefix: str = "invoice") -> Dict[str, str]:
@@ -181,6 +198,7 @@ def export_rag_bundle(
     outdir: str,
     domain: Optional[str] = None,
     summary: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
     limit_per_section: int = 40,
     embedding_provider: str = "aws_bedrock",
     embedding_model: str = "amazon.titan-embed-text-v2",
@@ -188,6 +206,7 @@ def export_rag_bundle(
     if not os.path.exists(jsonl):
         raise FileNotFoundError(jsonl)
     os.makedirs(outdir, exist_ok=True)
+    resolved_run = run_id or os.path.basename(os.path.normpath(outdir)) or "zocr-run"
     cells_path = os.path.join(outdir, "cells.jsonl")
     sections_path = os.path.join(outdir, "sections.jsonl")
     tables_path = os.path.join(outdir, "tables.json")
@@ -274,9 +293,43 @@ def export_rag_bundle(
         "trace_schema": trace_schema,
         "fact_tag_example": fact_tag_example,
         "embedding": embedding,
+        "provenance": {
+            "bundle_id": f"urn:trace:{resolved_run}",
+            "prov_bundle": os.path.join(outdir, "trace.prov.jsonld"),
+            "agent": "urn:agent:zocr",
+        },
     }
     with open(manifest_path, "w", encoding="utf-8") as fw:
         json.dump(manifest, fw, ensure_ascii=False, indent=2)
+
+    prov_info = _write_prov_bundle(
+        run_id=resolved_run,
+        outdir=outdir,
+        source_jsonl=jsonl,
+        cells_path=cells_path,
+        sections_path=sections_path,
+        tables_path=tables_path,
+        manifest_path=manifest_path,
+        agent_label=f"ZOCR ({resolved})",
+        doc_ids=sorted(doc_ids),
+        languages=sorted(languages),
+    )
+    if prov_info:
+        manifest["provenance"].update(prov_info)
+        with open(manifest_path, "w", encoding="utf-8") as fw:
+            json.dump(manifest, fw, ensure_ascii=False, indent=2)
+        prov_info = _write_prov_bundle(
+            run_id=resolved_run,
+            outdir=outdir,
+            source_jsonl=jsonl,
+            cells_path=cells_path,
+            sections_path=sections_path,
+            tables_path=tables_path,
+            manifest_path=manifest_path,
+            agent_label=f"ZOCR ({resolved})",
+            doc_ids=sorted(doc_ids),
+            languages=sorted(languages),
+        )
 
     with open(markdown_path, "w", encoding="utf-8") as fw:
         fw.write(f"# ZOCR RAG Bundle ({resolved})\n\n")
@@ -305,4 +358,216 @@ def export_rag_bundle(
         "trace_schema": trace_schema,
         "fact_tag_example": fact_tag_example,
         "embedding": embedding,
+        "prov_bundle": prov_info.get("prov_bundle") if prov_info else None,
+    }
+
+
+def _prov_entity_for_file(
+    *,
+    run_id: str,
+    label: str,
+    path: str,
+    mime: Optional[str] = None,
+    role: Optional[str] = None,
+    doc_ids: Optional[List[str]] = None,
+    languages: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return None
+    checksum = _sha256(path)
+    stats = os.stat(path)
+    entity: Dict[str, Any] = {
+        "id": f"urn:ent:{run_id}:{label}",
+        "type": "prov:Entity",
+        "prov:label": label,
+        "path": os.path.abspath(path),
+        "checksum": checksum,
+        "size": stats.st_size,
+    }
+    if mime:
+        entity["mime"] = mime
+    if role:
+        entity["role"] = role
+    if doc_ids:
+        entity["doc_ids"] = doc_ids
+    if languages:
+        entity["languages"] = languages
+    return entity
+
+
+def _write_prov_bundle(
+    *,
+    run_id: str,
+    outdir: str,
+    source_jsonl: str,
+    cells_path: str,
+    sections_path: str,
+    tables_path: str,
+    manifest_path: str,
+    agent_label: str,
+    doc_ids: List[str],
+    languages: List[str],
+) -> Optional[Dict[str, Any]]:
+    prov_path = os.path.join(outdir, "trace.prov.jsonld")
+    bundle_id = f"urn:trace:{run_id}"
+    agent_id = "urn:agent:zocr"
+    context = {
+        "prov": "http://www.w3.org/ns/prov#",
+        "id": "@id",
+        "type": "@type",
+        "label": "prov:label",
+        "role": "prov:hadRole",
+        "mime": "http://schema.org/encodingFormat",
+        "checksum": "http://schema.org/checksum",
+        "size": "http://schema.org/contentSize",
+        "path": "http://schema.org/contentUrl",
+        "params": "http://schema.org/encoding",
+        "doc_ids": "http://schema.org/identifier",
+        "languages": "http://schema.org/inLanguage",
+    }
+
+    raw_cells = _prov_entity_for_file(
+        run_id=run_id,
+        label="cells_raw",
+        path=source_jsonl,
+        mime="application/json",
+        role="raw-mm-jsonl",
+        doc_ids=doc_ids,
+        languages=languages,
+    )
+    cells_entity = _prov_entity_for_file(
+        run_id=run_id,
+        label="cells",
+        path=cells_path,
+        mime="application/json",
+        role="rag-cells",
+        doc_ids=doc_ids,
+        languages=languages,
+    )
+    sections_entity = _prov_entity_for_file(
+        run_id=run_id,
+        label="sections",
+        path=sections_path,
+        mime="application/json",
+        role="rag-sections",
+        doc_ids=doc_ids,
+        languages=languages,
+    )
+    tables_entity = _prov_entity_for_file(
+        run_id=run_id,
+        label="tables",
+        path=tables_path,
+        mime="application/json",
+        role="rag-tables",
+        doc_ids=doc_ids,
+        languages=languages,
+    )
+    manifest_entity = _prov_entity_for_file(
+        run_id=run_id,
+        label="manifest",
+        path=manifest_path,
+        mime="application/ld+json",
+        role="rag-manifest",
+        doc_ids=doc_ids,
+        languages=languages,
+    )
+
+    agent = {"id": agent_id, "type": "prov:SoftwareAgent", "prov:label": agent_label}
+
+    cells_activity_id = f"urn:act:{run_id}:cells-export"
+    sections_activity_id = f"urn:act:{run_id}:sections-build"
+    manifest_activity_id = f"urn:act:{run_id}:manifest-build"
+
+    activities = {
+        "cells_export": {
+            "id": cells_activity_id,
+            "type": "prov:Activity",
+            "prov:startedAtTime": _prov_time(),
+            "prov:endedAtTime": _prov_time(),
+            "params": {"limit_per_section": None},
+            "prov:used": [{"id": raw_cells["id"]}] if raw_cells else [],
+            "prov:wasAssociatedWith": [{"id": agent_id}],
+        },
+        "sections_build": {
+            "id": sections_activity_id,
+            "type": "prov:Activity",
+            "prov:startedAtTime": _prov_time(),
+            "prov:endedAtTime": _prov_time(),
+            "params": {"doc_ids": doc_ids, "languages": languages},
+            "prov:used": [{"id": cells_entity["id"]}] if cells_entity else [],
+            "prov:wasAssociatedWith": [{"id": agent_id}],
+        },
+        "manifest_build": {
+            "id": manifest_activity_id,
+            "type": "prov:Activity",
+            "prov:startedAtTime": _prov_time(),
+            "prov:endedAtTime": _prov_time(),
+            "params": {"doc_ids": doc_ids, "languages": languages},
+            "prov:used": [
+                {"id": ent_id}
+                for ent_id in (
+                    cells_entity["id"] if cells_entity else None,
+                    sections_entity["id"] if sections_entity else None,
+                    tables_entity["id"] if tables_entity else None,
+                )
+                if ent_id
+            ],
+            "prov:wasAssociatedWith": [{"id": agent_id}],
+        },
+    }
+
+    if cells_entity:
+        cells_entity["prov:wasGeneratedBy"] = {"id": cells_activity_id}
+        if raw_cells:
+            cells_entity["prov:wasDerivedFrom"] = [{"id": raw_cells["id"]}]
+    if sections_entity:
+        sections_entity["prov:wasGeneratedBy"] = {"id": sections_activity_id}
+        if cells_entity:
+            sections_entity["prov:wasDerivedFrom"] = [{"id": cells_entity["id"]}]
+    if tables_entity:
+        tables_entity["prov:wasGeneratedBy"] = {"id": sections_activity_id}
+        if cells_entity:
+            tables_entity["prov:wasDerivedFrom"] = [{"id": cells_entity["id"]}]
+    if manifest_entity:
+        manifest_entity["prov:wasGeneratedBy"] = {"id": manifest_activity_id}
+        manifest_entity["prov:wasDerivedFrom"] = [
+            {"id": ent_id}
+            for ent_id in (
+                cells_entity["id"] if cells_entity else None,
+                sections_entity["id"] if sections_entity else None,
+                tables_entity["id"] if tables_entity else None,
+            )
+            if ent_id
+        ]
+
+    entities = {
+        key: value
+        for key, value in {
+            "raw_cells": raw_cells,
+            "cells": cells_entity,
+            "sections": sections_entity,
+            "tables": tables_entity,
+            "manifest": manifest_entity,
+        }.items()
+        if value
+    }
+
+    bundle = {
+        "@context": context,
+        "id": bundle_id,
+        "type": "prov:Bundle",
+        "prov:agent": {"zocr": agent},
+        "prov:entity": entities,
+        "prov:activity": activities,
+    }
+
+    with open(prov_path, "w", encoding="utf-8") as fw:
+        json.dump(bundle, fw, ensure_ascii=False, indent=2)
+
+    return {
+        "bundle_id": bundle_id,
+        "prov_bundle": prov_path,
+        "entities": {k: v["id"] for k, v in entities.items()},
+        "activities": {k: v["id"] for k, v in activities.items()},
+        "agent": agent_id,
     }
