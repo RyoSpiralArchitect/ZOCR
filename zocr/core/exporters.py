@@ -318,18 +318,6 @@ def export_rag_bundle(
         manifest["provenance"].update(prov_info)
         with open(manifest_path, "w", encoding="utf-8") as fw:
             json.dump(manifest, fw, ensure_ascii=False, indent=2)
-        prov_info = _write_prov_bundle(
-            run_id=resolved_run,
-            outdir=outdir,
-            source_jsonl=jsonl,
-            cells_path=cells_path,
-            sections_path=sections_path,
-            tables_path=tables_path,
-            manifest_path=manifest_path,
-            agent_label=f"ZOCR ({resolved})",
-            doc_ids=sorted(doc_ids),
-            languages=sorted(languages),
-        )
 
     with open(markdown_path, "w", encoding="utf-8") as fw:
         fw.write(f"# ZOCR RAG Bundle ({resolved})\n\n")
