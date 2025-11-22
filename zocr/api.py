@@ -242,6 +242,16 @@ def _provenance_from_manifest(manifest: Dict[str, Any]) -> List[Dict[str, str]]:
                 "fact_text": fact_example or "",
             }
         )
+    prov_info = manifest.get("provenance") or {}
+    prov_path = prov_info.get("prov_bundle")
+    bundle_id = prov_info.get("bundle_id")
+    if prov_path:
+        provenance.append(
+            {
+                "trace": bundle_id or "prov_bundle",
+                "fact_text": f"PROV trace at {prov_path}",
+            }
+        )
     return provenance
 
 
