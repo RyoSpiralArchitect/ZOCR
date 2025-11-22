@@ -1745,6 +1745,23 @@ def _build_bigrams_from_words(words: Set[str]) -> Dict[str, Dict[str, float]]:
     return table
 
 
+def _merge_bigrams(
+    base: Dict[str, Dict[str, float]], additions: Dict[str, Dict[str, float]]
+) -> Dict[str, Dict[str, float]]:
+    """Extend a probability table without perturbing existing entries.
+
+    Existing rows/columns keep their probabilities. Only unseen rows or unseen
+    characters per row are filled from the ``additions`` table.
+    """
+
+    merged: Dict[str, Dict[str, float]] = {prev: dict(mapping) for prev, mapping in base.items()}
+    for prev, mapping in additions.items():
+        target = merged.setdefault(prev, {})
+        for ch, prob in mapping.items():
+            target.setdefault(ch, prob)
+    return merged
+
+
 def _seed_ngrams_from_words(words: Set[str]) -> None:
     """Prime the in-memory N-gram tables from a word lexicon."""
 
@@ -1799,22 +1816,26 @@ def _get_tesslite_model() -> Optional[_TessLiteModel]:
         bigrams = {prev: dict(mapping) for prev, mapping in built_bigrams.items()}
 
     rebuild_bigrams = False
+    added_words: Set[str] = set()
     domain_subset = _tesslite_domain_keywords()
     if domain_subset:
-        dictionary.update(domain_subset)
-        rebuild_bigrams = True
+        new_words = domain_subset - dictionary
+        if new_words:
+            dictionary.update(new_words)
+            added_words.update(new_words)
+            rebuild_bigrams = True
     extra_words = _load_dictionary_words(_tesslite_extra_dictionary_paths())
     if extra_words:
-        dictionary.update(extra_words)
-        rebuild_bigrams = True
+        new_words = extra_words - dictionary
+        if new_words:
+            dictionary.update(new_words)
+            added_words.update(new_words)
+            rebuild_bigrams = True
     if rebuild_bigrams:
-        bigrams = _build_bigrams_from_words(dictionary)
-    extra_words = _load_dictionary_words(_tesslite_extra_dictionary_paths())
-    if extra_words:
-        dictionary.update(extra_words)
-        merged = _build_bigrams_from_words(dictionary) if dictionary else {}
-        if merged:
-            bigrams = merged
+        if use_builtin and built_bigrams:
+            bigrams = _merge_bigrams(built_bigrams, _build_bigrams_from_words(added_words))
+        else:
+            bigrams = _build_bigrams_from_words(dictionary)
     if not bigrams and dictionary:
         bigrams = _build_bigrams_from_words(dictionary)
     model = _TessLiteModel(
