@@ -1,4 +1,5 @@
 import json
+import os
 
 from zocr.core.exporters import export_rag_bundle
 
@@ -41,4 +42,8 @@ def test_export_rag_bundle_embeds_bedrock_plan(tmp_path):
     assert result["table_sections"] == 1
     assert manifest["trace_schema"]["label"].startswith("doc=")
     assert "fact_tag_example" in manifest and manifest["fact_tag_example"]
+    assert manifest.get("provenance", {}).get("prov_bundle")
+    assert os.path.exists(manifest["provenance"]["prov_bundle"])
+    assert manifest["provenance"].get("bundle_id", "").startswith("urn:trace:")
+    assert result.get("prov_bundle") == manifest["provenance"]["prov_bundle"]
 
