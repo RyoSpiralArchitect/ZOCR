@@ -73,6 +73,7 @@ def test_core_surface_all_stays_in_sync_with_exports() -> None:
         "main",
         "augmenter",
         "base",
+        "extract_structural_grams",
         "domains",
         "embedders",
         "exporters",
@@ -80,6 +81,7 @@ def test_core_surface_all_stays_in_sync_with_exports() -> None:
         "monitoring",
         "numba_support",
         "query_engine",
+        "structural_grams",
         "tokenization",
     }
 

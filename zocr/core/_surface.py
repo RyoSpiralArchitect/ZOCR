@@ -22,6 +22,7 @@ _ATTR_TO_MODULE_ATTR: Dict[str, Tuple[str, str]] = {
         ".monitoring",
         "metric_col_alignment_energy_cached",
     ),
+    "extract_structural_grams": (".structural_grams", "extract_structural_grams"),
     "main": (".zocr_core", "main"),
 }
 
@@ -36,6 +37,7 @@ _MODULE_EXPORTS: Dict[str, str] = {
     "numba_support": ".numba_support",
     "query_engine": ".query_engine",
     "tokenization": ".tokenization",
+    "structural_grams": ".structural_grams",
 }
 
 __all__ = ["zocr_core", *_ATTR_TO_MODULE_ATTR.keys(), *_MODULE_EXPORTS.keys()]
