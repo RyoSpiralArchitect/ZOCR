@@ -1,0 +1,27 @@
+# 下流テキスト LLM と補助 vLM を分離したエンドポイント設定のサンプルです。
+# API キーは直接書かず、api_key_env に環境変数名だけを記載してください。
+
+# 下流 LLM (テキスト中心)
+downstream_llm:
+  provider: azure_openai   # local_hf | aws_bedrock | azure_openai | gemini | anthropic
+  model: gpt-4o-mini       # Bedrock の場合は modelId、Azure はデプロイ名
+  endpoint: https://<resource>.openai.azure.com/
+  region: us-east-1        # Bedrock/Gemini/Anthropic などリージョンが必要な場合のみ
+  api_key_env: AZURE_OPENAI_API_KEY
+  local_path: /models/text-llm        # provider が local_hf のときだけ使用
+
+# 補助 vLM (画像→テキスト説明など)
+aux_vlm:
+  provider: gemini        # local_hf | aws_bedrock | azure_openai | gemini | anthropic
+  model: gemini-1.5-pro-latest
+  endpoint: https://generativelanguage.googleapis.com
+  region: us-east1        # Bedrock なら us-east-1 など AWS リージョン
+  api_key_env: GEMINI_API_KEY
+  local_path: /models/vision-encoder   # provider が local_hf のときだけ使用
+
+# 追加メモ
+# - AWS Bedrock: model と region をここで指定し、AWS_PROFILE か AWS_ACCESS_KEY_ID/SECRET は環境変数で渡してください。
+# - Gemini: endpoint と api_key_env を埋め、必要なら region に `us-east1` などを指定してください。
+# - Anthropic: endpoint は空のままで構いません (SDK 側がデフォルトを使用)。
+# - Local HF: provider を local_hf にし、local_path だけを設定（api_key_env は未使用）。
+# - CI 用に使うときはこのファイルをコピーして機密情報のないままコミットし、実行環境で環境変数を注入してください。
