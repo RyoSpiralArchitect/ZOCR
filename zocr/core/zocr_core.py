@@ -19,6 +19,7 @@ __all__ = [
     "metric_col_over_under_rate",
     "metric_chunk_consistency",
     "metric_col_alignment_energy_cached",
+    "extract_structural_grams",
     "main",
 ]
 
@@ -55,6 +56,12 @@ def sql_export(*args, **kwargs):
 
 def export_rag_bundle(*args, **kwargs):
     from .exporters import export_rag_bundle as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def extract_structural_grams(*args, **kwargs):
+    from .structural_grams import extract_structural_grams as _impl
 
     return _impl(*args, **kwargs)
 
@@ -139,6 +146,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--jsonl", required=True)
     sp.add_argument("--outdir", required=True)
     sp.add_argument("--prefix", default="invoice")
+
+    sp = sub.add_parser("structural-grams")
+    sp.add_argument("--jsonl", required=True)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--max-ngram", type=int, default=4)
 
     sp = sub.add_parser("rag")
     sp.add_argument("--jsonl", required=True)
@@ -226,6 +238,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.cmd == "sql":
         paths = sql_export(args.jsonl, args.outdir, args.prefix)
         print(json.dumps(paths, ensure_ascii=False, indent=2))
+        return
+    if args.cmd == "structural-grams":
+        n = extract_structural_grams(args.jsonl, args.out, max_ngram=args.max_ngram)
+        print(f"Extracted {n} grams -> {args.out}")
         return
     if args.cmd == "rag":
         bundle = export_rag_bundle(args.jsonl, args.outdir, args.domain, limit_per_section=args.limit)
