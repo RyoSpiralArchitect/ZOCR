@@ -63,6 +63,23 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 | `python -m zocr core …` | **JA:** マルチモーダルコア（augment/index/query/sql/monitor）。<br>**EN:** Multi-domain core (augment/index/query/sql/monitor).<br>**FR:** Noyau multi-domaine (augment/index/query/sql/monitor). |
 | `python -m zocr simple …` | **JA:** 軽量なモジュラー OCR（シンプル/モック部品）。<br>**EN:** Lightweight modular OCR using the simple or mock stack.<br>**FR:** OCR modulaire léger avec composants simples ou mocks. |
 
+## LLM/vLM provider templates / LLM・vLM プロバイダー雛形 / Gabarits de fournisseurs LLM/vLM
+- **[JA]** 下流 LLM と補助 vLM を分けたプリセット JSON を即座に吐き出し、ローカル HF モデルパスや AWS / Azure OpenAI / Gemini / Anthropic の API 情報を書き込むだけで使えます。
+- **[EN]** Emit ready-to-edit JSON presets (split into downstream LLM vs. helper vLM) so you can drop in a local HF model path or AWS / Azure OpenAI / Gemini / Anthropic credentials.
+- **[FR]** Générez un JSON prêt à éditer (LLM principal et vLM auxiliaire séparés) pour renseigner un chemin HF local ou les identifiants AWS / Azure OpenAI / Gemini / Anthropic.
+
+```bash
+python - <<'PY'
+from zocr.resources.model_provider_presets import write_provider_templates
+
+print("wrote", write_provider_templates("provider_templates.json"))
+PY
+```
+
+`provider_templates.json` には `downstream_llm` と `helper_vlm` セクションがあり、`model_path` や `api_key` を書き換えるだけで配線できます。
+`provider_templates.json` exposes `downstream_llm` and `helper_vlm` sections—just edit `model_path` / `api_key` fields to wire your stack.
+`provider_templates.json` contient les sections `downstream_llm` et `helper_vlm` ; il suffit de modifier `model_path` / `api_key` pour les relier.
+
 ## CLI フラグ / CLI Flags / Options CLI
 | Flag | 説明 / Description / Description |
 |------|----------------------------------|
