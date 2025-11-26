@@ -7,6 +7,8 @@
 
 > Structure-aware RAG blueprint: see [`docs/hybrid_rag_zocr.md`](docs/hybrid_rag_zocr.md) for a minimal design that injects Z-OCR semantic tags into hybrid retrieval.
 
+> **LLM/VLM endpoints:** ready-to-fill templates for downstream LLMs and helper vLMs (local HF path, AWS Bedrock, Azure OpenAI, Gemini, Anthropic) live in [`docs/provider_endpoints.md`](docs/provider_endpoints.md) and [`samples/llm_vlm_endpoints.example.yaml`](samples/llm_vlm_endpoints.example.yaml).
+
 ## レイアウト / Layout / Structure
 ```
 zocr/
