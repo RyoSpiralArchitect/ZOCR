@@ -16,11 +16,17 @@ __all__ = [
     "extract_structural_grams",
 ]
 
-UNIT_PATTERN = re.compile(r"^(a|v|kw|kva|kv|mm|mpa|bar|hz|℃|°c|kgf/cm2|m3/h)$", re.IGNORECASE)
+UNIT_PATTERN = re.compile(
+    r"^(a|v|w|kw|kva|kv|mm|cm|m|mpa|bar|hz|rpm|pcs?|ea|set|kN|N|Nm|℃|°c|kgf/cm2|m3/h)$",
+    re.IGNORECASE,
+)
 ID_PATTERN = re.compile(r"^[A-Z]{2,}[A-Z0-9-]*\d{2,}$")
 NUM_PATTERN = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 SYMBOL_PATTERN = re.compile(r"^[±+\-×x＊*φΦØø°]+$")
 _TOKEN_RE = re.compile(r"[A-Za-z]+[A-Za-z0-9-]*|\d+(?:[.,]\d+)?|[一-龥ぁ-んァ-ヶー]+|\S")
+_RANGE_RE = re.compile(
+    r"(-?\d[\d,]*(?:\.\d+)?)[\s]*[\-~〜ー–—toTO]{1,3}[\s]*(-?\d[\d,]*(?:\.\d+)?)"
+)
 
 
 def tokenize_cell_text(text: str) -> List[str]:
@@ -39,6 +45,8 @@ def classify_token(token: str) -> str:
     """Classify a token into NUM/UNIT/ID/SYM/TEXT buckets."""
 
     tok = (token or "").strip()
+    tok = tok.strip("()[]{}")
+    tok = tok.rstrip(".,;:、。")
     if not tok:
         return "TEXT"
     if NUM_PATTERN.match(tok):
@@ -105,6 +113,7 @@ def extract_cell_structural_gram(
     features = {
         "has_unit": any(t == "UNIT" for t in type_seq),
         "has_id": any(t == "ID" for t in type_seq),
+        "has_symbol": any(t == "SYM" for t in type_seq),
     }
 
     numeric_value: Optional[float] = None
@@ -122,10 +131,28 @@ def extract_cell_structural_gram(
     if unit is not None:
         features["unit"] = unit
 
+    range_match = _RANGE_RE.search(text)
+    if range_match:
+        lower = _coerce_float(range_match.group(1))
+        upper = _coerce_float(range_match.group(2))
+        if lower is not None and upper is not None:
+            features["range"] = [lower, upper]
+
+    def _coalesce(seq: List[str]) -> List[str]:
+        collapsed: List[str] = []
+        for item in seq:
+            if not collapsed or collapsed[-1] != item:
+                collapsed.append(item)
+        return collapsed
+
     return {
         "kind": "structural_gram",
         "lexical_ngram": lexical_ngram,
         "type_ngram": type_seq,
+        "signatures": {
+            "type_signature": "-".join(type_seq),
+            "type_signature_coalesced": "-".join(_coalesce(type_seq)),
+        },
         "layout": layout,
         "value_features": features,
         "doc_meta": {k: v for k, v in doc_meta.items() if v is not None},
