@@ -3101,9 +3101,30 @@ def _simulate_param_shift(
             ) = _compute_vote_bias(vote_panel)
         vote_trust = max(0.0, min(1.0, 0.45 * vote_coherence + 0.35 * vote_stability + 0.2 * vote_agreement))
         vote_stress = min(1.0, (1.0 - vote_trust) * (0.35 + 0.65 * vote_conflict))
-        bias_ceiling *= (1.0 - vote_stress * 0.3)
-        theoretical_ceiling *= (1.0 - vote_stress * 0.35)
-        bias_scale *= 0.75 + 0.25 * vote_trust
+        vote_volatility = min(
+            1.0,
+            vote_stress * 0.6 + (1.0 - vote_stability) * 0.25 + max(0.0, 0.2 - vote_agreement) * 0.4,
+        )
+        vote_resilience = max(0.0, min(1.0, vote_trust * 0.55 + vote_stability * 0.35 + vote_coherence * 0.1))
+        vote_persistence = max(
+            0.0,
+            min(
+                1.0,
+                0.45 * vote_resilience
+                + 0.35 * (1.0 - vote_volatility)
+                + 0.2 * max(0.0, vote_agreement - vote_conflict * 0.35),
+            ),
+        )
+        bias_ceiling *= (1.0 - vote_stress * 0.25) * (0.9 + 0.12 * vote_resilience)
+        theoretical_ceiling *= (1.0 - vote_stress * 0.3) * (0.9 + 0.14 * vote_resilience)
+        bias_ceiling *= 0.95 + 0.1 * vote_persistence
+        theoretical_ceiling *= 0.95 + 0.12 * vote_persistence
+        bias_scale *= (
+            (0.75 + 0.25 * vote_trust)
+            * (0.82 + 0.18 * vote_resilience)
+            * (1.0 - 0.22 * vote_volatility)
+            * (0.9 + 0.16 * vote_persistence)
+        )
         vote_confidence_bonus = (
             vote_agreement * 0.08
             + min(0.05, vote_total_weight * 0.05)
@@ -3112,8 +3133,11 @@ def _simulate_param_shift(
         )
         vote_confidence_bonus = max(
             0.0,
-            vote_confidence_bonus * (0.85 + 0.3 * vote_trust)
-            - vote_stress * (0.05 + 0.04 * (1.0 - vote_agreement)),
+            vote_confidence_bonus
+            * (0.82 + 0.26 * vote_trust + 0.16 * vote_resilience + 0.1 * vote_persistence)
+            - vote_stress * (0.05 + 0.04 * (1.0 - vote_agreement))
+            - vote_volatility * 0.04
+            - max(0.0, 0.08 - vote_persistence) * 0.6,
         )
         confidence = 0.45 + min(
             0.4,
@@ -3141,6 +3165,9 @@ def _simulate_param_shift(
                     "p95_vote_stability": round(vote_stability, 4),
                     "p95_vote_trust": round(vote_trust, 4),
                     "p95_vote_stress": round(vote_stress, 4),
+                    "p95_vote_volatility": round(vote_volatility, 4),
+                    "p95_vote_resilience": round(vote_resilience, 4),
+                    "p95_vote_persistence": round(vote_persistence, 4),
                     "p95_vote_confidence_bonus": round(vote_confidence_bonus, 4),
                     "p95_vote_panel": vote_panel,
                 },
