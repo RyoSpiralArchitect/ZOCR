@@ -76,43 +76,6 @@ except Exception:  # pragma: no cover - local search is optional
     _consensus_load_local_index = None  # type: ignore
     _consensus_summarize_local_index = None  # type: ignore
 
-class _MissingModuleProxy:
-    """Minimal proxy that surfaces the original import error on access."""
-
-    def __init__(self, label: str, error: Exception):
-        self.__name__ = label
-        self._error = error
-
-    def __getattr__(self, name: str):  # pragma: no cover - triggered only when missing deps
-        raise AttributeError(f"{self.__name__} is unavailable: {self._error}") from self._error
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f"<Missing module {self.__name__}: {self._error}>"
-
-
-try:
-    from ..consensus.local_search import (
-        load_local_index as _consensus_load_local_index,
-        summarize_local_index as _consensus_summarize_local_index,
-    )
-except Exception:  # pragma: no cover - local search is optional
-    _consensus_load_local_index = None  # type: ignore
-    _consensus_summarize_local_index = None  # type: ignore
-
-class _MissingModuleProxy:
-    """Minimal proxy that surfaces the original import error on access."""
-
-    def __init__(self, label: str, error: Exception):
-        self.__name__ = label
-        self._error = error
-
-    def __getattr__(self, name: str):  # pragma: no cover - triggered only when missing deps
-        raise AttributeError(f"{self.__name__} is unavailable: {self._error}") from self._error
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f"<Missing module {self.__name__}: {self._error}>"
-
-
 try:
     from ..consensus import zocr_consensus as zocr_onefile_consensus  # type: ignore
     _CONSENSUS_IMPORT_ERROR: Optional[Exception] = None
@@ -173,6 +136,49 @@ _STOP_TOKENS = {"samples", "sample", "demo", "image", "images", "img", "scan", "
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def _compute_vote_bias(
+    vote_panel: Sequence[Dict[str, Any]],
+    *,
+    bias_cap: float = 0.1,
+    agreement_floor: float = 1e-6,
+) -> Tuple[float, float, float, float, float, float, float]:
+    """Aggregate weighted tendencies into a bounded bias signal.
+
+    Returns (vote_score, vote_agreement, vote_total_weight, vote_bias, vote_conflict, vote_coherence, vote_stability).
+    - vote_score: raw weighted tendency
+    - vote_agreement: normalized absolute agreement (0..1)
+    - vote_total_weight: sum of weights (non-negative)
+    - vote_bias: bounded bias contribution using a soft limiter
+    - vote_conflict: 0 (no conflict) to 1 (even split) based on opposing weight
+    - vote_coherence: 0..1 weighting that favors aligned votes over conflicts
+    - vote_stability: coherence- and mass-aware reliability dampener (0..1)
+    """
+
+    vote_total_weight = sum(max(0.0, v.get("weight", 0.0)) for v in vote_panel)
+    vote_score = sum(max(0.0, v.get("weight", 0.0)) * v.get("tendency", 0.0) for v in vote_panel)
+    if vote_total_weight <= agreement_floor:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    pos_weight = sum(max(0.0, v.get("weight", 0.0)) for v in vote_panel if v.get("tendency", 0.0) > 0)
+    neg_weight = sum(max(0.0, v.get("weight", 0.0)) for v in vote_panel if v.get("tendency", 0.0) < 0)
+    vote_conflict = min(1.0, max(0.0, 2.0 * min(pos_weight, neg_weight) / vote_total_weight))
+    vote_coherence = 1.0 - vote_conflict
+    normalized_score = vote_score / vote_total_weight
+    vote_agreement = min(1.0, max(0.0, abs(normalized_score))) * (0.6 + 0.4 * vote_coherence)
+    mass_factor = 1.0 - math.exp(-max(0.0, vote_total_weight) * 0.9)
+    vote_stability = max(0.0, min(1.0, vote_coherence * (0.45 + 0.55 * mass_factor) * (0.6 + 0.4 * vote_agreement)))
+    bias_scale = 0.4 + 0.4 * vote_coherence + 0.2 * vote_stability
+    vote_bias = max(-bias_cap, min(bias_cap, math.tanh(normalized_score) * bias_scale))
+    return (
+        vote_score,
+        vote_agreement,
+        vote_total_weight,
+        vote_bias,
+        vote_conflict,
+        vote_coherence,
+        vote_stability,
+    )
 
 
 def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
@@ -2849,9 +2855,17 @@ def _simulate_param_shift(
             high_surprisal_ratio = float(export_signals.get("high_surprisal_ratio"))
         except Exception:
             high_surprisal_ratio = None
+    learning_samples = None
+    if export_signals:
+        try:
+            ls_val = export_signals.get("learning_samples")
+            learning_samples = float(ls_val) if ls_val is not None else None
+        except Exception:
+            learning_samples = None
     recog_low_conf = None
     recog_high_surprisal = None
     cells = None
+    cell_pressure = None
     if recognition_stats:
         try:
             cells = float(recognition_stats.get("cells") or 0.0)
@@ -2866,6 +2880,10 @@ def _simulate_param_shift(
                 recog_high_surprisal = float(recognition_stats.get("high_surprisal_cells", 0.0)) / cells
             except Exception:
                 recog_high_surprisal = None
+            try:
+                cell_pressure = min(0.2, math.log1p(cells) * 0.02)
+            except Exception:
+                cell_pressure = None
     memory_growth = 0.0
     runtime_improved = 0.0
     if toy_memory_delta:
@@ -2935,22 +2953,186 @@ def _simulate_param_shift(
             base_p95 = float(monitor_row.get("p95_ms")) if monitor_row.get("p95_ms") is not None else None
         except Exception:
             base_p95 = None
-    for offset in (-0.4, 0.4):
-        candidate = float(min(8.0, max(2.0, base_lambda + offset)))
-        delta = candidate - base_lambda
-        predicted_p95 = None
-        if base_p95 is not None:
-            speed_factor = -delta * 18.0
-            predicted_p95 = max(120.0, base_p95 + speed_factor)
+    workload_penalty = 1.0
+    if averaged_low_conf is not None:
+        workload_penalty += min(0.3, max(0.0, averaged_low_conf - 0.1) * 0.6)
+    surprisal_signal = recog_high_surprisal
+    if surprisal_signal is None:
+        surprisal_signal = averaged_high_surprisal
+    if surprisal_signal is not None:
+        workload_penalty += min(0.12, max(0.0, surprisal_signal - 0.08))
+    if cell_pressure is not None:
+        workload_penalty += cell_pressure
+    memory_bonus = 1.0 - min(0.15, max(0.0, memory_growth) * 0.004)
+    replay_bonus = 1.0 - min(0.2, max(0.0, runtime_improved) * 0.008)
+    learning_bonus = 1.0 - min(0.1, max(0.0, (learning_samples or 0.0)) * 0.002)
+    vote_baseline = []
+    if workload_penalty != 1.0:
+        vote_baseline.append(
+            {
+                "label": "workload_penalty",
+                "weight": 0.35,
+                "tendency": workload_penalty - 1.0,
+                "basis": "low_conf/surprisal/cell_pressure",
+            }
+        )
+    if memory_bonus != 1.0:
+        vote_baseline.append(
+            {
+                "label": "memory_bonus",
+                "weight": 0.2,
+                "tendency": memory_bonus - 1.0,
+                "basis": "glyph_variant_growth",
+            }
+        )
+    if replay_bonus != 1.0:
+        vote_baseline.append(
+            {
+                "label": "replay_bonus",
+                "weight": 0.2,
+                "tendency": replay_bonus - 1.0,
+                "basis": "runtime_replay_improved",
+            }
+        )
+    if learning_bonus != 1.0:
+        vote_baseline.append(
+            {
+                "label": "learning_bonus",
+                "weight": 0.12,
+                "tendency": learning_bonus - 1.0,
+                "basis": "learning_samples",
+            }
+        )
+        for offset in (-0.4, 0.4):
+            candidate = float(min(8.0, max(2.0, base_lambda + offset)))
+            delta = candidate - base_lambda
+            predicted_p95 = None
+            theoretical_p95 = None
+            bias_ceiling = 1.0
+            theoretical_ceiling = 1.0
+            bias_scale = 1.0
+            vote_panel = list(vote_baseline)
+            vote_score = vote_agreement = vote_total_weight = vote_bias = vote_conflict = vote_coherence = 0.0
+            if base_p95 is not None:
+                theoretical_p95 = base_p95 * workload_penalty * memory_bonus * replay_bonus * learning_bonus
+                theoretical_p95 = max(80.0, min(theoretical_p95, base_p95 * 1.25))
+            speed_factor = -delta * (16.0 + 4.0 * replay_bonus)
+            vote_panel.append(
+                {
+                    "label": "lambda_speed_delta",
+                    "weight": 0.28,
+                    "tendency": speed_factor / base_p95 if base_p95 else 0.0,
+                    "basis": "lambda_shape delta",
+                }
+            )
+            (
+                vote_score,
+                vote_agreement,
+                vote_total_weight,
+                vote_bias,
+                vote_conflict,
+                vote_coherence,
+                vote_stability,
+            ) = _compute_vote_bias(vote_panel)
+            bias_ceiling = 1.12 + vote_agreement * 0.06 + vote_coherence * 0.04 + vote_stability * 0.02
+            theoretical_ceiling = 1.26 + vote_agreement * 0.08 + vote_coherence * 0.05 + vote_stability * 0.025
+            predicted_p95 = theoretical_p95 + speed_factor
+            bias_scale = 0.45 + 0.35 * vote_coherence + 0.2 * vote_stability
+            predicted_p95 = max(
+                90.0,
+                min(
+                    predicted_p95 * (1.0 + vote_bias * bias_scale),
+                    theoretical_p95 * bias_ceiling,
+                ),
+            )
+            theoretical_p95 = max(
+                80.0,
+                min(
+                    theoretical_p95 * (1.0 + vote_bias * 0.5 * bias_scale),
+                    base_p95 * theoretical_ceiling,
+                ),
+            )
+        else:
+            (
+                vote_score,
+                vote_agreement,
+                vote_total_weight,
+                vote_bias,
+                vote_conflict,
+                vote_coherence,
+                vote_stability,
+            ) = _compute_vote_bias(vote_panel)
+        vote_trust = max(0.0, min(1.0, 0.45 * vote_coherence + 0.35 * vote_stability + 0.2 * vote_agreement))
+        vote_stress = min(1.0, (1.0 - vote_trust) * (0.35 + 0.65 * vote_conflict))
+        vote_volatility = min(
+            1.0,
+            vote_stress * 0.6 + (1.0 - vote_stability) * 0.25 + max(0.0, 0.2 - vote_agreement) * 0.4,
+        )
+        vote_resilience = max(0.0, min(1.0, vote_trust * 0.55 + vote_stability * 0.35 + vote_coherence * 0.1))
+        vote_persistence = max(
+            0.0,
+            min(
+                1.0,
+                0.45 * vote_resilience
+                + 0.35 * (1.0 - vote_volatility)
+                + 0.2 * max(0.0, vote_agreement - vote_conflict * 0.35),
+            ),
+        )
+        bias_ceiling *= (1.0 - vote_stress * 0.25) * (0.9 + 0.12 * vote_resilience)
+        theoretical_ceiling *= (1.0 - vote_stress * 0.3) * (0.9 + 0.14 * vote_resilience)
+        bias_ceiling *= 0.95 + 0.1 * vote_persistence
+        theoretical_ceiling *= 0.95 + 0.12 * vote_persistence
+        bias_scale *= (
+            (0.75 + 0.25 * vote_trust)
+            * (0.82 + 0.18 * vote_resilience)
+            * (1.0 - 0.22 * vote_volatility)
+            * (0.9 + 0.16 * vote_persistence)
+        )
+        vote_confidence_bonus = (
+            vote_agreement * 0.08
+            + min(0.05, vote_total_weight * 0.05)
+            + vote_coherence * 0.03
+            + vote_stability * 0.025
+        )
+        vote_confidence_bonus = max(
+            0.0,
+            vote_confidence_bonus
+            * (0.82 + 0.26 * vote_trust + 0.16 * vote_resilience + 0.1 * vote_persistence)
+            - vote_stress * (0.05 + 0.04 * (1.0 - vote_agreement))
+            - vote_volatility * 0.04
+            - max(0.0, 0.08 - vote_persistence) * 0.6,
+        )
+        confidence = 0.45 + min(
+            0.4,
+            max(0.0, memory_growth) * 0.008
+            + max(0.0, runtime_improved) * 0.01
+            + max(0.0, (learning_samples or 0.0)) * 0.002
+            + (cell_pressure or 0.0) * 0.6
+            + vote_confidence_bonus,
+        )
         simulations.append(
             {
                 "type": "profile_param",
                 "param": "lambda_shape",
                 "delta": round(delta, 4),
                 "candidate": round(candidate, 4),
-                "confidence": 0.5,
+                "confidence": round(confidence, 3),
                 "predictions": {
                     "p95_ms": predicted_p95,
+                    "p95_ms_theoretical": theoretical_p95,
+                    "p95_vote_score": round(vote_score, 4),
+                    "p95_vote_agreement": round(vote_agreement, 4),
+                    "p95_vote_weight_total": round(vote_total_weight, 4),
+                    "p95_vote_conflict": round(vote_conflict, 4),
+                    "p95_vote_coherence": round(vote_coherence, 4),
+                    "p95_vote_stability": round(vote_stability, 4),
+                    "p95_vote_trust": round(vote_trust, 4),
+                    "p95_vote_stress": round(vote_stress, 4),
+                    "p95_vote_volatility": round(vote_volatility, 4),
+                    "p95_vote_resilience": round(vote_resilience, 4),
+                    "p95_vote_persistence": round(vote_persistence, 4),
+                    "p95_vote_confidence_bonus": round(vote_confidence_bonus, 4),
+                    "p95_vote_panel": vote_panel,
                 },
             }
         )
