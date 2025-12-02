@@ -36,6 +36,7 @@ _MODULE_EXPORTS: Dict[str, str] = {
     "monitoring": ".monitoring",
     "numba_support": ".numba_support",
     "query_engine": ".query_engine",
+    "rendering": ".rendering",
     "tokenization": ".tokenization",
     "structural_grams": ".structural_grams",
 }
