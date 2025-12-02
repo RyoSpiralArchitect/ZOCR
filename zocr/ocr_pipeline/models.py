@@ -8,7 +8,7 @@ objects in tests or future integrations.
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -109,6 +109,33 @@ class TableExtractionResult(BaseModel):
     format: str = Field("simple")
 
 
+class StructuralNode(BaseModel):
+    """Node in a lightweight document graph."""
+
+    node_id: str
+    type: str
+    page_number: Optional[int] = None
+    bounding_box: Optional[BoundingBox] = None
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StructuralEdge(BaseModel):
+    """Relationship between structural nodes."""
+
+    source: str
+    target: str
+    relation: str
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StructuralGraph(BaseModel):
+    """Graph describing relationships among extracted objects."""
+
+    document_id: str
+    nodes: List[StructuralNode] = Field(default_factory=list)
+    edges: List[StructuralEdge] = Field(default_factory=list)
+
+
 class RegionOutput(BaseModel):
     region_id: str
     type: RegionType
@@ -129,4 +156,5 @@ class DocumentOutput(BaseModel):
     page_number: int
     regions: List[RegionOutput]
     metadata: DocumentMetadata
+    structure: Optional[StructuralGraph] = None
 
