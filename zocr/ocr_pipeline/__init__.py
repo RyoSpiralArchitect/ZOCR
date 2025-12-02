@@ -32,9 +32,21 @@ from .models import (
     RegionOutput,
     RegionType,
     SegmentedRegion,
+    StructuralEdge,
+    StructuralGraph,
+    StructuralNode,
     TableData,
     TableExtractionResult,
     TextOcrResult,
+)
+from .structure import (
+    build_structural_graph,
+    graph_from_jsonld,
+    graph_to_jsonld,
+    graph_to_llm_prompts,
+    graph_to_tool_calls,
+    load_jsonld,
+    save_jsonld,
 )
 from .pipeline import DocumentPipeline, OcrPipeline
 from .simple import (
@@ -79,6 +91,9 @@ __all__ = [
     "RegionOutput",
     "RegionType",
     "SegmentedRegion",
+    "StructuralEdge",
+    "StructuralGraph",
+    "StructuralNode",
     "Segmenter",
     "TableData",
     "TableExtractionResult",
@@ -87,5 +102,12 @@ __all__ = [
     "TextOCR",
     "TextOcrResult",
     "VLLM",
+    "build_structural_graph",
+    "graph_from_jsonld",
+    "graph_to_jsonld",
+    "graph_to_llm_prompts",
+    "graph_to_tool_calls",
+    "load_jsonld",
+    "save_jsonld",
 ]
 
