@@ -1,10 +1,12 @@
 """Retrieval helpers combining BM25, keywords and symbolic filters."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pickle
 import re
+from io import StringIO
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .._compat import optional_numpy
@@ -104,6 +106,117 @@ def _cosine_sim(a: Optional[Iterable[float]], b: Optional[Iterable[float]]) -> f
     if denom == 0.0:
         return 0.0
     return float(np.dot(va, vb) / denom)
+
+
+def _infer_object_type(obj: Dict[str, Any]) -> str:
+    explicit = (
+        (obj.get("object_type") or "")
+        or ((obj.get("meta") or {}).get("object_type") or "")
+    ).strip()
+    if explicit:
+        return explicit.lower()
+
+    struct = obj.get("struct") or (obj.get("meta") or {}).get("struct") or {}
+    zone = obj.get("zone") or (obj.get("meta") or {}).get("zone") or ""
+    meta = obj.get("meta") or {}
+
+    if struct.get("table_id") or "table" in (zone or ""):
+        return "table"
+    if meta.get("thumbnail_b64") or meta.get("image_path") or meta.get("figure_id"):
+        return "figure"
+    return "text"
+
+
+def _rows_to_html(rows: Sequence[Sequence[Any]]) -> str:
+    html_rows: List[str] = []
+    for row in rows:
+        cells = [f"<td>{cell}</td>" for cell in row]
+        html_rows.append("<tr>" + "".join(cells) + "</tr>")
+    return "<table>" + "".join(html_rows) + "</table>"
+
+
+def _rows_to_csv(rows: Sequence[Sequence[Any]]) -> str:
+    sio = StringIO()
+    for row in rows:
+        sio.write(",".join(str(c) for c in row))
+        sio.write("\n")
+    return sio.getvalue().strip()
+
+
+def _figure_thumbnail_b64(meta: Dict[str, Any]) -> Optional[str]:
+    thumb = meta.get("thumbnail_b64") or meta.get("image_b64")
+    if thumb:
+        return thumb
+    img_path = meta.get("image_path")
+    if not img_path or not os.path.exists(img_path):
+        return None
+    try:
+        with open(img_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _renderable_payload(obj: Dict[str, Any], obj_type: str) -> Dict[str, Any]:
+    meta = obj.get("meta") or {}
+    payload: Dict[str, Any] = {"type": obj_type}
+    caption = meta.get("caption") or obj.get("caption") or obj.get("text")
+    if caption:
+        payload["caption"] = caption
+
+    if obj_type == "figure":
+        thumb = _figure_thumbnail_b64(meta)
+        if thumb:
+            payload["thumbnail_b64"] = thumb
+        if meta.get("image_uri"):
+            payload["image_uri"] = meta.get("image_uri")
+    elif obj_type == "table":
+        html = meta.get("table_html") or meta.get("html")
+        csv_data = meta.get("table_csv") or meta.get("csv")
+        rows = meta.get("rows")
+        if not html and isinstance(rows, (list, tuple)):
+            html = _rows_to_html(rows)
+        if not csv_data and isinstance(rows, (list, tuple)):
+            csv_data = _rows_to_csv(rows)
+        if html:
+            payload["html"] = html
+        if csv_data:
+            payload["csv"] = csv_data
+    else:
+        snippet = obj.get("synthesis_window") or obj.get("text")
+        if snippet:
+            payload["snippet"] = snippet[:240]
+    return payload
+
+
+def _intent_boost(q_text: str, obj_type: str, struct: Dict[str, Any]) -> float:
+    if not q_text:
+        return 0.0
+    text_lower = q_text.lower()
+    score = 0.0
+    figure_signals = [
+        "diagram",
+        "schematic",
+        "figure",
+        "chart",
+        "graph",
+        "plot",
+        "visual",
+        "illustration",
+        "map",
+    ]
+    table_signals = ["table", "grid", "column", "row", "spreadsheet", "csv"]
+    spatial_signals = ["top left", "bottom right", "layout", "coordinate", "axis"]
+
+    if obj_type == "figure" and any(sig in text_lower for sig in figure_signals):
+        score += 1.0
+    if obj_type == "table" and any(sig in text_lower for sig in table_signals):
+        score += 1.0
+    if obj_type != "text" and any(sig in text_lower for sig in spatial_signals):
+        score += 0.3
+    if struct.get("table_id") and "table" in text_lower:
+        score += 0.3
+    return score
 
 
 def _zone_match_score(zone: Optional[str], zone_filter: Optional[str]) -> float:
@@ -290,6 +403,7 @@ def hybrid_query(
     jsonl: str,
     q_text: str = "",
     q_embedding: Optional[Sequence[float]] = None,
+    hybrid_embedding: Optional[Sequence[float]] = None,
     layout_embedding: Optional[Sequence[float]] = None,
     topk: int = 10,
     zone_filter: Optional[str] = None,
@@ -309,18 +423,22 @@ def hybrid_query(
              + d * HeaderMatch + e * NeighborBoost
              - f * (1 - conf_ocr)(1 - conf_struct)
 
-    When ``q_embedding`` or ``layout_embedding`` are provided, cosine similarity
-    is computed against the chunk's ``embeddings.text`` / ``embeddings.layout``.
+    When ``q_embedding``/``layout_embedding``/``hybrid_embedding`` are provided,
+    cosine similarity is computed against the chunk's
+    ``embeddings.text`` / ``embeddings.layout`` / ``embeddings.hybrid``.
     """
 
     weights = {
-        "dense": 0.4,
+        "dense": 0.35,
+        "hybrid": 0.25,
+        "layout_dense": 0.15,
         "bm25": 0.25,
         "zone": 0.2,
         "header": 0.1,
         "neighbor": 0.1,
         "penalty": 0.2,
         "symbolic": 0.0,
+        "intent": 0.2,
         **(weights or {}),
     }
     boosts = boosts or {}
@@ -374,6 +492,7 @@ def hybrid_query(
         embeddings = ob.get("embeddings") or meta.get("embeddings") or {}
         dense = _cosine_sim(q_embedding, embeddings.get("text"))
         dense_layout = _cosine_sim(layout_embedding, embeddings.get("layout"))
+        dense_hybrid = _cosine_sim(hybrid_embedding, embeddings.get("hybrid"))
         dense_total = dense + (0.5 * dense_layout if dense_layout else 0.0)
 
         kw_boost = _kw_meta_boost(ob, toks, domain)
@@ -383,32 +502,41 @@ def hybrid_query(
         neighbor_score = _neighbor_boost(
             ob.get("region_id"), neighbor_graph, neighbor_seeds
         )
+        intent_score = _intent_boost(q_text or "", _infer_object_type(ob), struct)
         conf_penalty = _confidence_penalty(
             ob.get("confidence") or meta.get("confidence") or {}
         )
 
         score = (
             weights["dense"] * dense_total
+            + weights.get("hybrid", 0.0) * dense_hybrid
+            + weights.get("layout_dense", 0.0) * dense_layout
             + weights["bm25"] * bm25
             + weights["zone"] * zone_score
             + weights["header"] * header_score
             + weights["neighbor"] * neighbor_score
             + weights.get("keyword", 0.0) * kw_boost
             + weights.get("symbolic", 0.0) * sym
+            + weights.get("intent", 0.0) * intent_score
             - weights["penalty"] * conf_penalty
         )
 
         enriched = dict(ob)
         enriched_meta = dict(meta)
         enriched_meta.setdefault("filters", filters)
+        obj_type = _infer_object_type(enriched)
+        enriched_meta["object_type"] = obj_type
+        enriched_meta["render"] = _renderable_payload(enriched, obj_type)
         enriched_meta["retrieval_scores"] = {
             "bm25": float(bm25),
             "dense": float(dense_total),
+            "hybrid": float(dense_hybrid),
             "zone": float(zone_score),
             "header": float(header_score),
             "neighbor": float(neighbor_score),
             "symbolic": float(sym),
             "keyword": float(kw_boost),
+            "intent": float(intent_score),
             "penalty": float(conf_penalty),
         }
         enriched["meta"] = enriched_meta
