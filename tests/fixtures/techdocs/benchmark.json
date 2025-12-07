@@ -1,0 +1,46 @@
+[
+  {
+    "id": "schematic-resistor-label",
+    "pdf": "machine_schematic.pdf",
+    "page": 1,
+    "query": "In the wiring schematic, what is the label of the resistor connected directly before the LED?",
+    "answers": ["R1", "Resistor R1"],
+    "visual_type": "diagram",
+    "visual_target": "resistor r1 connected to led d1",
+    "answer_requires_visual": true,
+    "notes": "Answer requires reading the component labels in the diagram."
+  },
+  {
+    "id": "schematic-between-fuse-and-resistor",
+    "pdf": "machine_schematic.pdf",
+    "page": 1,
+    "query": "Which component is placed between Fuse F1 and Resistor R1 in the diagram?",
+    "answers": ["Switch S1", "S1"],
+    "visual_type": "diagram",
+    "visual_target": "switch s1",
+    "answer_requires_visual": true,
+    "notes": "Tests whether the model tracks ordering along the flow arrows."
+  },
+  {
+    "id": "table-comm-baud-rate",
+    "pdf": "control_panel_table.pdf",
+    "page": 1,
+    "query": "According to the configuration table, what baud rate is assigned to communications connector J7?",
+    "answers": ["9600 bps", "9600"],
+    "visual_type": "table",
+    "visual_target": "j7 communications row",
+    "answer_requires_visual": true,
+    "notes": "Requires scanning the table row for J7 instead of the narrative text."
+  },
+  {
+    "id": "flow-next-step",
+    "pdf": "safety_flow.pdf",
+    "page": 1,
+    "query": "After the access door is closed in the flow diagram, what is the next required action?",
+    "answers": ["Restore power and check green light", "Restore power & check green light"],
+    "visual_type": "procedure",
+    "visual_target": "restore power & check green light",
+    "answer_requires_visual": true,
+    "notes": "Answer is printed in the final step box of the flowchart." 
+  }
+]

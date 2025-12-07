@@ -1,0 +1,38 @@
+[
+  {
+    "id": "schematic-resistor-label",
+    "predicted_answer": "Resistor R1",
+    "retrieved_visuals": [
+      "resistor r1 connected to led d1",
+      "fuse f1",
+      "switch s1"
+    ]
+  },
+  {
+    "id": "schematic-between-fuse-and-resistor",
+    "predicted_answer": "Switch S1",
+    "retrieved_visuals": [
+      "switch s1",
+      "resistor r1",
+      "ac in"
+    ]
+  },
+  {
+    "id": "table-comm-baud-rate",
+    "predicted_answer": "9600 bps",
+    "retrieved_visuals": [
+      "j7 communications row",
+      "diagnostics j5 row",
+      "sensor bus p1"
+    ]
+  },
+  {
+    "id": "flow-next-step",
+    "predicted_answer": "Restore power and check green light",
+    "retrieved_visuals": [
+      "restore power & check green light",
+      "close access door",
+      "vent residual fluid"
+    ]
+  }
+]
