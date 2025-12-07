@@ -83,3 +83,23 @@ def test_llm_converter_emits_prompts_and_tool_calls():
     assert any(call["tool"] == "structural_node" for call in calls)
     figure_call = next(call for call in calls if call["arguments"]["id"] == "image-1")
     assert figure_call["arguments"]["bbox"]["width"] == 100
+
+
+def test_serialization_and_prompts_are_deterministic():
+    # Shuffle the order to ensure converters normalize ordering
+    reversed_regions = list(reversed(_sample_regions()))
+    graph = build_structural_graph("doc-123", 1, reversed_regions)
+
+    prompts = graph_to_llm_prompts(graph)
+    assert prompts == sorted(prompts, key=str.casefold)
+
+    calls = graph_to_tool_calls(graph)
+    call_signatures = [
+        (call["tool"], call["arguments"].get("id"), call["arguments"].get("relation"))
+        for call in calls
+    ]
+    assert call_signatures == sorted(call_signatures)
+
+    jsonld = graph_to_jsonld(graph)
+    ids = [entry["@id"] for entry in jsonld["@graph"]]
+    assert ids == sorted(ids)

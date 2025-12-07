@@ -63,6 +63,21 @@ def _nearest_text_region(
     return scored[0][1] if scored else None
 
 
+def _sorted_nodes(graph: StructuralGraph) -> List[StructuralNode]:
+    return sorted(
+        graph.nodes,
+        key=lambda node: (
+            node.page_number if node.page_number is not None else -1,
+            node.type,
+            node.node_id,
+        ),
+    )
+
+
+def _sorted_edges(graph: StructuralGraph) -> List[StructuralEdge]:
+    return sorted(graph.edges, key=lambda edge: (edge.relation, edge.source, edge.target))
+
+
 def build_structural_graph(
     document_id: str, page_number: int, regions: Sequence[RegionOutput]
 ) -> StructuralGraph:
@@ -171,7 +186,7 @@ def graph_to_jsonld(graph: StructuralGraph) -> Dict[str, Any]:
         "relation": "https://schema.org/interactionType",
     }
     entries: List[Dict[str, Any]] = []
-    for node in graph.nodes:
+    for node in _sorted_nodes(graph):
         payload: Dict[str, Any] = {
             "@id": node.node_id,
             "@type": node.type,
@@ -185,7 +200,7 @@ def graph_to_jsonld(graph: StructuralGraph) -> Dict[str, Any]:
             payload["attributes"] = node.attributes
         entries.append(payload)
 
-    for edge in graph.edges:
+    for edge in _sorted_edges(graph):
         entries.append(
             {
                 "@id": f"{edge.source}->{edge.target}:{edge.relation}",
@@ -198,7 +213,13 @@ def graph_to_jsonld(graph: StructuralGraph) -> Dict[str, Any]:
             }
         )
 
-    return {"@context": context, "@id": f"urn:zocr:{graph.document_id}:structure", "@graph": entries}
+    ordered_entries = sorted(entries, key=lambda entry: entry.get("@id", ""))
+
+    return {
+        "@context": context,
+        "@id": f"urn:zocr:{graph.document_id}:structure",
+        "@graph": ordered_entries,
+    }
 
 
 def graph_from_jsonld(payload: Dict[str, Any]) -> StructuralGraph:
@@ -246,7 +267,7 @@ def load_jsonld(path: str) -> StructuralGraph:
 
 def graph_to_llm_prompts(graph: StructuralGraph) -> List[str]:
     prompts: List[str] = []
-    for node in graph.nodes:
+    for node in _sorted_nodes(graph):
         parts = [f"{node.type} node {node.node_id}"]
         if node.page_number is not None:
             parts.append(f"page {node.page_number}")
@@ -263,14 +284,14 @@ def graph_to_llm_prompts(graph: StructuralGraph) -> List[str]:
             parts.append(f"units {units}")
         prompts.append("; ".join(parts))
 
-    for edge in graph.edges:
+    for edge in _sorted_edges(graph):
         prompts.append(f"Relation {edge.relation}: {edge.source} -> {edge.target}")
-    return prompts
+    return sorted(prompts, key=str.casefold)
 
 
 def graph_to_tool_calls(graph: StructuralGraph) -> List[Dict[str, Any]]:
     calls: List[Dict[str, Any]] = []
-    for node in graph.nodes:
+    for node in _sorted_nodes(graph):
         calls.append(
             {
                 "tool": "structural_node",
@@ -283,7 +304,7 @@ def graph_to_tool_calls(graph: StructuralGraph) -> List[Dict[str, Any]]:
                 },
             }
         )
-    for edge in graph.edges:
+    for edge in _sorted_edges(graph):
         calls.append(
             {
                 "tool": "structural_relation",
@@ -295,4 +316,12 @@ def graph_to_tool_calls(graph: StructuralGraph) -> List[Dict[str, Any]]:
                 },
             }
         )
-    return calls
+
+    return sorted(
+        calls,
+        key=lambda call: (
+            call.get("tool", ""),
+            call.get("arguments", {}).get("id") or "",
+            call.get("arguments", {}).get("relation") or "",
+        ),
+    )
