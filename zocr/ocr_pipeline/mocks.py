@@ -19,6 +19,7 @@ from .models import (
     TableExtractionResult,
     TextOcrResult,
 )
+from .structure import build_structural_graph
 
 
 class MockSegmenter(Segmenter):
@@ -183,10 +184,17 @@ class MockAggregator(Aggregator):
             table_regions=sum(1 for r in region_outputs if r.type == RegionType.TABLE),
         )
 
+        structure = build_structural_graph(
+            document_id=page.document_id,
+            page_number=page.page_number,
+            regions=region_outputs,
+        )
+
         return DocumentOutput(
             document_id=page.document_id,
             page_number=page.page_number,
             regions=region_outputs,
             metadata=metadata,
+            structure=structure,
         )
 
