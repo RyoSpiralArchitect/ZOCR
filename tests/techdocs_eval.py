@@ -115,6 +115,9 @@ def evaluate(examples: Iterable[BenchmarkExample], predictions: dict[str, Predic
     metrics = Metrics()
     for example in examples:
         pred = predictions.get(example.id)
+        if pred is None:
+            metrics.missing_predictions += 1
+
         if example.visual_type in {"diagram", "table"} and example.visual_target:
             metrics.diagram_table_total += 1
             retrieved = pred.retrieved_visuals if pred else []
@@ -123,8 +126,6 @@ def evaluate(examples: Iterable[BenchmarkExample], predictions: dict[str, Predic
 
         if example.answer_requires_visual:
             metrics.visual_answer_total += 1
-            if pred is None:
-                metrics.missing_predictions += 1
             if _answer_is_correct(pred.predicted_answer if pred else None, example.answers):
                 metrics.visual_answer_hits += 1
     return metrics
@@ -155,6 +156,9 @@ def main() -> None:
     )
     parser.add_argument("--top-k", type=int, default=3, help="Top-k cutoff for visual hit-rate calculation.")
     args = parser.parse_args()
+
+    if args.top_k < 1:
+        raise ValueError("--top-k must be at least 1")
 
     examples = load_benchmark(args.benchmark)
     predictions = load_predictions(args.predictions)

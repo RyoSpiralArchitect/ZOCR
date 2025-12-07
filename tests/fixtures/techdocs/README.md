@@ -43,7 +43,8 @@ python tests/techdocs_eval.py \
 ```
 
 This prints the top-k visual hit rate for diagram/table questions and end-to-end answer accuracy
-for questions that require visual grounding.
+for questions that require visual grounding. The summary also reports how many benchmark items were
+missing from the prediction file so you can spot coverage issues quickly.
 
 ## Adding new test PDFs or questions
 1. Keep PDFs concise (1–2 pages, minimal file size) so the repository stays lightweight.
