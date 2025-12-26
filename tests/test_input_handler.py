@@ -1,15 +1,18 @@
+import io
+
 import pytest
+from reportlab.pdfgen import canvas
 
 from zocr.ocr_pipeline import BasicInputHandler, DocumentInput
 
 
 def _write_simple_pdf(path):
-    import fitz
-
-    with fitz.open() as doc:
-        page = doc.new_page()
-        page.insert_text((72, 72), "hello world")
-        doc.save(path.as_posix())
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=(200, 200))
+    c.drawString(72, 72, "hello world")
+    c.showPage()
+    c.save()
+    path.write_bytes(buffer.getvalue())
 
 
 def test_basic_input_handler_with_images():
@@ -25,6 +28,7 @@ def test_basic_input_handler_with_images():
 
 
 def test_basic_input_handler_uses_pymupdf_fallback(tmp_path, monkeypatch):
+    pytest.importorskip("fitz")
     pdf_path = tmp_path / "sample.pdf"
     _write_simple_pdf(pdf_path)
 
@@ -64,3 +68,22 @@ def test_basic_input_handler_surfaces_pdf_errors(tmp_path, monkeypatch):
     message = str(err.value)
     assert "pdf2image" in message
     assert "pymupdf" in message
+
+
+def test_basic_input_handler_applies_default_dpi(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "sample.pdf"
+    _write_simple_pdf(pdf_path)
+
+    handler = BasicInputHandler(default_pdf_dpi=150)
+    seen = {}
+
+    def _fake_expand(self, path, dpi):
+        seen["dpi"] = dpi
+        return [object()]
+
+    monkeypatch.setattr(BasicInputHandler, "_expand_pdf", _fake_expand)
+
+    pages = handler.load(DocumentInput(document_id="doc-4", file_path=str(pdf_path)))
+
+    assert seen["dpi"] == 150
+    assert pages[0].dpi == 150

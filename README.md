@@ -125,9 +125,9 @@ python -m zocr simple --images samples/demo_inputs/invoice_page.png --out out_si
 python -m zocr simple --images samples/demo_inputs/invoice_page.png --out out_mock.json --use-mocks
 ```
 
-- **[JA]** PDF 入力は Poppler が無くても PyMuPDF に自動フォールバックし、コードから `DocumentInput.dpi` を指定すればレンダリング解像度も固定できます。
-- **[EN]** PDF inputs now fall back to the bundled PyMuPDF backend when Poppler/pdf2image are unavailable, and `DocumentInput.dpi` lets you clamp the render DPI programmatically.
-- **[FR]** Les PDF utilisent désormais PyMuPDF en secours quand Poppler/pdf2image sont absents, et `DocumentInput.dpi` permet de fixer le DPI de rendu côté code.
+- **[JA]** PDF 入力は Poppler が無くても PyMuPDF に自動フォールバックし、`DocumentInput.dpi` を指定しない場合は `default_pdf_dpi`（既定 200）でレンダリングします。
+- **[EN]** PDF inputs now fall back to the bundled PyMuPDF backend when Poppler/pdf2image are unavailable, and if `DocumentInput.dpi` is omitted the handler renders at `default_pdf_dpi` (200 by default).
+- **[FR]** Les PDF utilisent désormais PyMuPDF en secours quand Poppler/pdf2image sont absents ; sans `DocumentInput.dpi`, le rendu se fait à `default_pdf_dpi` (200 par défaut).
 
 ## 仕組み / Mechanics / Fonctionnement
 1. **OCR & Consensus** — `zocr.consensus.zocr_consensus` がレイアウト解析とセル信頼度計算を実行。

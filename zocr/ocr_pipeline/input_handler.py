@@ -20,7 +20,8 @@ class BasicInputHandler(InputHandler):
       dependency is missing or fails, it falls back to a pure-Python
       ``PyMuPDF`` renderer so environments without system packages remain
       usable. The optional ``poppler_path`` can be passed to the constructor
-      for environments without system-wide Poppler.
+      for environments without system-wide Poppler. A configurable
+      ``default_pdf_dpi`` is used when the input does not specify a DPI.
     * Otherwise, the file is opened with Pillow and treated as a
       single-page image.
     """
@@ -29,16 +30,16 @@ class BasicInputHandler(InputHandler):
         self.poppler_path = poppler_path
         self.default_pdf_dpi = default_pdf_dpi
 
-    def _render_pdf_with_pdf2image(self, path: Path, dpi: int | None) -> List[Image.Image]:
+    def _render_pdf_with_pdf2image(self, path: Path, dpi: int) -> List[Image.Image]:
         from pdf2image import convert_from_path
 
         kwargs = {}
         if self.poppler_path:
             kwargs["poppler_path"] = self.poppler_path
-        kwargs["dpi"] = dpi or self.default_pdf_dpi
+        kwargs["dpi"] = dpi
         return convert_from_path(path.as_posix(), **kwargs)
 
-    def _render_pdf_with_pymupdf(self, path: Path, dpi: int | None) -> List[Image.Image]:
+    def _render_pdf_with_pymupdf(self, path: Path, dpi: int) -> List[Image.Image]:
         import importlib
 
         spec = importlib.util.find_spec("fitz")
@@ -46,7 +47,7 @@ class BasicInputHandler(InputHandler):
             raise RuntimeError("PyMuPDF (fitz) is required to process PDF documents")
 
         fitz = importlib.import_module("fitz")
-        scale = (dpi or self.default_pdf_dpi) / 72.0
+        scale = dpi / 72.0
         matrix = fitz.Matrix(scale, scale)
         images: List[Image.Image] = []
         with fitz.open(path.as_posix()) as doc:  # type: ignore[attr-defined]
@@ -61,7 +62,7 @@ class BasicInputHandler(InputHandler):
                 images.append(Image.frombytes(mode, (pix.width, pix.height), pix.samples))
         return images
 
-    def _expand_pdf(self, path: Path, dpi: int | None) -> List[Image.Image]:
+    def _expand_pdf(self, path: Path, dpi: int) -> List[Image.Image]:
         errors: list[str] = []
         try:
             return self._render_pdf_with_pdf2image(path, dpi)
@@ -85,18 +86,19 @@ class BasicInputHandler(InputHandler):
                     page_number=idx + 1,
                     image=img,
                     dpi=document.dpi,
-                )
-                for idx, img in enumerate(document.images)
-            ]
+            )
+            for idx, img in enumerate(document.images)
+        ]
 
         if not document.file_path:
             raise ValueError("DocumentInput requires either images or a file_path")
 
         path = Path(document.file_path)
         suffix = path.suffix.lower()
+        render_dpi = document.dpi or self.default_pdf_dpi
 
         if suffix == ".pdf":
-            images = self._expand_pdf(path, document.dpi)
+            images = self._expand_pdf(path, render_dpi)
         else:
             images = [Image.open(path.as_posix())]
 
@@ -105,7 +107,7 @@ class BasicInputHandler(InputHandler):
                 document_id=document.document_id,
                 page_number=idx + 1,
                 image=img,
-                dpi=document.dpi,
+                dpi=render_dpi if suffix == ".pdf" else document.dpi,
             )
             for idx, img in enumerate(images)
         ]
