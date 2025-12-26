@@ -1,6 +1,18 @@
+import io
+
 import pytest
+from reportlab.pdfgen import canvas
 
 from zocr.ocr_pipeline import BasicInputHandler, DocumentInput
+
+
+def _write_simple_pdf(path):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=(200, 200))
+    c.drawString(72, 72, "hello world")
+    c.showPage()
+    c.save()
+    path.write_bytes(buffer.getvalue())
 
 
 def test_basic_input_handler_with_images():
@@ -15,14 +27,63 @@ def test_basic_input_handler_with_images():
     assert all(p.dpi == 300 for p in pages)
 
 
-def test_basic_input_handler_requires_pdf_dependency(tmp_path, monkeypatch):
+def test_basic_input_handler_uses_pymupdf_fallback(tmp_path, monkeypatch):
+    pytest.importorskip("fitz")
     pdf_path = tmp_path / "sample.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    _write_simple_pdf(pdf_path)
 
     handler = BasicInputHandler()
 
+    def _fail_pdf2image(self, path, dpi):
+        raise RuntimeError("pdf2image missing")
+
+    monkeypatch.setattr(BasicInputHandler, "_render_pdf_with_pdf2image", _fail_pdf2image)
+
+    pages = handler.load(DocumentInput(document_id="doc-2", file_path=str(pdf_path), dpi=180))
+
+    assert [p.page_number for p in pages] == [1]
+    assert pages[0].document_id == "doc-2"
+    assert getattr(pages[0].image, "size", None) is not None
+    assert pages[0].dpi == 180
+
+
+def test_basic_input_handler_surfaces_pdf_errors(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "sample.pdf"
+    _write_simple_pdf(pdf_path)
+
+    handler = BasicInputHandler()
+
+    def _fail_pdf2image(self, path, dpi):
+        raise RuntimeError("pdf2image missing")
+
+    def _fail_pymupdf(self, path, dpi):
+        raise RuntimeError("pymupdf missing")
+
+    monkeypatch.setattr(BasicInputHandler, "_render_pdf_with_pdf2image", _fail_pdf2image)
+    monkeypatch.setattr(BasicInputHandler, "_render_pdf_with_pymupdf", _fail_pymupdf)
+
     with pytest.raises(RuntimeError) as err:
-        handler.load(DocumentInput(document_id="doc-2", file_path=str(pdf_path)))
+        handler.load(DocumentInput(document_id="doc-3", file_path=str(pdf_path)))
 
-    assert "pdf2image" in str(err.value)
+    message = str(err.value)
+    assert "pdf2image" in message
+    assert "pymupdf" in message
 
+
+def test_basic_input_handler_applies_default_dpi(tmp_path, monkeypatch):
+    pdf_path = tmp_path / "sample.pdf"
+    _write_simple_pdf(pdf_path)
+
+    handler = BasicInputHandler(default_pdf_dpi=150)
+    seen = {}
+
+    def _fake_expand(self, path, dpi):
+        seen["dpi"] = dpi
+        return [object()]
+
+    monkeypatch.setattr(BasicInputHandler, "_expand_pdf", _fake_expand)
+
+    pages = handler.load(DocumentInput(document_id="doc-4", file_path=str(pdf_path)))
+
+    assert seen["dpi"] == 150
+    assert pages[0].dpi == 150
