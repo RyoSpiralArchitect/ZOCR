@@ -45,8 +45,9 @@ The legacy entry point `python -m zocr pipeline ...` and the simplified `zocr_al
 Generate ready-to-edit JSON presets for downstream LLMs and helper VLMs:
 ```bash
 python - <<'PY'
-from zocr.resources.model_provider_presets import write_provider_templates
+from zocr.resources.model_provider_presets import PROVIDER_ENV_VARS, write_provider_templates
 print("wrote", write_provider_templates("provider_templates.json"))
+print("env vars:", ", ".join(sorted(PROVIDER_ENV_VARS)))
 PY
 ```
 
@@ -60,6 +61,8 @@ The JSON contains `downstream_llm` and `helper_vlm` sections. Fill in API keys a
 - xAI (`XAI_API_KEY`)
 
 Helper models can mix and match: e.g., OpenAI `gpt-4o` for vision, Gemini for fast multimodal prompts, or Mistral/xAI for text or vision-capable helpers where supported.
+
+You can prime these environment variables using any secrets manager. The presets keep placeholders identical to the required env var names so `provider_templates.json` can be patched with simple tooling (e.g., `envsubst`).
 
 ## Lightweight modular OCR
 ```bash
