@@ -3,6 +3,7 @@ from pathlib import Path
 from zocr.resources.model_provider_presets import (
     AUXILIARY_VLM_PRESETS,
     DOWNSTREAM_LLM_PRESETS,
+    PROVIDER_ENV_VARS,
     render_provider_templates,
     write_provider_templates,
 )
@@ -17,6 +18,9 @@ def test_templates_have_expected_providers():
         "azure_openai",
         "gemini",
         "anthropic",
+        "openai",
+        "mistral",
+        "xai",
     }.issubset(llm)
     assert {
         "local_hf",
@@ -24,6 +28,9 @@ def test_templates_have_expected_providers():
         "azure_openai",
         "gemini",
         "anthropic",
+        "openai",
+        "mistral",
+        "xai",
     }.issubset(vlm)
 
 
@@ -40,3 +47,16 @@ def test_write_provider_templates(tmp_path: Path):
     text = Path(path).read_text(encoding="utf-8")
     assert "downstream_llm" in text
     assert "helper_vlm" in text
+
+
+def test_env_var_list_covers_all_cloud_providers():
+    expected = {
+        "OPENAI_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "AWS_BEDROCK_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "MISTRAL_API_KEY",
+        "XAI_API_KEY",
+    }
+    assert expected == PROVIDER_ENV_VARS
