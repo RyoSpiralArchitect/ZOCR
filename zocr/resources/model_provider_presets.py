@@ -13,6 +13,16 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+PROVIDER_ENV_VARS = {
+    "OPENAI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "AWS_BEDROCK_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "MISTRAL_API_KEY",
+    "XAI_API_KEY",
+}
+
 DOWNSTREAM_LLM_PRESETS: Dict[str, Dict[str, Any]] = {
     "local_hf": {
         "provider": "huggingface",
@@ -49,6 +59,24 @@ DOWNSTREAM_LLM_PRESETS: Dict[str, Dict[str, Any]] = {
         "model": "claude-3-5-sonnet-20241022",
         "api_key": "${ANTHROPIC_API_KEY}",
         "notes": "Pure text downstream reasoning via Anthropic's API.",
+    },
+    "openai": {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": "${OPENAI_API_KEY}",
+        "notes": "Set OPENAI_API_KEY to enable OpenAI-hosted downstream text reasoning.",
+    },
+    "mistral": {
+        "provider": "mistral",
+        "model": "mistral-small-latest",
+        "api_key": "${MISTRAL_API_KEY}",
+        "notes": "Set MISTRAL_API_KEY for Mistral-hosted text flows (e.g., mistral-large/mistral-small).",
+    },
+    "xai": {
+        "provider": "xai",
+        "model": "grok-beta",
+        "api_key": "${XAI_API_KEY}",
+        "notes": "Set XAI_API_KEY to call Grok models for downstream reasoning.",
     },
 }
 
@@ -89,6 +117,24 @@ AUXILIARY_VLM_PRESETS: Dict[str, Dict[str, Any]] = {
         "api_key": "${ANTHROPIC_API_KEY}",
         "notes": "Vision-friendly Claude tier for lightweight inspections.",
     },
+    "openai": {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": "${OPENAI_API_KEY}",
+        "notes": "Set OPENAI_API_KEY to route helper calls (with vision) to OpenAI gpt-4o.",
+    },
+    "mistral": {
+        "provider": "mistral",
+        "model": "pixtral-large-latest",
+        "api_key": "${MISTRAL_API_KEY}",
+        "notes": "Set MISTRAL_API_KEY to use Mistral's Pixtral vision-capable helper model.",
+    },
+    "xai": {
+        "provider": "xai",
+        "model": "grok-vision-beta",
+        "api_key": "${XAI_API_KEY}",
+        "notes": "Set XAI_API_KEY to enable Grok vision helpers for multimodal prompts.",
+    },
 }
 
 
@@ -105,10 +151,21 @@ def write_provider_templates(path: str | Path) -> str:
     """Write a JSON file containing both LLM and VLM provider stubs.
 
     The output only contains placeholders and documented keys so callers can
-    ``sed`` or edit in-place without reading source code.
+    ``sed`` or edit in-place without reading source code. Environment variable
+    placeholders match the exported ``PROVIDER_ENV_VARS`` set so you can
+    pre-seed them via your preferred secrets manager.
     """
 
     dst = Path(path)
     payload = render_provider_templates()
     dst.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return str(dst)
+
+
+__all__ = [
+    "AUXILIARY_VLM_PRESETS",
+    "DOWNSTREAM_LLM_PRESETS",
+    "PROVIDER_ENV_VARS",
+    "render_provider_templates",
+    "write_provider_templates",
+]
