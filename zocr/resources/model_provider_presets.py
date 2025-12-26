@@ -50,6 +50,24 @@ DOWNSTREAM_LLM_PRESETS: Dict[str, Dict[str, Any]] = {
         "api_key": "${ANTHROPIC_API_KEY}",
         "notes": "Pure text downstream reasoning via Anthropic's API.",
     },
+    "openai": {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": "${OPENAI_API_KEY}",
+        "notes": "Set OPENAI_API_KEY to enable OpenAI-hosted downstream text reasoning.",
+    },
+    "mistral": {
+        "provider": "mistral",
+        "model": "mistral-small-latest",
+        "api_key": "${MISTRAL_API_KEY}",
+        "notes": "Set MISTRAL_API_KEY for Mistral-hosted text flows (e.g., mistral-large/mistral-small).",
+    },
+    "xai": {
+        "provider": "xai",
+        "model": "grok-beta",
+        "api_key": "${XAI_API_KEY}",
+        "notes": "Set XAI_API_KEY to call Grok models for downstream reasoning.",
+    },
 }
 
 AUXILIARY_VLM_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -88,6 +106,24 @@ AUXILIARY_VLM_PRESETS: Dict[str, Dict[str, Any]] = {
         "model": "claude-3-haiku-20240307",
         "api_key": "${ANTHROPIC_API_KEY}",
         "notes": "Vision-friendly Claude tier for lightweight inspections.",
+    },
+    "openai": {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": "${OPENAI_API_KEY}",
+        "notes": "Set OPENAI_API_KEY to route helper calls (with vision) to OpenAI gpt-4o.",
+    },
+    "mistral": {
+        "provider": "mistral",
+        "model": "pixtral-large-latest",
+        "api_key": "${MISTRAL_API_KEY}",
+        "notes": "Set MISTRAL_API_KEY to use Mistral's Pixtral vision-capable helper model.",
+    },
+    "xai": {
+        "provider": "xai",
+        "model": "grok-vision-beta",
+        "api_key": "${XAI_API_KEY}",
+        "notes": "Set XAI_API_KEY to enable Grok vision helpers for multimodal prompts.",
     },
 }
 

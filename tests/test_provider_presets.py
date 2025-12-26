@@ -17,6 +17,9 @@ def test_templates_have_expected_providers():
         "azure_openai",
         "gemini",
         "anthropic",
+        "openai",
+        "mistral",
+        "xai",
     }.issubset(llm)
     assert {
         "local_hf",
@@ -24,6 +27,9 @@ def test_templates_have_expected_providers():
         "azure_openai",
         "gemini",
         "anthropic",
+        "openai",
+        "mistral",
+        "xai",
     }.issubset(vlm)
 
 
