@@ -60,6 +60,13 @@ def _find_gaps(
     return gaps
 
 
+def _smooth_density(density: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1:
+        return density
+    kernel = np.ones(window, dtype=float) / float(window)
+    return np.convolve(density, kernel, mode="same")
+
+
 def _segments_from_gaps(length: int, gaps: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
     if not gaps:
         return [(0, length)]
@@ -99,11 +106,13 @@ class FullPageSegmenter(Segmenter):
         gap_ratio: float = 0.015,
         min_gap_fraction: float = 0.02,
         min_region_fraction: float = 0.08,
+        smoothing_window: int = 7,
     ) -> None:
         self.confidence = confidence
         self.gap_ratio = gap_ratio
         self.min_gap_fraction = min_gap_fraction
         self.min_region_fraction = min_region_fraction
+        self.smoothing_window = smoothing_window
 
     def segment(self, page: PageInput) -> List[SegmentedRegion]:
         image = page.image
@@ -116,8 +125,8 @@ class FullPageSegmenter(Segmenter):
 
         gray = _to_gray_array(image)
         mask = _ink_mask(gray)
-        row_density = mask.mean(axis=1)
-        col_density = mask.mean(axis=0)
+        row_density = _smooth_density(mask.mean(axis=1), self.smoothing_window)
+        col_density = _smooth_density(mask.mean(axis=0), self.smoothing_window)
 
         min_row_gap = max(4, int(height * self.min_gap_fraction))
         min_col_gap = max(4, int(width * self.min_gap_fraction))
@@ -132,7 +141,10 @@ class FullPageSegmenter(Segmenter):
             row_slice = mask[row_start:row_end, :]
             if row_slice.size == 0:
                 continue
-            col_density_slice = row_slice.mean(axis=0)
+            col_density_slice = _smooth_density(
+                row_slice.mean(axis=0),
+                min(self.smoothing_window, max(3, row_slice.shape[1] // 50)),
+            )
             col_gaps = _find_gaps(col_density_slice, self.gap_ratio, min_col_gap)
             col_segments = _segments_from_gaps(width, col_gaps)
             for col_start, col_end in col_segments:
@@ -477,9 +489,30 @@ class SimpleTableExtractor(TableExtractor):
         if not centers:
             centers = [0.0]
 
+        line_values = sorted({word["line"] for word in words})
+        use_line_numbers = len(line_values) > 1 and any(value > 0 for value in line_values)
+
         lines: Dict[int, List[dict]] = {}
-        for word in words:
-            lines.setdefault(word["line"], []).append(word)
+        if use_line_numbers:
+            for word in words:
+                lines.setdefault(word["line"], []).append(word)
+        else:
+            heights = [w["height"] for w in words if w["height"] > 0]
+            median_height = float(np.median(heights)) if heights else 10.0
+            row_gap = max(8.0, median_height * 1.4)
+            row_centers = _cluster_centers(
+                (w["top"] + w["height"] / 2 for w in words),
+                row_gap,
+            )
+            row_centers = sorted(row_centers)
+            if not row_centers:
+                row_centers = [0.0]
+            for word in words:
+                center = word["top"] + word["height"] / 2
+                row_idx = min(
+                    range(len(row_centers)), key=lambda i: abs(row_centers[i] - center)
+                )
+                lines.setdefault(row_idx, []).append(word)
 
         ordered_lines = [lines[key] for key in sorted(lines.keys())]
         rows: List[List[str]] = []
