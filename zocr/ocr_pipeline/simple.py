@@ -90,6 +90,91 @@ def _bounding_box_from_mask(
     return x_offset + x0, y_offset + y0, width, height
 
 
+def _box_iou(box_a: BoundingBox, box_b: BoundingBox) -> float:
+    ax1, ay1 = box_a.x, box_a.y
+    ax2, ay2 = box_a.x + box_a.width, box_a.y + box_a.height
+    bx1, by1 = box_b.x, box_b.y
+    bx2, by2 = box_b.x + box_b.width, box_b.y + box_b.height
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    area_a = box_a.width * box_a.height
+    area_b = box_b.width * box_b.height
+    union = max(1.0, area_a + area_b - inter_area)
+    return float(inter_area / union)
+
+
+def _boxes_adjacent(box_a: BoundingBox, box_b: BoundingBox, gap: int) -> bool:
+    ax1, ay1 = box_a.x, box_a.y
+    ax2, ay2 = box_a.x + box_a.width, box_a.y + box_a.height
+    bx1, by1 = box_b.x, box_b.y
+    bx2, by2 = box_b.x + box_b.width, box_b.y + box_b.height
+    horizontal_gap = max(bx1 - ax2, ax1 - bx2, 0)
+    vertical_gap = max(by1 - ay2, ay1 - by2, 0)
+    return horizontal_gap <= gap and vertical_gap <= gap
+
+
+def _merge_regions(
+    regions: Sequence[SegmentedRegion],
+    image: Image.Image,
+    overlap_threshold: float,
+    adjacency_gap: int,
+    confidence: float,
+) -> List[SegmentedRegion]:
+    merged: List[SegmentedRegion] = []
+    for region in regions:
+        merged_into = None
+        for existing in merged:
+            iou = _box_iou(existing.bounding_box, region.bounding_box)
+            if iou >= overlap_threshold or _boxes_adjacent(
+                existing.bounding_box, region.bounding_box, adjacency_gap
+            ):
+                merged_into = existing
+                break
+        if merged_into is None:
+            merged.append(region)
+            continue
+
+        x1 = min(merged_into.bounding_box.x, region.bounding_box.x)
+        y1 = min(merged_into.bounding_box.y, region.bounding_box.y)
+        x2 = max(
+            merged_into.bounding_box.x + merged_into.bounding_box.width,
+            region.bounding_box.x + region.bounding_box.width,
+        )
+        y2 = max(
+            merged_into.bounding_box.y + merged_into.bounding_box.height,
+            region.bounding_box.y + region.bounding_box.height,
+        )
+        x2 = min(x2, image.width)
+        y2 = min(y2, image.height)
+        merged_into.bounding_box = BoundingBox(
+            x=x1, y=y1, width=max(1, x2 - x1), height=max(1, y2 - y1)
+        )
+        merged_into.image_crop = image.crop((x1, y1, x2, y2))
+        merged_into.confidence = max(merged_into.confidence, region.confidence, confidence)
+
+    merged_sorted = sorted(
+        merged,
+        key=lambda r: (
+            r.bounding_box.y,
+            r.bounding_box.x,
+            r.bounding_box.height,
+            r.bounding_box.width,
+        ),
+    )
+    output: List[SegmentedRegion] = []
+    for idx, region in enumerate(merged_sorted, start=1):
+        region.reading_order = idx - 1
+        region.region_id = f"{region.region_id.rsplit('-', 1)[0]}-region{idx}"
+        output.append(region)
+    return output
+
+
 class FullPageSegmenter(Segmenter):
     """Split the page into multiple regions using whitespace projections."""
 
@@ -99,11 +184,15 @@ class FullPageSegmenter(Segmenter):
         gap_ratio: float = 0.015,
         min_gap_fraction: float = 0.02,
         min_region_fraction: float = 0.08,
+        merge_overlap_threshold: float = 0.2,
+        merge_adjacency_gap: int = 6,
     ) -> None:
         self.confidence = confidence
         self.gap_ratio = gap_ratio
         self.min_gap_fraction = min_gap_fraction
         self.min_region_fraction = min_region_fraction
+        self.merge_overlap_threshold = merge_overlap_threshold
+        self.merge_adjacency_gap = merge_adjacency_gap
 
     def segment(self, page: PageInput) -> List[SegmentedRegion]:
         image = page.image
@@ -146,6 +235,10 @@ class FullPageSegmenter(Segmenter):
                     continue
                 if region_w < min_region_size and region_h < min_region_size:
                     continue
+                x1 = min(width, x0 + region_w)
+                y1 = min(height, y0 + region_h)
+                region_w = max(1, x1 - x0)
+                region_h = max(1, y1 - y0)
                 region_index += 1
                 region_id = f"{page.document_id}-page{page.page_number}-region{region_index}"
                 bbox = BoundingBox(x=x0, y=y0, width=region_w, height=region_h)
@@ -172,6 +265,17 @@ class FullPageSegmenter(Segmenter):
                     reading_order=0,
                 )
             ]
+
+        if len(regions) > 1:
+            regions = _merge_regions(
+                regions,
+                image,
+                overlap_threshold=self.merge_overlap_threshold,
+                adjacency_gap=self.merge_adjacency_gap,
+                confidence=self.confidence,
+            )
+        else:
+            regions[0].reading_order = 0
 
         return regions
 
@@ -429,7 +533,18 @@ class SimpleTableExtractor(TableExtractor):
                 format="empty",
             )
 
-        data = pytesseract.image_to_data(region.image_crop, output_type=pytesseract.Output.DICT)
+        try:
+            data = pytesseract.image_to_data(
+                region.image_crop, output_type=pytesseract.Output.DICT
+            )
+        except (pytesseract.TesseractNotFoundError, RuntimeError, ValueError):
+            table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
+            return TableExtractionResult(
+                region_id=region.region_id,
+                table_data=table_data,
+                confidence=0.2,
+                format="unavailable",
+            )
         words = []
         for text, conf, left, top, width, height, line_num in zip(
             data.get("text", []),
