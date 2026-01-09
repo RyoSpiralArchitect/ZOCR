@@ -55,6 +55,8 @@ from .simple import (
     DummyVLLM,
     FullPageSegmenter,
     SimpleAggregator,
+    SimpleTableExtractor,
+    SimpleVLLM,
 )
 from .hybrid import ToyRuntimeTextOCR, TwoStageTextOCR
 from .tesseract import TesseractTextOCR
@@ -80,6 +82,8 @@ __all__ = [
     "FullPageSegmenter",
     "AspectRatioRegionClassifier",
     "SimpleAggregator",
+    "SimpleTableExtractor",
+    "SimpleVLLM",
     "DummyVLLM",
     "DummyTableExtractor",
     "ToyRuntimeTextOCR",
@@ -110,4 +114,3 @@ __all__ = [
     "load_jsonld",
     "save_jsonld",
 ]
-
