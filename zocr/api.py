@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from jsonschema import Draft202012Validator
+import httpx
 
 from zocr.orchestrator import zocr_pipeline
 from zocr.api_spec import (
@@ -30,6 +32,8 @@ from zocr.api_spec import (
     QUERY_REQUEST_SCHEMA_V0,
     render_user_prompt_analysis_v0,
 )
+from zocr.core.indexer import build_index
+from zocr.core.query_engine import hybrid_query
 
 __all__ = [
     "FileSpec",
@@ -69,6 +73,7 @@ class IngestRequest:
     resume: bool = False
     dry_run: bool = False
     pipeline_kwargs: Dict[str, Any] = field(default_factory=dict)
+    async_mode: bool = False
 
     def resolved_job_id(self) -> str:
         return self.job_id or f"episode_{uuid.uuid4().hex[:12]}"
@@ -98,6 +103,7 @@ class IngestResult:
     artifacts: Dict[str, Optional[str]]
     summary: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    status_path: Optional[str] = None
 
 
 @dataclass
@@ -113,6 +119,103 @@ class QueryResult:
     provenance: List[Dict[str, str]]
     flags: Dict[str, Any]
     status: str
+
+
+_JOB_LOCK = threading.Lock()
+_STATUS_FILENAME = "job_status.json"
+
+
+def _safe_segment(raw: str, label: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in raw.strip())
+    cleaned = cleaned.strip("._")
+    if not cleaned:
+        raise ValueError(f"Invalid {label}")
+    return cleaned
+
+
+def _tenant_root(out_root: str, tenant_id: str) -> Path:
+    return Path(out_root) / _safe_segment(tenant_id, "tenant_id")
+
+
+def _job_root(out_root: str, tenant_id: str, job_id: str) -> Path:
+    return _tenant_root(out_root, tenant_id) / _safe_segment(job_id, "job_id")
+
+
+def _status_path(job_dir: Path) -> Path:
+    return job_dir / _STATUS_FILENAME
+
+
+def _write_job_status(job_dir: Path, payload: Dict[str, Any]) -> None:
+    os.makedirs(job_dir, exist_ok=True)
+    with open(_status_path(job_dir), "w", encoding="utf-8") as fw:
+        json.dump(payload, fw, ensure_ascii=False, indent=2)
+
+
+def _read_job_status(job_dir: Path) -> Dict[str, Any]:
+    path = _status_path(job_dir)
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as fr:
+        return json.load(fr)
+
+
+def _download_remote(uri: str, target: Path) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", uri, timeout=60.0) as response:
+        response.raise_for_status()
+        with open(target, "wb") as fw:
+            for chunk in response.iter_bytes():
+                fw.write(chunk)
+    return str(target)
+
+
+def _resolve_uri(uri: str, target_dir: Path, label: str) -> str:
+    if uri.startswith("http://") or uri.startswith("https://"):
+        filename = f"{label}{Path(uri).suffix or '.bin'}"
+        return _download_remote(uri, target_dir / filename)
+    if uri.startswith("s3://"):
+        try:
+            import boto3  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("boto3 is required to fetch s3:// URIs") from exc
+        bucket_key = uri[5:].split("/", 1)
+        if len(bucket_key) != 2:
+            raise ValueError(f"Invalid s3 URI: {uri}")
+        bucket, key = bucket_key
+        filename = f"{label}{Path(key).suffix or '.bin'}"
+        target = target_dir / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        boto3.client("s3").download_file(bucket, key, str(target))
+        return str(target)
+    return uri
+
+
+def _resolve_inputs(files: Iterable[FileSpec], job_dir: Path) -> List[FileSpec]:
+    resolved: List[FileSpec] = []
+    cache_dir = job_dir / "inputs"
+    for idx, item in enumerate(files):
+        label = _safe_segment(item.id or f"file_{idx}", "file_id")
+        uri = _resolve_uri(item.uri, cache_dir, label)
+        resolved.append(
+            FileSpec(id=item.id, uri=uri, kind=item.kind, tags=list(item.tags))
+        )
+    return resolved
+
+
+def _build_trace_label(cell: Dict[str, Any]) -> str:
+    doc_id = cell.get("doc_id") or ""
+    page = cell.get("page")
+    table_index = cell.get("table_index")
+    row = cell.get("row")
+    col = cell.get("col")
+    parts = [
+        f"doc={doc_id}",
+        f"page={page}" if page is not None else "page=",
+        f"table={table_index}" if table_index is not None else "table=",
+        f"row={row}" if row is not None else "row=",
+        f"col={col}" if col is not None else "col=",
+    ]
+    return ";".join(parts)
 
 
 def _existing(path: Path) -> Optional[str]:
@@ -151,12 +254,13 @@ def ingest_job(request: IngestRequest) -> IngestResult:
     ``request.pipeline_kwargs``.
     """
 
-    job_id = request.resolved_job_id()
-    outdir = Path(request.out_root) / job_id
+    job_id = _safe_segment(request.resolved_job_id(), "job_id")
+    outdir = _job_root(request.out_root, request.tenant_id, job_id)
     os.makedirs(outdir, exist_ok=True)
 
     files = _normalize_files(request.files)
-    pipeline_inputs = [fs.uri for fs in files]
+    resolved_files = _resolve_inputs(files, outdir)
+    pipeline_inputs = [fs.uri for fs in resolved_files]
 
     artifact_paths = {
         "pipeline_summary": str(outdir / "pipeline_summary.json"),
@@ -166,6 +270,79 @@ def ingest_job(request: IngestRequest) -> IngestResult:
     }
 
     if request.dry_run:
+        queued = IngestResult(
+            job_id=job_id,
+            tenant_id=request.tenant_id,
+            status="queued",
+            outdir=str(outdir),
+            artifacts=artifact_paths,
+            summary=None,
+            error=None,
+            status_path=str(_status_path(outdir)),
+        )
+        _write_job_status(
+            outdir,
+            {
+                "job_id": job_id,
+                "tenant_id": request.tenant_id,
+                "status": "queued",
+                "updated_at": _iso_now(),
+                "artifacts": artifact_paths,
+            },
+        )
+        return queued
+
+    def _run_pipeline() -> None:
+        with _JOB_LOCK:
+            _write_job_status(
+                outdir,
+                {
+                    "job_id": job_id,
+                    "tenant_id": request.tenant_id,
+                    "status": "running",
+                    "started_at": _iso_now(),
+                    "artifacts": artifact_paths,
+                },
+            )
+        try:
+            summary = zocr_pipeline.run_full_pipeline(
+                pipeline_inputs,
+                str(outdir),
+                domain_hint=request.domain_hint,
+                resume=request.resume,
+                **request.pipeline_kwargs,
+            )
+            status = "completed"
+            error = None
+        except Exception as exc:  # pragma: no cover - surfaced to caller
+            summary = None
+            status = "failed"
+            error = str(exc)
+        with _JOB_LOCK:
+            payload = _read_job_status(outdir)
+            payload.update(
+                {
+                    "status": status,
+                    "updated_at": _iso_now(),
+                    "summary": summary,
+                    "error": error,
+                }
+            )
+            _write_job_status(outdir, payload)
+
+    if request.async_mode:
+        _write_job_status(
+            outdir,
+            {
+                "job_id": job_id,
+                "tenant_id": request.tenant_id,
+                "status": "queued",
+                "updated_at": _iso_now(),
+                "artifacts": artifact_paths,
+            },
+        )
+        thread = threading.Thread(target=_run_pipeline, daemon=True)
+        thread.start()
         return IngestResult(
             job_id=job_id,
             tenant_id=request.tenant_id,
@@ -174,31 +351,20 @@ def ingest_job(request: IngestRequest) -> IngestResult:
             artifacts=artifact_paths,
             summary=None,
             error=None,
+            status_path=str(_status_path(outdir)),
         )
 
-    try:
-        summary = zocr_pipeline.run_full_pipeline(
-            pipeline_inputs,
-            str(outdir),
-            domain_hint=request.domain_hint,
-            resume=request.resume,
-            **request.pipeline_kwargs,
-        )
-        status = "completed"
-        error = None
-    except Exception as exc:  # pragma: no cover - surfaced to caller
-        summary = None
-        status = "failed"
-        error = str(exc)
-
+    _run_pipeline()
+    status_payload = _read_job_status(outdir)
     return IngestResult(
         job_id=job_id,
         tenant_id=request.tenant_id,
-        status=status,
+        status=status_payload.get("status", "failed"),
         outdir=str(outdir),
         artifacts={k: _existing(Path(v)) or v for k, v in artifact_paths.items()},
-        summary=summary,
-        error=error,
+        summary=status_payload.get("summary"),
+        error=status_payload.get("error"),
+        status_path=str(_status_path(outdir)),
     )
 
 
@@ -266,18 +432,56 @@ def query_job(
 ) -> QueryResult:
     """Build a minimal query response envelope grounded on existing artifacts."""
 
-    job_dir = Path(base_dir) / job_id
+    job_dir = _job_root(base_dir, tenant_id, job_id)
     manifest_path = job_dir / "rag" / "manifest.json"
     summary_path = job_dir / "pipeline_summary.json"
 
     manifest = _load_json(manifest_path)
     pipeline_summary = _load_json(summary_path)
+    status_payload = _read_job_status(job_dir)
+    job_status = status_payload.get("status") or ("ready" if manifest else "pending")
 
     manifest_summary = _summarize_manifest(manifest, job_id)
-    status = "ready" if manifest else "pending"
+    status = "ready" if manifest else job_status
+    facts: List[Dict[str, Any]] = []
+
+    cells_path = manifest.get("cells")
+    if cells_path and os.path.exists(cells_path):
+        index_path = job_dir / "rag" / "cells_index.pkl"
+        if not index_path.exists():
+            build_index(cells_path, str(index_path))
+        try:
+            hits = hybrid_query(
+                str(index_path),
+                cells_path,
+                q_text=query,
+                topk=8,
+            )
+        except Exception:
+            hits = []
+        for score, cell in hits:
+            text = cell.get("text") or ""
+            if not text:
+                continue
+            facts.append(
+                {
+                    "trace": cell.get("trace") or _build_trace_label(cell),
+                    "text": text,
+                    "score": float(score),
+                }
+            )
+
     answer = {
-        "data_summary": manifest_summary["data_summary"],
-        "business_commentary": f"Received query='{query}' for job {job_id} (mode={mode}).",
+        "data_summary": (
+            "\n".join(f"- {fact['text']}" for fact in facts)
+            if facts
+            else manifest_summary["data_summary"]
+        ),
+        "business_commentary": (
+            "取得できた事実が限定的なため、追加の資料や質問の絞り込みが必要です。"
+            if not facts
+            else "抽出された事実を基に、関連する指標の差分やトレンドを確認してください。"
+        ),
     }
 
     artifacts: Dict[str, Any] = {
@@ -293,8 +497,16 @@ def query_job(
     }
 
     provenance = _provenance_from_manifest(manifest)
+    if facts:
+        provenance.extend(
+            {
+                "trace": fact.get("trace", ""),
+                "fact_text": fact.get("text", ""),
+            }
+            for fact in facts
+        )
 
-    flags = {"facts_insufficient": not bool(manifest)}
+    flags = {"facts_insufficient": not bool(facts)}
 
     return QueryResult(
         job_id=job_id,

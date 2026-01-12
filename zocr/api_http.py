@@ -59,6 +59,7 @@ def ingest_request_from_payload(
     for key in ("snapshot", "seed", "priority"):
         if key in options and options[key] is not None:
             pipeline_kw.setdefault(key, options[key])
+    async_mode = bool(options.get("async"))
 
     return IngestRequest(
         tenant_id=payload["tenant_id"],
@@ -68,6 +69,7 @@ def ingest_request_from_payload(
         resume=resume,
         dry_run=dry_run,
         pipeline_kwargs=pipeline_kw,
+        async_mode=async_mode,
     )
 
 
