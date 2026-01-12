@@ -82,6 +82,11 @@ INGEST_REQUEST_SCHEMA_V0: Dict[str, Any] = {
                     "enum": ["low", "normal", "high"],
                     "default": "normal",
                 },
+                "async": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run ingestion asynchronously and return queued status",
+                },
             },
         },
     },
