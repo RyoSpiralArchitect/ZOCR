@@ -396,6 +396,52 @@ def _summarize_manifest(manifest: Dict[str, Any], job_id: str) -> Dict[str, Any]
     }
 
 
+def _tabulate_cells(cells: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    rows: Dict[int, Dict[int, str]] = {}
+    max_col = -1
+    for cell in cells:
+        row_idx = cell.get("row")
+        col_idx = cell.get("col")
+        if row_idx is None or col_idx is None:
+            continue
+        text = cell.get("text") or ""
+        rows.setdefault(int(row_idx), {})[int(col_idx)] = text
+        max_col = max(max_col, int(col_idx))
+    if max_col < 0 or not rows:
+        return None
+    ordered_rows = []
+    for row_idx in sorted(rows):
+        row = [rows[row_idx].get(col, "") for col in range(max_col + 1)]
+        ordered_rows.append(row)
+    columns = [f"col_{idx}" for idx in range(max_col + 1)]
+    return {"columns": columns, "rows": ordered_rows}
+
+
+def _load_tables_from_manifest(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tables_path = manifest.get("tables")
+    if not tables_path or not os.path.exists(tables_path):
+        return []
+    with open(tables_path, "r", encoding="utf-8") as fr:
+        raw_tables = json.load(fr)
+    output: List[Dict[str, Any]] = []
+    for key, payload in raw_tables.items():
+        cells = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(cells, list):
+            continue
+        table = _tabulate_cells(cells)
+        if not table:
+            continue
+        output.append(
+            {
+                "id": str(key),
+                "title": str(key),
+                "columns": table["columns"],
+                "rows": table["rows"],
+            }
+        )
+    return output
+
+
 def _provenance_from_manifest(manifest: Dict[str, Any]) -> List[Dict[str, str]]:
     provenance: List[Dict[str, str]] = []
     trace_schema = manifest.get("trace_schema") or {}
@@ -471,21 +517,27 @@ def query_job(
                 }
             )
 
-    answer = {
-        "data_summary": (
-            "\n".join(f"- {fact['text']}" for fact in facts)
-            if facts
-            else manifest_summary["data_summary"]
-        ),
-        "business_commentary": (
-            "取得できた事実が限定的なため、追加の資料や質問の絞り込みが必要です。"
-            if not facts
-            else "抽出された事実を基に、関連する指標の差分やトレンドを確認してください。"
-        ),
-    }
+    if status in {"queued", "running"} and not manifest:
+        answer = {
+            "data_summary": f"ジョブ {job_id} は現在 {status} です。",
+            "business_commentary": "完了後に再度問い合わせてください。",
+        }
+    else:
+        answer = {
+            "data_summary": (
+                "\n".join(f"- {fact['text']}" for fact in facts)
+                if facts
+                else manifest_summary["data_summary"]
+            ),
+            "business_commentary": (
+                "取得できた事実が限定的なため、追加の資料や質問の絞り込みが必要です。"
+                if not facts
+                else "抽出された事実を基に、関連する指標の差分やトレンドを確認してください。"
+            ),
+        }
 
     artifacts: Dict[str, Any] = {
-        "tables": [],
+        "tables": _load_tables_from_manifest(manifest),
         "charts": [],
         "sources": {
             "manifest": _existing(manifest_path),
