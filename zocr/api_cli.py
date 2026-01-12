@@ -47,6 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     ingest.add_argument("--domain-hint")
     ingest.add_argument("--resume", action="store_true")
     ingest.add_argument("--dry-run", action="store_true")
+    ingest.add_argument("--async", action="store_true", dest="async_mode")
     ingest.add_argument(
         "--pipeline-kw",
         nargs="*",
@@ -82,6 +83,7 @@ def _handle_ingest(args: argparse.Namespace) -> None:
         resume=args.resume,
         dry_run=args.dry_run,
         pipeline_kwargs=args.pipeline_kw,
+        async_mode=args.async_mode,
     )
     result = ingest_job(req)
     _print_json(asdict(result))
