@@ -13,6 +13,8 @@ This file is an informational pointer. Commercial terms are provided in a separa
 
 - Pricing (draft): `PRICING.md`
 - Support options (draft): `SUPPORT.md`
+- Client intake (template): `sales/CLIENT_INTAKE.md`
+- Quote template: `sales/QUOTE_TEMPLATE.md`
 
 ## When you probably need a commercial license
 
