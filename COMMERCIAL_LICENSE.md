@@ -15,6 +15,7 @@ This file is an informational pointer. Commercial terms are provided in a separa
 - Support options (draft): `SUPPORT.md`
 - Client intake (template): `sales/CLIENT_INTAKE.md`
 - Quote template: `sales/QUOTE_TEMPLATE.md`
+- Pilot one-slide: `sales/PILOT_ONE_SLIDE.md`
 
 ## When you probably need a commercial license
 
