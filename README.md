@@ -67,6 +67,9 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 # Build (comma-separated extras via build-arg)
 docker build -t zocr-suite --build-arg ZOCR_EXTRAS="api" .
 
+# Or bring up the reference API with Docker Compose
+docker compose up --build
+
 # Run the CLI against the current folder (mount as /work)
 docker run --rm -v "$PWD:/work" -w /work zocr-suite \
   zocr run --input demo --outdir out_allinone --snapshot --seed 12345
