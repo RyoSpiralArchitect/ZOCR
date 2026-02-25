@@ -21,6 +21,9 @@ If you want to use Z-OCR in a way that does **not** fit your AGPL compliance req
 
 Details: `COMMERCIAL_LICENSE.md`
 
+Pricing (draft): `PRICING.md`
+Support options (draft): `SUPPORT.md`
+
 ---
 
 ## Contributing and Dual-Licensing
@@ -31,4 +34,3 @@ Dual licensing is easiest when the project can relicense contributions under com
 - For substantial contributions, we may ask you to sign a Contributor License Agreement (CLA) so the project can continue offering commercial licenses.
 
 See `CONTRIBUTING.md`.
-

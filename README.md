@@ -85,6 +85,15 @@ zocr-api --host 127.0.0.1 --port 8000
 curl http://127.0.0.1:8000/healthz
 curl -F "file=@your.pdf" "http://127.0.0.1:8000/v1/run?domain=invoice"
 curl -o zocr_artifacts.zip -F "file=@your.pdf" "http://127.0.0.1:8000/v1/run.zip?domain=invoice"
+
+# Optional hardening (env)
+export ZOCR_API_KEY="change-me"             # require X-API-Key / Authorization: Bearer
+export ZOCR_API_MAX_UPLOAD_MB=50            # upload limit
+export ZOCR_API_CONCURRENCY=1               # worker slots
+export ZOCR_API_RUN_TIMEOUT_SEC=900         # 0 disables
+
+curl -H "X-API-Key: $ZOCR_API_KEY" -F "file=@your.pdf" \
+  "http://127.0.0.1:8000/v1/run?domain=invoice"
 ```
 
 ## 統一 CLI / Unified CLI / Interface unifiée

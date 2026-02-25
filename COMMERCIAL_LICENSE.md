@@ -9,6 +9,11 @@ Z-OCR is **dual-licensed**:
 
 This file is an informational pointer. Commercial terms are provided in a separate agreement.
 
+## Pricing and support
+
+- Pricing (draft): `PRICING.md`
+- Support options (draft): `SUPPORT.md`
+
 ## When you probably need a commercial license
 
 - You run Z-OCR (or a modified version) as part of a **network-accessible service** and you do not want to disclose your modifications under AGPL.
