@@ -6,7 +6,6 @@ import datetime
 import json
 import os
 import pickle
-import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -15,7 +14,6 @@ from .._compat import optional_numpy
 np = optional_numpy(__name__)
 
 from .base import (
-    _normalize_text,
     detect_domain_on_jsonl,
     lambda_schedule,
     thomas_tridiag,

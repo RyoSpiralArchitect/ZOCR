@@ -13,12 +13,21 @@ Deps: numpy, pillow  (pdftoppm があれば PDF もOK)
 """
 
 from __future__ import annotations
-import os, sys, io, json, argparse, tempfile, shutil, subprocess, time, math, re, hashlib, contextlib, bisect, unicodedata, atexit, difflib, concurrent.futures, glob
+
+import concurrent.futures
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from statistics import median
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set, Mapping, Union
-from dataclasses import dataclass, field
-from collections import Counter, defaultdict, OrderedDict, deque
-from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 try:  # pragma: no cover - optional built-in tesslite tables
     from ..resources import tesslite_defaults as _tesslite_defaults  # type: ignore
@@ -43,7 +52,7 @@ except Exception:  # pragma: no cover - fallback when relative import fails
     except Exception:  # pragma: no cover - standalone fallback
         _json_ready = None  # type: ignore
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops, ImageEnhance, ImageStat
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageEnhance
 try:
     import pytesseract  # type: ignore
     from pytesseract import Output as _PYTESS_OUTPUT  # type: ignore
@@ -1386,4 +1395,3 @@ def autotune_params(pages, base_params, trials=6):
         s=_unsup_objective(target, cand)
         if s<best_score: best_score=s; best=cand
     return best
-

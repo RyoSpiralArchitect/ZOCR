@@ -7,7 +7,7 @@ import json
 import math
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 

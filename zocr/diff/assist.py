@@ -1120,13 +1120,13 @@ class DiffAssistPlanner:
             return []
         items = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
         briefings: List[Dict[str, Any]] = []
-        for domain, count in items:
+        for domain, event_count in items:
             if domain == "general":
                 continue
             briefings.append(
                 {
                     "domain": domain,
-                    "events": count,
+                    "events": event_count,
                     "note": DOMAIN_SUMMARY_NOTES.get(domain, DOMAIN_SUMMARY_NOTES["general"]),
                 }
             )

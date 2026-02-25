@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zocr-suite"
+version = "0.1.0"
+description = "Z-OCR Suite: modular OCR→augmentation→indexing→monitoring pipeline with semantic diffs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["ocr", "pdf", "rag", "tables", "semantic-diff"]
+authors = [{ name = "Z-OCR contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Text Processing",
+]
+dependencies = [
+  "numpy>=1.23",
+  "Pillow>=10",
+]
+
+[project.optional-dependencies]
+speed = ["numba>=0.58"]
+pdf = ["pypdfium2>=4"]
+report = ["pandas>=2"]
+ocr_tess = ["pytesseract>=0.3.10"]
+ocr_easy = ["easyocr>=1.7.0"]
+api = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "python-multipart>=0.0.7",
+]
+dev = [
+  "pytest>=7",
+  "ruff>=0.3",
+  "build>=1",
+]
+
+[project.scripts]
+zocr = "zocr.__main__:main"
+zocr-consensus = "zocr.consensus.zocr_consensus:main"
+zocr-core = "zocr.core.zocr_core:main"
+zocr-diff = "zocr.diff.cli:main"
+zocr-api = "zocr.service.cli:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zocr*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"zocr/_surface.py" = ["F822"]
+"zocr/consensus/_surface.py" = ["F822"]

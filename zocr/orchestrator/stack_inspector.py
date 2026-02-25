@@ -99,7 +99,7 @@ def describe_consensus_stack(*, include_exports: bool = False) -> Dict[str, Any]
         load_error: Optional[Exception] = None
         try:
             module = getattr(pkg, name)
-        except Exception as exc:  # pragma: no cover - depends on optional deps
+        except Exception:  # pragma: no cover - depends on optional deps
             try:
                 module = import_module(f"{pkg.__name__}.{name}")
             except Exception as inner:

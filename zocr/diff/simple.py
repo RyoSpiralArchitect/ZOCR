@@ -478,7 +478,6 @@ class SimpleTextDiffer:
             best_score = 0.0
             left_sig = self._matchable_text(left[1])
             for b_idx in remaining_b:
-                right = slice_b[b_idx]
                 right_sig = right_signatures[b_idx]
                 score = self._text_similarity(left_sig, right_sig)
                 if score > best_score:

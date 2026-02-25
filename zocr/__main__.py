@@ -8,6 +8,8 @@ from textwrap import dedent
 from types import ModuleType
 from typing import Callable
 
+from ._version import __version__
+
 _COMMAND_TO_MODULE = {
     "pipeline": "zocr.orchestrator.zocr_pipeline",
     "orchestrator": "zocr.orchestrator.zocr_pipeline",
@@ -17,6 +19,7 @@ _COMMAND_TO_MODULE = {
     "core": "zocr.core.zocr_core",
     "simple": "zocr.ocr_pipeline.cli",
     "api": "zocr.api_cli",
+    "serve": "zocr.service.cli",
 }
 
 _DEFAULT_COMMAND = "pipeline"
@@ -34,12 +37,14 @@ def _print_help() -> None:
           core                Access the multi-domain core CLI (augment/index/query/...)
           simple              Run the lightweight modular OCR pipeline
           api                 Thin ingestion/query wrapper that prints JSON
+          serve               Run the reference FastAPI service
           help                Show this message
 
         Examples:
           python -m zocr run --input demo --snapshot --seed 12345
           python -m zocr consensus --demo --out out_cc
           python -m zocr core query --jsonl out/doc.mm.jsonl --index out/bm25.pkl --q "total amount"
+          python -m zocr serve --host 127.0.0.1 --port 8000
         """
     ).strip()
     print(msg)
@@ -70,6 +75,9 @@ def main(argv: list[str] | None = None) -> None:
         _invoke(_COMMAND_TO_MODULE[_DEFAULT_COMMAND], [])
         return
     cmd = argv[0]
+    if cmd in {"-V", "--version", "version"}:
+        print(__version__)
+        return
     if cmd in {"-h", "--help", "help"}:
         _print_help()
         return

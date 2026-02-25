@@ -10,9 +10,9 @@ import hashlib
 import json
 import math
 import os
-import pickle
 import re
 import shutil
+import sys
 import time
 import unicodedata
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -28,14 +28,12 @@ ImageDraw = _runtime.ImageDraw
 ImageFont = _runtime.ImageFont
 ImageOps = _runtime.ImageOps
 ImageFilter = _runtime.ImageFilter
-ImageChops = _runtime.ImageChops
 ImageEnhance = _runtime.ImageEnhance
-ImageStat = _runtime.ImageStat
 pytesseract = _runtime.pytesseract
 _PYTESS_OUTPUT = _runtime._PYTESS_OUTPUT
 _PYTESS_ERR = _runtime._PYTESS_ERR
+_cc_label_rle = _runtime._cc_label_rle
 _json_ready = _runtime._json_ready
-ensure_dir = _runtime.ensure_dir
 clamp = _runtime.clamp
 _tesslite_defaults = _runtime._tesslite_defaults
 _get_domain_keywords = _runtime._get_domain_keywords
@@ -288,7 +286,82 @@ _ASCII_SET = (
     " +#=_[]{}"
 )
 
-def _initial_toy_sweep_limit(default: int = 2) -> int:
+_TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
+
+_TOY_GLYPH_SENTINEL = "\uE000"
+
+_MISSING_GLYPH_CANDIDATES: Tuple[str, ...] = (
+    _TOY_GLYPH_SENTINEL,
+    "\uF8FF",  # Apple logo PUA (often missing)
+    "\u0378",  # unassigned codepoint
+    "\uFFFF",  # noncharacter
+)
+
+
+def _load_glyph_font(size: int = 18) -> "ImageFont.ImageFont":
+    font_path = os.environ.get("ZOCR_GLYPH_FONT") or os.environ.get("ZOCR_TEMPLATE_FONT")
+    if font_path and os.path.exists(font_path):
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _render_glyph_signature(font: "ImageFont.ImageFont", size: int, text: str) -> Optional[Tuple[Tuple[int, int], bytes]]:
+    if not text:
+        return None
+    try:
+        img = Image.new("L", (size * 3, size * 3), 0)
+        ImageDraw.Draw(img).text((2, 2), text, fill=255, font=font)
+        bbox = img.getbbox()
+        if not bbox:
+            return None
+        crop = img.crop(bbox)
+        arr = np.asarray(crop, dtype=np.uint8)
+        if arr.size == 0:
+            return None
+        return (tuple(int(v) for v in arr.shape), arr.tobytes())
+    except Exception:
+        return None
+
+
+def _missing_glyph_signature(font: "ImageFont.ImageFont", size: int) -> Optional[Tuple[Tuple[int, int], bytes]]:
+    """Best-effort signature for a font's "missing glyph" box.
+
+    Some fonts include glyphs for certain PUA/noncharacters; we render multiple candidates
+    and pick the most common resulting bitmap signature.
+    """
+
+    signatures: List[Tuple[Tuple[int, int], bytes]] = []
+    for candidate in _MISSING_GLYPH_CANDIDATES:
+        sig = _render_glyph_signature(font, size=size, text=candidate)
+        if sig is not None:
+            signatures.append(sig)
+    if not signatures:
+        return None
+    counts = Counter(signatures)
+    best_sig, _ = counts.most_common(1)[0]
+    return best_sig
+
+
+def _font_supports_text(font: "ImageFont.ImageFont", size: int, text: str) -> bool:
+    if not text:
+        return True
+    missing = _missing_glyph_signature(font, size=size)
+    if missing is None:
+        return True
+    for ch in text:
+        if ch.isspace():
+            continue
+        sig = _render_glyph_signature(font, size=size, text=ch)
+        if sig is None:
+            return False
+        if sig == missing:
+            return False
+    return True
+
+def _initial_toy_sweep_limit(default: int = 5) -> int:
     candidates = ("ZOCR_TOY_SWEEPS", "ZOCR_TOY_SWEEP_LIMIT")
     for key in candidates:
         raw = os.environ.get(key)
@@ -1096,19 +1169,82 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
     }
 
 def _render_glyphs(font=None, size=16):
-    # PIL's default bitmap font via ImageFont.load_default() matches our demo
-    f = ImageFont.load_default() if font is None else font
-    atlas = {}
-    feats = {}
-    for ch in _ASCII_SET:
-        # Render on tight canvas
-        img = Image.new("L", (size*2, size*2), 0)
+    """Render the initial glyph atlas.
+
+    Notes:
+    - We optionally extend the atlas with tesslite glyphs (domain keywords) when available.
+    - Unsupported glyphs that render as the font's "missing character" box are filtered out.
+    - We seed each glyph with a couple of stroke-thickness variants to improve robustness.
+    """
+
+    f = _load_glyph_font(size=size) if font is None else font
+    atlas: Dict[str, List["Image.Image"]] = {}
+    feats: Dict[str, Dict[str, float]] = {}
+
+    glyph_candidates: List[str] = list(_ASCII_SET)
+    glyph_candidates.extend(sorted(str(ch) for ch in _TOY_ALLOWED_SYMBOLS if str(ch)))
+    if _tesslite_defaults is not None:
+        try:
+            glyph_candidates.extend([str(ch) for ch in getattr(_tesslite_defaults, "DEFAULT_GLYPHS", [])])
+        except Exception:
+            pass
+    # de-duplicate while preserving order
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for ch in glyph_candidates:
+        if not ch or ch in seen:
+            continue
+        seen.add(ch)
+        ordered.append(ch)
+
+    sentinel_hash = _missing_glyph_signature(f, size=size)
+
+    def _is_missing_glyph(arr_u8: "np.ndarray") -> bool:
+        if sentinel_hash is None:
+            return False
+        shape, payload = sentinel_hash
+        return tuple(arr_u8.shape) == shape and arr_u8.tobytes() == payload
+
+    def _append_variant(key: str, variant: "Image.Image") -> None:
+        seq = atlas.setdefault(key, [])
+        try:
+            arr_new = np.asarray(variant, dtype=np.uint8)
+        except Exception:
+            return
+        if arr_new.size == 0:
+            return
+        for prior in seq:
+            try:
+                if np.array_equal(np.asarray(prior, dtype=np.uint8), arr_new):
+                    return
+            except Exception:
+                continue
+        seq.append(variant)
+
+    for ch in ordered:
+        img = Image.new("L", (size * 2, size * 2), 0)
         dr = ImageDraw.Draw(img)
-        dr.text((2,2), ch, fill=255, font=f)
-        # crop to bbox
-        bbox = img.getbbox() or (0,0,1,1)
+        try:
+            dr.text((2, 2), ch, fill=255, font=f)
+        except Exception:
+            continue
+        bbox = img.getbbox()
+        if not bbox:
+            continue
         crop = img.crop(bbox)
-        atlas[ch] = [crop]
+        try:
+            crop_arr = np.asarray(crop, dtype=np.uint8)
+        except Exception:
+            continue
+        if crop_arr.size == 0 or _is_missing_glyph(crop_arr):
+            continue
+        _append_variant(ch, crop)
+        # Stroke-thickness variants (best-effort).
+        try:
+            _append_variant(ch, crop.filter(ImageFilter.MaxFilter(3)))
+            _append_variant(ch, crop.filter(ImageFilter.MinFilter(3)))
+        except Exception:
+            pass
         feats[ch] = _compute_glyph_features_from_array(np.asarray(crop, dtype=np.float32))
     return atlas, feats
 
@@ -1512,9 +1648,6 @@ def _looks_like_numeric_token(text: str) -> bool:
 
 def _looks_like_upper_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9]{3,}", text or ""))
-
-
-_TOY_ALLOWED_SYMBOLS = set("-_.:/%$¥,+#&()[]{}\\")
 
 
 @dataclass
@@ -1955,6 +2088,35 @@ def get_toy_feature_status() -> Dict[str, Any]:
     }
 
     status["tesslite"] = get_tesslite_status()
+
+    glyph_variants = 0
+    for variants in _GLYPH_ATLAS.values():
+        if variants:
+            glyph_variants += len(variants)
+    tesslite_requested = set()
+    if _tesslite_defaults is not None:
+        try:
+            tesslite_requested = set(getattr(_tesslite_defaults, "DEFAULT_GLYPHS", []) or [])
+        except Exception:
+            tesslite_requested = set()
+    glyph_font_path = os.environ.get("ZOCR_GLYPH_FONT") or os.environ.get("ZOCR_TEMPLATE_FONT") or None
+    glyph_font_source = (
+        "env"
+        if os.environ.get("ZOCR_GLYPH_FONT") is not None
+        else ("template_font" if os.environ.get("ZOCR_TEMPLATE_FONT") is not None else "default")
+    )
+    status["glyph_atlas"] = {
+        "glyphs": int(len(_GLYPH_ATLAS)),
+        "variants": int(glyph_variants),
+        "tesslite_requested": int(len(tesslite_requested)),
+        "tesslite_loaded": int(sum(1 for ch in tesslite_requested if ch in _GLYPH_ATLAS)),
+        "font_path": glyph_font_path,
+        "font_source": glyph_font_source,
+    }
+    status["template_font"] = {
+        "path": (os.environ.get("ZOCR_TEMPLATE_FONT") or None),
+        "source": "env" if os.environ.get("ZOCR_TEMPLATE_FONT") is not None else "default",
+    }
 
     status["pytesseract"] = {
         "allowed": True,
@@ -2427,7 +2589,7 @@ def _contextual_rerank_candidates(candidates: Dict[str, float]) -> Tuple[str, fl
         variants = _generate_contextual_variants(text)
         if _looks_like_numeric_token(text):
             variants.add(_normalize_digit_like(text))
-        for v in variants:
+        for v in sorted(variants):
             if not v or v == text:
                 continue
             if v not in enriched:
@@ -3111,13 +3273,15 @@ def _extract_date_filters(text: str, header_role: Optional[str]) -> Optional[Dic
 
 
 _NUMERIC_COLUMN_CHARSETS: Dict[str, str] = {
-    "qty": "0123456789",
-    "unit_price": "0123456789.-",
-    "amount": "0123456789.-",
-    "subtotal": "0123456789.-",
-    "tax_amount": "0123456789.-",
-    "tax_rate": "0123456789.%",
+    "qty": "0123456789,",
+    "unit_price": "0123456789,.-",
+    "amount": "0123456789,.-",
+    "subtotal": "0123456789,.-",
+    "tax_amount": "0123456789,.-",
+    "tax_rate": "0123456789,.%-",
 }
+
+_DATE_COLUMN_CHARSET = "0123456789-/.年月日"
 
 _ITEM_QTY_SCHEMA_COLUMNS: List[Dict[str, Any]] = [
     {
@@ -3783,14 +3947,24 @@ def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
     if not headers or not _FORCE_NUMERIC:
         return []
     kinds = _numeric_header_kinds(headers)
-    if not kinds:
+    roles = _date_header_roles(headers)
+    if not kinds and not roles:
         return []
     hints: List[Optional[str]] = []
-    for kind in kinds:
-        hints.append(_NUMERIC_COLUMN_CHARSETS.get(kind) if kind else None)
+    width = max(len(kinds), len(roles))
+    for idx in range(width):
+        kind = kinds[idx] if idx < len(kinds) else None
+        if kind:
+            hints.append(_NUMERIC_COLUMN_CHARSETS.get(kind))
+            continue
+        role = roles[idx] if idx < len(roles) else None
+        if role:
+            hints.append(_DATE_COLUMN_CHARSET)
+        else:
+            hints.append(None)
     return hints
 
-_AMBIGUOUS_CHAR_MAP: Dict[str, Tuple[str, ...]] = {
+_AMBIGUOUS_VARIANT_MAP: Dict[str, Tuple[str, ...]] = {
     "?": ("7", "1", "2"),
     "I": ("1", "l"),
     "l": ("1",),
@@ -3814,7 +3988,7 @@ def _ambiguous_variants(text: Optional[str]) -> List[str]:
     candidates: Set[str] = set()
     chars = list(text)
     for idx, ch in enumerate(chars):
-        repls = _AMBIGUOUS_CHAR_MAP.get(ch)
+        repls = _AMBIGUOUS_VARIANT_MAP.get(ch)
         if not repls:
             continue
         for repl in repls:
@@ -4198,7 +4372,7 @@ _TOKEN_TEMPLATE_PRESETS = [
 
 
 def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
-    font_path = os.environ.get("ZOCR_TEMPLATE_FONT")
+    font_path = os.environ.get("ZOCR_TEMPLATE_FONT") or os.environ.get("ZOCR_GLYPH_FONT")
     if font_path and os.path.exists(font_path):
         try:
             return ImageFont.truetype(font_path, size=size)
@@ -4259,7 +4433,11 @@ def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
 
 def _init_token_template_library() -> Dict[str, deque]:
     library: Dict[str, deque] = {}
+    font = _TOKEN_TEMPLATE_FONT
+    font_size = 18
     for token in _TOKEN_TEMPLATE_PRESETS:
+        if not _font_supports_text(font, size=font_size, text=token):
+            continue
         bmp = _render_template_bitmap(token)
         if bmp is None:
             continue
@@ -4445,27 +4623,45 @@ def _observe_token_template(token: str, arr: Any) -> None:
 
 
 def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
-    import numpy as _np
-
     _ensure_template_cache_loaded()
     _ensure_template_cache_autosave()
     norm = _normalize_template_bitmap(arr)
     if norm is None:
         return "", 0.0
-    best_token = ""
-    best_score = -1.0
+    token_best: Dict[str, float] = {}
     _GLYPH_RUNTIME_STATS["template_cache_checks"] += 1.0
     for token, variants in _TOKEN_TEMPLATE_LIBRARY.items():
         if not variants:
             continue
+        best_for_token = -1.0
         for tpl in variants:
             if tpl.shape != norm.shape:
                 continue
             score = float((norm * tpl).mean())
-            if score > best_score:
-                best_score = score
-                best_token = token
-    if best_score < 0.35:
+            if score > best_for_token:
+                best_for_token = score
+        if best_for_token > -1.0:
+            token_best[token] = best_for_token
+    if not token_best:
+        _GLYPH_RUNTIME_STATS["template_cache_misses"] += 1.0
+        return "", 0.0
+    best_token, best_score = max(token_best.items(), key=lambda kv: kv[1])
+    second_score = -1.0
+    if len(token_best) >= 2:
+        for tok, score in token_best.items():
+            if tok == best_token:
+                continue
+            if score > second_score:
+                second_score = score
+    try:
+        min_score = float(os.environ.get("ZOCR_TEMPLATE_MATCH_MIN_SCORE", "0.45") or 0.45)
+    except Exception:
+        min_score = 0.45
+    try:
+        min_margin = float(os.environ.get("ZOCR_TEMPLATE_MATCH_MIN_MARGIN", "0.05") or 0.05)
+    except Exception:
+        min_margin = 0.05
+    if best_score < min_score or (second_score > -1.0 and (best_score - second_score) < min_margin):
         _GLYPH_RUNTIME_STATS["template_cache_misses"] += 1.0
         return "", 0.0
     conf = float(max(0.0, min(1.0, (best_score + 1.0) / 2.0)))
@@ -4505,6 +4701,7 @@ def _template_override_thresholds() -> Tuple[float, float, float, float]:
 
 def _decide_template_override(
     final_text: str,
+    final_conf: float,
     final_effective_conf: float,
     final_quality: float,
     template_text: str,
@@ -4513,14 +4710,24 @@ def _decide_template_override(
     if not template_text:
         return ""
     strict_delta, min_quality, flex_delta, min_diff = _template_override_thresholds()
+    try:
+        min_conf = float(os.environ.get("ZOCR_TEMPLATE_OVERRIDE_MIN_CONF", "0.65") or 0.65)
+    except Exception:
+        min_conf = 0.65
+    try:
+        max_final_conf = float(os.environ.get("ZOCR_TEMPLATE_OVERRIDE_MAX_FINAL_CONF", "0.78") or 0.78)
+    except Exception:
+        max_final_conf = 0.78
+    if template_conf < min_conf:
+        return ""
     lexical = float(final_quality)
     if (not lexical) and final_text:
         lexical = _toy_text_quality(final_text)[0]
     if not final_text:
         return "missing"
-    if template_conf >= final_effective_conf + strict_delta:
+    if template_conf >= float(final_conf) + strict_delta:
         return "conf"
-    if lexical < min_quality and template_conf + flex_delta >= final_effective_conf:
+    if lexical < min_quality and float(final_conf) <= max_final_conf and template_conf + flex_delta >= final_effective_conf:
         distance = _normalized_string_distance(final_text, template_text)
         if distance >= min_diff:
             return "quality"
@@ -4543,14 +4750,23 @@ def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
 def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None):
     # try best correlation over atlas with light shift tolerance and feature penalties
     cw, ch = cell_bin.size
+    if cw < 12 or ch < 12:
+        try:
+            cell_bin = _resize_keep_ar(cell_bin, max(cw, 12), max(ch, 12))
+            cw, ch = cell_bin.size
+        except Exception:
+            pass
     import numpy as _np
-    cell_arr = _np.asarray(cell_bin, dtype=_np.float32)
-    if cell_arr.size == 0:
+    cell_u8 = _np.asarray(cell_bin, dtype=_np.uint8)
+    if cell_u8.size == 0:
         return "", 0.0
-    cell_norm = (cell_arr - cell_arr.mean()) / (cell_arr.std() + 1e-6)
-    cell_density = float((cell_arr > 0).mean())
+    cell_mask = (cell_u8 > 32).astype(_np.float32)
+    if float(cell_mask.mean()) <= 1e-4:
+        cell_mask = (cell_u8 > 0).astype(_np.float32)
+    cell_norm = (cell_mask - cell_mask.mean()) / (cell_mask.std() + 1e-6)
+    cell_density = float(cell_mask.mean())
     cell_aspect = float(cw) / float(ch or 1)
-    cell_scaled = cell_arr / 255.0 if cell_arr.max() > 1.5 else cell_arr
+    cell_scaled = cell_mask
     cell_inner = 0.0
     cell_outer = 0.0
     if cell_scaled.ndim == 2 and cell_scaled.size:
@@ -4571,10 +4787,13 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         variant_best = -1.0
         for glyph_img in tpl_list:
             t = _resize_keep_ar(glyph_img, cw, ch)
-            b = _np.asarray(t, dtype=_np.float32)
-            if b.size == 0:
+            b_u8 = _np.asarray(t, dtype=_np.uint8)
+            if b_u8.size == 0:
                 continue
-            b_norm = (b - b.mean()) / (b.std() + 1e-6)
+            b_mask = (b_u8 > 32).astype(_np.float32)
+            if float(b_mask.mean()) <= 1e-4:
+                b_mask = (b_u8 > 0).astype(_np.float32)
+            b_norm = (b_mask - b_mask.mean()) / (b_mask.std() + 1e-6)
             score = -1.0
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
@@ -4596,7 +4815,7 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
         density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
         if glyph_sym > 0.5:
-            sym_cell = float(1.0 - _np.mean(_np.abs(cell_arr - _np.flip(cell_arr, axis=1))) / 255.0)
+            sym_cell = float(1.0 - _np.mean(_np.abs(cell_mask - _np.flip(cell_mask, axis=1))))
             symmetry_penalty = 0.8 + 0.2 * max(0.0, sym_cell)
         else:
             symmetry_penalty = 1.0
@@ -4613,7 +4832,20 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
             best_score = variant_best
             best_ch = ch_key
     conf = (best_score + 1.0) / 2.0
-    return (best_ch if conf >= 0.52 else "?"), float(conf)
+    threshold = 0.52
+    if allowed is None:
+        threshold = 0.6
+    else:
+        count = len(allowed)
+        if count <= 6:
+            threshold = 0.52
+        elif count <= 14:
+            threshold = 0.55
+        elif count <= 32:
+            threshold = 0.58
+        else:
+            threshold = 0.6
+    return (best_ch if conf >= threshold else "?"), float(conf)
 
 def _otsu_threshold_toy(arr):
     import numpy as _np
@@ -4791,11 +5023,67 @@ def _refine_component_segments(
     return output
 
 def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
-    cc = _cc_label_rle(bw)
-    cc = [b for b in cc if (b[2]-b[0])*(b[3]-b[1]) >= 10]
+    cc_all = _cc_label_rle(bw)
+    if not cc_all:
+        return "", 0.0
+
+    try:
+        bw_arr = np.asarray(bw, dtype=np.uint8)
+        min_dim = max(1, min(int(bw_arr.shape[0]), int(bw_arr.shape[1])))
+    except Exception:
+        bw_arr = bw
+        min_dim = 64
+
+    bbox_area_thr = int(round((float(min_dim) * 0.02) ** 2))
+    bbox_area_thr = max(4, min(24, bbox_area_thr))
+    pix_area_thr = max(2, min(16, int(round(bbox_area_thr * 0.45))))
+
+    allowed_set: Optional[Set[str]] = None
+    if allowed_chars:
+        allowed_set = {str(ch) for ch in allowed_chars if str(ch)}
+        if any(ch in allowed_set for ch in ".,:/-%$¥"):
+            bbox_area_thr = min(bbox_area_thr, 4)
+            pix_area_thr = min(pix_area_thr, 2)
+
+    def _bbox_area(entry: Tuple[int, int, int, int, float]) -> int:
+        try:
+            return int(max(0, (entry[2] - entry[0]) * (entry[3] - entry[1])))
+        except Exception:
+            return 0
+
+    cc: List[Tuple[int, int, int, int, float]] = []
+    for entry in cc_all:
+        try:
+            x1, y1, x2, y2, area = entry
+        except Exception:
+            continue
+        box_area = int(max(0, (x2 - x1) * (y2 - y1)))
+        try:
+            pix_area = float(area)
+        except Exception:
+            pix_area = float(box_area)
+        if box_area >= bbox_area_thr and pix_area >= pix_area_thr:
+            cc.append((int(x1), int(y1), int(x2), int(y2), float(area)))
+
+    if not cc:
+        # Fallback: keep a handful of the largest components to avoid early dropouts.
+        ranked = sorted(
+            (entry for entry in cc_all if isinstance(entry, (list, tuple)) and len(entry) >= 5),
+            key=lambda b: _bbox_area(b),  # type: ignore[arg-type]
+            reverse=True,
+        )
+        cc = [
+            (int(b[0]), int(b[1]), int(b[2]), int(b[3]), float(b[4]))  # type: ignore[index]
+            for b in ranked[: min(3, len(ranked))]
+        ]
+
     if not cc:
         return "", 0.0
-    baseline_stats = _estimate_baseline_stats(cc)
+
+    baseline_candidates = [b for b in cc if _bbox_area(b) >= max(bbox_area_thr, int(round(bbox_area_thr * 1.75)))]
+    baseline_stats = _estimate_baseline_stats(baseline_candidates) if baseline_candidates else None
+    if baseline_stats is None:
+        baseline_stats = _estimate_baseline_stats(cc)
     refined: List[Tuple[int, int, int, int, float]] = []
     for bbox in cc:
         refined.extend(_refine_component_segments(bw, bbox, baseline=baseline_stats))
@@ -4833,8 +5121,9 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
                 patch_img = None
             if patch_img is not None:
                 _adapt_glyph(ch, patch_img)
-        text.append(ch)
-        scores.append(sc)
+        if ch:
+            text.append(ch)
+            scores.append(sc)
     if not text:
         return "", 0.0
     raw = np.asarray(scores, dtype=np.float64)
@@ -5012,7 +5301,7 @@ def toy_ocr_text_from_cell(
     force_augment = bool(cfg.get("force_augment")) if isinstance(cfg, dict) else False
     extra_augment_passes = int(cfg.get("extra_augment_passes", 0)) if isinstance(cfg, dict) else 0
     extra_augment_passes = max(0, extra_augment_passes)
-    need_augment = force_augment or (best_conf < target_conf)
+    need_augment = force_augment or (best_conf < target_conf) or (best_effective_conf < target_conf)
     augment_cycles = max(1, 1 + extra_augment_passes) if need_augment else extra_augment_passes
     for _ in range(augment_cycles):
         start_len = len(candidates)
@@ -5059,7 +5348,7 @@ def toy_ocr_text_from_cell(
     if ref_bitmap is not None:
         template_text, template_conf = _match_token_template_from_cache(ref_bitmap)
     override_reason = _decide_template_override(
-        final_text, final_effective_conf, final_quality, template_text, template_conf
+        final_text, final_conf, final_effective_conf, final_quality, template_text, template_conf
     )
     if override_reason:
         final_text = template_text
@@ -5084,8 +5373,24 @@ def toy_ocr_text_from_cell(
         )
         _update_ngram_model(final_text)
         if ref_bitmap is not None:
-            _observe_token_template(final_text, ref_bitmap)
-            _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
+            observe_min_conf = 0.55
+            observe_min_quality = 0.65
+            observe_max_len = 48
+            try:
+                observe_min_conf = float(os.environ.get("ZOCR_TEMPLATE_OBSERVE_MIN_CONF", observe_min_conf))
+            except Exception:
+                pass
+            try:
+                observe_min_quality = float(os.environ.get("ZOCR_TEMPLATE_OBSERVE_MIN_QUALITY", observe_min_quality))
+            except Exception:
+                pass
+            try:
+                observe_max_len = int(os.environ.get("ZOCR_TEMPLATE_OBSERVE_MAX_LEN", str(observe_max_len)) or observe_max_len)
+            except Exception:
+                pass
+            if bounded_conf >= observe_min_conf and final_quality >= observe_min_quality and len(final_text) <= observe_max_len:
+                _observe_token_template(final_text, ref_bitmap)
+                _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
         return final_text, bounded_conf
     return "", 0.0
 
@@ -5360,6 +5665,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
     page_lookup_order: List[str] = []
     default_image_path: Optional[str]
     temp_dirs_to_cleanup: List[str] = []
+    _page_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 
     def _expand_single_source(candidate: str) -> Optional[List[str]]:
         if not isinstance(candidate, str):
@@ -5390,7 +5696,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
             ext = os.path.splitext(entry_norm)[1].lower()
             if ext == ".pdf" and os.path.exists(entry_norm):
                 try:
-                    pdf_pages = pdf_to_images_via_poppler(entry_norm)
+                    pdf_pages = _runtime.pdf_to_images_via_poppler(entry_norm)
                 except Exception as exc:
                     print(f"[WARN] [Export] failed to rasterize PDF {entry_norm}: {exc}")
                     continue
@@ -5456,7 +5762,6 @@ def export_jsonl_with_ocr(doc_json_path: str,
     doc_dir = os.path.dirname(os.path.abspath(doc_json_path))
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
-    _page_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
     doc_image_inventory: Optional[Dict[str, List[str]]] = None
 
     def _ensure_doc_inventory() -> Dict[str, List[str]]:

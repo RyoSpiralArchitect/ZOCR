@@ -1,3 +1,22 @@
+# Python
 __pycache__/
-*.pyc
-/zocr_allinone_merged_plus.py
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local pipeline outputs
+out*/
+
+# Demo inputs are user-provided by default (keep the folder via .gitkeep)
+samples/demo_inputs/*
+!samples/demo_inputs/.gitkeep
