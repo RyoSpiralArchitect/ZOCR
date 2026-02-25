@@ -5,6 +5,11 @@ services:
       args:
         ZOCR_EXTRAS: "api"
     command: ["zocr-api", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      ZOCR_API_KEY: ${ZOCR_API_KEY:-}
+      ZOCR_API_MAX_UPLOAD_MB: ${ZOCR_API_MAX_UPLOAD_MB:-50}
+      ZOCR_API_CONCURRENCY: ${ZOCR_API_CONCURRENCY:-1}
+      ZOCR_API_RUN_TIMEOUT_SEC: ${ZOCR_API_RUN_TIMEOUT_SEC:-900}
     ports:
       - "8000:8000"
     healthcheck:
@@ -19,4 +24,3 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-

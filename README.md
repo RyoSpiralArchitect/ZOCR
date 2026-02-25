@@ -68,6 +68,7 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 docker build -t zocr-suite --build-arg ZOCR_EXTRAS="api" .
 
 # Or bring up the reference API with Docker Compose
+export ZOCR_API_KEY="change-me"   # optional (enable auth)
 docker compose up --build
 
 # Run the CLI against the current folder (mount as /work)
