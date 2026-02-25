@@ -6,6 +6,7 @@ import bisect
 import contextlib
 import difflib
 import glob
+import html as _html
 import hashlib
 import json
 import math
@@ -622,6 +623,115 @@ def _row_band_midpoints(row_bands: Sequence[Tuple[int, int]]) -> List[float]:
         if math.isfinite(mid):
             mids.append(mid)
     return mids
+
+
+def _infer_row_bands_from_table_projection(
+    table_img: "Image.Image",
+    y_offset: int = 0,
+    *,
+    min_rows: int = 2,
+    max_rows: int = 96,
+) -> List[Tuple[int, int]]:
+    try:
+        gray = np.asarray(table_img.convert("L"), dtype=np.uint8)
+    except Exception:
+        return []
+    if gray.ndim != 2 or gray.size == 0:
+        return []
+    height, width = gray.shape[:2]
+    if height < 8 or width < 8:
+        return []
+
+    thr = _otsu_threshold_toy(gray)
+    ink = gray <= thr
+    if float(ink.mean()) > 0.55:
+        ink = gray > thr
+    ink_u8 = ink.astype(np.uint8)
+    try:
+        col_density = ink_u8.sum(axis=0)
+        vert_cols = np.nonzero(col_density >= int(round(height * 0.8)))[0]
+        if vert_cols.size:
+            ink_u8[:, vert_cols] = 0
+    except Exception:
+        pass
+
+    row_density = ink_u8.sum(axis=1).astype(np.float32)
+    window = 3
+    if height >= 220:
+        window = 5
+    if height >= 520:
+        window = 7
+    if window > 1:
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        row_smooth = np.convolve(row_density, kernel, mode="same")
+    else:
+        row_smooth = row_density
+
+    base_thr = max(1.0, float(width) * 0.003)
+    try:
+        p90 = float(np.percentile(row_smooth, 90))
+    except Exception:
+        p90 = float(row_smooth.max() if row_smooth.size else 0.0)
+    row_thr = max(base_thr, p90 * 0.2)
+    if row_thr <= 0:
+        return []
+
+    segments: List[Tuple[int, int]] = []
+    idx = 0
+    while idx < height:
+        while idx < height and row_smooth[idx] <= row_thr:
+            idx += 1
+        if idx >= height:
+            break
+        start = idx
+        while idx < height and row_smooth[idx] > row_thr:
+            idx += 1
+        segments.append((start, idx))
+
+    if not segments:
+        return []
+    min_h = 1 if height < 60 else 2
+    min_h = max(min_h, int(round(height * 0.008)))
+    segments = [seg for seg in segments if seg[1] - seg[0] >= min_h]
+    if not segments:
+        return []
+
+    join_gap = max(1, int(round(height * 0.004)))
+    merged: List[Tuple[int, int]] = []
+    for top, bottom in segments:
+        if not merged:
+            merged.append((top, bottom))
+            continue
+        prev_top, prev_bottom = merged[-1]
+        if top - prev_bottom <= join_gap:
+            merged[-1] = (prev_top, max(prev_bottom, bottom))
+        else:
+            merged.append((top, bottom))
+    segments = merged
+
+    if len(segments) < min_rows:
+        return []
+    if len(segments) > max_rows:
+        avg_height = height / float(max(1, len(segments)))
+        if avg_height < 6.0:
+            return []
+        segments = segments[:max_rows]
+
+    centers = [0.5 * (float(top) + float(bottom)) for top, bottom in segments]
+    boundaries: List[int] = [0]
+    for i in range(len(centers) - 1):
+        boundaries.append(int(round(0.5 * (centers[i] + centers[i + 1]))))
+    boundaries.append(height)
+    bands: List[Tuple[int, int]] = []
+    prev = 0
+    for nxt in boundaries[1:]:
+        top = int(max(prev, 0))
+        bottom = int(min(max(top + 1, nxt), height))
+        bands.append((int(y_offset + top), int(y_offset + bottom)))
+        prev = bottom
+    if len(bands) < min_rows:
+        return []
+    return bands
 
 
 def _prior_cache_path(cache_dir: str, signature: str) -> str:
@@ -3962,6 +4072,67 @@ def _column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
             hints.append(_DATE_COLUMN_CHARSET)
         else:
             hints.append(None)
+    if not any(hints):
+        return []
+    return hints
+
+
+_HTML_TAG_RX = re.compile(r"<[^>]+>")
+
+
+def _table_headers_from_html(html_payload: Any) -> List[str]:
+    if not isinstance(html_payload, str):
+        return []
+    raw = html_payload.strip()
+    if not raw:
+        return []
+    rows = re.findall(r"<tr\b[^>]*>.*?</tr>", raw, flags=re.IGNORECASE | re.DOTALL)
+    if not rows:
+        return []
+    header_row = None
+    for row in rows:
+        if re.search(r"<th\b", row, flags=re.IGNORECASE):
+            header_row = row
+            break
+    if header_row is None:
+        header_row = rows[0]
+    cells = re.findall(r"<th\b[^>]*>(.*?)</th>", header_row, flags=re.IGNORECASE | re.DOTALL)
+    if not cells:
+        cells = re.findall(r"<td\b[^>]*>(.*?)</td>", header_row, flags=re.IGNORECASE | re.DOTALL)
+    if not cells:
+        return []
+    headers: List[str] = []
+    for cell in cells:
+        try:
+            stripped = _HTML_TAG_RX.sub("", cell)
+            stripped = _html.unescape(stripped)
+            stripped = re.sub(r"\s+", " ", stripped).strip()
+        except Exception:
+            stripped = str(cell).strip()
+        headers.append(stripped)
+    return headers
+
+
+def _heuristic_column_charset_hints(headers: Sequence[str]) -> List[Optional[str]]:
+    if not headers:
+        return []
+    hints: List[Optional[str]] = []
+    for header in headers:
+        text = str(header or "").strip()
+        if not text:
+            hints.append(None)
+            continue
+        compact = re.sub(r"\s+", "", text)
+        if not re.fullmatch(r"[0-9,./:\-+()%$¥]*", compact) or not re.search(r"[0-9]", compact):
+            hints.append(None)
+            continue
+        allowed = "0123456789"
+        for ch in ",./:-+()%$¥":
+            if ch in compact and ch not in allowed:
+                allowed += ch
+        hints.append(allowed)
+    if not any(hints):
+        return []
     return hints
 
 _AMBIGUOUS_VARIANT_MAP: Dict[str, Tuple[str, ...]] = {
@@ -5041,7 +5212,7 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     allowed_set: Optional[Set[str]] = None
     if allowed_chars:
         allowed_set = {str(ch) for ch in allowed_chars if str(ch)}
-        if any(ch in allowed_set for ch in ".,:/-%$¥"):
+        if any(ch in allowed_set for ch in ".,:/-%$¥,"):
             bbox_area_thr = min(bbox_area_thr, 4)
             pix_area_thr = min(pix_area_thr, 2)
 
@@ -5103,6 +5274,13 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
             arr = sub
         sig = _glyph_signature(arr)
         cached = _glyph_runtime_lookup(sig)
+        if cached is not None and allowed_set is not None:
+            try:
+                cached_ch = cached[0]
+            except Exception:
+                cached_ch = ""
+            if cached_ch not in allowed_set:
+                cached = None
         if cached is not None:
             ch, sc = cached
         else:
@@ -5111,10 +5289,11 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
             except Exception:
                 patch = Image.fromarray(sub)
             ch, sc = _match_glyph(patch, atlas, allowed_chars=allowed_chars)
-            _glyph_runtime_store(sig, ch, sc)
+            if allowed_set is None:
+                _glyph_runtime_store(sig, ch, sc)
             if not ch or ch == "?" or sc < 0.6:
                 _glyph_pending_enqueue(sig, arr, sc)
-        if ch and ch != "?" and sc > 0.6:
+        if allowed_set is None and ch and ch != "?" and sc > 0.6:
             try:
                 patch_img = Image.fromarray(arr, mode="L")
             except Exception:
@@ -5388,7 +5567,12 @@ def toy_ocr_text_from_cell(
                 observe_max_len = int(os.environ.get("ZOCR_TEMPLATE_OBSERVE_MAX_LEN", str(observe_max_len)) or observe_max_len)
             except Exception:
                 pass
-            if bounded_conf >= observe_min_conf and final_quality >= observe_min_quality and len(final_text) <= observe_max_len:
+            if (
+                allowed_chars is None
+                and bounded_conf >= observe_min_conf
+                and final_quality >= observe_min_quality
+                and len(final_text) <= observe_max_len
+            ):
                 _observe_token_template(final_text, ref_bitmap)
                 _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
         return final_text, bounded_conf
@@ -6104,7 +6288,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 C = max(1, len(col_bounds)-1)
                 baselines = list(dbg.get("baselines_segs", []) or [])
                 # rows: prefer reconstruction bands if available
-                row_bands = []
+                row_bands: List[Tuple[int, int]] = []
                 rel_bands = dbg.get("row_bands_rel") or []
                 if isinstance(rel_bands, list) and rel_bands:
                     H = max(1, y2 - y1)
@@ -6117,12 +6301,37 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         fr = max(0.0, min(float(H), fr))
                         to = max(fr, min(float(H), to))
                         row_bands.append((int(y1 + fr), int(y1 + to)))
+                fallback_rows = max(2, len(baselines)) if baselines else 2
+                dbg_rows = dbg.get("rows")
+                if isinstance(dbg_rows, int) and dbg_rows >= 2:
+                    fallback_rows = max(fallback_rows, int(dbg_rows))
                 if not row_bands:
-                    R = max(2, len(baselines)) or 2
-                    for r in range(R):
-                        yt = int(y1 + (y2-y1)*r/R)
-                        yb = int(y1 + (y2-y1)*(r+1)/R)
-                        row_bands.append((yt, yb))
+                    projected = []
+                    try:
+                        table_crop = page_image.crop(
+                            (
+                                max(0, int(x1)),
+                                max(0, int(y1)),
+                                min(page_w, int(x2)),
+                                min(page_h, int(y2)),
+                            )
+                        )
+                        projected = _infer_row_bands_from_table_projection(table_crop, y_offset=int(y1))
+                    except Exception:
+                        projected = []
+                    if projected:
+                        avg_fallback_h = (y2 - y1) / float(max(1, fallback_rows))
+                        proj_rows = len(projected)
+                        avg_proj_h = (y2 - y1) / float(max(1, proj_rows))
+                        ratio = proj_rows / float(max(1, fallback_rows))
+                        oversplit = bool(ratio > 2.5 and avg_proj_h < 18.0)
+                        if not oversplit and (proj_rows > fallback_rows or avg_fallback_h >= 55.0):
+                            row_bands = projected
+                    if not row_bands:
+                        for r in range(fallback_rows):
+                            yt = int(y1 + (y2 - y1) * r / fallback_rows)
+                            yb = int(y1 + (y2 - y1) * (r + 1) / fallback_rows)
+                            row_bands.append((yt, yb))
                 row_heights = [int(max(1, band[1] - band[0])) for band in row_bands]
                 prev_keys = sweep_tracker.get(doc_identifier, page_index_int, ti)
                 if not prev_keys and prior_cache_seed:
@@ -6165,6 +6374,17 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
                 col_charset_hints: List[Optional[str]] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
+                if toy_runner:
+                    html_headers = _table_headers_from_html(t.get("html"))
+                    if html_headers:
+                        col_charset_hints = _column_charset_hints(html_headers)
+                        if not col_charset_hints:
+                            col_charset_hints = _heuristic_column_charset_hints(html_headers)
+                        if col_charset_hints and len(col_charset_hints) != C:
+                            if len(col_charset_hints) < C:
+                                col_charset_hints.extend([None for _ in range(C - len(col_charset_hints))])
+                            else:
+                                col_charset_hints = col_charset_hints[:C]
                 guard_deadline = (time.time() + guard_ms / 1000.0) if guard_ms > 0 else None
                 guard_triggered = False
                 for r in range(R):
@@ -6188,7 +6408,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             min(page_h, cy2 + pad_y)
                         ))
                         allowed_chars = None
-                        if r > 0 and col_charset_hints and c < len(col_charset_hints):
+                        if col_charset_hints and c < len(col_charset_hints):
                             allowed_chars = col_charset_hints[c]
                         if blank_cfg.enabled and _should_skip_blank_crop(crop, blank_cfg):
                             blank_skipped += 1
@@ -6211,6 +6431,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     if r == 0 and not col_charset_hints:
                         headers_sample = grid_text[0] if grid_text else []
                         col_charset_hints = _column_charset_hints(headers_sample)
+                        if not col_charset_hints:
+                            col_charset_hints = _heuristic_column_charset_hints(headers_sample)
                     if stop_due_to_limit:
                         break
                 if guard_triggered:
