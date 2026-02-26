@@ -27,6 +27,15 @@ ZOCR_DELIVERY_DOCKER_APT_PACKAGES="poppler-utils tesseract-ocr tesseract-ocr-eng
   bash scripts/make_delivery.sh
 ```
 
+Optional (multi-arch Docker images):
+```bash
+# Build and bundle Docker images for multiple target platforms.
+# Produces one tar per platform, e.g.:
+#   zocr-suite-<version>-linux-amd64-docker.tar
+#   zocr-suite-<version>-linux-arm64-docker.tar
+ZOCR_DELIVERY_DOCKER_PLATFORMS="linux/amd64,linux/arm64" bash scripts/make_delivery.sh
+```
+
 Optional (recommended for commercial deliveries):
 ```bash
 # Include SBOM + third-party notices under <bundle>/compliance/

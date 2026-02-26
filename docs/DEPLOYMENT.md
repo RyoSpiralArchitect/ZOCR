@@ -11,7 +11,7 @@ curl http://127.0.0.1:8000/healthz
 
 Using a pre-built image (recommended for internal delivery bundles):
 ```bash
-docker load -i /path/to/zocr-suite-*-docker.tar
+docker load -i /path/to/zocr-suite-*-docker.tar  # pick the tar matching your host arch (amd64/arm64)
 export ZOCR_API_IMAGE="zocr-suite:<version>"
 docker compose up -d --no-build
 ```

@@ -60,9 +60,10 @@ fi
 SKIP_DOCKER="${ZOCR_DELIVERY_SKIP_DOCKER:-0}"
 if [ "$SKIP_DOCKER" != "1" ]; then
   echo "[5/7] Build Docker image (api)"
-  IMAGE_TAG="${ZOCR_API_IMAGE_TAG:-zocr-suite:${VERSION}}"
+  IMAGE_TAG_BASE="${ZOCR_API_IMAGE_TAG:-zocr-suite:${VERSION}}"
   DOCKER_EXTRAS="$(echo "${ZOCR_DELIVERY_DOCKER_EXTRAS:-api}" | tr -d '[:space:]')"
   DOCKER_APT_PACKAGES="${ZOCR_DELIVERY_DOCKER_APT_PACKAGES:-poppler-utils}"
+  DOCKER_PLATFORMS_RAW="${ZOCR_DELIVERY_DOCKER_PLATFORMS:-}"
   if ! docker info >/dev/null 2>&1; then
     cat <<EOF >&2
 [ERROR] Docker daemon is not available.
@@ -71,16 +72,60 @@ if [ "$SKIP_DOCKER" != "1" ]; then
 EOF
     exit 3
   fi
-  docker build -t "$IMAGE_TAG" \
-    --build-arg ZOCR_EXTRAS="$DOCKER_EXTRAS" \
-    --build-arg ZOCR_APT_PACKAGES="$DOCKER_APT_PACKAGES" \
-    .
 
-  echo "[6/7] Save Docker image"
-  docker save "$IMAGE_TAG" -o "$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar"
+  DOCKER_TARS=()
+  DOCKER_TAGS=()
+
+  if [ -z "$DOCKER_PLATFORMS_RAW" ]; then
+    docker build -t "$IMAGE_TAG_BASE" \
+      --build-arg ZOCR_EXTRAS="$DOCKER_EXTRAS" \
+      --build-arg ZOCR_APT_PACKAGES="$DOCKER_APT_PACKAGES" \
+      .
+    echo "[6/7] Save Docker image"
+    DOCKER_TAGS+=("$IMAGE_TAG_BASE")
+    DOCKER_TARS+=("$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar")
+    docker save "$IMAGE_TAG_BASE" -o "${DOCKER_TARS[0]}"
+  else
+    if ! docker buildx version >/dev/null 2>&1; then
+      cat <<EOF >&2
+[ERROR] docker buildx is not available (required for multi-platform builds).
+- Update Docker Desktop / Docker Engine with buildx support, OR
+- unset ZOCR_DELIVERY_DOCKER_PLATFORMS to build only for the current platform.
+EOF
+      exit 3
+    fi
+    echo "      platforms: $DOCKER_PLATFORMS_RAW"
+    IFS=',' read -r -a _PLATS <<< "$DOCKER_PLATFORMS_RAW"
+    for plat in "${_PLATS[@]}"; do
+      plat="$(echo "$plat" | tr -d '[:space:]')"
+      if [ -z "$plat" ]; then
+        continue
+      fi
+      safe_plat="$(echo "$plat" | tr '/' '-' | tr -cd '[:alnum:]-_.')"
+      tag="${IMAGE_TAG_BASE}-${safe_plat}"
+      tar_path="$BUNDLE_DIR/zocr-suite-${VERSION}-${safe_plat}-docker.tar"
+      DOCKER_TAGS+=("$tag")
+      DOCKER_TARS+=("$tar_path")
+      echo "[5/7] Build Docker image ($plat) -> $tag"
+      docker buildx build \
+        --platform "$plat" \
+        --load \
+        -t "$tag" \
+        --build-arg ZOCR_EXTRAS="$DOCKER_EXTRAS" \
+        --build-arg ZOCR_APT_PACKAGES="$DOCKER_APT_PACKAGES" \
+        .
+      echo "[6/7] Save Docker image ($plat)"
+      docker save "$tag" -o "$tar_path"
+    done
+    if [ "${#DOCKER_TAGS[@]}" -eq 0 ]; then
+      echo "[ERROR] No valid platforms found in ZOCR_DELIVERY_DOCKER_PLATFORMS=$DOCKER_PLATFORMS_RAW" >&2
+      exit 2
+    fi
+  fi
 else
   echo "[5/7] Skip Docker image build/save (ZOCR_DELIVERY_SKIP_DOCKER=1)"
-  IMAGE_TAG=""
+  DOCKER_TAGS=()
+  DOCKER_TARS=()
 fi
 
 echo "[7/7] Generate SHA256SUMS"
@@ -105,18 +150,23 @@ cat <<EOF
 
 Done.
 - Bundle: $BUNDLE_DIR
-- Docker tag: ${IMAGE_TAG:-"(skipped)"}
+- Docker image(s): ${DOCKER_TAGS[*]:-"(skipped)"}
 
 Next:
   bash scripts/verify_delivery.sh "$BUNDLE_DIR/SHA256SUMS"
 EOF
 
-if [ "$SKIP_DOCKER" != "1" ]; then
+if [ "$SKIP_DOCKER" != "1" ] && [ "${#DOCKER_TAGS[@]}" -gt 0 ]; then
   cat <<EOF
 
 Docker:
-  docker load -i "$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar"
-  export ZOCR_API_IMAGE="$IMAGE_TAG"
+  # Pick the tar that matches your target host architecture.
+EOF
+  for i in "${!DOCKER_TAGS[@]}"; do
+    cat <<EOF
+  docker load -i "${DOCKER_TARS[$i]}"
+  export ZOCR_API_IMAGE="${DOCKER_TAGS[$i]}"
   docker compose up -d --no-build
 EOF
+  done
 fi
