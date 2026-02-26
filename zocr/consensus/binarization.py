@@ -1,7 +1,7 @@
 """Image binarization helpers extracted from the consensus runtime."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 from .utils import has_numpy, require_numpy
 

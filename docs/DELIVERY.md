@@ -20,6 +20,18 @@ If Docker is unavailable on the build machine, you can still produce a Python-on
 ZOCR_DELIVERY_SKIP_DOCKER=1 bash scripts/make_delivery.sh
 ```
 
+Optional (recommended for commercial deliveries):
+```bash
+# Include SBOM + third-party notices under <bundle>/compliance/
+ZOCR_DELIVERY_COMPLIANCE=1 bash scripts/make_delivery.sh
+```
+
+Optional (offline installs):
+```bash
+# Download wheels into <bundle>/wheels/ (build on the target OS/arch for best results)
+ZOCR_DELIVERY_WHEELS=1 ZOCR_DELIVERY_WHEEL_EXTRAS=api bash scripts/make_delivery.sh
+```
+
 ## Verify a bundle / 検証
 ```bash
 bash scripts/verify_delivery.sh delivery/zocr-suite-*/SHA256SUMS
@@ -38,6 +50,14 @@ python -m zocr --version
 If the environment is fully offline, you must also pre-stage wheels for runtime deps
 (`numpy`, `Pillow`, and optionally FastAPI extras). A common pattern is to use an
 internal PyPI mirror or attach a `wheels/` folder to the delivery.
+
+If your bundle includes a `wheels/` directory, you can install without PyPI:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install --no-index --find-links wheels zocr_suite-*.whl
+```
 
 ## Run (Docker) / Dockerで使う
 Load the image tar then start compose without building:

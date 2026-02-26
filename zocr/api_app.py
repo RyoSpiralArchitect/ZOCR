@@ -121,7 +121,7 @@ def create_app(
     async def ingest(payload: Dict[str, Any]):
         try:
             Draft202012Validator(INGEST_REQUEST_SCHEMA_V0).validate(payload)
-            async with anyio.fail_after(request_timeout_s):
+            with anyio.fail_after(request_timeout_s):
                 _, response = await anyio.to_thread.run_sync(safe_ingest, payload)
             return response
         except ValidationError as exc:
@@ -137,7 +137,7 @@ def create_app(
     async def query(payload: Dict[str, Any]):
         try:
             Draft202012Validator(QUERY_REQUEST_SCHEMA_V0).validate(payload)
-            async with anyio.fail_after(request_timeout_s):
+            with anyio.fail_after(request_timeout_s):
                 _, response = await anyio.to_thread.run_sync(safe_query, payload)
             return response
         except ValidationError as exc:

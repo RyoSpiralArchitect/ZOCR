@@ -22,6 +22,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --build
 ```
 
 ## Data persistence / データ永続化
+- Storage backend: `ZOCR_API_STORAGE_BACKEND` (default: `local`).
 - Job artifacts are stored under `ZOCR_API_STORAGE_DIR` (default: `/data`).
 - `compose.yaml` mounts a named volume to `/data` (`zocr_api_data`).
 - Back up the volume if you need to retain historical results.

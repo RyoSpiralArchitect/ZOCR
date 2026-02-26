@@ -45,6 +45,8 @@ dev = [
   "pytest>=7",
   "ruff>=0.3",
   "build>=1",
+  "pdfminer.six>=20221105",
+  "reportlab>=4",
 ]
 
 [project.scripts]
@@ -71,3 +73,4 @@ select = ["E9", "F"]
 [tool.ruff.lint.per-file-ignores]
 "zocr/_surface.py" = ["F822"]
 "zocr/consensus/_surface.py" = ["F822"]
+"zocr/core/_surface.py" = ["F822"]

@@ -2837,6 +2837,12 @@ def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
         return default
 
 
+def _pytesseract_allowed() -> bool:
+    """Return ``True`` when pytesseract execution is enabled."""
+
+    return not _env_flag("ZOCR_PYTESS_DISABLE", default=False)
+
+
 _PYTESS_TIMEOUT = max(0.0, _env_float("ZOCR_PYTESS_TIMEOUT", 3.5))
 _PYTESS_NICE = _env_int("ZOCR_PYTESS_NICE", None)
 

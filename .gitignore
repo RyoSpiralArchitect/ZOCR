@@ -23,6 +23,9 @@ data/
 # Delivery bundles (generated)
 delivery/
 
+# Compliance artifacts (generated)
+compliance/
+
 # Demo inputs are user-provided by default (keep the folder via .gitkeep)
 samples/demo_inputs/*
 !samples/demo_inputs/.gitkeep

@@ -5,7 +5,6 @@ from .interfaces import (
     Aggregator,
     DocumentOcrPipeline,
     InputHandler,
-    OcrPipeline,
     RegionClassifier,
     Segmenter,
     TableExtractor,

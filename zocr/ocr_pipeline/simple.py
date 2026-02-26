@@ -126,7 +126,6 @@ class FullPageSegmenter(Segmenter):
         gray = _to_gray_array(image)
         mask = _ink_mask(gray)
         row_density = _smooth_density(mask.mean(axis=1), self.smoothing_window)
-        col_density = _smooth_density(mask.mean(axis=0), self.smoothing_window)
 
         min_row_gap = max(4, int(height * self.min_gap_fraction))
         min_col_gap = max(4, int(width * self.min_gap_fraction))

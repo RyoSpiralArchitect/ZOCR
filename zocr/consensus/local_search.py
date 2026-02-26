@@ -374,8 +374,6 @@ def _img_search(jsonl_path: str, query_img_path: str, topk: int = 20):
 
     if Image is None:
         return []
-    import numpy as _np
-
     with Image.open(query_img_path) as q_im:
         qv = _img_embed64_from_bbox(
             {
@@ -405,7 +403,7 @@ def _rrf_merge(listA, listB, k: int = 60, topk: int = 10) -> List[LocalSearchRes
 
     def add_list(lst: Iterable[Any], is_img: bool = False) -> None:
         for r, tup in enumerate(lst, start=1):
-            s, obj = tup[0], (tup[-1] if is_img else tup[1])
+            obj = tup[-1] if is_img else tup[1]
             key_bits = obj.get("bbox", []) + [obj.get("page"), obj.get("table_index")]
             key = json.dumps(key_bits)
             rank.setdefault(key, {"obj": obj, "score": 0.0})
@@ -567,4 +565,3 @@ def describe_local_index(
         except Exception:
             stats["stale"] = None
     return stats
-

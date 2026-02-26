@@ -1,7 +1,7 @@
 """Connected-component helpers for consensus runtime consumers."""
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from collections.abc import Sequence
 
 __all__ = ["_rle_runs", "_cc_label_rle"]
 

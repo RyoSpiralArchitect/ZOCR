@@ -37,28 +37,20 @@ def _print_help() -> None:
           pipeline | run      Execute the end-to-end orchestrator (default)
           consensus | cc      Access the consensus/table reconstruction CLI
           core                Access the multi-domain core CLI (augment/index/query/...)
-<<<<<<< HEAD
           simple              Run the lightweight modular OCR pipeline
           api                 Thin ingestion/query wrapper that prints JSON
           serve               Run the reference FastAPI service
-=======
-          api | serve         Run the reference FastAPI service
           validate            Validate a run directory (schemas + artifacts)
           bench               Run a small benchmark harness
->>>>>>> d933c33 (Add manifest/validate, jobs API, bench + golden tests)
           help                Show this message
 
         Examples:
           python -m zocr run --input demo --snapshot --seed 12345
           python -m zocr consensus --demo --out out_cc
           python -m zocr core query --jsonl out/doc.mm.jsonl --index out/bm25.pkl --q "total amount"
-<<<<<<< HEAD
           python -m zocr serve --host 127.0.0.1 --port 8000
-=======
-          python -m zocr api --host 127.0.0.1 --port 8000
           python -m zocr validate out_allinone
           python -m zocr bench toy --iterations 5
->>>>>>> d933c33 (Add manifest/validate, jobs API, bench + golden tests)
         """
     ).strip()
     print(msg)

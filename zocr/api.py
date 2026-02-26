@@ -258,10 +258,6 @@ def ingest_job(request: IngestRequest) -> IngestResult:
     outdir = _job_root(request.out_root, request.tenant_id, job_id)
     os.makedirs(outdir, exist_ok=True)
 
-    files = _normalize_files(request.files)
-    resolved_files = _resolve_inputs(files, outdir)
-    pipeline_inputs = [fs.uri for fs in resolved_files]
-
     artifact_paths = {
         "pipeline_summary": str(outdir / "pipeline_summary.json"),
         "doc_jsonl": str(outdir / "doc.mm.jsonl"),
@@ -291,6 +287,10 @@ def ingest_job(request: IngestRequest) -> IngestResult:
             },
         )
         return queued
+
+    files = _normalize_files(request.files)
+    resolved_files = _resolve_inputs(files, outdir)
+    pipeline_inputs = [fs.uri for fs in resolved_files]
 
     def _run_pipeline() -> None:
         with _JOB_LOCK:
@@ -482,6 +482,14 @@ def query_job(
     manifest_path = job_dir / "rag" / "manifest.json"
     summary_path = job_dir / "pipeline_summary.json"
 
+    if not manifest_path.exists():
+        legacy_job_dir = Path(base_dir) / _safe_segment(job_id, "job_id")
+        legacy_manifest = legacy_job_dir / "rag" / "manifest.json"
+        if legacy_manifest.exists():
+            job_dir = legacy_job_dir
+            manifest_path = legacy_manifest
+            summary_path = job_dir / "pipeline_summary.json"
+
     manifest = _load_json(manifest_path)
     pipeline_summary = _load_json(summary_path)
     status_payload = _read_job_status(job_dir)
@@ -492,7 +500,7 @@ def query_job(
     facts: List[Dict[str, Any]] = []
 
     cells_path = manifest.get("cells")
-    if cells_path and os.path.exists(cells_path):
+    if isinstance(cells_path, str) and os.path.exists(cells_path):
         index_path = job_dir / "rag" / "cells_index.pkl"
         if not index_path.exists():
             build_index(cells_path, str(index_path))
@@ -518,11 +526,15 @@ def query_job(
             )
 
     if status in {"queued", "running"} and not manifest:
+        query_label = query.strip() or "<empty>"
+        prefix = f"Received query '{query_label}' for job {job_id}."
         answer = {
             "data_summary": f"ジョブ {job_id} は現在 {status} です。",
-            "business_commentary": "完了後に再度問い合わせてください。",
+            "business_commentary": f"{prefix} Job is {status}; retry after completion.",
         }
     else:
+        query_label = query.strip() or "<empty>"
+        prefix = f"Received query '{query_label}' for job {job_id}."
         answer = {
             "data_summary": (
                 "\n".join(f"- {fact['text']}" for fact in facts)
@@ -530,9 +542,9 @@ def query_job(
                 else manifest_summary["data_summary"]
             ),
             "business_commentary": (
-                "取得できた事実が限定的なため、追加の資料や質問の絞り込みが必要です。"
+                f"{prefix} No indexed facts found; refine the query or rebuild the index."
                 if not facts
-                else "抽出された事実を基に、関連する指標の差分やトレンドを確認してください。"
+                else f"{prefix} Retrieved {len(facts)} facts; review them for trends and deltas."
             ),
         }
 
@@ -558,7 +570,7 @@ def query_job(
             for fact in facts
         )
 
-    flags = {"facts_insufficient": not bool(facts)}
+    flags = {"facts_insufficient": (not bool(manifest)) and (not bool(facts))}
 
     return QueryResult(
         job_id=job_id,

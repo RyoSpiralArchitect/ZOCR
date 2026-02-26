@@ -1,7 +1,6 @@
 """Lightweight helpers for surfacing retrieval payloads in notebooks or UIs."""
 from __future__ import annotations
 
-import base64
 import csv
 import html
 from io import StringIO

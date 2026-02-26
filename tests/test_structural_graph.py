@@ -1,7 +1,5 @@
 import json
 
-import pytest
-
 from zocr.ocr_pipeline import (
     BoundingBox,
     RegionOutput,

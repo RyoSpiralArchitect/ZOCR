@@ -36,7 +36,6 @@ _MODULE_EXPORTS: Dict[str, str] = {
     "monitoring": ".monitoring",
     "numba_support": ".numba_support",
     "query_engine": ".query_engine",
-    "rendering": ".rendering",
     "tokenization": ".tokenization",
     "structural_grams": ".structural_grams",
 }
@@ -46,7 +45,7 @@ __all__ = ["zocr_core", *_ATTR_TO_MODULE_ATTR.keys(), *_MODULE_EXPORTS.keys()]
 _LOADED: Dict[str, Any] = {}
 
 if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
-    from . import (
+    from . import (  # noqa: F401
         augmenter,
         base,
         domains,
@@ -57,9 +56,9 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         query_engine,
         tokenization,
     )
-    from .augmenter import augment
-    from .indexer import build_index
-    from .monitoring import (
+    from .augmenter import augment  # noqa: F401
+    from .indexer import build_index  # noqa: F401
+    from .monitoring import (  # noqa: F401
         autotune_unlabeled,
         learn_from_monitor,
         metric_chunk_consistency,
@@ -67,9 +66,9 @@ if TYPE_CHECKING:  # pragma: no cover - import-time type hints only
         metric_col_over_under_rate,
         monitor,
     )
-    from .query_engine import hybrid_query, query
-    from .exporters import export_rag_bundle, sql_export
-    from .zocr_core import main
+    from .query_engine import hybrid_query, query  # noqa: F401
+    from .exporters import export_rag_bundle, sql_export  # noqa: F401
+    from .zocr_core import main  # noqa: F401
 
 
 def _load_module(module_spec: str) -> Any:

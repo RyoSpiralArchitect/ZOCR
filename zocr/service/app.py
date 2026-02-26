@@ -105,6 +105,9 @@ def create_app():
         raise RuntimeError("anyio is required (it should be installed with FastAPI).") from exc
 
     from zocr.orchestrator.zocr_pipeline import run_full_pipeline
+    from .storage import build_job_store
+
+    storage_backend, job_store = build_job_store()
 
     api_key = os.environ.get("ZOCR_API_KEY") or None
     max_upload_mb = max(1, _env_int("ZOCR_API_MAX_UPLOAD_MB", 50))
@@ -134,25 +137,8 @@ def create_app():
     def _utc_now_iso() -> str:
         return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    def _pick_storage_dir() -> Path:
-        env = os.environ.get("ZOCR_API_STORAGE_DIR")
-        if env:
-            return Path(env)
-        candidates = [
-            Path("/data"),
-            Path(tempfile.gettempdir()) / "zocr_api_store",
-        ]
-        for candidate in candidates:
-            try:
-                candidate.mkdir(parents=True, exist_ok=True)
-                return candidate
-            except Exception:
-                continue
-        return Path(tempfile.gettempdir()) / "zocr_api_store"
-
-    storage_dir = _pick_storage_dir()
-    jobs_dir = storage_dir / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
+    storage_dir = job_store.storage_dir
+    jobs_dir = job_store.jobs_dir
     active_jobs: set[str] = set()
     metrics_lock = Lock()
     http_requests_total: Counter[tuple[str, str, str]] = Counter()
@@ -238,19 +224,16 @@ def create_app():
             raise HTTPException(status_code=404, detail="Unknown job id")
 
     def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        job_store.atomic_write_json(path, payload)
 
     def _job_paths(job_id: str) -> Dict[str, Path]:
-        job_root = jobs_dir / job_id
+        paths = job_store.job_paths(job_id)
         return {
-            "root": job_root,
-            "job_json": job_root / "job.json",
-            "input_dir": job_root / "input",
-            "out_dir": job_root / "out",
-            "artifacts_zip": job_root / "artifacts.zip",
+            "root": paths.root,
+            "job_json": paths.job_json,
+            "input_dir": paths.input_dir,
+            "out_dir": paths.out_dir,
+            "artifacts_zip": paths.artifacts_zip,
         }
 
     def _read_job(job_id: str) -> Dict[str, Any]:
@@ -289,26 +272,15 @@ def create_app():
         """Best-effort cleanup for persisted jobs."""
 
         deleted = 0
-        candidates: list[Path] = []
-        try:
-            for entry in jobs_dir.iterdir():
-                if entry.is_dir():
-                    candidates.append(entry)
-        except Exception:
+        candidates = job_store.list_job_roots()
+        if not candidates:
             return {"deleted": 0, "kept": 0}
 
         job_infos: list[tuple[float, Path, Optional[Dict[str, Any]]]] = []
         now = datetime.now(timezone.utc)
         for root in candidates:
             job_path = root / "job.json"
-            job_obj: Optional[Dict[str, Any]] = None
-            if job_path.exists():
-                try:
-                    loaded = json.loads(job_path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        job_obj = loaded
-                except Exception:
-                    job_obj = None
+            job_obj = job_store.read_json(job_path)
             try:
                 mtime = root.stat().st_mtime
             except Exception:
@@ -322,7 +294,7 @@ def create_app():
             is_terminal = status in {"succeeded", "failed"}
             ttl_expired = bool(jobs_ttl_hours > 0 and is_terminal and age_hours > jobs_ttl_hours)
             if ttl_expired:
-                _cleanup_tree(str(root))
+                job_store.delete_tree(root)
                 deleted += 1
                 continue
             job_infos.append((mtime, root, job_obj))
@@ -343,7 +315,7 @@ def create_app():
         remaining_terminal_budget = max(0, jobs_max_count - len(kept))
         kept.extend(terminal[:remaining_terminal_budget])
         for _, root, _ in terminal[remaining_terminal_budget:]:
-            _cleanup_tree(str(root))
+            job_store.delete_tree(root)
             deleted += 1
         return {"deleted": deleted, "kept": len(kept)}
 
@@ -411,22 +383,14 @@ def create_app():
         if jobs_cleanup_on_startup:
             _cleanup_jobs()
         if jobs_resume_on_startup:
-            try:
-                candidates = [p for p in jobs_dir.iterdir() if p.is_dir()]
-            except Exception:
-                candidates = []
+            candidates = job_store.list_job_roots()
             for root in candidates:
                 job_id = root.name
                 if not _JOB_ID_RE.match(job_id):
                     continue
                 job_path = root / "job.json"
-                if not job_path.exists():
-                    continue
-                try:
-                    job = json.loads(job_path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if not isinstance(job, dict):
+                job = job_store.read_json(job_path)
+                if not job:
                     continue
                 if job.get("status") not in {"queued", "running"}:
                     continue
@@ -496,7 +460,7 @@ def create_app():
             "version": __version__,
             "auth": {"enabled": bool(api_key)},
             "limits": {"max_upload_mb": max_upload_mb, "concurrency": concurrency, "timeout_sec": run_timeout_sec},
-            "storage": {"dir": str(storage_dir)},
+            "storage": {"backend": storage_backend, "dir": str(storage_dir)},
             "jobs": {
                 "dir": str(jobs_dir),
                 "max_count": jobs_max_count,
@@ -828,7 +792,7 @@ def create_app():
         paths = _job_paths(job_id)
         if not paths["root"].exists():
             raise HTTPException(status_code=404, detail="Unknown job id")
-        _cleanup_tree(str(paths["root"]))
+        job_store.delete_tree(paths["root"])
         return {"ok": True, "job_id": job_id}
 
     return app
