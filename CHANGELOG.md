@@ -22,6 +22,15 @@ The format is based on *Keep a Changelog*, and this project aims to follow *Sema
 - Reference API now supports job retention/resume settings (`ZOCR_API_JOBS_*`) and uses FastAPI lifespan events.
 - `compose.yaml` can now run from a pre-built image via `ZOCR_API_IMAGE` (avoids rebuilds for internal delivery).
 
+## [0.1.1] - 2026-02-26
+
+### Added
+- Multi-arch delivery bundles via `ZOCR_DELIVERY_DOCKER_PLATFORMS` (one Docker image tar per platform).
+
+### Changed
+- Release workflow now builds/pushes multi-arch Docker images (`linux/amd64`, `linux/arm64`).
+- Delivery script output now reliably lists bundled Docker image tags.
+
 ## [0.1.0] - 2026-02-25
 
 ### Added
