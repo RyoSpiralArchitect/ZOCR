@@ -295,7 +295,13 @@ def _iter_toy_bench_samples(dataset_path: str) -> List[Dict[str, Any]]:
                 if not row:
                     continue
                 image = (row.get("image") or row.get("path") or row.get("img") or "").strip()
-                expected = row.get("text") or row.get("expected") or row.get("label") or ""
+                expected = None
+                for key in ("text", "expected", "label"):
+                    if key in row:
+                        expected = row.get(key)
+                        break
+                if expected is None:
+                    expected = ""
                 allowed = row.get("allowed_chars") or row.get("allowed") or row.get("charset")
                 sample_id = row.get("id") or row.get("name") or ""
                 if not image:
@@ -319,7 +325,11 @@ def _iter_toy_bench_samples(dataset_path: str) -> List[Dict[str, Any]]:
             if not isinstance(obj, dict):
                 continue
             image = obj.get("image") or obj.get("path") or obj.get("img")
-            expected = obj.get("text") or obj.get("expected") or obj.get("label")
+            expected = None
+            for key in ("text", "expected", "label"):
+                if key in obj:
+                    expected = obj.get(key)
+                    break
             allowed = obj.get("allowed_chars") or obj.get("allowed") or obj.get("charset")
             sample_id = obj.get("id") or obj.get("name") or obj.get("key")
             if not image or expected is None:
