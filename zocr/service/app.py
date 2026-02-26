@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 import asyncio
+import functools
 import logging
 import hmac
 import json
@@ -340,7 +339,11 @@ def create_app():
         if job_id in active_jobs:
             return False
         active_jobs.add(job_id)
-        asyncio.create_task(_process_job(job_id))
+        try:
+            asyncio.create_task(_process_job(job_id))
+        except Exception:
+            active_jobs.discard(job_id)
+            raise
         return True
 
     def _extract_api_key(value: Optional[str]) -> Optional[str]:
@@ -385,15 +388,49 @@ def create_app():
                 pass
             return written
 
-    async def _run_pipeline(**kwargs):
-        await run_semaphore.acquire()
+    async def _run_pipeline(*, ignore_cancel: bool = False, **kwargs):
+        acquired = False
         try:
-            if run_timeout_sec > 0:
-                with anyio.fail_after(run_timeout_sec):
-                    return await anyio.to_thread.run_sync(run_full_pipeline, **kwargs)
-            return await anyio.to_thread.run_sync(run_full_pipeline, **kwargs)
+            while True:
+                try:
+                    await run_semaphore.acquire()
+                    acquired = True
+                    break
+                except asyncio.CancelledError:
+                    if not ignore_cancel:
+                        raise
+                    current_task = asyncio.current_task()
+                    if current_task is not None:
+                        try:
+                            while current_task.cancelling():
+                                current_task.uncancel()
+                        except AttributeError:
+                            pass
+                    continue
+
+            runner = functools.partial(run_full_pipeline, **kwargs)
+            thread_task = asyncio.create_task(anyio.to_thread.run_sync(runner, abandon_on_cancel=True))
+            waitable = asyncio.shield(thread_task) if ignore_cancel else thread_task
+            try:
+                if run_timeout_sec > 0:
+                    return await asyncio.wait_for(waitable, timeout=run_timeout_sec)
+                return await waitable
+            except asyncio.CancelledError:
+                if not ignore_cancel:
+                    raise
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    try:
+                        while current_task.cancelling():
+                            current_task.uncancel()
+                    except AttributeError:
+                        pass
+                if run_timeout_sec > 0:
+                    return await asyncio.wait_for(asyncio.shield(thread_task), timeout=run_timeout_sec)
+                return await asyncio.shield(thread_task)
         finally:
-            run_semaphore.release()
+            if acquired:
+                run_semaphore.release()
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
@@ -572,67 +609,93 @@ def create_app():
         status = "unknown"
         error: Optional[str] = None
         try:
-            paths = _job_paths(job_id)
-            try:
-                job = _read_job(job_id)
-            except Exception:
-                return
+            with anyio.CancelScope(shield=True):
+                paths = _job_paths(job_id)
+                try:
+                    job = _read_job(job_id)
+                except Exception:
+                    return
 
-            now = _utc_now_iso()
-            job["status"] = "running"
-            job["updated_at"] = now
-            _write_job(job_id, job)
-            status = "running"
-            _log("job_started", {"job_id": job_id})
-
-            input_path = paths["input_dir"] / (job.get("input", {}) or {}).get("filename", "input")
-            if not input_path.exists():
-                job["status"] = "failed"
-                job["updated_at"] = _utc_now_iso()
-                job["error"] = "Input file missing"
-                status = "failed"
-                error = str(job["error"])
+                now = _utc_now_iso()
+                job["status"] = "running"
+                job["updated_at"] = now
                 _write_job(job_id, job)
-                return
+                status = "running"
+                _log("job_started", {"job_id": job_id})
 
-            out_dir = paths["out_dir"]
-            out_dir.mkdir(parents=True, exist_ok=True)
-            params = job.get("params") if isinstance(job.get("params"), dict) else {}
-            try:
-                summary = await _run_pipeline(
-                    inputs=[str(input_path)],
-                    outdir=str(out_dir),
-                    dpi=int(params.get("dpi") or 200),
-                    domain_hint=params.get("domain"),
-                    k=int(params.get("k") or 10),
-                    seed=int(params.get("seed") or 24601),
-                    snapshot=bool(params.get("snapshot") or False),
-                    toy_lite=bool(params.get("toy_lite") or False),
-                )
-            except TimeoutError:
-                job["status"] = "failed"
-                job["error"] = "Pipeline timeout"
-                status = "failed"
-                error = str(job["error"])
-            except Exception as exc:
-                job["status"] = "failed"
-                job["error"] = str(exc)
-                status = "failed"
-                error = str(job["error"])
-            else:
+                input_path = paths["input_dir"] / (job.get("input", {}) or {}).get("filename", "input")
+                if not input_path.exists():
+                    job["status"] = "failed"
+                    job["updated_at"] = _utc_now_iso()
+                    job["error"] = "Input file missing"
+                    status = "failed"
+                    error = str(job["error"])
+                    _write_job(job_id, job)
+                    return
+
+                out_dir = paths["out_dir"]
+                out_dir.mkdir(parents=True, exist_ok=True)
+                params = job.get("params") if isinstance(job.get("params"), dict) else {}
+                summary: Optional[Dict[str, Any]] = None
+                pipeline_ok = False
                 try:
-                    manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
-                    job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths["root"]))
-                except Exception:
-                    pass
-                try:
-                    _zip_dir(str(out_dir), str(paths["artifacts_zip"]))
-                except Exception:
-                    pass
-                job["status"] = "succeeded"
-                status = "succeeded"
-            job["updated_at"] = _utc_now_iso()
-            _write_job(job_id, job)
+                    summary = await _run_pipeline(
+                        ignore_cancel=True,
+                        inputs=[str(input_path)],
+                        outdir=str(out_dir),
+                        dpi=int(params.get("dpi") or 200),
+                        domain_hint=params.get("domain"),
+                        k=int(params.get("k") or 10),
+                        seed=int(params.get("seed") or 24601),
+                        snapshot=bool(params.get("snapshot") or False),
+                        toy_lite=bool(params.get("toy_lite") or False),
+                    )
+                except TimeoutError:
+                    job["status"] = "failed"
+                    job["error"] = "Pipeline timeout"
+                    status = "failed"
+                    error = str(job["error"])
+                except asyncio.CancelledError:
+                    summary_path = out_dir / "pipeline_summary.json"
+                    for _ in range(50):
+                        if not summary_path.exists():
+                            time.sleep(0.01)
+                            continue
+                        try:
+                            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            summary = None
+                        if summary:
+                            break
+                        time.sleep(0.01)
+                    if summary:
+                        pipeline_ok = True
+                    else:
+                        job["status"] = "failed"
+                        job["error"] = "Pipeline cancelled"
+                        status = "failed"
+                        error = str(job["error"])
+                except Exception as exc:
+                    job["status"] = "failed"
+                    job["error"] = str(exc)
+                    status = "failed"
+                    error = str(job["error"])
+                else:
+                    pipeline_ok = True
+                if pipeline_ok and summary is not None:
+                    try:
+                        manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
+                        job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths["root"]))
+                    except Exception:
+                        pass
+                    try:
+                        _zip_dir(str(out_dir), str(paths["artifacts_zip"]))
+                    except Exception:
+                        pass
+                    job["status"] = "succeeded"
+                    status = "succeeded"
+                job["updated_at"] = _utc_now_iso()
+                _write_job(job_id, job)
         finally:
             dt = time.perf_counter() - job_t0
             with metrics_lock:

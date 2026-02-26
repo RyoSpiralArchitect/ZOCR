@@ -43,6 +43,7 @@ Tune via `.env`:
   - If `ZOCR_API_KEY` is set, `/metrics` also requires the same API key header.
 
 ## Performance knobs / 性能パラメータ
+- `ZOCR_API_WORKERS`: uvicorn worker processes (total slots = workers × concurrency).
 - `ZOCR_API_CONCURRENCY`: parallel pipeline slots inside one process.
 - `ZOCR_API_ZIP_COMPRESSION=stored` can make `artifacts.zip` downloads faster to generate
   (at the cost of larger files); keep `deflated` for smaller bundles.
