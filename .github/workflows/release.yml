@@ -56,7 +56,7 @@ jobs:
             ZOCR_EXTRAS=api
 
       - name: Generate image SBOM (SPDX JSON)
-        uses: anchore/sbom-action@v0.17.0
+        uses: anchore/sbom-action@v0.23.0
         with:
           image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           format: spdx-json
