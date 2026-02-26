@@ -101,6 +101,16 @@ def test_self_augment_views_opening_removes_speckle() -> None:
     assert len(toy_runtime._cc_label_rle(open_bw)) == 1
 
 
+def test_refine_component_segments_never_drops_component() -> None:
+    from zocr.consensus import toy_runtime
+
+    bw = toy_runtime.np.zeros((4, 8), dtype=toy_runtime.np.uint8)
+    bw[1:3, 1:7] = 255
+    bbox = (1, 1, 7, 3, float((7 - 1) * (3 - 1)))
+    refined = toy_runtime._refine_component_segments(bw, bbox)
+    assert refined
+
+
 def test_restore_digit_commas_by_headers() -> None:
     from zocr.consensus import toy_runtime
 

@@ -5333,14 +5333,46 @@ def _refine_component_segments(
     queue = [bbox]
     output: List[Tuple[int, int, int, int, float]] = []
     steps = 0
-    while queue and steps < 32:
+    seen: set[Tuple[int, int, int, int]] = set()
+
+    def _key(b: Tuple[int, int, int, int, float]) -> Tuple[int, int, int, int]:
+        return (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+
+    while queue and steps < 64:
         current = queue.pop()
+        key = _key(current)
+        if key in seen:
+            steps += 1
+            continue
+        seen.add(key)
+
         children = _segment_component_bbox(bw, current, baseline=baseline)
+        if children and any(_key(child) == key for child in children):
+            children = []
+
         if children:
-            queue.extend(children)
+            for child in children:
+                ckey = _key(child)
+                if ckey in seen:
+                    continue
+                if ckey[2] <= ckey[0] or ckey[3] <= ckey[1]:
+                    continue
+                queue.append(child)
         else:
             output.append(current)
         steps += 1
+
+    if queue:
+        for leftover in queue:
+            lkey = _key(leftover)
+            if lkey in seen:
+                continue
+            if lkey[2] <= lkey[0] or lkey[3] <= lkey[1]:
+                continue
+            output.append(leftover)
+
+    if not output:
+        return [bbox]
     return output
 
 def _merge_glyph_fragments(
