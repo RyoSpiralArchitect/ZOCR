@@ -521,7 +521,7 @@ def _make_views(im: "Image.Image", out_dir: str, base: str) -> Dict[str,str]:
     gray = ImageOps.grayscale(im)
     gray_u8 = np.asarray(gray, dtype=np.uint8)
     grad_rgb, mag = _gradient_false_color(gray_u8.astype(np.float32))
-    xray_img = Image.fromarray(grad_rgb, mode="RGB")
+    xray_img = Image.fromarray(grad_rgb)
     p_xr = os.path.join(out_dir, f"{base}.xray.png")
     xray_img.save(p_xr)
     paths["xray"] = p_xr
@@ -545,10 +545,10 @@ def _make_views(im: "Image.Image", out_dir: str, base: str) -> Dict[str,str]:
 
     otsu = _otsu_threshold(gray_u8)
     binary = (gray_u8 >= otsu).astype(np.uint8) * 255
-    binary_img = Image.fromarray(binary, mode="L").resize(zoom_size, resample=Image.NEAREST)
+    binary_img = Image.fromarray(binary).resize(zoom_size, resample=Image.NEAREST)
     binary_col = ImageOps.colorize(binary_img, black="#111111", white="#f7f7f7")
 
-    heat = Image.fromarray(np.clip(mag * 255.0, 0.0, 255.0).astype(np.uint8), mode="L")
+    heat = Image.fromarray(np.clip(mag * 255.0, 0.0, 255.0).astype(np.uint8))
     heat = heat.resize(zoom_size, resample=Image.BICUBIC)
     heat_col = ImageOps.colorize(heat, black="#001f3f", white="#ff6b6b")
     heat_overlay = Image.blend(heat_col.convert("RGB"), overlay_zoom, 0.4)

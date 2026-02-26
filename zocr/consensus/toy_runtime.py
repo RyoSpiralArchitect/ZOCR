@@ -1052,7 +1052,7 @@ def _glyph_runtime_replay(limit: int = 8) -> int:
         if sig is None or arr is None:
             continue
         try:
-            img = Image.fromarray(np.asarray(arr, dtype=np.uint8), mode="L")
+            img = Image.fromarray(np.asarray(arr, dtype=np.uint8))
         except Exception:
             continue
         ch, conf = _match_glyph(img, _GLYPH_ATLAS)
@@ -1598,7 +1598,7 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
                         np_arr = np.asarray(arr, dtype=np.uint8)
                         if np_arr.ndim != 2:
                             continue
-                        atlas_list.append(Image.fromarray(np_arr, mode="L"))
+                        atlas_list.append(Image.fromarray(np_arr))
                     except Exception:
                         continue
                 if atlas_list:
@@ -1709,7 +1709,7 @@ def _adapt_glyph(ch: str, img: "Image.Image") -> None:
                 return
         except Exception:
             continue
-    atlas_list.append(Image.fromarray(arr, mode="L"))
+    atlas_list.append(Image.fromarray(arr))
     if len(atlas_list) > _GLYPH_VARIANT_LIMIT:
         atlas_list.pop(0)
     feats = _compute_glyph_features_from_array(arr)
@@ -4374,7 +4374,7 @@ def _synthetic_external_variants(img: "Image.Image") -> List[Tuple[str, float, s
                 if not mask.any():
                     continue
                 try:
-                    bw = Image.fromarray((1 - mask) * 255, mode="L")
+                    bw = Image.fromarray(((1 - mask) * 255).astype(np.uint8))
                 except Exception:
                     continue
                 _emit_variant(bw, f"threshold_{thr:03d}", 0.05)
@@ -4588,7 +4588,7 @@ def _normalize_template_bitmap(arr: Any) -> Optional["np.ndarray"]:
     import numpy as _np
 
     try:
-        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8), mode="L")
+        img = Image.fromarray(_np.asarray(arr, dtype=_np.uint8))
     except Exception:
         return None
     resized = _resize_keep_ar(img, _TOKEN_TEMPLATE_SIZE[0], _TOKEN_TEMPLATE_SIZE[1])
@@ -5285,7 +5285,7 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
             ch, sc = cached
         else:
             try:
-                patch = Image.fromarray(arr, mode="L")
+                patch = Image.fromarray(np.asarray(arr, dtype=np.uint8))
             except Exception:
                 patch = Image.fromarray(sub)
             ch, sc = _match_glyph(patch, atlas, allowed_chars=allowed_chars)
@@ -5295,7 +5295,7 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
                 _glyph_pending_enqueue(sig, arr, sc)
         if allowed_set is None and ch and ch != "?" and sc > 0.6:
             try:
-                patch_img = Image.fromarray(arr, mode="L")
+                patch_img = Image.fromarray(np.asarray(arr, dtype=np.uint8))
             except Exception:
                 patch_img = None
             if patch_img is not None:
@@ -5318,7 +5318,7 @@ def _shadow_correct_array(arr: "np.ndarray") -> "np.ndarray":
     if arr.size == 0:
         return arr
     try:
-        img = Image.fromarray(arr, mode="L")
+        img = Image.fromarray(np.asarray(arr, dtype=np.uint8))
     except Exception:
         img = Image.fromarray(arr)
     try:
@@ -5369,7 +5369,7 @@ def toy_ocr_text_from_cell(
         if bright_ratio > 0.6:
             arr = 255 - arr
             arr_f = arr.astype(_np.float32)
-            g = Image.fromarray(arr, mode="L")
+            # Keep `arr` as the source of truth; no need to materialize a Pillow image here.
     thr_med = int(_np.clip(_np.median(arr), 48, 208))
     candidates: List[Tuple[np.ndarray, Dict[str, Any]]] = []
     seen_hashes: Set[Tuple[int, int, str]] = set()
