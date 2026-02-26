@@ -204,6 +204,44 @@ def get_toy_feature_status() -> Dict[str, Any]:
     return _toy_runtime_module().get_toy_feature_status()
 
 
+def reanalyze_learning_jsonl(
+    learning_jsonl_path: str,
+    out_dir: Optional[str] = None,
+    limit: int = 64,
+    rotate: bool = True,
+    ocr_engine: str = "toy",
+    focus: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Delegate learning reanalysis to the toy runtime implementation."""
+
+    return _toy_runtime_module().reanalyze_learning_jsonl(
+        learning_jsonl_path,
+        out_dir=out_dir,
+        limit=limit,
+        rotate=rotate,
+        ocr_engine=ocr_engine,
+        focus=focus,
+    )
+
+
+def apply_reanalysis_to_jsonl(
+    contextual_jsonl_path: str,
+    reanalyzed_jsonl_path: str,
+    dest_jsonl_path: Optional[str] = None,
+    ocr_min_conf: float = 0.58,
+    surprisal_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Delegate applying reanalysis results to the toy runtime implementation."""
+
+    return _toy_runtime_module().apply_reanalysis_to_jsonl(
+        contextual_jsonl_path,
+        reanalyzed_jsonl_path,
+        dest_jsonl_path,
+        ocr_min_conf=ocr_min_conf,
+        surprisal_threshold=surprisal_threshold,
+    )
+
+
 def export_jsonl_with_ocr(
     doc_json_path: str,
     source_images: Union[str, Sequence[str], Mapping[int, str]],
