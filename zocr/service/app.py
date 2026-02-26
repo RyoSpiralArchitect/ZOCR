@@ -173,6 +173,9 @@ def create_app():
         return request.url.path
 
     def _log(event: str, payload: Dict[str, Any], *, level: str = "info") -> None:
+        numeric_level = getattr(logging, level.upper(), logging.INFO)
+        if not logger.isEnabledFor(numeric_level):
+            return
         record = {"ts": _utc_now_iso(), "event": event, **payload}
         if log_format == "json":
             msg = json.dumps(record, ensure_ascii=False)
@@ -386,7 +389,7 @@ def create_app():
                 await upload.close()
             except Exception:
                 pass
-            return written
+        return written
 
     async def _run_pipeline(*, ignore_cancel: bool = False, **kwargs):
         acquired = False
@@ -482,10 +485,11 @@ def create_app():
                     response.headers["X-Request-ID"] = request_id
                 except Exception:
                     pass
-            with metrics_lock:
-                http_requests_total[(request.method, route_path, str(status_code))] += 1
-                http_duration_sum[(request.method, route_path)] += float(dt)
-                http_duration_count[(request.method, route_path)] += 1
+            if metrics_enabled:
+                with metrics_lock:
+                    http_requests_total[(request.method, route_path, str(status_code))] += 1
+                    http_duration_sum[(request.method, route_path)] += float(dt)
+                    http_duration_count[(request.method, route_path)] += 1
             client = request.client.host if request.client else None
             _log(
                 "http_request",
