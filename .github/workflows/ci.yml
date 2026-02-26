@@ -19,7 +19,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev,api]"
       - name: Lint
         run: |
           python -m ruff check .
@@ -29,3 +29,15 @@ jobs:
       - name: Build
         run: |
           python -m build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          docker build -t zocr-suite:ci --build-arg ZOCR_EXTRAS="api" .
+      - name: Smoke test
+        run: |
+          docker run --rm zocr-suite:ci zocr --version
+          docker run --rm zocr-suite:ci zocr validate --help
