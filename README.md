@@ -81,20 +81,38 @@ docker run --rm -v "$PWD:/work" -w /work zocr-suite \
 # Local
 python -m pip install -e ".[api]"
 zocr-api --host 127.0.0.1 --port 8000
-# or: python -m zocr api --host 127.0.0.1 --port 8000
+# or: python -m zocr serve --host 127.0.0.1 --port 8000
 
 curl http://127.0.0.1:8000/healthz
 curl -F "file=@your.pdf" "http://127.0.0.1:8000/v1/run?domain=invoice"
 curl -o zocr_artifacts.zip -F "file=@your.pdf" "http://127.0.0.1:8000/v1/run.zip?domain=invoice"
+
+# Persistent jobs (recommended for internal service use)
+curl -F "file=@your.pdf" "http://127.0.0.1:8000/v1/jobs?domain=invoice"
+curl "http://127.0.0.1:8000/v1/jobs/<job_id>"
+curl -o zocr_job.zip "http://127.0.0.1:8000/v1/jobs/<job_id>/artifacts.zip"
+curl -o pipeline_summary.json "http://127.0.0.1:8000/v1/jobs/<job_id>/artifacts/pipeline_summary"
 
 # Optional hardening (env)
 export ZOCR_API_KEY="change-me"             # require X-API-Key / Authorization: Bearer
 export ZOCR_API_MAX_UPLOAD_MB=50            # upload limit
 export ZOCR_API_CONCURRENCY=1               # worker slots
 export ZOCR_API_RUN_TIMEOUT_SEC=900         # 0 disables
+export ZOCR_API_STORAGE_DIR=/data           # job persistence root (Docker: mount a volume)
 
 curl -H "X-API-Key: $ZOCR_API_KEY" -F "file=@your.pdf" \
   "http://127.0.0.1:8000/v1/run?domain=invoice"
+```
+
+## Validation / 検証
+```bash
+# Validate an outdir (creates zocr.manifest.json if missing)
+python -m zocr validate out_allinone --write-manifest
+```
+
+## Bench / ベンチ
+```bash
+python -m zocr bench toy --iterations 5
 ```
 
 ## 統一 CLI / Unified CLI / Interface unifiée

@@ -10,8 +10,11 @@ services:
       ZOCR_API_MAX_UPLOAD_MB: ${ZOCR_API_MAX_UPLOAD_MB:-50}
       ZOCR_API_CONCURRENCY: ${ZOCR_API_CONCURRENCY:-1}
       ZOCR_API_RUN_TIMEOUT_SEC: ${ZOCR_API_RUN_TIMEOUT_SEC:-900}
+      ZOCR_API_STORAGE_DIR: ${ZOCR_API_STORAGE_DIR:-/data}
     ports:
       - "8000:8000"
+    volumes:
+      - zocr_api_data:/data
     healthcheck:
       test:
         [
@@ -24,3 +27,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+volumes:
+  zocr_api_data:

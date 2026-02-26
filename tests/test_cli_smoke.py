@@ -37,3 +37,13 @@ def test_diff_help() -> None:
     proc = _run("-m", "zocr.diff", "--help")
     assert proc.returncode == 0
     assert "semantic diff" in proc.stdout.lower()
+
+
+def test_validate_help() -> None:
+    proc = _run("-m", "zocr", "validate", "--help")
+    assert proc.returncode == 0
+
+
+def test_bench_help() -> None:
+    proc = _run("-m", "zocr", "bench", "--help")
+    assert proc.returncode == 0

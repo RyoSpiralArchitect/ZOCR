@@ -33,6 +33,7 @@ from .plugins import PLUGINS, call_stage, describe_plugins, register_stage
 from .prior import PriorBandit, normalize_headers_to_signature, decide_success
 from .history import load_history, print_history, read_meta, read_summary
 from .reporting import generate_report
+from ..artifacts.manifest import write_manifest as _write_manifest
 from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
     DiffAssistPlanner,
@@ -5039,6 +5040,13 @@ def _patched_run_full_pipeline(
         generate_report(outdir, dest=report_path, summary=summary, history=history_records, meta=read_meta(outdir))
     except Exception as e:
         print("Report generation skipped:", e)
+    try:
+        manifest_path = _write_manifest(outdir, summary=summary, inputs=inputs)
+        summary["manifest_json"] = str(manifest_path)
+        with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print("[WARN] Manifest generation skipped:", exc)
     set_stage_trace_sink(None)
     return summary
 

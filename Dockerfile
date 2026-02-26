@@ -4,6 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
+    ZOCR_API_STORAGE_DIR=/data \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
@@ -25,7 +26,8 @@ RUN python -m pip install --upgrade pip \
     && if [ -n "${ZOCR_EXTRAS}" ]; then python -m pip install ".[${ZOCR_EXTRAS}]"; else python -m pip install "."; fi \
     && groupadd -r zocr \
     && useradd -r -g zocr -m -d /home/zocr zocr \
-    && chown -R zocr:zocr /app
+    && mkdir -p /data \
+    && chown -R zocr:zocr /app /data
 
 USER zocr
 

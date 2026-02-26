@@ -17,6 +17,9 @@ venv/
 # Local pipeline outputs
 out*/
 
+# Local API/job storage (optional)
+data/
+
 # Demo inputs are user-provided by default (keep the folder via .gitkeep)
 samples/demo_inputs/*
 !samples/demo_inputs/.gitkeep
