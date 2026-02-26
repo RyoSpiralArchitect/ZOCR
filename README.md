@@ -148,6 +148,8 @@ python -m zocr validate out_allinone --write-manifest
 ## Bench / ベンチ
 ```bash
 python -m zocr bench toy --iterations 5
+# Benchmark the reference FastAPI service (requires `.[api]` extras and the server running)
+python -m zocr bench api --url http://127.0.0.1:8000 --requests 50 --concurrency 8 --toy-lite
 ```
 
 ### Toy OCR golden bench / Toy OCR 回帰ベンチ

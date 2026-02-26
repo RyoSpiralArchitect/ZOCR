@@ -48,6 +48,24 @@ Tune via `.env`:
 - `ZOCR_API_ZIP_COMPRESSION=stored` can make `artifacts.zip` downloads faster to generate
   (at the cost of larger files); keep `deflated` for smaller bundles.
 
+## Benchmarking / ベンチ
+Run a quick client-side load test against the reference API:
+
+```bash
+# (example) benchmark /v1/run with a generated PNG + toy-lite pipeline
+python -m zocr bench api --url http://127.0.0.1:8000 --requests 50 --concurrency 8 --toy-lite
+```
+
+If `ZOCR_API_KEY` is enabled, pass the same key:
+```bash
+python -m zocr bench api --url http://127.0.0.1:8000 --api-key "$ZOCR_API_KEY" --requests 50 --concurrency 8
+```
+
+To benchmark with a real document, pass `--file` (pdf/png/jpg/tiff) and optionally disable toy mode:
+```bash
+python -m zocr bench api --file path/to/sample.pdf --no-toy-lite --requests 10 --concurrency 2
+```
+
 ## Security notes / セキュリティ注意
 - Set `ZOCR_API_KEY` and place the service behind your internal reverse proxy / network controls.
 - Treat the reference API as an internal wrapper; production hardening (rate limit, mTLS, audit logging) should be added per environment.
