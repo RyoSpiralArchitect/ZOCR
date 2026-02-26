@@ -3081,6 +3081,7 @@ def _header_variants_for_numeric(label: str) -> List[str]:
 def _infer_numeric_kinds_from_values(
     grid_text: Sequence[Sequence[str]],
     kinds: List[Optional[str]],
+    headers: Optional[Sequence[str]] = None,
 ) -> List[Optional[str]]:
     global _NUMERIC_HEADER_INFERRED_LAST
     inferred = 0
@@ -3093,6 +3094,8 @@ def _infer_numeric_kinds_from_values(
     currency_rx = re.compile(r"[¥￥円＄$元]")
     for c in range(num_cols):
         if c < len(kinds) and kinds[c]:
+            continue
+        if headers and c < len(headers) and _digit_comma_spec(headers[c]) is not None:
             continue
         total = 0
         numeric_hits = 0
@@ -3162,7 +3165,7 @@ def _numeric_header_kinds(
                     break
             kinds.append(kind)
     if grid_text:
-        kinds = _infer_numeric_kinds_from_values(grid_text, kinds)
+        kinds = _infer_numeric_kinds_from_values(grid_text, kinds, headers=headers)
     else:
         _NUMERIC_HEADER_INFERRED_LAST = 0
     return kinds
@@ -4140,6 +4143,138 @@ def _heuristic_column_charset_hints(headers: Sequence[str]) -> List[Optional[str
     if not any(hints):
         return []
     return hints
+
+
+_DIGIT_COMMA_DIGIT_RX = re.compile(r"^\d{1,8},\d{1,8}$")
+
+
+def _digit_comma_spec(text: Any) -> Optional[Tuple[int, int]]:
+    """Return (comma_pos, digits_total) for strings like '12,34'."""
+
+    if text is None:
+        return None
+    try:
+        work = unicodedata.normalize("NFKC", str(text))
+    except Exception:
+        work = str(text)
+    work = re.sub(r"\s+", "", work).strip()
+    if not work:
+        return None
+    if work.count(",") != 1:
+        return None
+    if not _DIGIT_COMMA_DIGIT_RX.fullmatch(work):
+        return None
+    comma_pos = work.index(",")
+    digits_total = len(work) - 1
+    if comma_pos <= 0 or comma_pos >= digits_total:
+        return None
+    return comma_pos, digits_total
+
+
+def _restore_digit_commas_by_headers(
+    headers: Sequence[str],
+    grid_text: Sequence[Sequence[str]],
+    grid_conf: Optional[Sequence[Sequence[float]]] = None,
+    col_charset_hints: Optional[Sequence[Optional[str]]] = None,
+    fallback_notes: Optional[Dict[Tuple[int, int], str]] = None,
+) -> int:
+    """Restore commas in digit-only tokens when a column consistently uses digit,comma,digit."""
+
+    if not headers or not grid_text or len(grid_text) < 2:
+        return 0
+    num_cols = max((len(row) for row in grid_text if isinstance(row, (list, tuple))), default=0)
+    if num_cols <= 0:
+        return 0
+
+    def _hint_allows_comma(col: int) -> bool:
+        if not col_charset_hints or col >= len(col_charset_hints):
+            return True
+        hint = col_charset_hints[col]
+        if not hint:
+            return True
+        return "," in str(hint)
+
+    specs: Dict[int, Tuple[int, int]] = {}
+    for c in range(min(num_cols, len(headers))):
+        if not _hint_allows_comma(c):
+            continue
+        spec = _digit_comma_spec(headers[c])
+        if spec is not None:
+            specs[c] = spec
+
+    if len(specs) < num_cols:
+        for c in range(num_cols):
+            if c in specs or not _hint_allows_comma(c):
+                continue
+            counter: Counter = Counter()
+            for r in range(1, len(grid_text)):
+                row = grid_text[r]
+                if not isinstance(row, (list, tuple)) or c >= len(row):
+                    continue
+                token = row[c]
+                try:
+                    work = unicodedata.normalize("NFKC", str(token or ""))
+                except Exception:
+                    work = str(token or "")
+                work = re.sub(r"\s+", "", work).strip()
+                if not _DIGIT_COMMA_DIGIT_RX.fullmatch(work):
+                    continue
+                counter[(work.index(","), len(work) - 1)] += 1
+            if not counter:
+                continue
+            (pos, digits_total), hits = counter.most_common(1)[0]
+            if hits >= 2:
+                specs[c] = (int(pos), int(digits_total))
+
+    changed = 0
+    for r in range(1, len(grid_text)):
+        row = grid_text[r]
+        if not isinstance(row, list):
+            continue
+        for c, spec in specs.items():
+            if c >= len(row):
+                continue
+            token = row[c]
+            try:
+                work = unicodedata.normalize("NFKC", str(token or ""))
+            except Exception:
+                work = str(token or "")
+            work = re.sub(r"\s+", "", work).strip()
+            if not work:
+                continue
+            pos, digits_total = spec
+            if "," in work:
+                continue
+            if "." in work and re.fullmatch(r"\d+\.\d+", work):
+                dot_pos = work.index(".")
+                if dot_pos == pos and (len(work) - 1) == digits_total:
+                    restored = work.replace(".", ",", 1)
+                else:
+                    continue
+            else:
+                if not work.isdigit() or len(work) != digits_total:
+                    continue
+                if pos <= 0 or pos >= len(work):
+                    continue
+                restored = work[:pos] + "," + work[pos:]
+            if restored == token:
+                continue
+            row[c] = restored
+            changed += 1
+            if fallback_notes is not None:
+                fallback_notes.setdefault((r, c), "comma_restore")
+            if grid_conf is not None and r < len(grid_conf):
+                try:
+                    conf_row = grid_conf[r]
+                except Exception:
+                    conf_row = None
+                if isinstance(conf_row, list) and c < len(conf_row):
+                    try:
+                        conf_row[c] = float(max(0.0, min(1.0, float(conf_row[c]) * 0.85)))
+                    except Exception:
+                        pass
+    return changed
+
 
 _AMBIGUOUS_VARIANT_MAP: Dict[str, Tuple[str, ...]] = {
     "?": ("7", "1", "2"),
@@ -5199,6 +5334,91 @@ def _refine_component_segments(
         steps += 1
     return output
 
+def _merge_glyph_fragments(
+    boxes: Sequence[Tuple[int, int, int, int, float]],
+    baseline: Optional[_BaselineStats],
+) -> List[Tuple[int, int, int, int, float]]:
+    """Merge likely single-glyph fragments (':' dots, '=', 'i' dot, broken strokes)."""
+
+    if not boxes:
+        return []
+    if len(boxes) < 2 or baseline is None:
+        return list(boxes)
+    try:
+        avg_w = float(baseline.avg_width or baseline.xheight or 12.0)
+        avg_h = float(baseline.avg_height or baseline.xheight or 12.0)
+    except Exception:
+        avg_w = 12.0
+        avg_h = 12.0
+
+    avg_w = max(4.0, avg_w)
+    avg_h = max(4.0, avg_h)
+
+    x_gap_thr = max(1, int(round(avg_w * 0.12)))
+    y_gap_thr = max(1, int(round(avg_h * 0.25)))
+    max_h_stack = float(avg_h * 1.6 + y_gap_thr)
+    max_w_pair = float(avg_w * 1.25 + x_gap_thr)
+
+    def _union(
+        a: Tuple[int, int, int, int, float],
+        b: Tuple[int, int, int, int, float],
+    ) -> Tuple[int, int, int, int, float]:
+        return (
+            int(min(a[0], b[0])),
+            int(min(a[1], b[1])),
+            int(max(a[2], b[2])),
+            int(max(a[3], b[3])),
+            float(a[4] + b[4]),
+        )
+
+    def _dims(b: Tuple[int, int, int, int, float]) -> Tuple[int, int]:
+        return int(max(1, b[2] - b[0])), int(max(1, b[3] - b[1]))
+
+    def _should_merge(a: Tuple[int, int, int, int, float], b: Tuple[int, int, int, int, float]) -> bool:
+        aw, ah = _dims(a)
+        bw, bh = _dims(b)
+        u = _union(a, b)
+        uw, uh = _dims(u)
+
+        x_overlap = int(min(a[2], b[2]) - max(a[0], b[0]))
+        y_overlap = int(min(a[3], b[3]) - max(a[1], b[1]))
+        x_ov_ratio = float(x_overlap) / float(min(aw, bw)) if x_overlap > 0 else 0.0
+        y_ov_ratio = float(y_overlap) / float(min(ah, bh)) if y_overlap > 0 else 0.0
+
+        top, bottom = (a, b) if a[1] <= b[1] else (b, a)
+        y_gap = int(bottom[1] - top[3])
+        small_fragment = min(ah, bh) <= int(round(avg_h * 0.6))
+        if small_fragment:
+            v_gap_thr = max(y_gap_thr, int(round(avg_h * 0.45)))
+            if avg_h <= 6.0:
+                v_gap_thr = max(v_gap_thr, int(round(avg_h * 1.1)))
+            v_max_h_stack = max(max_h_stack, float(avg_h * 1.6 + v_gap_thr))
+            if x_ov_ratio >= 0.75 and y_gap <= v_gap_thr and uh <= v_max_h_stack:
+                return True
+
+        x_gap = int(b[0] - a[2])
+        if (
+            y_ov_ratio >= 0.75
+            and x_gap <= x_gap_thr
+            and uw <= max_w_pair
+            and aw <= int(round(avg_w * 0.85))
+            and bw <= int(round(avg_w * 0.85))
+        ):
+            return True
+        return False
+
+    merged: List[Tuple[int, int, int, int, float]] = []
+    current = boxes[0]
+    for nxt in boxes[1:]:
+        if _should_merge(current, nxt):
+            current = _union(current, nxt)
+        else:
+            merged.append(current)
+            current = nxt
+    merged.append(current)
+    return merged
+
+
 def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     cc_all = _cc_label_rle(bw)
     if not cc_all:
@@ -5267,6 +5487,10 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     if not refined:
         refined = cc
     refined.sort(key=lambda b: b[0])
+    merged = _merge_glyph_fragments(refined, baseline_stats)
+    if len(merged) < len(refined):
+        _GLYPH_RUNTIME_STATS["fragment_merges"] += float(len(refined) - len(merged))
+        refined = merged
     atlas = _GLYPH_ATLAS
     text = []
     scores = []
@@ -6071,6 +6295,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
     total_rows_reflowed = 0
     total_rows_ocr_attempts = 0
     total_rows_ocr_success = 0
+    comma_restored_cells = 0
     seg_tables = 0
     seg_row_initial = 0
     seg_row_final = 0
@@ -6379,6 +6604,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 grid_text = [["" for _ in range(C)] for __ in range(R)]
                 grid_conf = [[0.0 for _ in range(C)] for __ in range(R)]
                 col_charset_hints: List[Optional[str]] = []
+                html_headers: List[str] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
                 if toy_runner:
                     html_headers = _table_headers_from_html(t.get("html"))
@@ -6499,6 +6725,16 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             schema_trailing_examples.append(str(sample))
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
+                restore_headers = html_headers if html_headers and len(html_headers) == C else (grid_text[0] if grid_text else [])
+                restored = _restore_digit_commas_by_headers(
+                    restore_headers,
+                    grid_text,
+                    grid_conf=grid_conf,
+                    col_charset_hints=col_charset_hints,
+                    fallback_notes=fallback_notes,
+                )
+                if restored:
+                    comma_restored_cells += int(restored)
                 for r in range(R):
                     if _is_total_row(grid_text[r]):
                         total_rows_seen += 1
@@ -6877,6 +7113,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
             "reflowed": int(total_rows_reflowed),
             "ocr_attempts": int(total_rows_ocr_attempts),
             "ocr_success": int(total_rows_ocr_success),
+        }
+    if comma_restored_cells:
+        export_stats["comma_restore"] = {
+            "cells": int(comma_restored_cells),
         }
     if seg_tables:
         inv_tables = 1.0 / float(max(1, seg_tables))

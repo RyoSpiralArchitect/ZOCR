@@ -873,13 +873,14 @@ def reconstruct_table_html_cc(image_path: str, bbox: Tuple[int,int,int,int],
     debug_page_key = os.path.abspath(image_path) if image_path else ""
     if amb_crops and _DEBUG_CELLS_ENABLED and _DEBUG_CELLS_PER_PAGE > 0:
         vdir: Optional[str] = None
+        page_stem = os.path.splitext(os.path.basename(image_path))[0]
         for (bl, r0, c0, st) in amb_crops[:64]:
             xl, yt, xr, yb = bl
             area = max(0, int(xr - xl) * int(yb - yt))
             if not _allow_debug_cell_dump(debug_page_key, area):
                 continue
             if vdir is None:
-                vdir = os.path.join(os.path.dirname(image_path), "views_cells")
+                vdir = os.path.join(os.path.dirname(image_path), "views_cells", page_stem)
                 ensure_dir(vdir)
             crop = imc.crop((xl, yt, xr, yb))
             name = f"cell_r{r0}_c{c0}_s{st}"
@@ -1236,6 +1237,71 @@ def _rows_cols_from_html(html: str) -> Tuple[int,int]:
     cols=Counter(rows).most_common(1)[0][0]
     return len(rows), cols
 
+
+def _pipeline_process_page_task(
+    i: int,
+    page_path: str,
+    out_dir: str,
+    anno_path: Optional[str],
+    cc_params: Dict[str, float],
+    bench_iterations: int,
+    views_enabled: bool,
+):
+    page_base=os.path.splitext(os.path.basename(page_path))[0]
+    im=Image.open(page_path).convert("RGB"); W,H=im.size
+    anno=None
+    if anno_path:
+        with open(anno_path,"r",encoding="utf-8") as f: anno=json.load(f)
+    tbl_bbox=[int(W*0.05), int(H*0.2), int(W*0.95), int(H*0.6)]
+    if anno and "tables" in anno and anno["tables"]:
+        tbl_bbox=anno["tables"][0]["bbox"]
+    latencies=[]; html_pred=None; dbg=None
+    for _ in range(max(1,bench_iterations)):
+        t0=time.perf_counter()
+        html_pred, dbg = reconstruct_table_html_cc(page_path, tbl_bbox, cc_params, want_dbg=True)
+        latencies.append((time.perf_counter()-t0)*1000.0)
+    if views_enabled:
+        view_prefix = f"p{i+1:04d}_{page_base}.table"
+        vpaths = _make_views(im.crop(tuple(tbl_bbox)), out_dir, view_prefix)
+    else:
+        vpaths = {}
+    if dbg is None: dbg = {}
+    dbg["views"] = vpaths
+    rows_pred, cols_pred = _rows_cols_from_html(html_pred)
+    if anno and "tables" in anno and anno["tables"]:
+        html_gt=anno["tables"][0].get("html","")
+        teds=compute_teds(html_pred, html_gt)
+        rows_gt, cols_gt = _rows_cols_from_html(html_gt)
+    else:
+        html_gt=None; teds=compute_teds(html_pred,None); rows_gt=cols_gt=None
+    page_entry = {
+        "index": i + 1,
+        "image_path": os.path.abspath(page_path),
+        "tables": [{"bbox": tbl_bbox, "html": html_pred, "dbg": dbg, "teds": teds}],
+    }
+    latencies_sorted=sorted(latencies)
+    p50 = latencies_sorted[len(latencies_sorted)//2]
+    p95 = latencies_sorted[max(0,int(len(latencies_sorted)*0.95)-1)]
+    lam = dbg.get("lambda",{})
+    k_pred = lam.get("k_pred", cols_pred) if lam else cols_pred
+    k_mode = lam.get("k_mode", cols_pred) if lam else cols_pred
+    col_over_under = abs(k_pred - max(1,k_mode))/max(1,k_mode)
+    meds = int(np.median(dbg.get("row_counts",[cols_pred])) if np is not None else cols_pred)
+    good_rows = sum(1 for rc in dbg.get("row_counts",[cols_pred]) if abs(rc - meds) <= 1)
+    row_outlier_rate = 1.0 - (good_rows/max(1,len(dbg.get("row_counts",[1]))))
+    metric_entry = {
+        "page": i+1,
+        "latency_p50_ms": p50, "latency_p95_ms": p95,
+        "rows_pred": rows_pred, "cols_pred": cols_pred,
+        "rows_gt": rows_gt, "cols_gt": cols_gt,
+        "teds": teds,
+        "col_jitter": dbg.get("col_jitter",0.0) if dbg else 0.0,
+        "col_over_under": col_over_under,
+        "row_outlier_rate": row_outlier_rate
+    }
+    return i, page_entry, metric_entry
+
+
 class Pipeline:
     def __init__(self, cfg: Dict[str,Any]):
         tcfg=cfg.get("table",{})
@@ -1264,58 +1330,61 @@ class Pipeline:
         ensure_dir(out_dir)
         results={"doc_id":doc_id,"pages":[]}
         per_page_metrics=[]
-        for i,page_path in enumerate(pages):
-            page_base=os.path.splitext(os.path.basename(page_path))[0]
-            im=Image.open(page_path).convert("RGB"); W,H=im.size
-            anno=None
-            if annotation_paths and i<len(annotation_paths) and annotation_paths[i]:
-                with open(annotation_paths[i],"r",encoding="utf-8") as f: anno=json.load(f)
-            tbl_bbox=[int(W*0.05), int(H*0.2), int(W*0.95), int(H*0.6)]
-            if anno and "tables" in anno and anno["tables"]:
-                tbl_bbox=anno["tables"][0]["bbox"]
-            latencies=[]; html_pred=None; dbg=None
-            for _ in range(max(1,self.bench_iterations)):
-                t0=time.perf_counter()
-                html_pred, dbg = reconstruct_table_html_cc(page_path, tbl_bbox, self.cc_params, want_dbg=True)
-                latencies.append((time.perf_counter()-t0)*1000.0)
-            # attach views (table region)
-            vpaths = _make_views(im.crop(tuple(tbl_bbox)), out_dir, f"{page_base}.table")
-            if dbg is None: dbg = {}
-            dbg["views"] = vpaths
-            rows_pred, cols_pred = _rows_cols_from_html(html_pred)
-            if anno and "tables" in anno and anno["tables"]:
-                html_gt=anno["tables"][0].get("html","")
-                teds=compute_teds(html_pred, html_gt)
-                rows_gt, cols_gt = _rows_cols_from_html(html_gt)
+
+        views_enabled = _env_truthy_local("ZOCR_CONSENSUS_VIEWS", True)
+        worker_count = max(1, _env_int_local("ZOCR_CONSENSUS_PAGE_WORKERS", 1))
+        executor = (os.environ.get("ZOCR_CONSENSUS_PAGE_EXECUTOR") or "thread").strip().lower()
+
+        if worker_count <= 1 or len(pages) <= 1:
+            for i,page_path in enumerate(pages):
+                anno_path = None
+                if annotation_paths and i<len(annotation_paths) and annotation_paths[i]:
+                    anno_path = annotation_paths[i]
+                _, page_entry, metric_entry = _pipeline_process_page_task(
+                    i,
+                    page_path,
+                    out_dir,
+                    anno_path,
+                    self.cc_params,
+                    self.bench_iterations,
+                    views_enabled,
+                )
+                results["pages"].append(page_entry)
+                per_page_metrics.append(metric_entry)
+        else:
+            tasks = []
+            for i, page_path in enumerate(pages):
+                anno_path = None
+                if annotation_paths and i < len(annotation_paths) and annotation_paths[i]:
+                    anno_path = annotation_paths[i]
+                tasks.append((i, page_path, anno_path))
+
+            if executor in {"process", "proc", "multiprocess"}:
+                pool_cls = concurrent.futures.ProcessPoolExecutor
             else:
-                html_gt=None; teds=compute_teds(html_pred,None); rows_gt=cols_gt=None
-            results["pages"].append({
-                "index": i + 1,
-                "image_path": os.path.abspath(page_path),
-                "tables": [{"bbox": tbl_bbox, "html": html_pred, "dbg": dbg, "teds": teds}],
-            })
-            latencies_sorted=sorted(latencies)
-            p50 = latencies_sorted[len(latencies_sorted)//2]
-            p95 = latencies_sorted[max(0,int(len(latencies_sorted)*0.95)-1)]
-            # derived unlabeled penalties
-            lam = dbg.get("lambda",{})
-            k_pred = lam.get("k_pred", cols_pred) if lam else cols_pred
-            k_mode = lam.get("k_mode", cols_pred) if lam else cols_pred
-            col_over_under = abs(k_pred - max(1,k_mode))/max(1,k_mode)
-            # row outlier rate: within ±1 of median
-            meds = int(np.median(dbg.get("row_counts",[cols_pred])) if np is not None else cols_pred)
-            good_rows = sum(1 for rc in dbg.get("row_counts",[cols_pred]) if abs(rc - meds) <= 1)
-            row_outlier_rate = 1.0 - (good_rows/max(1,len(dbg.get("row_counts",[1]))))
-            per_page_metrics.append({
-                "page": i+1,
-                "latency_p50_ms": p50, "latency_p95_ms": p95,
-                "rows_pred": rows_pred, "cols_pred": cols_pred,
-                "rows_gt": rows_gt, "cols_gt": cols_gt,
-                "teds": teds,
-                "col_jitter": dbg.get("col_jitter",0.0) if dbg else 0.0,
-                "col_over_under": col_over_under,
-                "row_outlier_rate": row_outlier_rate
-            })
+                pool_cls = concurrent.futures.ThreadPoolExecutor
+
+            finished = []
+            with pool_cls(max_workers=worker_count) as pool:
+                futures = [
+                    pool.submit(
+                        _pipeline_process_page_task,
+                        i,
+                        page_path,
+                        out_dir,
+                        anno_path,
+                        self.cc_params,
+                        self.bench_iterations,
+                        views_enabled,
+                    )
+                    for (i, page_path, anno_path) in tasks
+                ]
+                for fut in concurrent.futures.as_completed(futures):
+                    finished.append(fut.result())
+            finished.sort(key=lambda item: item[0])
+            for _, page_entry, metric_entry in finished:
+                results["pages"].append(page_entry)
+                per_page_metrics.append(metric_entry)
         agg={}
         if per_page_metrics:
             med = lambda k: float(np.median([m[k] for m in per_page_metrics])) if np is not None else per_page_metrics[0][k]

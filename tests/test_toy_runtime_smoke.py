@@ -57,6 +57,56 @@ def test_text_from_binary_cache_respects_allowed_chars() -> None:
     assert restricted_txt in "0123456789"
 
 
+def test_text_from_binary_merges_colon_fragments() -> None:
+    from zocr.consensus import toy_runtime
+
+    glyph = toy_runtime._GLYPH_ATLAS[":"][0]
+    arr = toy_runtime.np.asarray(glyph, dtype=toy_runtime.np.uint8)
+    bw = (arr > 32).astype(toy_runtime.np.uint8) * 255
+    txt, _ = toy_runtime._text_from_binary(bw, allowed_chars=":")
+    assert txt == ":"
+
+
+def test_restore_digit_commas_by_headers() -> None:
+    from zocr.consensus import toy_runtime
+
+    grid_text = [
+        ["1,1", "2,2"],
+        ["11", "22"],
+        ["1.1", "2.2"],
+    ]
+    grid_conf = [
+        [0.9, 0.9],
+        [0.9, 0.9],
+        [0.9, 0.9],
+    ]
+    notes = {}
+    changed = toy_runtime._restore_digit_commas_by_headers(
+        grid_text[0],
+        grid_text,
+        grid_conf=grid_conf,
+        col_charset_hints=["0123456789,", "0123456789,"],
+        fallback_notes=notes,
+    )
+    assert changed == 4
+    assert grid_text[1] == ["1,1", "2,2"]
+    assert grid_text[2] == ["1,1", "2,2"]
+    assert notes[(1, 0)] == "comma_restore"
+    assert grid_conf[1][0] < 0.9
+
+
+def test_numeric_header_kinds_skips_coordinate_headers() -> None:
+    from zocr.consensus import toy_runtime
+
+    grid_text = [
+        ["1,1"],
+        ["11"],
+        ["22"],
+    ]
+    kinds = toy_runtime._numeric_header_kinds(grid_text[0], grid_text)
+    assert kinds and kinds[0] is None
+
+
 def test_template_library_contains_ascii_presets() -> None:
     from zocr.consensus import toy_runtime
 
