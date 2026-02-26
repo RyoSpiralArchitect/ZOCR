@@ -11,9 +11,12 @@ The format is based on *Keep a Changelog*, and this project aims to follow *Sema
 - `python -m zocr validate` CLI to validate manifests + core artifacts.
 - Persistent job API endpoints (`/v1/jobs`) with storage rooted at `ZOCR_API_STORAGE_DIR`.
 - `python -m zocr bench` lightweight benchmark harness.
+- Docker CI job to build the image and run a minimal smoke check.
+- `.env.example`, `compose.prod.yaml`, and `docs/DEPLOYMENT.md` for internal deployments.
 
 ### Changed
 - Orchestrator now writes `zocr.manifest.json` and records `manifest_json` in `pipeline_summary.json`.
+- Reference API now supports job retention/resume settings (`ZOCR_API_JOBS_*`) and uses FastAPI lifespan events.
 
 ## [0.1.0] - 2026-02-25
 

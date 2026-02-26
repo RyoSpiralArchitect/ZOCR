@@ -68,8 +68,12 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 docker build -t zocr-suite --build-arg ZOCR_EXTRAS="api" .
 
 # Or bring up the reference API with Docker Compose
+cp .env.example .env  # optional
 export ZOCR_API_KEY="change-me"   # optional (enable auth)
 docker compose up --build
+
+# Slightly hardened (read-only rootfs, no-new-privileges, log rotation)
+docker compose -f compose.yaml -f compose.prod.yaml up -d --build
 
 # Run the CLI against the current folder (mount as /work)
 docker run --rm -v "$PWD:/work" -w /work zocr-suite \
@@ -99,6 +103,8 @@ export ZOCR_API_MAX_UPLOAD_MB=50            # upload limit
 export ZOCR_API_CONCURRENCY=1               # worker slots
 export ZOCR_API_RUN_TIMEOUT_SEC=900         # 0 disables
 export ZOCR_API_STORAGE_DIR=/data           # job persistence root (Docker: mount a volume)
+export ZOCR_API_JOBS_TTL_HOURS=168          # terminal job retention
+export ZOCR_API_JOBS_MAX_COUNT=200          # keep latest N terminal jobs
 
 curl -H "X-API-Key: $ZOCR_API_KEY" -F "file=@your.pdf" \
   "http://127.0.0.1:8000/v1/run?domain=invoice"
