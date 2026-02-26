@@ -63,8 +63,25 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 
 
 def _zip_dir(src_dir: str, dest_zip: str) -> None:
+    compression_raw = (os.environ.get("ZOCR_API_ZIP_COMPRESSION") or "deflated").strip().lower()
+    if compression_raw in {"store", "stored", "none", "0"}:
+        compression = zipfile.ZIP_STORED
+    else:
+        compression = zipfile.ZIP_DEFLATED
+
+    compresslevel = None
+    raw_level = os.environ.get("ZOCR_API_ZIP_COMPRESSLEVEL")
+    if raw_level is not None and raw_level.strip():
+        try:
+            compresslevel = max(0, min(9, int(raw_level)))
+        except ValueError:
+            compresslevel = None
+
     src_path = Path(src_dir)
-    with zipfile.ZipFile(dest_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    zip_kwargs = {}
+    if compression == zipfile.ZIP_DEFLATED and compresslevel is not None:
+        zip_kwargs["compresslevel"] = compresslevel
+    with zipfile.ZipFile(dest_zip, "w", compression=compression, **zip_kwargs) as zf:
         for path in src_path.rglob("*"):
             if path.is_dir():
                 continue

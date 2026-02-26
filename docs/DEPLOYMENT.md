@@ -42,6 +42,11 @@ Tune via `.env`:
 - Prometheus-style metrics are exposed at `/metrics` when `ZOCR_API_METRICS_ENABLED=1`.
   - If `ZOCR_API_KEY` is set, `/metrics` also requires the same API key header.
 
+## Performance knobs / 性能パラメータ
+- `ZOCR_API_CONCURRENCY`: parallel pipeline slots inside one process.
+- `ZOCR_API_ZIP_COMPRESSION=stored` can make `artifacts.zip` downloads faster to generate
+  (at the cost of larger files); keep `deflated` for smaller bundles.
+
 ## Security notes / セキュリティ注意
 - Set `ZOCR_API_KEY` and place the service behind your internal reverse proxy / network controls.
 - Treat the reference API as an internal wrapper; production hardening (rate limit, mTLS, audit logging) should be added per environment.

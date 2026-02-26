@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import os
 import pickle
@@ -24,6 +25,93 @@ from .numba_support import HAS_NUMBA
 from .tokenization import tokenize_jp
 
 __all__ = ["query", "hybrid_query"]
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+_INDEX_CACHE_SIZE = max(0, _env_int("ZOCR_INDEX_CACHE_SIZE", 4))
+_JSONL_CACHE_SIZE = max(0, _env_int("ZOCR_JSONL_CACHE_SIZE", 2))
+_JSONL_CACHE_MAX_BYTES = max(0, _env_int("ZOCR_JSONL_CACHE_MAX_BYTES", 50 * 1024 * 1024))
+_CACHE_ENABLED = _env_truthy("ZOCR_QUERY_CACHE", True)
+
+
+def _file_sig(path: str) -> tuple[int, int]:
+    st = os.stat(path)
+    return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size)
+
+
+@functools.lru_cache(maxsize=_INDEX_CACHE_SIZE)
+def _load_index_cached(path: str, mtime_ns: int, size: int) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        loaded = pickle.load(f)
+    if not isinstance(loaded, dict):
+        raise RuntimeError("Index payload invalid")
+    ix = dict(loaded)
+    try:
+        ix["df"] = np.asarray(ix.get("df"), dtype=np.int32)
+    except Exception:
+        pass
+    return ix
+
+
+def _load_index(path: str) -> Dict[str, Any]:
+    if not _CACHE_ENABLED or _INDEX_CACHE_SIZE <= 0:
+        with open(path, "rb") as f:
+            loaded = pickle.load(f)
+        if not isinstance(loaded, dict):
+            raise RuntimeError("Index payload invalid")
+        ix = dict(loaded)
+        try:
+            ix["df"] = np.asarray(ix.get("df"), dtype=np.int32)
+        except Exception:
+            pass
+        return ix
+    mtime_ns, size = _file_sig(path)
+    return _load_index_cached(path, mtime_ns, size)
+
+
+@functools.lru_cache(maxsize=_JSONL_CACHE_SIZE)
+def _load_jsonl_cached(path: str, mtime_ns: int, size: int) -> List[Dict[str, Any]]:
+    return _read_jsonl(path)
+
+
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    raws: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as fr:
+        for line in fr:
+            line = line.strip()
+            if not line:
+                continue
+            ob = json.loads(line)
+            if isinstance(ob, dict):
+                raws.append(ob)
+    return raws
+
+
+def _load_jsonl(path: str) -> List[Dict[str, Any]]:
+    if not _CACHE_ENABLED or _JSONL_CACHE_SIZE <= 0:
+        return _read_jsonl(path)
+    mtime_ns, size = _file_sig(path)
+    if _JSONL_CACHE_MAX_BYTES and size > _JSONL_CACHE_MAX_BYTES:
+        return _read_jsonl(path)
+    return _load_jsonl_cached(path, mtime_ns, size)
 
 
 def _phash_sim(q_img_path: Optional[str], ph: int) -> float:
@@ -352,16 +440,12 @@ def query(
     w_sym: float = 0.45,
     domain: str = "invoice",
 ):
-    with open(index_pkl, "rb") as f:
-        ix = pickle.load(f)
+    ix = _load_index(index_pkl)
     vocab = ix["vocab"]
-    df = np.array(ix["df"], dtype=np.int32)
+    df = np.asarray(ix["df"], dtype=np.int32)
     N = int(ix["N"])
     avgdl = float(ix["avgdl"])
-    raws: List[Dict[str, Any]] = []
-    with open(jsonl, "r", encoding="utf-8") as fr:
-        for line in fr:
-            raws.append(json.loads(line))
+    raws = _load_jsonl(jsonl)
     q_ids: List[int] = []
     toks = tokenize_jp(q_text or "")
     for t in toks:
@@ -446,17 +530,13 @@ def hybrid_query(
     neighbor_seeds = list(neighbor_seeds or [])
     filters = filters or {}
 
-    with open(index_pkl, "rb") as f:
-        ix = pickle.load(f)
+    ix = _load_index(index_pkl)
     vocab = ix["vocab"]
-    df = np.array(ix["df"], dtype=np.int32)
+    df = np.asarray(ix["df"], dtype=np.int32)
     N = int(ix["N"])
     avgdl = float(ix["avgdl"])
 
-    raws: List[Dict[str, Any]] = []
-    with open(jsonl, "r", encoding="utf-8") as fr:
-        for line in fr:
-            raws.append(json.loads(line))
+    raws = _load_jsonl(jsonl)
 
     q_ids: List[int] = []
     toks = tokenize_jp(q_text or "")
