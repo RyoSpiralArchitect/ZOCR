@@ -8,8 +8,12 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-import pytesseract
 from PIL import Image
+
+try:  # pragma: no cover - optional dependency
+    import pytesseract  # type: ignore
+except Exception:  # pragma: no cover - optional dependency missing
+    pytesseract = None  # type: ignore
 
 from .interfaces import Aggregator, RegionClassifier, Segmenter, TableExtractor, VLLM
 from .models import (
@@ -431,6 +435,14 @@ class SimpleTableExtractor(TableExtractor):
         self.confidence = confidence
 
     def extract(self, region: ClassifiedRegion) -> TableExtractionResult:
+        if pytesseract is None:
+            table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
+            return TableExtractionResult(
+                region_id=region.region_id,
+                table_data=table_data,
+                confidence=0.0,
+                format="missing_pytesseract",
+            )
         if not isinstance(region.image_crop, Image.Image):
             table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
             return TableExtractionResult(

@@ -65,7 +65,16 @@ python -m zocr run --outdir out_invoice --resume --seed 12345
 ## Docker
 ```bash
 # Build (comma-separated extras via build-arg)
-docker build -t zocr-suite --build-arg ZOCR_EXTRAS="api" .
+docker build -t zocr-suite \
+  --build-arg ZOCR_EXTRAS="api" \
+  --build-arg ZOCR_APT_PACKAGES="poppler-utils" \
+  .
+
+# Example (enable Tesseract OCR in the image)
+# docker build -t zocr-suite \
+#   --build-arg ZOCR_EXTRAS="api,ocr_tess" \
+#   --build-arg ZOCR_APT_PACKAGES="poppler-utils tesseract-ocr tesseract-ocr-eng" \
+#   .
 
 # Or bring up the reference API with Docker Compose
 cp .env.example .env  # optional

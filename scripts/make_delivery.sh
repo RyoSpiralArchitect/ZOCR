@@ -61,6 +61,8 @@ SKIP_DOCKER="${ZOCR_DELIVERY_SKIP_DOCKER:-0}"
 if [ "$SKIP_DOCKER" != "1" ]; then
   echo "[5/7] Build Docker image (api)"
   IMAGE_TAG="${ZOCR_API_IMAGE_TAG:-zocr-suite:${VERSION}}"
+  DOCKER_EXTRAS="$(echo "${ZOCR_DELIVERY_DOCKER_EXTRAS:-api}" | tr -d '[:space:]')"
+  DOCKER_APT_PACKAGES="${ZOCR_DELIVERY_DOCKER_APT_PACKAGES:-poppler-utils}"
   if ! docker info >/dev/null 2>&1; then
     cat <<EOF >&2
 [ERROR] Docker daemon is not available.
@@ -69,7 +71,10 @@ if [ "$SKIP_DOCKER" != "1" ]; then
 EOF
     exit 3
   fi
-  docker build -t "$IMAGE_TAG" --build-arg ZOCR_EXTRAS="api" .
+  docker build -t "$IMAGE_TAG" \
+    --build-arg ZOCR_EXTRAS="$DOCKER_EXTRAS" \
+    --build-arg ZOCR_APT_PACKAGES="$DOCKER_APT_PACKAGES" \
+    .
 
   echo "[6/7] Save Docker image"
   docker save "$IMAGE_TAG" -o "$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar"

@@ -20,6 +20,13 @@ If Docker is unavailable on the build machine, you can still produce a Python-on
 ZOCR_DELIVERY_SKIP_DOCKER=1 bash scripts/make_delivery.sh
 ```
 
+Optional (customize the Docker image build):
+```bash
+ZOCR_DELIVERY_DOCKER_EXTRAS=api,ocr_tess \
+ZOCR_DELIVERY_DOCKER_APT_PACKAGES="poppler-utils tesseract-ocr tesseract-ocr-eng" \
+  bash scripts/make_delivery.sh
+```
+
 Optional (recommended for commercial deliveries):
 ```bash
 # Include SBOM + third-party notices under <bundle>/compliance/

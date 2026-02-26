@@ -11,8 +11,15 @@ import base64
 import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import fitz  # PyMuPDF
-import pandas as pd
+try:  # pragma: no cover - optional dependency
+    import fitz  # type: ignore
+except Exception:  # pragma: no cover - optional dependency missing
+    fitz = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency (parquet export)
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover - optional dependency missing
+    pd = None  # type: ignore
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTFigure, LTLine, LTRect
 
@@ -43,6 +50,21 @@ class PageGraph:
 
 
 CaptionPrefixes = ("figure", "fig.", "table", "diagram")
+
+
+def _require_pymupdf() -> Any:
+    if fitz is None:  # pragma: no cover
+        raise RuntimeError(
+            "PyMuPDF is not installed (module 'fitz' missing). "
+            "Install it to enable PDF multimodal ingestion."
+        )
+    return fitz
+
+
+def _require_pandas() -> Any:
+    if pd is None:  # pragma: no cover
+        raise RuntimeError("pandas is not installed. Install it to enable Parquet export.")
+    return pd
 
 
 def _rect_to_bbox(rect: Sequence[float]) -> BBox:
@@ -82,8 +104,9 @@ def _horizontal_overlap(a: BBox, b: BBox) -> float:
 
 
 def _encode_thumbnail(page: fitz.Page, bbox: BBox, scale: float = 1.0) -> str:
-    clip = fitz.Rect(bbox)
-    pix = page.get_pixmap(clip=clip, matrix=fitz.Matrix(scale, scale))
+    fitz_mod = _require_pymupdf()
+    clip = fitz_mod.Rect(bbox)
+    pix = page.get_pixmap(clip=clip, matrix=fitz_mod.Matrix(scale, scale))
     return base64.b64encode(pix.tobytes("png")).decode("ascii")
 
 
@@ -201,7 +224,8 @@ def _attach_references(page_objects: List[PageObject]) -> None:
 def extract_pdf_multimodal(pdf_path: str, thumbnail_scale: float = 0.5) -> PageGraph:
     """Extract text, tables, figures, and diagrams from a PDF into a page graph."""
 
-    doc = fitz.open(pdf_path)
+    fitz_mod = _require_pymupdf()
+    doc = fitz_mod.open(pdf_path)
     shape_boxes = _collect_pdfminer_shapes(pdf_path)
     pages: List[Dict[str, Any]] = []
 
@@ -306,6 +330,7 @@ def save_page_graph_json(graph: PageGraph, path: str) -> None:
 
 
 def save_page_graph_parquet(graph: PageGraph, path: str) -> None:
+    pandas = _require_pandas()
     records: List[Dict[str, Any]] = []
     for page in graph.pages:
         for obj in page["objects"]:
@@ -322,7 +347,7 @@ def save_page_graph_parquet(graph: PageGraph, path: str) -> None:
                 "references": obj.references,
             }
             records.append(record)
-    df = pd.DataFrame.from_records(records)
+    df = pandas.DataFrame.from_records(records)
     df.to_parquet(path, index=False)
 
 

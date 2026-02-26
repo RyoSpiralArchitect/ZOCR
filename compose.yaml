@@ -4,7 +4,8 @@ services:
     build:
       context: .
       args:
-        ZOCR_EXTRAS: "api"
+        ZOCR_EXTRAS: ${ZOCR_EXTRAS:-api}
+        ZOCR_APT_PACKAGES: ${ZOCR_APT_PACKAGES:-poppler-utils}
     command: ["zocr-api", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       ZOCR_API_KEY: ${ZOCR_API_KEY:-}

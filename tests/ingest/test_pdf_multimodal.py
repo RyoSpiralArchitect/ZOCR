@@ -5,6 +5,9 @@ import pytest
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
+pytest.importorskip("fitz")
+pytest.importorskip("pandas")
+
 from zocr.ingest.pdf_multimodal import (
     chunk_page_graph,
     extract_pdf_multimodal,

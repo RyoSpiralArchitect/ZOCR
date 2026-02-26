@@ -6,7 +6,7 @@ Thanks for your interest in improving Z-OCR.
 
 - Python: 3.10+
 - Install (editable):
-  - `python3 -m pip install -e .[dev]`
+  - `python3 -m pip install -e ".[dev,api]"`
 - Run tests:
   - `python3 -m pytest`
 

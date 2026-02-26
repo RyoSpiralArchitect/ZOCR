@@ -12,8 +12,12 @@ import os
 from statistics import mean
 from typing import List
 
-import pytesseract
-from pytesseract import Output
+try:  # pragma: no cover - optional dependency
+    import pytesseract  # type: ignore
+    from pytesseract import Output  # type: ignore
+except Exception:  # pragma: no cover - optional dependency missing
+    pytesseract = None  # type: ignore
+    Output = None  # type: ignore
 
 from .interfaces import TextOCR
 from .models import BoundingBox, ClassifiedRegion, RegionType, TextOcrResult, WordInfo
@@ -40,6 +44,11 @@ class TesseractTextOCR(TextOCR):
     """
 
     def __init__(self, lang: str = "eng", oem: int = 3, psm: int = 6, extra_config: str = "") -> None:
+        if pytesseract is None or Output is None:  # pragma: no cover
+            raise RuntimeError(
+                "pytesseract is not installed. Install with `pip install -e '.[ocr_tess]'` "
+                "(or `pip install 'zocr-suite[ocr_tess]'`)."
+            )
         if not _pytesseract_allowed():
             raise RuntimeError(
                 "pytesseract is disabled by ZOCR_ALLOW_PYTESSERACT; set it to 1/true to enable"
@@ -91,4 +100,3 @@ class TesseractTextOCR(TextOCR):
             engine="tesseract",
             words=words if words else None,
         )
-

@@ -1,5 +1,7 @@
 import pytest
 
+pytest.importorskip("pytesseract")
+
 from zocr.ocr_pipeline import BoundingBox, ClassifiedRegion, RegionType, TesseractTextOCR
 
 
@@ -63,4 +65,3 @@ def test_tesseract_text_ocr_respects_env_toggle(monkeypatch):
 
     with pytest.raises(RuntimeError):
         TesseractTextOCR()
-
