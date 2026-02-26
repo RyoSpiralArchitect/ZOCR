@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .._version import __version__
+from ..utils.json_utils import json_ready
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
@@ -187,7 +188,7 @@ def create_app():
                 toy_lite=bool(toy_lite),
             )
 
-            return {"summary": summary}
+            return {"summary": json_ready(summary)}
 
     @app.post("/v1/run.zip", dependencies=[Depends(_require_api_key)])
     async def run_pipeline_zip(
