@@ -20,8 +20,13 @@ from .base import (
     _second_diff_tridiag,
 )
 from .domains import DOMAIN_ALIAS, DOMAIN_DEFAULTS, DOMAIN_MONITOR_QUERIES
-from .indexer import build_index, _bm25_numba_score, _bm25_py_score
-from .numba_support import HAS_NUMBA
+from .indexer import (
+    build_index,
+    _bm25_numba_scores_all,
+    _bm25_numba_scores_all_parallel,
+    _bm25_py_scores_all,
+)
+from .numba_support import HAS_NUMBA, HAS_NUMBA_PARALLEL
 from .query_engine import query, _kw_meta_boost, _symbolic_match_score
 from .tokenization import tokenize_jp
 
@@ -143,11 +148,76 @@ def _evaluate_gate(
 def _preload_index_and_raws(index_pkl: str, jsonl: str):
     with open(index_pkl, "rb") as f:
         ix = pickle.load(f)
+    if isinstance(ix, dict):
+        try:
+            ix["df"] = np.asarray(ix.get("df"), dtype=np.int32)
+        except Exception:
+            pass
+        try:
+            _ensure_bm25_arrays(ix)
+        except Exception:
+            pass
     raws: List[Dict[str, Any]] = []
     with open(jsonl, "r", encoding="utf-8") as fr:
         for line in fr:
             raws.append(json.loads(line))
     return ix, raws
+
+
+def _ensure_bm25_arrays(ix: Dict[str, Any]) -> Tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+    lengths = ix.get("lengths")
+    offsets = ix.get("doc_offsets")
+    flat = ix.get("docs_tokens_flat")
+
+    offsets_arr = None
+    flat_arr = None
+    if offsets is not None and flat is not None:
+        try:
+            offsets_arr = np.asarray(offsets, dtype=np.int64)
+            flat_arr = np.asarray(flat, dtype=np.int32)
+        except Exception:
+            offsets_arr = None
+            flat_arr = None
+
+    lengths_arr = None
+    if lengths is not None:
+        try:
+            lengths_arr = np.asarray(lengths, dtype=np.int32)
+        except Exception:
+            lengths_arr = None
+
+    if offsets_arr is None or flat_arr is None:
+        docs_tokens = ix.get("docs_tokens")
+        if not isinstance(docs_tokens, list):
+            raise RuntimeError("Index missing doc tokens payload")
+        if lengths_arr is None or len(lengths_arr) != len(docs_tokens):
+            lengths_arr = np.array([len(doc) for doc in docs_tokens], dtype=np.int32)
+        offsets_arr = np.zeros(len(docs_tokens) + 1, dtype=np.int64)
+        if len(docs_tokens):
+            offsets_arr[1:] = np.cumsum(lengths_arr, dtype=np.int64)
+        flat_arr = np.empty(int(offsets_arr[-1]), dtype=np.int32)
+        if flat_arr.size:
+            for i, doc in enumerate(docs_tokens):
+                if not doc:
+                    continue
+                start = int(offsets_arr[i])
+                flat_arr[start : start + len(doc)] = np.asarray(doc, dtype=np.int32)
+        ix["doc_offsets"] = offsets_arr
+        ix["docs_tokens_flat"] = flat_arr
+        ix["lengths"] = lengths_arr
+        try:
+            del ix["docs_tokens"]
+        except KeyError:
+            pass
+        return lengths_arr, offsets_arr, flat_arr
+
+    if lengths_arr is None:
+        lengths_arr = np.diff(offsets_arr).astype(np.int32)
+        ix["lengths"] = lengths_arr
+
+    ix["doc_offsets"] = offsets_arr
+    ix["docs_tokens_flat"] = flat_arr
+    return lengths_arr, offsets_arr, flat_arr
 
 
 def _query_scores_preloaded(
@@ -160,24 +230,37 @@ def _query_scores_preloaded(
     w_sym: float,
 ) -> float:
     vocab = ix["vocab"]
-    df = np.array(ix["df"], dtype=np.int32)
+    df = np.asarray(ix["df"], dtype=np.int32)
     N = int(ix["N"])
     avgdl = float(ix["avgdl"])
+    lengths, doc_offsets, docs_tokens_flat = _ensure_bm25_arrays(ix)
     tokens = tokenize_jp(q_text or "")
     q_ids = [vocab[t] for t in tokens if t in vocab]
     if not q_ids:
         q_ids = [-1]
     q_ids = np.array(q_ids, dtype=np.int32)
-    best = -1e9
-    for i, doc_ids in enumerate(ix["docs_tokens"]):
-        di = np.array(doc_ids + [-1], dtype=np.int32)
-        dl = len(doc_ids)
-        sb = (
-            _bm25_numba_score(N, avgdl, df, dl, q_ids, di)
-            if HAS_NUMBA
-            else _bm25_py_score(N, avgdl, df, dl, q_ids, di)
+
+    if HAS_NUMBA:
+        if (
+            HAS_NUMBA_PARALLEL
+            and _bm25_numba_scores_all_parallel is not None
+            and len(lengths) >= 256
+        ):
+            bm25_scores = _bm25_numba_scores_all_parallel(
+                N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_ids
+            )
+        else:
+            bm25_scores = _bm25_numba_scores_all(
+                N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_ids
+            )
+    else:
+        bm25_scores = _bm25_py_scores_all(
+            N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_ids
         )
-        ob = raws[i]
+
+    best = -1e9
+    for i, ob in enumerate(raws):
+        sb = float(bm25_scores[i]) if i < len(bm25_scores) else 0.0
         sk = _kw_meta_boost(ob, tokens, domain or "invoice")
         filters = ((ob.get("meta") or {}).get("filters") or {})
         sym = _symbolic_match_score(filters, q_text or "", tokens)

@@ -20,8 +20,12 @@ except Exception:  # pragma: no cover - fallback stub
 
 from .base import hamm64, phash64, _normalize_text
 from .domains import DOMAIN_KW
-from .indexer import _bm25_numba_score, _bm25_py_score
-from .numba_support import HAS_NUMBA
+from .indexer import (
+    _bm25_numba_scores_all,
+    _bm25_numba_scores_all_parallel,
+    _bm25_py_scores_all,
+)
+from .numba_support import HAS_NUMBA, HAS_NUMBA_PARALLEL
 from .tokenization import tokenize_jp
 
 __all__ = ["query", "hybrid_query"]
@@ -57,34 +61,112 @@ def _file_sig(path: str) -> tuple[int, int]:
     return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size)
 
 
-@functools.lru_cache(maxsize=_INDEX_CACHE_SIZE)
-def _load_index_cached(path: str, mtime_ns: int, size: int) -> Dict[str, Any]:
-    with open(path, "rb") as f:
-        loaded = pickle.load(f)
+def _normalize_index_payload(loaded: Any) -> Dict[str, Any]:
     if not isinstance(loaded, dict):
         raise RuntimeError("Index payload invalid")
     ix = dict(loaded)
+
     try:
         ix["df"] = np.asarray(ix.get("df"), dtype=np.int32)
     except Exception:
         pass
+
+    docs_tokens_flat = ix.get("docs_tokens_flat")
+    doc_offsets = ix.get("doc_offsets")
+    lengths = ix.get("lengths")
+
+    lengths_arr = None
+    if lengths is not None:
+        try:
+            lengths_arr = np.asarray(lengths, dtype=np.int32)
+        except Exception:
+            lengths_arr = None
+
+    offsets_arr = None
+    if doc_offsets is not None:
+        try:
+            offsets_arr = np.asarray(doc_offsets, dtype=np.int64)
+        except Exception:
+            offsets_arr = None
+
+    flat_arr = None
+    if docs_tokens_flat is not None:
+        try:
+            flat_arr = np.asarray(docs_tokens_flat, dtype=np.int32)
+        except Exception:
+            flat_arr = None
+
+    if (offsets_arr is None or flat_arr is None) and isinstance(ix.get("docs_tokens"), list):
+        docs_tokens = ix["docs_tokens"]
+        if lengths_arr is None or len(lengths_arr) != len(docs_tokens):
+            lengths_arr = np.array([len(doc) for doc in docs_tokens], dtype=np.int32)
+        offsets_arr = np.zeros(len(docs_tokens) + 1, dtype=np.int64)
+        if len(docs_tokens):
+            offsets_arr[1:] = np.cumsum(lengths_arr, dtype=np.int64)
+        flat_arr = np.empty(int(offsets_arr[-1]), dtype=np.int32)
+        if flat_arr.size:
+            for i, doc in enumerate(docs_tokens):
+                if not doc:
+                    continue
+                start = int(offsets_arr[i])
+                flat_arr[start : start + len(doc)] = np.asarray(doc, dtype=np.int32)
+        ix["doc_offsets"] = offsets_arr
+        ix["docs_tokens_flat"] = flat_arr
+        ix["lengths"] = lengths_arr
+        try:
+            del ix["docs_tokens"]
+        except KeyError:
+            pass
+        return ix
+
+    if offsets_arr is not None:
+        ix["doc_offsets"] = offsets_arr
+    if flat_arr is not None:
+        ix["docs_tokens_flat"] = flat_arr
+    if lengths_arr is not None:
+        ix["lengths"] = lengths_arr
+    elif offsets_arr is not None:
+        ix["lengths"] = np.diff(offsets_arr).astype(np.int32)
+
     return ix
+
+
+@functools.lru_cache(maxsize=_INDEX_CACHE_SIZE)
+def _load_index_cached(path: str, mtime_ns: int, size: int) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        loaded = pickle.load(f)
+    return _normalize_index_payload(loaded)
 
 
 def _load_index(path: str) -> Dict[str, Any]:
     if not _CACHE_ENABLED or _INDEX_CACHE_SIZE <= 0:
         with open(path, "rb") as f:
             loaded = pickle.load(f)
-        if not isinstance(loaded, dict):
-            raise RuntimeError("Index payload invalid")
-        ix = dict(loaded)
-        try:
-            ix["df"] = np.asarray(ix.get("df"), dtype=np.int32)
-        except Exception:
-            pass
-        return ix
+        return _normalize_index_payload(loaded)
     mtime_ns, size = _file_sig(path)
     return _load_index_cached(path, mtime_ns, size)
+
+
+def _bm25_scores(
+    N: int,
+    avgdl: float,
+    df: "np.ndarray",
+    lengths: "np.ndarray",
+    doc_offsets: "np.ndarray",
+    docs_tokens_flat: "np.ndarray",
+    q_ids: "np.ndarray",
+) -> "np.ndarray":
+    if HAS_NUMBA:
+        if (
+            HAS_NUMBA_PARALLEL
+            and _bm25_numba_scores_all_parallel is not None
+            and len(lengths) >= 256
+        ):
+            return _bm25_numba_scores_all_parallel(
+                N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_ids
+            )
+        return _bm25_numba_scores_all(N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_ids)
+    return _bm25_py_scores_all(N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_ids)
 
 
 @functools.lru_cache(maxsize=_JSONL_CACHE_SIZE)
@@ -445,6 +527,9 @@ def query(
     df = np.asarray(ix["df"], dtype=np.int32)
     N = int(ix["N"])
     avgdl = float(ix["avgdl"])
+    lengths = np.asarray(ix.get("lengths", []), dtype=np.int32)
+    doc_offsets = np.asarray(ix.get("doc_offsets", []), dtype=np.int64)
+    docs_tokens_flat = np.asarray(ix.get("docs_tokens_flat", []), dtype=np.int32)
     raws = _load_jsonl(jsonl)
     q_ids: List[int] = []
     toks = tokenize_jp(q_text or "")
@@ -452,16 +537,12 @@ def query(
         if t in vocab:
             q_ids.append(vocab[t])
     q_arr = np.array(q_ids, dtype=np.int32) if q_ids else np.array([-1], dtype=np.int32)
+
+    bm25_scores = _bm25_scores(N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_arr)
+
     results: List[Tuple[float, Dict[str, Any], int]] = []
-    for i, doc_ids in enumerate(ix["docs_tokens"]):
-        di = np.array(doc_ids + [-1], dtype=np.int32)
-        dl = len(doc_ids)
-        sb = (
-            _bm25_numba_score(N, avgdl, df, dl, q_arr, di)
-            if HAS_NUMBA
-            else _bm25_py_score(N, avgdl, df, dl, q_arr, di)
-        )
-        ob = raws[i]
+    for i, ob in enumerate(raws):
+        sb = float(bm25_scores[i]) if i < len(bm25_scores) else 0.0
         sk = _kw_meta_boost(ob, toks, domain)
         si = _phash_sim(q_image, (ob.get("meta") or {}).get("phash64") or 0)
         filters = ((ob.get("meta") or {}).get("filters") or {})
@@ -545,17 +626,14 @@ def hybrid_query(
             q_ids.append(vocab[t])
     q_arr = np.array(q_ids, dtype=np.int32) if q_ids else np.array([-1], dtype=np.int32)
 
-    results: List[Tuple[float, Dict[str, Any], int]] = []
-    for i, doc_ids in enumerate(ix["docs_tokens"]):
-        di = np.array(doc_ids + [-1], dtype=np.int32)
-        dl = len(doc_ids)
-        bm25 = (
-            _bm25_numba_score(N, avgdl, df, dl, q_arr, di)
-            if HAS_NUMBA
-            else _bm25_py_score(N, avgdl, df, dl, q_arr, di)
-        )
+    lengths = np.asarray(ix.get("lengths", []), dtype=np.int32)
+    doc_offsets = np.asarray(ix.get("doc_offsets", []), dtype=np.int64)
+    docs_tokens_flat = np.asarray(ix.get("docs_tokens_flat", []), dtype=np.int32)
+    bm25_scores = _bm25_scores(N, avgdl, df, lengths, doc_offsets, docs_tokens_flat, q_arr)
 
-        ob = raws[i]
+    results: List[Tuple[float, Dict[str, Any], int]] = []
+    for i, ob in enumerate(raws):
+        bm25 = float(bm25_scores[i]) if i < len(bm25_scores) else 0.0
         meta = dict(ob.get("meta") or {})
         struct = dict(ob.get("struct") or meta.get("struct") or {})
         zone = ob.get("zone") or meta.get("zone") or ""
