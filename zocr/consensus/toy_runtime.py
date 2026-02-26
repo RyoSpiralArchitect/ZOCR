@@ -2759,10 +2759,19 @@ def _self_augment_views(arr: "np.ndarray", best_bw: Optional["np.ndarray"]) -> L
             norm_sizes = sorted({s for s in filter_sizes if 1 <= s <= max_filter})
             if not norm_sizes:
                 norm_sizes = [3, 5]
+            include_morph = cfg.get("augment_close_open", True) if isinstance(cfg, dict) else True
+            include_median = bool(cfg.get("augment_median_bw")) if isinstance(cfg, dict) else False
             for size in norm_sizes:
                 try:
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MaxFilter(size)), dtype=np.uint8), {"type": "augment_max", "size": size}))
                     variants.append((np.asarray(bw_img.filter(ImageFilter.MinFilter(size)), dtype=np.uint8), {"type": "augment_min", "size": size}))
+                    if include_morph:
+                        close_img = bw_img.filter(ImageFilter.MaxFilter(size)).filter(ImageFilter.MinFilter(size))
+                        variants.append((np.asarray(close_img, dtype=np.uint8), {"type": "augment_close", "size": size}))
+                        open_img = bw_img.filter(ImageFilter.MinFilter(size)).filter(ImageFilter.MaxFilter(size))
+                        variants.append((np.asarray(open_img, dtype=np.uint8), {"type": "augment_open", "size": size}))
+                    if include_median and size == 3:
+                        variants.append((np.asarray(bw_img.filter(ImageFilter.MedianFilter(size)), dtype=np.uint8), {"type": "augment_median_bw", "size": size}))
                 except Exception:
                     continue
             if cfg and cfg.get("augment_invert"):

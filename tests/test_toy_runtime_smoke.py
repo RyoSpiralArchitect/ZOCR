@@ -67,6 +67,40 @@ def test_text_from_binary_merges_colon_fragments() -> None:
     assert txt == ":"
 
 
+def test_self_augment_views_closing_merges_components() -> None:
+    from zocr.consensus import toy_runtime
+
+    bw = toy_runtime.np.zeros((10, 10), dtype=toy_runtime.np.uint8)
+    bw[2:5, 1:3] = 255
+    bw[2:5, 4:6] = 255
+    assert len(toy_runtime._cc_label_rle(bw)) == 2
+
+    close_bw = None
+    for aug, meta in toy_runtime._self_augment_views(None, bw):
+        if meta.get("type") == "augment_close" and meta.get("size") == 3:
+            close_bw = aug
+            break
+    assert close_bw is not None
+    assert len(toy_runtime._cc_label_rle(close_bw)) == 1
+
+
+def test_self_augment_views_opening_removes_speckle() -> None:
+    from zocr.consensus import toy_runtime
+
+    bw = toy_runtime.np.zeros((10, 10), dtype=toy_runtime.np.uint8)
+    bw[2:6, 2:6] = 255
+    bw[1, 1] = 255
+    assert len(toy_runtime._cc_label_rle(bw)) == 2
+
+    open_bw = None
+    for aug, meta in toy_runtime._self_augment_views(None, bw):
+        if meta.get("type") == "augment_open" and meta.get("size") == 3:
+            open_bw = aug
+            break
+    assert open_bw is not None
+    assert len(toy_runtime._cc_label_rle(open_bw)) == 1
+
+
 def test_restore_digit_commas_by_headers() -> None:
     from zocr.consensus import toy_runtime
 

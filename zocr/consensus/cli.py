@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import os
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -35,6 +38,7 @@ __all__ = [
     "cli_index",
     "cli_stats",
     "cli_query",
+    "cli_toy_bench",
     "main",
 ]
 
@@ -254,6 +258,223 @@ def cli_query(args):
         )
 
 
+def _normalize_bench_text(text: str, mode: str) -> str:
+    raw = "" if text is None else str(text)
+    if mode == "exact":
+        return raw
+    if mode == "strip":
+        return raw.strip()
+    if mode == "nfkc_strip":
+        return unicodedata.normalize("NFKC", raw).strip()
+    return raw.strip()
+
+
+def _resolve_toy_bench_image_path(image: str, base_dir: Path) -> Path:
+    candidate = Path(str(image)).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    by_dataset = base_dir / candidate
+    if by_dataset.exists():
+        return by_dataset.resolve()
+    if candidate.exists():
+        return candidate.resolve()
+    return by_dataset.resolve()
+
+
+def _iter_toy_bench_samples(dataset_path: str) -> List[Dict[str, Any]]:
+    path = Path(dataset_path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    base_dir = path.parent
+    samples: List[Dict[str, Any]] = []
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                image = (row.get("image") or row.get("path") or row.get("img") or "").strip()
+                expected = row.get("text") or row.get("expected") or row.get("label") or ""
+                allowed = row.get("allowed_chars") or row.get("allowed") or row.get("charset")
+                sample_id = row.get("id") or row.get("name") or ""
+                if not image:
+                    continue
+                img_path = _resolve_toy_bench_image_path(image, base_dir)
+                samples.append(
+                    {
+                        "id": sample_id.strip() or None,
+                        "image": str(img_path),
+                        "expected": str(expected),
+                        "allowed_chars": str(allowed) if allowed else None,
+                    }
+                )
+        return samples
+    with path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if not isinstance(obj, dict):
+                continue
+            image = obj.get("image") or obj.get("path") or obj.get("img")
+            expected = obj.get("text") or obj.get("expected") or obj.get("label")
+            allowed = obj.get("allowed_chars") or obj.get("allowed") or obj.get("charset")
+            sample_id = obj.get("id") or obj.get("name") or obj.get("key")
+            if not image or expected is None:
+                continue
+            img_path = _resolve_toy_bench_image_path(str(image), base_dir)
+            samples.append(
+                {
+                    "id": str(sample_id) if sample_id else None,
+                    "image": str(img_path),
+                    "expected": str(expected),
+                    "allowed_chars": str(allowed) if allowed else None,
+                    "source_line": lineno,
+                }
+            )
+    return samples
+
+
+def cli_toy_bench(args) -> None:
+    from PIL import Image
+
+    from . import toy_runtime as _toy_runtime
+
+    dataset = getattr(args, "dataset", None) or ""
+    dataset = dataset.strip()
+    if not dataset:
+        print("Missing --dataset")
+        return
+    compare_mode = getattr(args, "compare", "nfkc_strip") or "nfkc_strip"
+    limit = int(getattr(args, "limit", 0) or 0)
+    save_fails = bool(getattr(args, "save_fails", False))
+    global_allowed = getattr(args, "allowed_chars", None)
+    if global_allowed is not None and not str(global_allowed).strip():
+        global_allowed = None
+
+    runtime_overrides: Dict[str, Any] = {}
+    sweeps = getattr(args, "toy_sweeps", None)
+    if sweeps is not None and sweeps > 0:
+        runtime_overrides["sweeps"] = sweeps
+    force_numeric = getattr(args, "force_numeric", None)
+    if force_numeric is not None:
+        runtime_overrides["force_numeric"] = force_numeric
+    if runtime_overrides:
+        configure_toy_runtime(**runtime_overrides)
+
+    samples = _iter_toy_bench_samples(dataset)
+    if not samples:
+        print("No samples found in", dataset)
+        return
+    if limit > 0:
+        samples = samples[:limit]
+
+    out_dir = Path(args.out).resolve()
+    out_results = out_dir / "toy_bench_results.jsonl"
+    out_report = out_dir / "toy_bench_report.json"
+    fails_dir = out_dir / "toy_bench_fails"
+    if save_fails:
+        fails_dir.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    correct = 0
+    skipped = 0
+    conf_sum = 0.0
+    conf_ok_sum = 0.0
+    conf_bad_sum = 0.0
+    ok_count = 0
+    bad_count = 0
+
+    with out_results.open("w", encoding="utf-8") as f_out:
+        for idx, sample in enumerate(samples, 1):
+            image_path = sample.get("image") or ""
+            expected = sample.get("expected") or ""
+            allowed_chars = global_allowed if global_allowed is not None else sample.get("allowed_chars")
+            try:
+                img = Image.open(image_path)
+            except Exception as exc:
+                skipped += 1
+                rec = {
+                    "id": sample.get("id"),
+                    "image": image_path,
+                    "expected": expected,
+                    "pred": "",
+                    "conf": 0.0,
+                    "ok": False,
+                    "skipped": True,
+                    "error": str(exc),
+                }
+                f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                continue
+
+            pred, conf = _toy_runtime.toy_ocr_text_from_cell(img, allowed_chars=allowed_chars)
+            expected_cmp = _normalize_bench_text(expected, compare_mode)
+            pred_cmp = _normalize_bench_text(pred, compare_mode)
+            ok = pred_cmp == expected_cmp
+
+            total += 1
+            conf_sum += float(conf)
+            if ok:
+                correct += 1
+                ok_count += 1
+                conf_ok_sum += float(conf)
+            else:
+                bad_count += 1
+                conf_bad_sum += float(conf)
+
+            rec = {
+                "id": sample.get("id"),
+                "image": image_path,
+                "expected": expected,
+                "pred": pred,
+                "conf": float(conf),
+                "ok": bool(ok),
+                "compare": compare_mode,
+                "allowed_chars": allowed_chars,
+            }
+            f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            if save_fails and not ok:
+                src = Path(image_path)
+                base = src.name or f"sample_{idx}.png"
+                digest = hashlib.sha1(
+                    f"{idx}:{image_path}".encode("utf-8", errors="ignore")
+                ).hexdigest()[:10]
+                dest = fails_dir / f"{idx:05d}_{digest}_{base}"
+                try:
+                    if src.exists():
+                        dest.write_bytes(src.read_bytes())
+                    else:
+                        img.save(dest)
+                except Exception:
+                    pass
+
+    evaluated = total
+    accuracy = float(correct) / float(evaluated or 1)
+    report = {
+        "dataset": str(Path(dataset).resolve()),
+        "out_dir": str(out_dir),
+        "compare": compare_mode,
+        "limit": limit if limit > 0 else None,
+        "evaluated": evaluated,
+        "correct": correct,
+        "accuracy": accuracy,
+        "skipped": skipped,
+        "avg_conf": float(conf_sum) / float(evaluated or 1),
+        "avg_conf_ok": float(conf_ok_sum) / float(ok_count or 1),
+        "avg_conf_bad": float(conf_bad_sum) / float(bad_count or 1),
+        "results_jsonl": str(out_results),
+        "report_json": str(out_report),
+        "fails_dir": str(fails_dir) if save_fails else None,
+    }
+    out_report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"Toy bench: {correct}/{evaluated} correct  acc={accuracy:.3f}  avg_conf={report['avg_conf']:.3f}  out={out_dir}"
+    )
+
+
 def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd")
 
@@ -300,6 +521,21 @@ def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argpars
     sp.add_argument("--topk", type=int, default=10)
     add_common(sp)
     sp.set_defaults(func=cli_query)
+
+    sp = sub.add_parser("toy-bench", help="Evaluate toy OCR against a golden CSV/JSONL dataset")
+    sp.add_argument("--dataset", type=str, required=True, help="Path to CSV or JSONL with image/text pairs")
+    sp.add_argument(
+        "--compare",
+        type=str,
+        choices=("exact", "strip", "nfkc_strip"),
+        default="nfkc_strip",
+        help="Text comparison mode (default: nfkc_strip)",
+    )
+    sp.add_argument("--limit", type=int, default=0, help="Limit evaluated samples (0 = no limit)")
+    sp.add_argument("--allowed-chars", type=str, default=None, help="Override allowed character set for all samples")
+    sp.add_argument("--save-fails", action="store_true", help="Copy failing crops into out/toy_bench_fails/")
+    add_common(sp)
+    sp.set_defaults(func=cli_toy_bench)
     return parser
 
 

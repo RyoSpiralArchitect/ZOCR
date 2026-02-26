@@ -150,6 +150,25 @@ python -m zocr validate out_allinone --write-manifest
 python -m zocr bench toy --iterations 5
 ```
 
+### Toy OCR golden bench / Toy OCR 回帰ベンチ
+`zocr-consensus toy-bench` で、画像cropと正解文字列の対応（CSV/JSONL）を使った簡易回帰ベンチができます。
+
+```bash
+# JSONL or CSV (see format below)
+zocr-consensus toy-bench --dataset path/to/golden.jsonl --out out_consensus --save-fails
+```
+
+**JSONL format (1 sample per line):**
+```json
+{"image":"crop.png","text":"12,3","allowed_chars":"0123456789,."}
+```
+
+**CSV format (header required):**
+```csv
+image,text,allowed_chars
+crop.png,"12,3","0123456789,."
+```
+
 ## 統一 CLI / Unified CLI / Interface unifiée
 - **[JA]** `python -m zocr run ...` でオーケストレータを実行し、`consensus` や `core` サブコマンドで個別モジュールも呼び出せます。
 - **[EN]** `python -m zocr run ...` triggers the orchestrator, while `consensus` and `core` expose the specialised CLIs.
