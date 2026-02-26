@@ -10,7 +10,7 @@ fi
 DIR="$(cd "$(dirname "$SUMS_FILE")" && pwd)"
 cd "$DIR"
 
-python3 - <<'PY'
+python3 -S - <<'PY'
 import hashlib
 from pathlib import Path
 

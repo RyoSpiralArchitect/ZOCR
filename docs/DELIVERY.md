@@ -15,6 +15,11 @@ bash scripts/make_delivery.sh
 
 Outputs land in `delivery/` (timestamped subfolder).
 
+If Docker is unavailable on the build machine, you can still produce a Python-only bundle:
+```bash
+ZOCR_DELIVERY_SKIP_DOCKER=1 bash scripts/make_delivery.sh
+```
+
 ## Verify a bundle / 検証
 ```bash
 bash scripts/verify_delivery.sh delivery/zocr-suite-*/SHA256SUMS

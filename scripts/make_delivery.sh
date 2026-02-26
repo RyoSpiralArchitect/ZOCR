@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="$(python3 -c 'from zocr._version import __version__; print(__version__)')"
+VERSION="$(python3 -S -c 'from zocr._version import __version__; print(__version__)')"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 OUT_ROOT="${ZOCR_DELIVERY_DIR:-delivery}"
@@ -25,17 +25,31 @@ if [ -d deploy ]; then
   cp -R deploy "$BUNDLE_DIR/"
 fi
 
-echo "[3/5] Build Docker image (api)"
-IMAGE_TAG="${ZOCR_API_IMAGE_TAG:-zocr-suite:${VERSION}}"
-docker build -t "$IMAGE_TAG" --build-arg ZOCR_EXTRAS="api" .
+SKIP_DOCKER="${ZOCR_DELIVERY_SKIP_DOCKER:-0}"
+if [ "$SKIP_DOCKER" != "1" ]; then
+  echo "[3/5] Build Docker image (api)"
+  IMAGE_TAG="${ZOCR_API_IMAGE_TAG:-zocr-suite:${VERSION}}"
+  if ! docker info >/dev/null 2>&1; then
+    cat <<EOF >&2
+[ERROR] Docker daemon is not available.
+- Start Docker Desktop (or the docker daemon) and re-run, OR
+- set ZOCR_DELIVERY_SKIP_DOCKER=1 to build a Python-only bundle.
+EOF
+    exit 3
+  fi
+  docker build -t "$IMAGE_TAG" --build-arg ZOCR_EXTRAS="api" .
 
-echo "[4/5] Save Docker image"
-docker save "$IMAGE_TAG" -o "$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar"
+  echo "[4/5] Save Docker image"
+  docker save "$IMAGE_TAG" -o "$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar"
+else
+  echo "[3/5] Skip Docker image build/save (ZOCR_DELIVERY_SKIP_DOCKER=1)"
+  IMAGE_TAG=""
+fi
 
 echo "[5/5] Generate SHA256SUMS"
 (
   cd "$BUNDLE_DIR"
-  python3 - <<'PY' > SHA256SUMS
+  python3 -S - <<'PY' > SHA256SUMS
 import hashlib
 from pathlib import Path
 
@@ -54,10 +68,18 @@ cat <<EOF
 
 Done.
 - Bundle: $BUNDLE_DIR
-- Docker tag: $IMAGE_TAG
+- Docker tag: ${IMAGE_TAG:-"(skipped)"}
 
 Next:
+  bash scripts/verify_delivery.sh "$BUNDLE_DIR/SHA256SUMS"
+EOF
+
+if [ "$SKIP_DOCKER" != "1" ]; then
+  cat <<EOF
+
+Docker:
   docker load -i "$BUNDLE_DIR/zocr-suite-${VERSION}-docker.tar"
   export ZOCR_API_IMAGE="$IMAGE_TAG"
   docker compose up -d --no-build
 EOF
+fi
