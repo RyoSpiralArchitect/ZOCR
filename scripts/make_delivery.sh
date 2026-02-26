@@ -128,6 +128,11 @@ else
   DOCKER_TARS=()
 fi
 
+DOCKER_IMAGES_SUMMARY="(skipped)"
+if [ "${#DOCKER_TAGS[@]}" -gt 0 ]; then
+  DOCKER_IMAGES_SUMMARY="${DOCKER_TAGS[*]}"
+fi
+
 echo "[7/7] Generate SHA256SUMS"
 (
   cd "$BUNDLE_DIR"
@@ -150,7 +155,7 @@ cat <<EOF
 
 Done.
 - Bundle: $BUNDLE_DIR
-- Docker image(s): ${DOCKER_TAGS[*]:-"(skipped)"}
+- Docker image(s): $DOCKER_IMAGES_SUMMARY
 
 Next:
   bash scripts/verify_delivery.sh "$BUNDLE_DIR/SHA256SUMS"
