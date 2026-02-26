@@ -1210,11 +1210,16 @@ def _collect_pages(
         for pat in file_patterns:
             if fnmatch.fnmatch(name, pat):
                 return True
-        parts = [segment.lower() for segment in p.parts if segment not in {"", os.sep}]
-        for segment in parts:
-            for pat in seg_patterns:
-                if fnmatch.fnmatch(segment, pat):
-                    return True
+        # Segment-based excludes are intended to prevent accidental recursive scans into
+        # output/debug/tmp folders when enumerating directories. For explicit file inputs,
+        # honour the file even if it lives under a segment like `/tmp`.
+        ext = p.suffix.lower()
+        if ext not in allowed_exts:
+            parts = [segment.lower() for segment in p.parts if segment not in {"", os.sep}]
+            for segment in parts:
+                for pat in seg_patterns:
+                    if fnmatch.fnmatch(segment, pat):
+                        return True
         return False
 
     def _append_file(full: str) -> None:
