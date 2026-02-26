@@ -72,12 +72,22 @@ cp .env.example .env  # optional
 export ZOCR_API_KEY="change-me"   # optional (enable auth)
 docker compose up --build
 
+# Use a pre-built image tar (internal delivery) without rebuilding:
+#   docker load -i zocr-suite-*-docker.tar
+#   export ZOCR_API_IMAGE="zocr-suite:<version>"
+#   docker compose up -d --no-build
+
 # Slightly hardened (read-only rootfs, no-new-privileges, log rotation)
 docker compose -f compose.yaml -f compose.prod.yaml up -d --build
 
 # Run the CLI against the current folder (mount as /work)
 docker run --rm -v "$PWD:/work" -w /work zocr-suite \
   zocr run --input demo --outdir out_allinone --snapshot --seed 12345
+```
+
+## Delivery pack (internal)
+```bash
+bash scripts/make_delivery.sh
 ```
 
 ## Reference API (FastAPI)
@@ -105,6 +115,7 @@ export ZOCR_API_RUN_TIMEOUT_SEC=900         # 0 disables
 export ZOCR_API_STORAGE_DIR=/data           # job persistence root (Docker: mount a volume)
 export ZOCR_API_JOBS_TTL_HOURS=168          # terminal job retention
 export ZOCR_API_JOBS_MAX_COUNT=200          # keep latest N terminal jobs
+export ZOCR_API_METRICS_ENABLED=1           # expose /metrics (requires API key if enabled)
 
 curl -H "X-API-Key: $ZOCR_API_KEY" -F "file=@your.pdf" \
   "http://127.0.0.1:8000/v1/run?domain=invoice"

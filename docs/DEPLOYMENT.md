@@ -9,6 +9,13 @@ docker compose up -d --build
 curl http://127.0.0.1:8000/healthz
 ```
 
+Using a pre-built image (recommended for internal delivery bundles):
+```bash
+docker load -i /path/to/zocr-suite-*-docker.tar
+export ZOCR_API_IMAGE="zocr-suite:<version>"
+docker compose up -d --no-build
+```
+
 For a slightly hardened setup:
 ```bash
 docker compose -f compose.yaml -f compose.prod.yaml up -d --build
@@ -28,7 +35,16 @@ Tune via `.env`:
 - `ZOCR_API_JOBS_RESUME_ON_STARTUP=1` re-queues persisted `queued`/`running` jobs on startup.
 - `ZOCR_API_JOBS_CLEANUP_ON_STARTUP=1` runs best-effort cleanup at startup.
 
+## Observability / 監視
+- Logs are emitted as JSON lines by default (`ZOCR_API_LOG_FORMAT=json`).
+- Every HTTP response includes `X-Request-ID` (you can also supply it on the request).
+- Prometheus-style metrics are exposed at `/metrics` when `ZOCR_API_METRICS_ENABLED=1`.
+  - If `ZOCR_API_KEY` is set, `/metrics` also requires the same API key header.
+
 ## Security notes / セキュリティ注意
 - Set `ZOCR_API_KEY` and place the service behind your internal reverse proxy / network controls.
 - Treat the reference API as an internal wrapper; production hardening (rate limit, mTLS, audit logging) should be added per environment.
 
+## Kubernetes / Helm (Optional) / Kubernetes/Helm（任意）
+- Kustomize: `deploy/k8s/`
+- Helm chart: `deploy/helm/zocr-suite/`

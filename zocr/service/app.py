@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import hmac
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import time
 import uuid
 import zipfile
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Optional
 
 from .._version import __version__
@@ -78,7 +83,7 @@ def _allowed_suffix(filename: str) -> bool:
 
 def create_app():
     try:
-        from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
+        from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
         from fastapi.responses import FileResponse
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
@@ -114,6 +119,17 @@ def create_app():
     jobs_resume_on_startup = _env_truthy("ZOCR_API_JOBS_RESUME_ON_STARTUP", True)
     jobs_cleanup_on_startup = _env_truthy("ZOCR_API_JOBS_CLEANUP_ON_STARTUP", True)
     jobs_cleanup_on_create = _env_truthy("ZOCR_API_JOBS_CLEANUP_ON_CREATE", True)
+    log_format = (os.environ.get("ZOCR_API_LOG_FORMAT") or "json").strip().lower()
+    log_level = (os.environ.get("ZOCR_API_LOG_LEVEL") or "INFO").strip().upper()
+    metrics_enabled = _env_truthy("ZOCR_API_METRICS_ENABLED", True)
+
+    logger = logging.getLogger("zocr.api")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(getattr(logging, log_level, logging.INFO))
+    logger.propagate = False
 
     def _utc_now_iso() -> str:
         return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -138,6 +154,84 @@ def create_app():
     jobs_dir = storage_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
     active_jobs: set[str] = set()
+    metrics_lock = Lock()
+    http_requests_total: Counter[tuple[str, str, str]] = Counter()
+    http_duration_sum: dict[tuple[str, str], float] = defaultdict(float)
+    http_duration_count: Counter[tuple[str, str]] = Counter()
+    job_creates_total = 0
+    job_completions_total: Counter[str] = Counter()
+    job_duration_sum: dict[str, float] = defaultdict(float)
+    job_duration_count: Counter[str] = Counter()
+
+    def _route_template(request: Request) -> str:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None)
+        if isinstance(path, str) and path:
+            return path
+        return request.url.path
+
+    def _log(event: str, payload: Dict[str, Any], *, level: str = "info") -> None:
+        record = {"ts": _utc_now_iso(), "event": event, **payload}
+        if log_format == "json":
+            msg = json.dumps(record, ensure_ascii=False)
+        else:
+            msg = f"{record.get('ts')} {event} {payload}"
+        fn = getattr(logger, level, logger.info)
+        fn(msg)
+
+    def _prom_escape(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+    def _render_metrics() -> str:
+        lines: list[str] = []
+        lines.append("# HELP zocr_api_http_requests_total Total HTTP requests.")
+        lines.append("# TYPE zocr_api_http_requests_total counter")
+        lines.append("# HELP zocr_api_http_request_duration_seconds Request duration (sum/count).")
+        lines.append("# TYPE zocr_api_http_request_duration_seconds summary")
+        lines.append("# HELP zocr_api_jobs_active Active job workers.")
+        lines.append("# TYPE zocr_api_jobs_active gauge")
+        lines.append("# HELP zocr_api_job_creates_total Total created jobs.")
+        lines.append("# TYPE zocr_api_job_creates_total counter")
+        lines.append("# HELP zocr_api_job_completions_total Job completions by status.")
+        lines.append("# TYPE zocr_api_job_completions_total counter")
+        lines.append("# HELP zocr_api_job_duration_seconds Job runtime duration by status (sum/count).")
+        lines.append("# TYPE zocr_api_job_duration_seconds summary")
+
+        with metrics_lock:
+            for (method, path, status), count in sorted(http_requests_total.items()):
+                lines.append(
+                    'zocr_api_http_requests_total{method="%s",path="%s",status="%s"} %d'
+                    % (_prom_escape(method), _prom_escape(path), _prom_escape(status), int(count))
+                )
+            for (method, path), total in sorted(http_duration_sum.items()):
+                count = int(http_duration_count.get((method, path), 0))
+                lines.append(
+                    'zocr_api_http_request_duration_seconds_sum{method="%s",path="%s"} %.6f'
+                    % (_prom_escape(method), _prom_escape(path), float(total))
+                )
+                lines.append(
+                    'zocr_api_http_request_duration_seconds_count{method="%s",path="%s"} %d'
+                    % (_prom_escape(method), _prom_escape(path), count)
+                )
+            lines.append("zocr_api_jobs_active %d" % (len(active_jobs),))
+            lines.append("zocr_api_job_creates_total %d" % (int(job_creates_total),))
+            for status, count in sorted(job_completions_total.items()):
+                lines.append(
+                    'zocr_api_job_completions_total{status="%s"} %d'
+                    % (_prom_escape(status), int(count))
+                )
+            for status, total in sorted(job_duration_sum.items()):
+                count = int(job_duration_count.get(status, 0))
+                lines.append(
+                    'zocr_api_job_duration_seconds_sum{status="%s"} %.6f'
+                    % (_prom_escape(status), float(total))
+                )
+                lines.append(
+                    'zocr_api_job_duration_seconds_count{status="%s"} %d'
+                    % (_prom_escape(status), count)
+                )
+
+        return "\n".join(lines) + "\n"
 
     def _validate_job_id(job_id: str) -> None:
         if not _JOB_ID_RE.match(job_id or ""):
@@ -350,6 +444,51 @@ def create_app():
         lifespan=_lifespan,
     )
 
+    @app.middleware("http")
+    async def _request_observability(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        t0 = time.perf_counter()
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            dt = time.perf_counter() - t0
+            status_code = int(getattr(response, "status_code", 500)) if response is not None else 500
+            try:
+                route_path = _route_template(request)
+            except Exception:
+                route_path = request.url.path
+            if response is not None:
+                try:
+                    response.headers["X-Request-ID"] = request_id
+                except Exception:
+                    pass
+            with metrics_lock:
+                http_requests_total[(request.method, route_path, str(status_code))] += 1
+                http_duration_sum[(request.method, route_path)] += float(dt)
+                http_duration_count[(request.method, route_path)] += 1
+            client = request.client.host if request.client else None
+            _log(
+                "http_request",
+                {
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": route_path,
+                    "status": status_code,
+                    "duration_ms": int(round(dt * 1000.0)),
+                    "client": client,
+                },
+                level="info" if status_code < 500 else "error",
+            )
+
+    if metrics_enabled:
+        from fastapi.responses import Response
+
+        @app.get("/metrics", dependencies=[Depends(_require_api_key)] if api_key else [])
+        async def metrics() -> Response:
+            return Response(_render_metrics(), media_type="text/plain; version=0.0.4")
+
     @app.get("/healthz")
     async def healthz() -> Dict[str, Any]:
         return {
@@ -364,6 +503,7 @@ def create_app():
                 "ttl_hours": jobs_ttl_hours,
                 "resume_on_startup": jobs_resume_on_startup,
             },
+            "metrics": {"enabled": bool(metrics_enabled), "path": "/metrics"},
         }
 
     @app.post("/v1/run", dependencies=[Depends(_require_api_key)])
@@ -447,6 +587,9 @@ def create_app():
         return FileResponse(zip_path, media_type="application/zip", filename="zocr_artifacts.zip")
 
     async def _process_job(job_id: str) -> None:
+        job_t0 = time.perf_counter()
+        status = "unknown"
+        error: Optional[str] = None
         try:
             paths = _job_paths(job_id)
             try:
@@ -458,12 +601,16 @@ def create_app():
             job["status"] = "running"
             job["updated_at"] = now
             _write_job(job_id, job)
+            status = "running"
+            _log("job_started", {"job_id": job_id})
 
             input_path = paths["input_dir"] / (job.get("input", {}) or {}).get("filename", "input")
             if not input_path.exists():
                 job["status"] = "failed"
                 job["updated_at"] = _utc_now_iso()
                 job["error"] = "Input file missing"
+                status = "failed"
+                error = str(job["error"])
                 _write_job(job_id, job)
                 return
 
@@ -484,9 +631,13 @@ def create_app():
             except TimeoutError:
                 job["status"] = "failed"
                 job["error"] = "Pipeline timeout"
+                status = "failed"
+                error = str(job["error"])
             except Exception as exc:
                 job["status"] = "failed"
                 job["error"] = str(exc)
+                status = "failed"
+                error = str(job["error"])
             else:
                 try:
                     manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
@@ -498,10 +649,26 @@ def create_app():
                 except Exception:
                     pass
                 job["status"] = "succeeded"
+                status = "succeeded"
             job["updated_at"] = _utc_now_iso()
             _write_job(job_id, job)
         finally:
+            dt = time.perf_counter() - job_t0
+            with metrics_lock:
+                job_completions_total[status] += 1
+                job_duration_sum[status] += float(dt)
+                job_duration_count[status] += 1
             active_jobs.discard(job_id)
+            _log(
+                "job_finished",
+                {
+                    "job_id": job_id,
+                    "status": status,
+                    "duration_ms": int(round(dt * 1000.0)),
+                    "error": error,
+                },
+                level="info" if status == "succeeded" else "error",
+            )
 
     @app.post("/v1/jobs", dependencies=[Depends(_require_api_key)])
     async def create_job(
@@ -514,6 +681,7 @@ def create_app():
         snapshot: bool = False,
         toy_lite: bool = False,
     ) -> Dict[str, Any]:
+        nonlocal job_creates_total
         filename = Path(file.filename or "upload").name
         if not _allowed_suffix(filename):
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename!r}")
@@ -553,6 +721,17 @@ def create_app():
             "error": None,
         }
         _write_job(job_id, job)
+        with metrics_lock:
+            job_creates_total += 1
+        _log(
+            "job_created",
+            {
+                "job_id": job_id,
+                "filename": filename,
+                "bytes": int(written),
+                "params": job.get("params"),
+            },
+        )
 
         if jobs_cleanup_on_create:
             _cleanup_jobs()

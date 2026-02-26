@@ -1,5 +1,6 @@
 services:
   api:
+    image: ${ZOCR_API_IMAGE:-zocr-suite:latest}
     build:
       context: .
       args:

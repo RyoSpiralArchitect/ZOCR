@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "zocr-suite.fullname" . }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ include "zocr-suite.fullname" . }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+

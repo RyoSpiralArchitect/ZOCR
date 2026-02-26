@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zocr-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zocr-api
+  template:
+    metadata:
+      labels:
+        app: zocr-api
+    spec:
+      containers:
+        - name: api
+          image: zocr-suite:latest
+          imagePullPolicy: IfNotPresent
+          command: ["zocr-api"]
+          args: ["--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: zocr-api-config
+          env:
+            - name: ZOCR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zocr-api-secret
+                  key: ZOCR_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: zocr-api-data
+        - name: tmp
+          emptyDir: {}
+

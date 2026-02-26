@@ -1,0 +1,43 @@
+replicaCount: 1
+
+image:
+  repository: zocr-suite
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+env:
+  ZOCR_API_MAX_UPLOAD_MB: "50"
+  ZOCR_API_CONCURRENCY: "1"
+  ZOCR_API_RUN_TIMEOUT_SEC: "900"
+  ZOCR_API_STORAGE_DIR: "/data"
+
+  ZOCR_API_JOBS_MAX_COUNT: "200"
+  ZOCR_API_JOBS_TTL_HOURS: "168"
+  ZOCR_API_JOBS_RESUME_ON_STARTUP: "1"
+  ZOCR_API_JOBS_CLEANUP_ON_STARTUP: "1"
+  ZOCR_API_JOBS_CLEANUP_ON_CREATE: "1"
+
+  ZOCR_API_LOG_FORMAT: "json"
+  ZOCR_API_LOG_LEVEL: "INFO"
+  ZOCR_API_METRICS_ENABLED: "1"
+
+secret:
+  # If set, the chart creates a Secret with this key.
+  # apiKey: change-me
+  existingSecretName: ""
+  keyName: ZOCR_API_KEY
+
+persistence:
+  enabled: true
+  size: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
