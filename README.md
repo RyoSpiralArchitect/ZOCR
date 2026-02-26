@@ -43,6 +43,8 @@ python -m pip install -e .
 #   • speed: `python -m pip install -e ".[speed]"`
 #   • PDF fallback: `python -m pip install -e ".[pdf]"` (or install Poppler's `pdftoppm`)
 #   • Reports: `python -m pip install -e ".[report]"`
+#   • Multimodal PDF ingest: `python -m pip install -e ".[multimodal]"` (pdfminer + PyMuPDF)
+#   • Parquet export: `python -m pip install -e ".[parquet]"` (pandas + pyarrow)
 #   • API service: `python -m pip install -e ".[api]"`
 #   • OCR engines: `python -m pip install -e ".[ocr_tess]"` / `.[ocr_easy]` (optional)
 
@@ -74,6 +76,12 @@ docker build -t zocr-suite \
 # docker build -t zocr-suite \
 #   --build-arg ZOCR_EXTRAS="api,ocr_tess" \
 #   --build-arg ZOCR_APT_PACKAGES="poppler-utils tesseract-ocr tesseract-ocr-eng" \
+#   .
+#
+# Example (enable multimodal PDF ingest + Parquet export)
+# docker build -t zocr-suite \
+#   --build-arg ZOCR_EXTRAS="api,multimodal,parquet" \
+#   --build-arg ZOCR_APT_PACKAGES="poppler-utils" \
 #   .
 
 # Or bring up the reference API with Docker Compose

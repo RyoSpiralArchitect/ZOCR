@@ -20,8 +20,14 @@ try:  # pragma: no cover - optional dependency (parquet export)
     import pandas as pd  # type: ignore
 except Exception:  # pragma: no cover - optional dependency missing
     pd = None  # type: ignore
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTFigure, LTLine, LTRect
+try:  # pragma: no cover - optional dependency
+    from pdfminer.high_level import extract_pages  # type: ignore
+    from pdfminer.layout import LTFigure, LTLine, LTRect  # type: ignore
+except Exception:  # pragma: no cover - optional dependency missing
+    extract_pages = None  # type: ignore
+    LTFigure = None  # type: ignore
+    LTLine = None  # type: ignore
+    LTRect = None  # type: ignore
 
 BBox = Tuple[float, float, float, float]
 
@@ -65,6 +71,14 @@ def _require_pandas() -> Any:
     if pd is None:  # pragma: no cover
         raise RuntimeError("pandas is not installed. Install it to enable Parquet export.")
     return pd
+
+
+def _require_pdfminer() -> Any:
+    if extract_pages is None or LTFigure is None or LTLine is None or LTRect is None:  # pragma: no cover
+        raise RuntimeError(
+            "pdfminer.six is not installed. Install it to enable PDF multimodal ingestion."
+        )
+    return extract_pages, LTFigure, LTLine, LTRect
 
 
 def _rect_to_bbox(rect: Sequence[float]) -> BBox:
@@ -112,16 +126,17 @@ def _encode_thumbnail(page: fitz.Page, bbox: BBox, scale: float = 1.0) -> str:
 
 def _collect_pdfminer_shapes(pdf_path: str) -> Dict[int, List[BBox]]:
     """Collect line/rect boxes per page using pdfminer for table detection."""
+    extract_pages_fn, LTFigure_cls, LTLine_cls, LTRect_cls = _require_pdfminer()
     shapes: Dict[int, List[BBox]] = {}
-    for page_no, layout in enumerate(extract_pages(pdf_path), start=1):
+    for page_no, layout in enumerate(extract_pages_fn(pdf_path), start=1):
         boxes: List[BBox] = []
         for element in layout:
-            if isinstance(element, (LTLine, LTRect)):
+            if isinstance(element, (LTLine_cls, LTRect_cls)):
                 boxes.append(_rect_to_bbox(element.bbox))
-            elif isinstance(element, LTFigure):
+            elif isinstance(element, LTFigure_cls):
                 # descend to capture nested lines within figures
                 for child in element:
-                    if isinstance(child, (LTLine, LTRect)):
+                    if isinstance(child, (LTLine_cls, LTRect_cls)):
                         boxes.append(_rect_to_bbox(child.bbox))
         shapes[page_no] = boxes
     return shapes

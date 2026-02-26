@@ -6,6 +6,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 pytest.importorskip("fitz")
+pytest.importorskip("pdfminer")
 pytest.importorskip("pandas")
 
 from zocr.ingest.pdf_multimodal import (
