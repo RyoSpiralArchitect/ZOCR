@@ -20,7 +20,6 @@ from . import (
     DocumentInput,
     DocumentPipeline,
     DummyTableExtractor,
-    DummyVLLM,
     FullPageSegmenter,
     MockAggregator,
     MockInputHandler,
@@ -30,9 +29,10 @@ from . import (
     MockTextOCR,
     MockVLLM,
     SimpleAggregator,
+    SimpleVisualDescriptor,
     TesseractTextOCR,
-    ToyRuntimeTextOCR,
     TwoStageTextOCR,
+    ZocrRuntimeOCR,
 )
 from .interfaces import TextOCR
 from .pipeline import OcrPipeline
@@ -82,7 +82,7 @@ def _load_batch_documents(
 
 
 def _build_default_text_ocr() -> TextOCR:
-    primary = ToyRuntimeTextOCR()
+    primary = ZocrRuntimeOCR()
     try:
         fallback = TesseractTextOCR()
     except RuntimeError:
@@ -90,7 +90,7 @@ def _build_default_text_ocr() -> TextOCR:
     return TwoStageTextOCR(
         primary=primary,
         fallback=fallback,
-        compare_primary_engines=("toy_runtime",),
+        compare_primary_engines=("zocr_runtime", "toy_runtime"),
     )
 
 
@@ -98,7 +98,7 @@ def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
     segmenter = MockSegmenter() if use_mocks else FullPageSegmenter()
     classifier = MockRegionClassifier() if use_mocks else AspectRatioRegionClassifier()
     text_ocr = MockTextOCR() if use_mocks else _build_default_text_ocr()
-    vllm = MockVLLM() if use_mocks else DummyVLLM()
+    vllm = MockVLLM() if use_mocks else SimpleVisualDescriptor()
     table_extractor = MockTableExtractor() if use_mocks else DummyTableExtractor()
     aggregator = MockAggregator() if use_mocks else SimpleAggregator()
 
