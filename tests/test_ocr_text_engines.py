@@ -127,3 +127,17 @@ def test_build_document_pipeline_wires_two_stage_default(monkeypatch):
     pipeline: DocumentPipeline = build_document_pipeline(use_mocks=False)
 
     assert isinstance(pipeline.page_pipeline.text_ocr, TwoStageTextOCR)
+
+
+def test_build_document_pipeline_allows_missing_tesseract(monkeypatch):
+    primary = DummyTextOCR(text="p", confidence=1.0, engine="toy_runtime")
+    monkeypatch.setattr("zocr.ocr_pipeline.cli.ToyRuntimeTextOCR", lambda: primary)
+
+    def unavailable_tesseract():
+        raise RuntimeError("pytesseract missing")
+
+    monkeypatch.setattr("zocr.ocr_pipeline.cli.TesseractTextOCR", unavailable_tesseract)
+
+    pipeline: DocumentPipeline = build_document_pipeline(use_mocks=False)
+
+    assert pipeline.page_pipeline.text_ocr is primary

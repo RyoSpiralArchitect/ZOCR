@@ -75,6 +75,17 @@ def test_full_page_segmenter_splits_separated_components():
     assert regions[0].bounding_box.x < regions[1].bounding_box.x
 
 
+def test_full_page_segmenter_handles_solid_dark_crop():
+    image = Image.new("RGB", (40, 30), "black")
+    page = PageInput(document_id="doc-dark", page_number=1, image=image)
+
+    regions = FullPageSegmenter(min_region_fraction=0.01).segment(page)
+
+    assert len(regions) == 1
+    assert regions[0].bounding_box.width == 40
+    assert regions[0].bounding_box.height == 30
+
+
 def test_simple_vllm_describes_visual_statistics():
     image = Image.new("RGB", (80, 60), "white")
     draw = ImageDraw.Draw(image)
@@ -139,6 +150,35 @@ def test_simple_table_extractor_uses_grid_lines(monkeypatch):
     assert result.format == "tesseract_grid"
     assert result.table_data.headers == ["Name", "Qty"]
     assert result.table_data.rows == [{"Name": "Bolt", "Qty": "4"}]
+
+
+def test_simple_table_extractor_returns_error_format_when_tesseract_fails(monkeypatch):
+    image = Image.new("RGB", (120, 80), "white")
+
+    class FakeOutput:
+        DICT = "dict"
+
+    class BrokenTesseract:
+        Output = FakeOutput
+
+        @staticmethod
+        def image_to_data(image, output_type):  # noqa: ANN001
+            raise RuntimeError("missing binary")
+
+    monkeypatch.setattr(simple_module, "pytesseract", BrokenTesseract)
+    region = ClassifiedRegion(
+        region_id="table-broken",
+        bounding_box=BoundingBox(x=0, y=0, width=120, height=80),
+        classification=RegionType.TABLE,
+        confidence=0.9,
+        reading_order=0,
+        image_crop=image,
+    )
+
+    result = SimpleTableExtractor().extract(region)
+
+    assert result.format == "tesseract_error"
+    assert result.confidence == 0.0
 
 
 def test_simple_pipeline_with_basic_components():

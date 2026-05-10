@@ -34,14 +34,20 @@ from . import (
     ToyRuntimeTextOCR,
     TwoStageTextOCR,
 )
+from .interfaces import TextOCR
 from .pipeline import OcrPipeline
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 
 
+def _load_image(path: Path) -> Image.Image:
+    with Image.open(path.as_posix()) as image:
+        return image.copy()
+
+
 def _load_images(paths: Iterable[str]) -> List[Image.Image]:
-    return [Image.open(Path(p).as_posix()) for p in paths]
+    return [_load_image(Path(p)) for p in paths]
 
 
 def _collect_images(directory: Path, pattern: str, recursive: bool) -> List[Path]:
@@ -75,18 +81,23 @@ def _load_batch_documents(
     return documents
 
 
+def _build_default_text_ocr() -> TextOCR:
+    primary = ToyRuntimeTextOCR()
+    try:
+        fallback = TesseractTextOCR()
+    except RuntimeError:
+        return primary
+    return TwoStageTextOCR(
+        primary=primary,
+        fallback=fallback,
+        compare_primary_engines=("toy_runtime",),
+    )
+
+
 def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
     segmenter = MockSegmenter() if use_mocks else FullPageSegmenter()
     classifier = MockRegionClassifier() if use_mocks else AspectRatioRegionClassifier()
-    text_ocr = (
-        MockTextOCR()
-        if use_mocks
-        else TwoStageTextOCR(
-            primary=ToyRuntimeTextOCR(),
-            fallback=TesseractTextOCR(),
-            compare_primary_engines=("toy_runtime",),
-        )
-    )
+    text_ocr = MockTextOCR() if use_mocks else _build_default_text_ocr()
     vllm = MockVLLM() if use_mocks else DummyVLLM()
     table_extractor = MockTableExtractor() if use_mocks else DummyTableExtractor()
     aggregator = MockAggregator() if use_mocks else SimpleAggregator()
@@ -144,8 +155,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
 
-    if not any([args.images, args.pdf, args.input_dir, args.batch_dir]):
+    selected_inputs = [
+        bool(args.images),
+        bool(args.pdf),
+        bool(args.input_dir),
+        bool(args.batch_dir),
+    ]
+    if not any(selected_inputs):
         raise SystemExit("Provide --images, --pdf, --input-dir, or --batch-dir")
+    if sum(selected_inputs) > 1:
+        raise SystemExit("Provide exactly one of --images, --pdf, --input-dir, or --batch-dir")
 
     pipeline = build_document_pipeline(use_mocks=args.use_mocks)
 

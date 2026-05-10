@@ -58,7 +58,7 @@ def _ink_mask(gray: np.ndarray) -> np.ndarray:
     if 10.0 < otsu < 245.0:
         threshold = min(threshold, otsu)
     threshold = max(0.0, min(255.0, threshold))
-    return gray < threshold
+    return gray <= threshold
 
 
 def _otsu_threshold(gray: np.ndarray) -> float:
@@ -439,7 +439,7 @@ class AspectRatioRegionClassifier(RegionClassifier):
             edge_ratio = _edge_density(gray)
             row_ratio, col_ratio = _line_ratios(mask)
 
-            if row_ratio > 0.03 and col_ratio > 0.02 and ink_ratio > 0.01:
+            if row_ratio > 0.03 and col_ratio > 0.02 and 0.01 < ink_ratio < 0.45:
                 classification = RegionType.TABLE
                 confidence = min(1.0, confidence + 0.1)
             elif ink_ratio < 0.02 and edge_ratio > 0.06:
@@ -739,7 +739,7 @@ def _grid_boundaries(mask: np.ndarray) -> Tuple[List[int], List[int]]:
 
 
 def _assign_words_to_grid(
-    words: Sequence[dict], horizontal: Sequence[int], vertical: Sequence[int]
+    words: Sequence[OcrWord], horizontal: Sequence[int], vertical: Sequence[int]
 ) -> List[List[str]]:
     row_count = len(horizontal) - 1
     col_count = len(vertical) - 1
@@ -812,7 +812,16 @@ class SimpleTableExtractor(TableExtractor):
                 format="missing_pytesseract",
             )
 
-        data = pytesseract.image_to_data(region.image_crop, output_type=pytesseract.Output.DICT)
+        try:
+            data = pytesseract.image_to_data(region.image_crop, output_type=pytesseract.Output.DICT)
+        except Exception:
+            table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
+            return TableExtractionResult(
+                region_id=region.region_id,
+                table_data=table_data,
+                confidence=0.0,
+                format="tesseract_error",
+            )
         texts = data.get("text", [])
         for idx, text in enumerate(texts):
             if not text or text.strip() == "":
