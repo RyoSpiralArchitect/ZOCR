@@ -80,3 +80,23 @@ def test_cli_runs_batch_dir_with_mock_components(tmp_path):
     payload = out_path.read_text(encoding="utf-8")
     assert "doc-a" in payload
     assert "doc-b" in payload
+
+
+def test_cli_rejects_multiple_input_modes(tmp_path):
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (10, 10), color="white").save(img_path)
+    input_dir = tmp_path / "pages"
+    input_dir.mkdir()
+
+    try:
+        cli.main([
+            "--images",
+            img_path.as_posix(),
+            "--input-dir",
+            input_dir.as_posix(),
+            "--use-mocks",
+        ])
+    except SystemExit as exc:
+        assert "exactly one" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
