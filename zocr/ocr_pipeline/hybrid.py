@@ -57,15 +57,23 @@ class TwoStageTextOCR(TextOCR):
     fallback: TextOCR
     min_primary_confidence: float = 0.5
     min_primary_chars: int = 1
+    compare_primary_engines: Tuple[str, ...] = ()
+    min_fallback_confidence: float = 0.35
+    fallback_confidence_margin: float = 0.05
 
     def run(self, region: ClassifiedRegion) -> TextOcrResult:
         primary_result = self.primary.run(region)
 
-        if not self._needs_fallback(primary_result):
+        compare_with_fallback = self._should_compare(primary_result)
+        if not self._needs_fallback(primary_result) and not compare_with_fallback:
             return primary_result
 
         fallback_result = self.fallback.run(region)
-        if self._accept_fallback(fallback_result, primary_result):
+        if self._accept_fallback(
+            fallback_result,
+            primary_result,
+            prefer_when_usable=compare_with_fallback,
+        ):
             return fallback_result
         return primary_result
 
@@ -74,14 +82,34 @@ class TwoStageTextOCR(TextOCR):
             return True
         return len(result.text.strip()) < self.min_primary_chars
 
-    @staticmethod
-    def _accept_fallback(candidate: TextOcrResult, baseline: TextOcrResult) -> bool:
+    def _should_compare(self, result: TextOcrResult) -> bool:
+        if not self.compare_primary_engines:
+            return False
+        engine = (result.engine or "").lower()
+        return engine in {item.lower() for item in self.compare_primary_engines}
+
+    def _accept_fallback(
+        self,
+        candidate: TextOcrResult,
+        baseline: TextOcrResult,
+        *,
+        prefer_when_usable: bool = False,
+    ) -> bool:
         has_text = bool(candidate.text.strip())
         if not has_text:
             return False
-        if candidate.confidence > baseline.confidence:
+        if candidate.confidence > baseline.confidence + self.fallback_confidence_margin:
             return True
         if not baseline.text.strip():
             return True
+        if prefer_when_usable and candidate.confidence >= self.min_fallback_confidence:
+            candidate_text = candidate.text.strip()
+            baseline_text = baseline.text.strip()
+            if (
+                candidate.confidence + self.fallback_confidence_margin >= baseline.confidence
+                and len(candidate_text) >= len(baseline_text)
+            ):
+                return True
+            if len(candidate_text) >= max(len(baseline_text) + 3, int(len(baseline_text) * 1.5)):
+                return True
         return False
-

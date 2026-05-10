@@ -1,6 +1,7 @@
 """Reference service layer for deploying Z-OCR as an API.
 
-This package is intentionally minimal and is meant as a starting point for
-production deployments rather than a fully featured hosted offering.
+This package contains the operational API surface: persistent jobs, tenant
+scoping, auth, quotas, Redis worker integration, metrics, audit hooks, and
+artifact downloads. Environment-specific controls such as WAF, mTLS, and
+central log shipping still belong at the deployment layer.
 """
-

@@ -81,7 +81,11 @@ def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
     text_ocr = (
         MockTextOCR()
         if use_mocks
-        else TwoStageTextOCR(primary=ToyRuntimeTextOCR(), fallback=TesseractTextOCR())
+        else TwoStageTextOCR(
+            primary=ToyRuntimeTextOCR(),
+            fallback=TesseractTextOCR(),
+            compare_primary_engines=("toy_runtime",),
+        )
     )
     vllm = MockVLLM() if use_mocks else DummyVLLM()
     table_extractor = MockTableExtractor() if use_mocks else DummyTableExtractor()
