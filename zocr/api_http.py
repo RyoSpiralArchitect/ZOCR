@@ -1,14 +1,16 @@
 """HTTP-friendly helpers that wrap the ingest/query primitives.
 
-These utilities keep a minimal dependency footprint while providing a
+These utilities keep a small dependency footprint while providing a
 straightforward way for web handlers (FastAPI, Flask, Lambda, etc.) to:
 
 - Validate incoming JSON bodies against the v0 schemas,
 - Convert them into ``IngestRequest`` / ``QueryRequest`` instances, and
 - Emit public response payloads that conform to the canonical schemas.
 
-The goal is to avoid duplicating validation/mapping glue across services while
-still leaving concurrency/job-management choices to the caller.
+The goal is to avoid duplicating validation/mapping glue across services. For
+persistent jobs, auth, quotas, Redis workers, and artifact downloads, use the
+reference service in :mod:`zocr.service.app`; this module remains the synchronous
+schema adapter for custom HTTP surfaces.
 """
 from __future__ import annotations
 

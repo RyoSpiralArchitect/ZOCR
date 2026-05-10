@@ -1,8 +1,10 @@
-from PIL import Image
+from PIL import Image, ImageDraw
 
+import zocr.ocr_pipeline.simple as simple_module
 from zocr.ocr_pipeline import (
     AspectRatioRegionClassifier,
     BoundingBox,
+    ClassifiedRegion,
     DummyTableExtractor,
     DummyVLLM,
     FullPageSegmenter,
@@ -12,6 +14,8 @@ from zocr.ocr_pipeline import (
     RegionType,
     SegmentedRegion,
     SimpleAggregator,
+    SimpleTableExtractor,
+    SimpleVLLM,
 )
 
 
@@ -58,6 +62,85 @@ def test_aspect_ratio_region_classifier_uses_geometry():
     assert classifier.classify(tall_region).classification == RegionType.TEXT
 
 
+def test_full_page_segmenter_splits_separated_components():
+    image = Image.new("RGB", (180, 90), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((10, 10, 55, 30), fill="black")
+    draw.rectangle((120, 48, 170, 72), fill="black")
+    page = PageInput(document_id="doc-components", page_number=1, image=image)
+
+    regions = FullPageSegmenter(min_region_fraction=0.01).segment(page)
+
+    assert len(regions) == 2
+    assert regions[0].bounding_box.x < regions[1].bounding_box.x
+
+
+def test_simple_vllm_describes_visual_statistics():
+    image = Image.new("RGB", (80, 60), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((10, 10, 70, 50), outline="black", width=2)
+    draw.line((10, 30, 70, 30), fill="black", width=2)
+    region = ClassifiedRegion(
+        region_id="visual-1",
+        bounding_box=BoundingBox(x=0, y=0, width=80, height=60),
+        classification=RegionType.IMAGE,
+        confidence=0.9,
+        reading_order=0,
+        image_crop=image,
+    )
+
+    result = SimpleVLLM().describe(region)
+
+    assert "Visual region 80x60" in result.caption
+    assert result.detailed_description is not None
+    assert "edge density" in result.detailed_description
+
+
+def test_simple_table_extractor_uses_grid_lines(monkeypatch):
+    image = Image.new("RGB", (120, 80), "white")
+    draw = ImageDraw.Draw(image)
+    for x in (0, 60, 119):
+        draw.line((x, 0, x, 79), fill="black", width=2)
+    for y in (0, 30, 79):
+        draw.line((0, y, 119, y), fill="black", width=2)
+
+    class FakeOutput:
+        DICT = "dict"
+
+    class FakeTesseract:
+        Output = FakeOutput
+
+        @staticmethod
+        def image_to_data(image, output_type):  # noqa: ANN001
+            return {
+                "text": ["Name", "Qty", "Bolt", "4"],
+                "conf": ["90", "88", "91", "93"],
+                "left": [10, 72, 10, 78],
+                "top": [10, 10, 45, 45],
+                "width": [30, 20, 28, 8],
+                "height": [10, 10, 10, 10],
+                "block_num": [1, 1, 1, 1],
+                "par_num": [1, 1, 1, 1],
+                "line_num": [1, 1, 2, 2],
+            }
+
+    monkeypatch.setattr(simple_module, "pytesseract", FakeTesseract)
+    region = ClassifiedRegion(
+        region_id="table-1",
+        bounding_box=BoundingBox(x=0, y=0, width=120, height=80),
+        classification=RegionType.TABLE,
+        confidence=0.9,
+        reading_order=0,
+        image_crop=image,
+    )
+
+    result = SimpleTableExtractor().extract(region)
+
+    assert result.format == "tesseract_grid"
+    assert result.table_data.headers == ["Name", "Qty"]
+    assert result.table_data.rows == [{"Name": "Bolt", "Qty": "4"}]
+
+
 def test_simple_pipeline_with_basic_components():
     image = Image.new("RGB", (120, 80))
     page = PageInput(document_id="doc-2", page_number=1, image=image)
@@ -80,4 +163,3 @@ def test_simple_pipeline_with_basic_components():
     assert output.metadata.total_regions == 1
     assert output.metadata.text_regions == 1
     assert output.regions[0].content["text"].startswith("text content")
-

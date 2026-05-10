@@ -72,6 +72,24 @@ def test_two_stage_text_ocr_keeps_primary_when_confident():
     assert fallback.calls == 0
 
 
+def test_two_stage_text_ocr_can_verify_toy_runtime_with_fallback():
+    primary = DummyTextOCR(text="p", confidence=0.95, engine="toy_runtime")
+    fallback = DummyTextOCR(text="printed text", confidence=0.55, engine="tesseract")
+    hybrid = TwoStageTextOCR(
+        primary=primary,
+        fallback=fallback,
+        min_primary_confidence=0.5,
+        compare_primary_engines=("toy_runtime",),
+    )
+
+    result = hybrid.run(_region())
+
+    assert result.text == "printed text"
+    assert result.engine == "tesseract"
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+
 def test_two_stage_text_ocr_retains_primary_when_fallback_empty():
     primary = DummyTextOCR(text="low", confidence=0.2, engine="primary")
     fallback = DummyTextOCR(text="   ", confidence=0.8, engine="secondary")
@@ -109,4 +127,3 @@ def test_build_document_pipeline_wires_two_stage_default(monkeypatch):
     pipeline: DocumentPipeline = build_document_pipeline(use_mocks=False)
 
     assert isinstance(pipeline.page_pipeline.text_ocr, TwoStageTextOCR)
-
