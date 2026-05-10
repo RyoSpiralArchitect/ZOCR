@@ -86,6 +86,22 @@ def test_full_page_segmenter_handles_solid_dark_crop():
     assert regions[0].bounding_box.height == 30
 
 
+def test_aspect_ratio_region_classifier_rejects_dense_filled_regions_as_tables():
+    classifier = AspectRatioRegionClassifier()
+    filled = Image.new("RGB", (100, 70), "black")
+    region = SegmentedRegion(
+        region_id="dense-1",
+        bounding_box=BoundingBox(x=0, y=0, width=100, height=70),
+        image_crop=filled,
+        confidence=0.8,
+        reading_order=0,
+    )
+
+    result = classifier.classify(region)
+
+    assert result.classification != RegionType.TABLE
+
+
 def test_simple_vllm_describes_visual_statistics():
     image = Image.new("RGB", (80, 60), "white")
     draw = ImageDraw.Draw(image)
