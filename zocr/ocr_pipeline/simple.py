@@ -32,6 +32,8 @@ from .models import (
 )
 from .structure import build_structural_graph
 
+LineKey = Tuple[int, int, int]
+
 
 def _to_gray_array(image: Image.Image) -> np.ndarray:
     gray = image.convert("L")
@@ -868,7 +870,7 @@ class SimpleTableExtractor(TableExtractor):
             any(value > 0 for value in key) for key in line_values
         )
 
-        lines: Dict[object, List[dict]] = {}
+        lines: Dict[LineKey, List[dict]] = {}
         if use_line_numbers:
             for word in words:
                 lines.setdefault(word["row_key"], []).append(word)
@@ -888,7 +890,7 @@ class SimpleTableExtractor(TableExtractor):
                 row_idx = min(
                     range(len(row_centers)), key=lambda i: abs(row_centers[i] - center)
                 )
-                lines.setdefault(row_idx, []).append(word)
+                lines.setdefault((row_idx, 0, 0), []).append(word)
 
         ordered_lines = [lines[key] for key in sorted(lines.keys())]
         rows: List[List[str]] = []
