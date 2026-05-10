@@ -5,7 +5,7 @@ external ML models while still exercising the end-to-end flow on real images.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, TypedDict
 
 import numpy as np
 from PIL import Image
@@ -33,6 +33,15 @@ from .models import (
 from .structure import build_structural_graph
 
 LineKey = Tuple[int, int, int]
+
+
+class OcrWord(TypedDict):
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    row_key: LineKey
 
 
 def _to_gray_array(image: Image.Image) -> np.ndarray:
@@ -779,7 +788,7 @@ class SimpleTableExtractor(TableExtractor):
         gray = _to_gray_array(region.image_crop)
         mask = _ink_mask(gray)
         horizontal, vertical = _grid_boundaries(mask)
-        words = []
+        words: List[OcrWord] = []
 
         if pytesseract is None:
             if horizontal and vertical:
@@ -870,7 +879,7 @@ class SimpleTableExtractor(TableExtractor):
             any(value > 0 for value in key) for key in line_values
         )
 
-        lines: Dict[LineKey, List[dict]] = {}
+        lines: Dict[LineKey, List[OcrWord]] = {}
         if use_line_numbers:
             for word in words:
                 lines.setdefault(word["row_key"], []).append(word)
