@@ -128,8 +128,10 @@ def _bounding_box_from_mask(
 def _clip_box(
     x: int, y: int, width: int, height: int, image_width: int, image_height: int
 ) -> Tuple[int, int, int, int]:
-    x0 = max(0, min(image_width, x))
-    y0 = max(0, min(image_height, y))
+    if image_width <= 0 or image_height <= 0:
+        return 0, 0, 0, 0
+    x0 = max(0, min(image_width - 1, x))
+    y0 = max(0, min(image_height - 1, y))
     x1 = max(x0 + 1, min(image_width, x + width))
     y1 = max(y0 + 1, min(image_height, y + height))
     return x0, y0, x1 - x0, y1 - y0
