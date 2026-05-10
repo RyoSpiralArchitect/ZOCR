@@ -323,40 +323,39 @@ def test_jobs_lifecycle_smoke(monkeypatch, tmp_path) -> None:
 
     from fastapi.testclient import TestClient
 
-    client = TestClient(app)
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.json()["storage"]["dir"] == str(storage_dir)
 
-    health = client.get("/healthz")
-    assert health.status_code == 200
-    assert health.json()["storage"]["dir"] == str(storage_dir)
+        resp = client.post(
+            "/v1/jobs?domain=invoice",
+            files={"file": ("test.png", b"fake", "image/png")},
+        )
+        assert resp.status_code == 200, resp.text
+        job = resp.json()["job"]
+        job_id = job["id"]
 
-    resp = client.post(
-        "/v1/jobs?domain=invoice",
-        files={"file": ("test.png", b"fake", "image/png")},
-    )
-    assert resp.status_code == 200, resp.text
-    job = resp.json()["job"]
-    job_id = job["id"]
+        final = None
+        for _ in range(100):
+            polled = client.get(f"/v1/jobs/{job_id}")
+            assert polled.status_code == 200
+            status = polled.json()["job"]["status"]
+            if status in {"succeeded", "failed"}:
+                final = polled.json()["job"]
+                break
+            time.sleep(0.02)
+        assert final is not None
+        assert final["status"] == "succeeded"
 
-    final = None
-    for _ in range(100):
-        polled = client.get(f"/v1/jobs/{job_id}")
-        assert polled.status_code == 200
-        status = polled.json()["job"]["status"]
-        if status in {"succeeded", "failed"}:
-            final = polled.json()["job"]
-            break
-        time.sleep(0.02)
-    assert final is not None
-    assert final["status"] == "succeeded"
+        summary_resp = client.get(f"/v1/jobs/{job_id}/artifacts/pipeline_summary")
+        assert summary_resp.status_code == 200
+        summary_payload = summary_resp.json()
+        assert summary_payload["inputs"]
 
-    summary_resp = client.get(f"/v1/jobs/{job_id}/artifacts/pipeline_summary")
-    assert summary_resp.status_code == 200
-    summary_payload = summary_resp.json()
-    assert summary_payload["inputs"]
-
-    zip_resp = client.get(f"/v1/jobs/{job_id}/artifacts.zip")
-    assert zip_resp.status_code == 200
-    assert zip_resp.headers.get("content-type") == "application/zip"
+        zip_resp = client.get(f"/v1/jobs/{job_id}/artifacts.zip")
+        assert zip_resp.status_code == 200
+        assert zip_resp.headers.get("content-type") == "application/zip"
 
 
 def test_jobs_queue_dispatch_smoke(monkeypatch, tmp_path) -> None:

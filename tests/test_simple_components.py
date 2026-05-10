@@ -16,6 +16,7 @@ from zocr.ocr_pipeline import (
     SimpleAggregator,
     SimpleTableExtractor,
     SimpleVLLM,
+    SimpleVisualDescriptor,
 )
 
 
@@ -102,7 +103,7 @@ def test_aspect_ratio_region_classifier_rejects_dense_filled_regions_as_tables()
     assert result.classification != RegionType.TABLE
 
 
-def test_simple_vllm_describes_visual_statistics():
+def test_simple_visual_descriptor_describes_visual_statistics():
     image = Image.new("RGB", (80, 60), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((10, 10, 70, 50), outline="black", width=2)
@@ -116,11 +117,15 @@ def test_simple_vllm_describes_visual_statistics():
         image_crop=image,
     )
 
-    result = SimpleVLLM().describe(region)
+    result = SimpleVisualDescriptor().describe(region)
 
     assert "Visual region 80x60" in result.caption
     assert result.detailed_description is not None
     assert "edge density" in result.detailed_description
+
+
+def test_simple_vllm_remains_legacy_alias():
+    assert isinstance(SimpleVLLM(), SimpleVisualDescriptor)
 
 
 def test_simple_table_extractor_uses_grid_lines(monkeypatch):

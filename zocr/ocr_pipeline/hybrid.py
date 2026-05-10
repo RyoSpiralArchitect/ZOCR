@@ -1,11 +1,11 @@
-"""Hybrid text OCR utilities combining toy and Tesseract engines.
+"""Hybrid text OCR utilities combining ZOCR-native and Tesseract engines.
 
-The toy runtime provides a lightweight, low-latency recogniser that works well
-on the synthetic/demo fonts used throughout Z-OCR. Tesseract is more accurate
-on difficult inputs (handwriting-like glyphs, skew, noisy scans) but slower. A
-two-stage wrapper lets the toy engine answer quickly while still falling back
+The ZOCR runtime is the local, evidence-first recogniser that grew out of the
+original toy OCR path. Tesseract is more accurate on some difficult inputs
+(handwriting-like glyphs, skew, noisy scans) but slower and optional. A
+two-stage wrapper lets the ZOCR runtime answer quickly while still falling back
 to Tesseract when confidence is low or text is missing, reinforcing the
-"ground truth before LLM" contract emphasized in Phase 1.
+"ground truth before LLM" contract.
 """
 
 from __future__ import annotations
@@ -19,34 +19,55 @@ from .interfaces import TextOCR
 from .models import ClassifiedRegion, RegionType, TextOcrResult
 
 
-class ToyRuntimeTextOCR(TextOCR):
-    """Wrap the consensus toy runtime for use inside the modular pipeline."""
+class ZocrRuntimeOCR(TextOCR):
+    """Wrap the ZOCR glyph runtime for use inside the modular pipeline."""
 
-    def __init__(self, toy_runner: Callable[[Image.Image], Tuple[str, float]] | None = None) -> None:
-        if toy_runner is None:
+    engine_name = "zocr_runtime"
+    language = "zocr"
+    display_name = "ZocrRuntimeOCR"
+
+    def __init__(
+        self,
+        runtime_runner: Callable[[Image.Image], Tuple[str, float]] | None = None,
+        *,
+        toy_runner: Callable[[Image.Image], Tuple[str, float]] | None = None,
+    ) -> None:
+        if runtime_runner is not None and toy_runner is not None:
+            raise ValueError("Provide either runtime_runner or toy_runner, not both")
+        if runtime_runner is None:
+            runtime_runner = toy_runner
+        if runtime_runner is None:
             try:  # Lazy import to keep upstream dependencies optional
                 from zocr.consensus.toy_runtime import toy_ocr_text_from_cell
             except Exception as exc:  # pragma: no cover - guarded for environments without consensus deps
-                raise ImportError("Toy runtime is unavailable") from exc
+                raise ImportError("ZOCR runtime OCR is unavailable") from exc
 
-            toy_runner = toy_ocr_text_from_cell
+            runtime_runner = toy_ocr_text_from_cell
 
-        self._toy_runner = toy_runner
+        self._runtime_runner = runtime_runner
 
     def run(self, region: ClassifiedRegion) -> TextOcrResult:
         if region.classification != RegionType.TEXT:
-            raise ValueError("ToyRuntimeTextOCR can only process text regions")
+            raise ValueError(f"{self.display_name} can only process text regions")
         if not isinstance(region.image_crop, Image.Image):
-            raise ValueError("ToyRuntimeTextOCR requires a PIL.Image crop on the region")
+            raise ValueError(f"{self.display_name} requires a PIL.Image crop on the region")
 
-        text, confidence = self._toy_runner(region.image_crop)
+        text, confidence = self._runtime_runner(region.image_crop)
         return TextOcrResult(
             region_id=region.region_id,
             text=text,
             confidence=float(confidence or 0.0),
-            language="toy",
-            engine="toy_runtime",
+            language=self.language,
+            engine=self.engine_name,
         )
+
+
+class ToyRuntimeTextOCR(ZocrRuntimeOCR):
+    """Backward-compatible alias for the legacy toy-runtime name."""
+
+    engine_name = "toy_runtime"
+    language = "toy"
+    display_name = "ToyRuntimeTextOCR"
 
 
 @dataclass

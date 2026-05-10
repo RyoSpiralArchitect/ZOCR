@@ -566,7 +566,7 @@ def _colorfulness(image: Image.Image) -> float:
     )
 
 
-class SimpleVLLM(VLLM):
+class SimpleVisualDescriptor(VLLM):
     """Local visual descriptor for image-like regions.
 
     This is deliberately offline and deterministic. It does not claim semantic
@@ -634,8 +634,12 @@ class SimpleVLLM(VLLM):
         )
 
 
-class DummyVLLM(SimpleVLLM):
-    """Backward-compatible alias for the heuristic VLM."""
+class SimpleVLLM(SimpleVisualDescriptor):
+    """Backward-compatible alias for the legacy VLM-like name."""
+
+
+class DummyVLLM(SimpleVisualDescriptor):
+    """Backward-compatible alias for the heuristic visual descriptor."""
 
 
 def _cluster_centers(values: Iterable[float], gap: float) -> List[float]:
