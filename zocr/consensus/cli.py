@@ -23,6 +23,7 @@ from .runtime import (
     configure_toy_runtime,
     ensure_dir,
     export_jsonl_with_ocr,
+    last_export_stats,
     pdf_to_images_via_poppler,
 )
 
@@ -175,6 +176,13 @@ def cli_export(args):
         configure_toy_runtime(**runtime_overrides)
     n = export_jsonl_with_ocr(jpath, source_images, out_jsonl, ocr_engine="toy", contextual=True)
     print("Exported", n, "records to", out_jsonl)
+    stats = last_export_stats()
+    quality = stats.get("quality") if isinstance(stats, dict) else None
+    if isinstance(quality, dict):
+        artifacts = quality.get("artifacts") if isinstance(quality.get("artifacts"), dict) else {}
+        quality_path = artifacts.get("quality_json") if isinstance(artifacts, dict) else None
+        suffix = f" -> {quality_path}" if quality_path else ""
+        print(f"Quality {quality.get('status', 'unknown')} score={quality.get('score', '?')}{suffix}")
 
 
 def cli_index(args):
