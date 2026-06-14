@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -13,6 +14,51 @@ from .artifacts.manifest import (
     build_manifest,
     write_manifest,
 )
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _guess_kind(path: Path) -> str:
+    if path.is_dir():
+        return "dir"
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return "json"
+    if suffix == ".jsonl":
+        return "jsonl"
+    if suffix == ".zip":
+        return "zip"
+    if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+        return "image"
+    if suffix == ".csv":
+        return "csv"
+    if suffix == ".pkl":
+        return "pickle"
+    if suffix in {".html", ".htm"}:
+        return "html"
+    if suffix == ".md":
+        return "markdown"
+    return "file"
+
+
+def _resolve_artifact_path(base_dir: Path, rel: str) -> Tuple[Path, bool]:
+    raw = Path(rel)
+    path = raw if raw.is_absolute() else base_dir / raw
+    try:
+        resolved = path.resolve()
+        base = base_dir.resolve()
+    except Exception:
+        return path, True
+    return resolved, resolved == base or base in resolved.parents
 
 
 def _load_json(path: Path) -> Any:
@@ -50,8 +96,39 @@ def _validate_pipeline_summary(obj: Any) -> List[str]:
     return errors
 
 
-def _validate_jsonl(path: Path, *, max_lines: int) -> List[str]:
+def _validate_simple_summary(obj: Any) -> List[str]:
     errors: List[str] = []
+    if not isinstance(obj, dict):
+        return ["summary.json: expected object"]
+    schema = obj.get("schema")
+    if schema is None:
+        return errors
+    if schema != "zocr.simple_run.v1":
+        errors.append(f"summary.json: unexpected schema={obj.get('schema')!r}")
+    totals = obj.get("totals")
+    if not isinstance(totals, dict):
+        errors.append("summary.json: missing/invalid totals")
+    return errors
+
+
+def _validate_simple_manifest(obj: Any) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(obj, dict):
+        return ["manifest.json: expected object"]
+    schema = obj.get("schema")
+    if schema is None:
+        return errors
+    if schema != "zocr.simple_run.v1":
+        errors.append(f"manifest.json: unexpected schema={obj.get('schema')!r}")
+    artifacts = obj.get("artifacts")
+    if not isinstance(artifacts, dict):
+        errors.append("manifest.json: missing/invalid artifacts")
+    return errors
+
+
+def _validate_jsonl(path: Path, *, max_lines: int) -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
     try:
         with path.open("r", encoding="utf-8") as f:
             for idx, line in enumerate(f):
@@ -61,15 +138,63 @@ def _validate_jsonl(path: Path, *, max_lines: int) -> List[str]:
                 if not line:
                     continue
                 try:
-                    json.loads(line)
+                    payload = json.loads(line)
                 except Exception as exc:
                     errors.append(f"{path.name}: invalid JSONL at line {idx+1}: {exc}")
+                    break
+                if not isinstance(payload, dict):
+                    warnings.append(f"{path.name}: JSONL line {idx+1} is not an object")
                     break
     except FileNotFoundError:
         errors.append(f"{path.name}: missing")
     except Exception as exc:
         errors.append(f"{path.name}: unreadable: {exc}")
-    return errors
+    return errors, warnings
+
+
+def _validate_artifact_integrity(name: str, entry: Dict[str, Any], path: Path) -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    kind = entry.get("kind")
+    actual_kind = _guess_kind(path)
+    if isinstance(kind, str) and kind and kind != actual_kind:
+        warnings.append(f"manifest: artifact {name!r} kind={kind!r} but path looks like {actual_kind!r}")
+    if not path.is_file():
+        return errors, warnings
+    try:
+        actual_bytes = path.stat().st_size
+    except Exception as exc:
+        errors.append(f"{entry.get('path')}: cannot stat artifact: {exc}")
+        return errors, warnings
+    expected_bytes = entry.get("bytes")
+    if isinstance(expected_bytes, int) and expected_bytes != actual_bytes:
+        errors.append(f"{entry.get('path')}: byte size mismatch manifest={expected_bytes} actual={actual_bytes}")
+    expected_sha = entry.get("sha256")
+    if isinstance(expected_sha, str) and expected_sha:
+        try:
+            actual_sha = _sha256_file(path)
+        except Exception as exc:
+            errors.append(f"{entry.get('path')}: sha256 check failed: {exc}")
+        else:
+            if actual_sha != expected_sha:
+                errors.append(f"{entry.get('path')}: sha256 mismatch")
+    return errors, warnings
+
+
+def _validate_manifest_audit(manifest: Dict[str, Any]) -> List[str]:
+    audit = manifest.get("audit")
+    if not isinstance(audit, dict):
+        return []
+    warnings: List[str] = []
+    audit_warnings = audit.get("warnings")
+    if isinstance(audit_warnings, list):
+        for item in audit_warnings:
+            if isinstance(item, str) and item:
+                warnings.append(f"manifest audit: {item}")
+    missing = audit.get("missing_references")
+    if isinstance(missing, list) and missing:
+        warnings.append(f"manifest audit: {len(missing)} missing artifact reference(s)")
+    return warnings
 
 
 def _validate_manifest(manifest: Any, *, base_dir: Path, max_jsonl_lines: int) -> Tuple[List[str], List[str]]:
@@ -81,6 +206,7 @@ def _validate_manifest(manifest: Any, *, base_dir: Path, max_jsonl_lines: int) -
         errors.append(f"manifest: unexpected schema={manifest.get('schema')!r}")
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         errors.append(f"manifest: unexpected schema_version={manifest.get('schema_version')!r}")
+    warnings.extend(_validate_manifest_audit(manifest))
 
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -95,10 +221,16 @@ def _validate_manifest(manifest: Any, *, base_dir: Path, max_jsonl_lines: int) -
         if not isinstance(rel, str) or not rel:
             warnings.append(f"manifest: artifact {name!r} missing path")
             continue
-        path = base_dir / rel
+        path, inside_base = _resolve_artifact_path(base_dir, rel)
+        if not inside_base:
+            errors.append(f"artifact path escapes run directory: {rel}")
+            continue
         if not path.exists():
             errors.append(f"artifact missing: {rel}")
             continue
+        integrity_errors, integrity_warnings = _validate_artifact_integrity(name, entry, path)
+        errors.extend(integrity_errors)
+        warnings.extend(integrity_warnings)
         kind = entry.get("kind")
         if kind == "json":
             try:
@@ -110,8 +242,14 @@ def _validate_manifest(manifest: Any, *, base_dir: Path, max_jsonl_lines: int) -
                 errors.extend(_validate_doc_zocr(obj))
             elif name == "pipeline_summary":
                 errors.extend(_validate_pipeline_summary(obj))
+            elif name == "simple_summary":
+                errors.extend(_validate_simple_summary(obj))
+            elif name == "simple_manifest":
+                errors.extend(_validate_simple_manifest(obj))
         elif kind == "jsonl":
-            errors.extend(_validate_jsonl(path, max_lines=max_jsonl_lines))
+            jsonl_errors, jsonl_warnings = _validate_jsonl(path, max_lines=max_jsonl_lines)
+            errors.extend(jsonl_errors)
+            warnings.extend(jsonl_warnings)
     return (errors, warnings)
 
 
@@ -193,4 +331,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-

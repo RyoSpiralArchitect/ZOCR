@@ -162,6 +162,7 @@ python -m zocr simple --input-dir pages/ --outdir out/with-vlm
 # Validate an outdir (creates zocr.manifest.json if missing)
 python -m zocr validate out_allinone --write-manifest
 ```
+`zocr.manifest.json` now records discovered pipeline/simple-run artifacts with byte sizes, modified timestamps, and SHA-256 hashes for files under `ZOCR_MANIFEST_HASH_MAX_BYTES` (default 16 MiB). `zocr validate` checks those hashes and sizes, surfaces missing summary references, and validates simple handoff JSON/JSONL artifacts.
 
 ## Lightweight OCR pipeline CLI
 For quick component-level runs without the full orchestrator, call the modular
