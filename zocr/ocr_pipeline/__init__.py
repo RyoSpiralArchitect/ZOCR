@@ -57,8 +57,9 @@ from .simple import (
     SimpleAggregator,
     SimpleTableExtractor,
     SimpleVLLM,
+    SimpleVisualDescriptor,
 )
-from .hybrid import ToyRuntimeTextOCR, TwoStageTextOCR
+from .hybrid import ToyRuntimeTextOCR, TwoStageTextOCR, ZocrRuntimeOCR
 from .tesseract import TesseractTextOCR
 
 __all__ = [
@@ -84,11 +85,13 @@ __all__ = [
     "AspectRatioRegionClassifier",
     "SimpleAggregator",
     "SimpleTableExtractor",
+    "SimpleVisualDescriptor",
     "SimpleVLLM",
     "DummyVLLM",
     "DummyTableExtractor",
     "ToyRuntimeTextOCR",
     "TwoStageTextOCR",
+    "ZocrRuntimeOCR",
     "OcrPipeline",
     "DocumentPipeline",
     "PageInput",

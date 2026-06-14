@@ -163,6 +163,25 @@ python -m zocr.ocr_pipeline.cli --input-dir pages/ --out doc.json
 python -m zocr validate out_allinone --write-manifest
 ```
 
+## Lightweight OCR pipeline CLI
+For quick component-level runs without the full orchestrator, call the modular
+OCR pipeline directly. It accepts a single ordered image list, one PDF, a
+directory of page images, or a batch directory whose subdirectories are treated
+as separate documents:
+
+```bash
+python -m zocr.ocr_pipeline.cli --images page1.png page2.png --out result.json
+python -m zocr.ocr_pipeline.cli --pdf report.pdf --document-id report-001
+python -m zocr.ocr_pipeline.cli --input-dir pages/ --recursive --pattern "*.png"
+python -m zocr.ocr_pipeline.cli --batch-dir batches/ --out batch-result.json
+```
+
+The default lightweight stack is centered on `ZocrRuntimeOCR`, the local
+glyph-runtime OCR engine that grew out of the legacy `ToyRuntimeTextOCR` name.
+Image-like regions use `SimpleVisualDescriptor`, an offline descriptor rather
+than a provider-backed VLM; external VLMs should sit beside this path as
+optional reviewers/captioners instead of replacing the ZOCR-native read.
+
 ## Bench / ベンチ
 ```bash
 python -m zocr bench toy --iterations 5

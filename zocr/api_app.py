@@ -1,9 +1,11 @@
 """FastAPI application exposing the ingest/query surfaces.
 
-This module keeps the HTTP wiring lightweight and reuses the validation and
-response mappers defined in :mod:`zocr.api_http`. Callers can provide custom
-``ingest_runner`` / ``query_runner`` callbacks for dependency injection in
-tests or to wrap job orchestration in their own queues.
+This module keeps the schema-first ``/ingest`` and ``/query`` wiring lightweight
+and reuses the validation/response mappers defined in :mod:`zocr.api_http`.
+Callers can provide custom ``ingest_runner`` / ``query_runner`` callbacks for
+dependency injection in tests. Production deployments that need persistent jobs,
+tenant auth, quotas, Redis workers, or artifact downloads should use
+``zocr.service.app`` / ``zocr-api`` instead.
 """
 from __future__ import annotations
 

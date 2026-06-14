@@ -11,7 +11,7 @@ import json
 import urllib.error
 import urllib.request
 from bisect import bisect_right
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TypedDict
 
 import numpy as np
 from PIL import Image
@@ -38,8 +38,18 @@ from .models import (
 )
 from .structure import build_structural_graph
 
+LineKey = Tuple[int, int, int]
+XYBox = Tuple[int, int, int, int]
 
-_Box = Tuple[int, int, int, int]
+
+class OcrWord(TypedDict):
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    conf: float
+    row_key: LineKey
 
 
 def _to_gray_array(image: Image.Image) -> np.ndarray:
@@ -51,8 +61,32 @@ def _ink_mask(gray: np.ndarray) -> np.ndarray:
     if gray.size == 0:
         return np.zeros_like(gray, dtype=bool)
     percentile = float(np.percentile(gray, 70))
-    threshold = max(0.0, min(255.0, percentile - 12.0))
-    return gray < threshold
+    otsu = _otsu_threshold(gray)
+    threshold = percentile - 12.0
+    if 10.0 < otsu < 245.0:
+        threshold = min(threshold, otsu)
+    threshold = max(0.0, min(255.0, threshold))
+    return gray <= threshold
+
+
+def _otsu_threshold(gray: np.ndarray) -> float:
+    if gray.size == 0:
+        return 0.0
+    hist = np.bincount(gray.reshape(-1), minlength=256).astype(float)
+    total = hist.sum()
+    if total <= 0:
+        return 0.0
+    cumulative = np.cumsum(hist)
+    cumulative_mean = np.cumsum(hist * np.arange(256))
+    global_mean = cumulative_mean[-1]
+    denominator = cumulative * (total - cumulative)
+    valid = denominator > 0
+    variance = np.zeros(256, dtype=float)
+    variance[valid] = (
+        (global_mean * cumulative[valid] - cumulative_mean[valid] * total) ** 2
+        / denominator[valid]
+    )
+    return float(np.argmax(variance))
 
 
 def _find_gaps(
@@ -110,7 +144,7 @@ def _bounding_box_from_mask(
     return x_offset + x0, y_offset + y0, width, height
 
 
-def _ink_bounds(mask: np.ndarray) -> Optional[_Box]:
+def _ink_bounds(mask: np.ndarray) -> Optional[XYBox]:
     if mask.size == 0 or not mask.any():
         return None
     rows = np.any(mask, axis=1)
@@ -127,7 +161,7 @@ def _ink_bounds(mask: np.ndarray) -> Optional[_Box]:
     )
 
 
-def _pad_box(box: _Box, width: int, height: int, padding: int) -> _Box:
+def _pad_xy_box(box: XYBox, width: int, height: int, padding: int) -> XYBox:
     x0, y0, x1, y1 = box
     return (
         max(0, x0 - padding),
@@ -137,7 +171,7 @@ def _pad_box(box: _Box, width: int, height: int, padding: int) -> _Box:
     )
 
 
-def _tighten_box_to_ink(mask: np.ndarray, box: _Box, padding: int = 0) -> Optional[_Box]:
+def _tighten_xy_box_to_ink(mask: np.ndarray, box: XYBox, padding: int = 0) -> Optional[XYBox]:
     x0, y0, x1, y1 = box
     x0 = max(0, min(int(x0), mask.shape[1]))
     x1 = max(0, min(int(x1), mask.shape[1]))
@@ -149,7 +183,12 @@ def _tighten_box_to_ink(mask: np.ndarray, box: _Box, padding: int = 0) -> Option
     if local is None:
         return None
     lx0, ly0, lx1, ly1 = local
-    return _pad_box((x0 + lx0, y0 + ly0, x0 + lx1, y0 + ly1), mask.shape[1], mask.shape[0], padding)
+    return _pad_xy_box(
+        (x0 + lx0, y0 + ly0, x0 + lx1, y0 + ly1),
+        mask.shape[1],
+        mask.shape[0],
+        padding,
+    )
 
 
 def _valid_split_gap(start: int, end: int, axis_len: int, min_side_px: int) -> bool:
@@ -179,7 +218,7 @@ def _best_gap(
 
 def _split_box_xy(
     mask: np.ndarray,
-    box: _Box,
+    box: XYBox,
     *,
     gap_ratio: float,
     min_gap_fraction: float,
@@ -188,8 +227,8 @@ def _split_box_xy(
     max_depth: int,
     bbox_padding: int = 0,
     depth: int = 0,
-) -> List[_Box]:
-    tightened = _tighten_box_to_ink(mask, box, padding=bbox_padding)
+) -> List[XYBox]:
+    tightened = _tighten_xy_box_to_ink(mask, box, padding=bbox_padding)
     if tightened is None:
         return []
     x0, y0, x1, y1 = tightened
@@ -234,7 +273,7 @@ def _split_box_xy(
     else:
         children = [(x0, y0, x0 + start, y1), (x0 + end, y0, x1, y1)]
 
-    leaves: List[_Box] = []
+    leaves: List[XYBox] = []
     for child in children:
         leaves.extend(
             _split_box_xy(
@@ -252,7 +291,7 @@ def _split_box_xy(
     return leaves or [tightened]
 
 
-def _box_iou(a: _Box, b: _Box) -> float:
+def _xy_box_iou(a: XYBox, b: XYBox) -> float:
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
     ix0, iy0 = max(ax0, bx0), max(ay0, by0)
@@ -265,17 +304,122 @@ def _box_iou(a: _Box, b: _Box) -> float:
     return float(intersection / max(1, area_a + area_b - intersection))
 
 
-def _dedupe_boxes(boxes: Sequence[_Box], iou_threshold: float = 0.92) -> List[_Box]:
-    deduped: List[_Box] = []
+def _dedupe_xy_boxes(boxes: Sequence[XYBox], iou_threshold: float = 0.92) -> List[XYBox]:
+    deduped: List[XYBox] = []
     for box in boxes:
-        if any(_box_iou(box, existing) >= iou_threshold for existing in deduped):
+        if any(_xy_box_iou(box, existing) >= iou_threshold for existing in deduped):
             continue
         deduped.append(box)
     return deduped
 
 
+def _clip_box(
+    x: int, y: int, width: int, height: int, image_width: int, image_height: int
+) -> Tuple[int, int, int, int]:
+    if image_width <= 0 or image_height <= 0:
+        return 0, 0, 0, 0
+    x0 = max(0, min(image_width - 1, x))
+    y0 = max(0, min(image_height - 1, y))
+    x1 = max(x0 + 1, min(image_width, x + width))
+    y1 = max(y0 + 1, min(image_height, y + height))
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def _pad_box(
+    box: Tuple[int, int, int, int], padding: int, image_width: int, image_height: int
+) -> Tuple[int, int, int, int]:
+    x, y, width, height = box
+    return _clip_box(
+        x - padding,
+        y - padding,
+        width + padding * 2,
+        height + padding * 2,
+        image_width,
+        image_height,
+    )
+
+
+def _coarse_mask(mask: np.ndarray, cell_size: int) -> np.ndarray:
+    if mask.size == 0:
+        return np.zeros((0, 0), dtype=bool)
+    height, width = mask.shape
+    rows = int(np.ceil(height / cell_size))
+    cols = int(np.ceil(width / cell_size))
+    padded = np.zeros((rows * cell_size, cols * cell_size), dtype=bool)
+    padded[:height, :width] = mask
+    return padded.reshape(rows, cell_size, cols, cell_size).any(axis=(1, 3))
+
+
+def _dilate_bool(mask: np.ndarray, radius_y: int, radius_x: int) -> np.ndarray:
+    if mask.size == 0:
+        return mask
+    radius_y = max(0, radius_y)
+    radius_x = max(0, radius_x)
+    padded = np.pad(mask, ((radius_y, radius_y), (radius_x, radius_x)), constant_values=False)
+    out = np.zeros_like(mask, dtype=bool)
+    for dy in range(radius_y * 2 + 1):
+        for dx in range(radius_x * 2 + 1):
+            out |= padded[dy : dy + mask.shape[0], dx : dx + mask.shape[1]]
+    return out
+
+
+def _component_boxes_from_mask(
+    mask: np.ndarray,
+    *,
+    image_width: int,
+    image_height: int,
+    cell_size: int,
+    dilation: int,
+    min_component_cells: int,
+    padding: int,
+) -> List[Tuple[int, int, int, int]]:
+    coarse = _dilate_bool(_coarse_mask(mask, cell_size), dilation, dilation)
+    if coarse.size == 0:
+        return []
+
+    visited = np.zeros_like(coarse, dtype=bool)
+    boxes: List[Tuple[int, int, int, int]] = []
+    rows, cols = coarse.shape
+    for row in range(rows):
+        for col in range(cols):
+            if visited[row, col] or not coarse[row, col]:
+                continue
+            stack = [(row, col)]
+            visited[row, col] = True
+            min_row = max_row = row
+            min_col = max_col = col
+            count = 0
+            while stack:
+                current_row, current_col = stack.pop()
+                count += 1
+                min_row = min(min_row, current_row)
+                max_row = max(max_row, current_row)
+                min_col = min(min_col, current_col)
+                max_col = max(max_col, current_col)
+                for next_row, next_col in (
+                    (current_row - 1, current_col),
+                    (current_row + 1, current_col),
+                    (current_row, current_col - 1),
+                    (current_row, current_col + 1),
+                ):
+                    if next_row < 0 or next_col < 0 or next_row >= rows or next_col >= cols:
+                        continue
+                    if visited[next_row, next_col] or not coarse[next_row, next_col]:
+                        continue
+                    visited[next_row, next_col] = True
+                    stack.append((next_row, next_col))
+            if count < min_component_cells:
+                continue
+            x = min_col * cell_size
+            y = min_row * cell_size
+            width = (max_col - min_col + 1) * cell_size
+            height = (max_row - min_row + 1) * cell_size
+            boxes.append(_pad_box((x, y, width, height), padding, image_width, image_height))
+    return sorted(boxes, key=lambda item: (item[1], item[0], item[3], item[2]))
+
+
 class FullPageSegmenter(Segmenter):
-    """Split the page into layout regions with recursive whitespace cuts."""
+    """Split the page into regions using whitespace plus connected components."""
 
     def __init__(
         self,
@@ -284,16 +428,22 @@ class FullPageSegmenter(Segmenter):
         min_gap_fraction: float = 0.02,
         min_region_fraction: float = 0.08,
         smoothing_window: int = 7,
+        bbox_padding: int = 3,
+        component_cell_size: int = 12,
+        component_dilation: int = 1,
+        min_component_cells: int = 2,
         max_depth: int = 6,
-        bbox_padding: int = 2,
     ) -> None:
         self.confidence = confidence
         self.gap_ratio = gap_ratio
         self.min_gap_fraction = min_gap_fraction
         self.min_region_fraction = min_region_fraction
         self.smoothing_window = smoothing_window
-        self.max_depth = max_depth
         self.bbox_padding = bbox_padding
+        self.component_cell_size = component_cell_size
+        self.component_dilation = component_dilation
+        self.min_component_cells = min_component_cells
+        self.max_depth = max_depth
 
     def segment(self, page: PageInput) -> List[SegmentedRegion]:
         image = page.image
@@ -309,11 +459,15 @@ class FullPageSegmenter(Segmenter):
         regions: List[SegmentedRegion] = []
         min_region_size = max(8, int(min(width, height) * self.min_region_fraction))
         if mask.any():
-            content_box = _tighten_box_to_ink(mask, (0, 0, width, height), padding=self.bbox_padding)
+            content_box = _tighten_xy_box_to_ink(
+                mask,
+                (0, 0, width, height),
+                padding=self.bbox_padding,
+            )
             boxes = (
                 _split_box_xy(
                     mask,
-                    content_box or (0, 0, width, height),
+                    content_box,
                     gap_ratio=self.gap_ratio,
                     min_gap_fraction=self.min_gap_fraction,
                     min_region_size=min_region_size,
@@ -324,7 +478,10 @@ class FullPageSegmenter(Segmenter):
                 if content_box
                 else []
             )
-            for region_index, (x0, y0, x1, y1) in enumerate(_dedupe_boxes(boxes), start=1):
+            for region_index, (x0, y0, x1, y1) in enumerate(
+                _dedupe_xy_boxes(boxes),
+                start=1,
+            ):
                 region_w = max(1, x1 - x0)
                 region_h = max(1, y1 - y0)
                 if region_w < min_region_size and region_h < min_region_size:
@@ -342,6 +499,18 @@ class FullPageSegmenter(Segmenter):
                     )
                 )
 
+        if len(regions) <= 1:
+            component_regions = self._component_regions(
+                page=page,
+                image=image,
+                mask=mask,
+                image_width=width,
+                image_height=height,
+                min_region_size=min_region_size,
+            )
+            if len(component_regions) > len(regions):
+                regions = component_regions
+
         if not regions:
             bounding_box = BoundingBox(x=0, y=0, width=width, height=height)
             region_id = f"{page.document_id}-page{page.page_number}-full"
@@ -355,6 +524,45 @@ class FullPageSegmenter(Segmenter):
                 )
             ]
 
+        return regions
+
+    def _component_regions(
+        self,
+        *,
+        page: PageInput,
+        image: Image.Image,
+        mask: np.ndarray,
+        image_width: int,
+        image_height: int,
+        min_region_size: int,
+    ) -> List[SegmentedRegion]:
+        cell_size = max(4, min(self.component_cell_size, max(4, min(image_width, image_height) // 8)))
+        boxes = _component_boxes_from_mask(
+            mask,
+            image_width=image_width,
+            image_height=image_height,
+            cell_size=cell_size,
+            dilation=self.component_dilation,
+            min_component_cells=self.min_component_cells,
+            padding=max(self.bbox_padding, cell_size // 2),
+        )
+        regions: List[SegmentedRegion] = []
+        for box in boxes:
+            x, y, region_w, region_h = box
+            if region_w < min_region_size and region_h < min_region_size:
+                continue
+            region_id = f"{page.document_id}-page{page.page_number}-component{len(regions) + 1}"
+            bbox = BoundingBox(x=x, y=y, width=region_w, height=region_h)
+            crop = image.crop((x, y, x + region_w, y + region_h))
+            regions.append(
+                SegmentedRegion(
+                    region_id=region_id,
+                    bounding_box=bbox,
+                    image_crop=crop,
+                    confidence=max(0.0, self.confidence - 0.05),
+                    reading_order=len(regions),
+                )
+            )
         return regions
 
 
@@ -404,7 +612,7 @@ class AspectRatioRegionClassifier(RegionClassifier):
             edge_ratio = _edge_density(gray)
             row_ratio, col_ratio = _line_ratios(mask)
 
-            if row_ratio > 0.03 and col_ratio > 0.02 and ink_ratio > 0.01:
+            if row_ratio > 0.03 and col_ratio > 0.02 and 0.01 < ink_ratio < 0.45:
                 classification = RegionType.TABLE
                 confidence = min(1.0, confidence + 0.1)
             elif ink_ratio < 0.02 and edge_ratio > 0.06:
@@ -518,6 +726,19 @@ def _dominant_color(image: Image.Image) -> str:
     return f"rgb({int(mean[0])},{int(mean[1])},{int(mean[2])})"
 
 
+def _colorfulness(image: Image.Image) -> float:
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    small = image.resize((32, 32))
+    data = np.array(small)[:, :, :3].astype(float)
+    rg = np.abs(data[:, :, 0] - data[:, :, 1])
+    yb = np.abs(0.5 * (data[:, :, 0] + data[:, :, 1]) - data[:, :, 2])
+    return float(
+        np.sqrt(np.var(rg) + np.var(yb))
+        + 0.3 * np.sqrt(np.mean(rg) ** 2 + np.mean(yb) ** 2)
+    )
+
+
 CaptionerResult = ImageCaptionResult | Mapping[str, Any] | str | None
 Captioner = Callable[[ClassifiedRegion], CaptionerResult]
 
@@ -569,8 +790,14 @@ def _caption_result_from_provider(
     )
 
 
-class SimpleVLLM(VLLM):
-    """Caption image-like regions with an optional provider and local fallback."""
+class SimpleVisualDescriptor(VLLM):
+    """Local visual descriptor for image-like regions.
+
+    This is deliberately offline and deterministic. It does not claim semantic
+    object recognition, but it produces richer cues than a bare placeholder so
+    downstream review can distinguish photos, screenshots, diagrams, and flat
+    graphics without adding a required model dependency.
+    """
 
     def __init__(self, confidence: float = 0.55, captioner: Captioner | None = None) -> None:
         self.confidence = confidence
@@ -601,28 +828,40 @@ class SimpleVLLM(VLLM):
             mask = _ink_mask(gray)
             ink_ratio = float(mask.mean()) if mask.size else 0.0
             edge_ratio = _edge_density(gray)
+            row_ratio, col_ratio = _line_ratios(mask)
             variance = float(np.var(gray)) if gray.size else 0.0
             dominant = _dominant_color(image)
+            colorfulness = _colorfulness(image)
+            aspect = width / height if height else 0.0
 
-            caption_parts.append(f"Image region {width}x{height}")
+            caption_parts.append(f"Visual region {width}x{height}")
             detail.append(f"dominant color {dominant}")
+            detail.append(f"aspect ratio {aspect:.2f}")
+            detail.append(f"colorfulness {colorfulness:.1f}")
             detail.append(f"edge density {edge_ratio:.2f}")
 
-            if ink_ratio < 0.02 and edge_ratio > 0.07:
-                caption_parts.append("photo-like content")
-                detected.append("photo")
+            if row_ratio > 0.03 and col_ratio > 0.02:
+                caption_parts.append("grid or table-like graphic")
+                detected.append("table_grid")
+            elif ink_ratio < 0.02 and edge_ratio > 0.07 and colorfulness > 8.0:
+                caption_parts.append("photo-like raster content")
+                detected.append("photo_like")
             elif ink_ratio > 0.05 and edge_ratio > 0.05:
-                caption_parts.append("diagram or chart")
-                detected.append("diagram")
+                caption_parts.append("line-art diagram or chart")
+                detected.append("diagram_like")
+            elif edge_ratio > 0.08 and colorfulness < 6.0:
+                caption_parts.append("screenshot or document crop")
+                detected.append("screenshot_like")
             elif variance < 120:
                 caption_parts.append("flat graphic")
-                detected.append("graphic")
+                detected.append("flat_graphic")
             else:
                 caption_parts.append("mixed visual content")
             detail.append(f"ink ratio {ink_ratio:.3f}")
+            detail.append(f"line ratios h={row_ratio:.3f} v={col_ratio:.3f}")
             detail.append(f"variance {variance:.1f}")
         else:
-            caption_parts.append(f"Image region {region.region_id}")
+            caption_parts.append(f"Visual region {region.region_id}")
 
         return ImageCaptionResult(
             region_id=region.region_id,
@@ -633,8 +872,12 @@ class SimpleVLLM(VLLM):
         )
 
 
-class HttpVLLM(SimpleVLLM):
-    """HTTP-backed VLM adapter with the same result contract as ``SimpleVLLM``."""
+class SimpleVLLM(SimpleVisualDescriptor):
+    """Backward-compatible alias for the legacy VLM-like name."""
+
+
+class HttpVLLM(SimpleVisualDescriptor):
+    """HTTP-backed VLM adapter with the same result contract as ``SimpleVisualDescriptor``."""
 
     def __init__(
         self,
@@ -677,8 +920,8 @@ class HttpVLLM(SimpleVLLM):
         return json.loads(raw)
 
 
-class DummyVLLM(SimpleVLLM):
-    """Backward-compatible alias for the heuristic VLM."""
+class DummyVLLM(SimpleVisualDescriptor):
+    """Backward-compatible alias for the heuristic visual descriptor."""
 
 
 def _cluster_centers(values: Iterable[float], gap: float) -> List[float]:
@@ -722,7 +965,7 @@ def _data_value(data: Mapping[str, Sequence[Any]], key: str, idx: int, default: 
         return default
 
 
-def _word_rows(words: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+def _word_rows(words: Sequence[OcrWord]) -> List[List[OcrWord]]:
     if not words:
         return []
     heights = [float(w["height"]) for w in words if float(w.get("height", 0)) > 0]
@@ -733,7 +976,7 @@ def _word_rows(words: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         row_gap,
     )
     centers = sorted(centers) or [0.0]
-    rows: Dict[int, List[Dict[str, Any]]] = {}
+    rows: Dict[int, List[OcrWord]] = {}
     for word in words:
         center = float(word["top"]) + float(word["height"]) / 2.0
         row_idx = min(range(len(centers)), key=lambda i: abs(centers[i] - center))
@@ -741,7 +984,7 @@ def _word_rows(words: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     return [sorted(rows[key], key=lambda w: (int(w["left"]), int(w["top"]))) for key in sorted(rows)]
 
 
-def _row_cell_starts(rows: Sequence[Sequence[Dict[str, Any]]]) -> List[float]:
+def _row_cell_starts(rows: Sequence[Sequence[OcrWord]]) -> List[float]:
     widths = [float(w["width"]) for row in rows for w in row if float(w.get("width", 0)) > 0]
     median_width = float(np.median(widths)) if widths else 20.0
     gap_threshold = max(10.0, median_width * 0.75)
@@ -761,7 +1004,7 @@ def _row_cell_starts(rows: Sequence[Sequence[Dict[str, Any]]]) -> List[float]:
     return starts
 
 
-def _infer_column_anchors(rows: Sequence[Sequence[Dict[str, Any]]]) -> List[float]:
+def _infer_column_anchors(rows: Sequence[Sequence[OcrWord]]) -> List[float]:
     starts = _row_cell_starts(rows)
     widths = [float(w["width"]) for row in rows for w in row if float(w.get("width", 0)) > 0]
     median_width = float(np.median(widths)) if widths else 20.0
@@ -785,31 +1028,120 @@ def _assign_word_to_column(word: Mapping[str, Any], anchors: Sequence[float]) ->
 
 
 def _unique_headers(cells: Sequence[str]) -> List[str]:
-    seen: Dict[str, int] = {}
     headers: List[str] = []
+    seen: Dict[str, int] = {}
     for idx, cell in enumerate(cells):
-        base = (cell or f"col{idx + 1}").strip() or f"col{idx + 1}"
-        count = seen.get(base, 0) + 1
-        seen[base] = count
-        headers.append(base if count == 1 else f"{base}_{count}")
+        base = cell.strip() or f"col{idx + 1}"
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        headers.append(base if count == 0 else f"{base}_{count + 1}")
     return headers
 
 
+def _table_data_from_rows(rows: List[List[str]], column_count: int) -> TableData:
+    if column_count <= 0:
+        column_count = max((len(row) for row in rows), default=1)
+    normalized_rows = [
+        [row[idx] if idx < len(row) else "" for idx in range(column_count)] for row in rows
+    ]
+    if normalized_rows and _is_header_candidate(normalized_rows[0]):
+        header_cells = _unique_headers(normalized_rows[0])
+        data_rows = normalized_rows[1:]
+    else:
+        header_cells = [f"col{idx + 1}" for idx in range(column_count)]
+        data_rows = normalized_rows
+
+    row_dicts = [
+        {header: row[idx] if idx < len(row) else "" for idx, header in enumerate(header_cells)}
+        for row in data_rows
+    ]
+    return TableData(
+        headers=header_cells,
+        rows=row_dicts,
+        num_rows=len(row_dicts),
+        num_columns=len(header_cells),
+    )
+
+
+def _dense_runs(density: np.ndarray, threshold: float, min_width: int) -> List[Tuple[int, int]]:
+    runs: List[Tuple[int, int]] = []
+    start = None
+    for idx, value in enumerate(density):
+        if value >= threshold:
+            if start is None:
+                start = idx
+        else:
+            if start is not None and idx - start >= min_width:
+                runs.append((start, idx))
+            start = None
+    if start is not None and len(density) - start >= min_width:
+        runs.append((start, len(density)))
+    return runs
+
+
+def _run_centers(runs: Sequence[Tuple[int, int]]) -> List[int]:
+    return [int(round((start + end - 1) / 2.0)) for start, end in runs]
+
+
+def _grid_boundaries(mask: np.ndarray) -> Tuple[List[int], List[int]]:
+    if mask.size == 0:
+        return [], []
+    height, width = mask.shape
+    horizontal_runs = _dense_runs(
+        mask.mean(axis=1),
+        threshold=0.55,
+        min_width=max(1, int(height * 0.002)),
+    )
+    vertical_runs = _dense_runs(
+        mask.mean(axis=0),
+        threshold=0.55,
+        min_width=max(1, int(width * 0.002)),
+    )
+    horizontal = _run_centers(horizontal_runs)
+    vertical = _run_centers(vertical_runs)
+    if len(horizontal) < 2 or len(vertical) < 2:
+        return [], []
+    return horizontal, vertical
+
+
+def _assign_words_to_grid(
+    words: Sequence[OcrWord], horizontal: Sequence[int], vertical: Sequence[int]
+) -> List[List[str]]:
+    row_count = len(horizontal) - 1
+    col_count = len(vertical) - 1
+    rows: List[List[List[str]]] = [[[] for _ in range(col_count)] for _ in range(row_count)]
+    for word in sorted(words, key=lambda item: (item["top"], item["left"])):
+        center_x = word["left"] + word["width"] / 2.0
+        center_y = word["top"] + word["height"] / 2.0
+        row_idx = next(
+            (
+                idx
+                for idx in range(row_count)
+                if horizontal[idx] <= center_y <= horizontal[idx + 1]
+            ),
+            None,
+        )
+        col_idx = next(
+            (
+                idx
+                for idx in range(col_count)
+                if vertical[idx] <= center_x <= vertical[idx + 1]
+            ),
+            None,
+        )
+        if row_idx is None or col_idx is None:
+            continue
+        rows[row_idx][col_idx].append(word["text"])
+    return [[" ".join(cell).strip() for cell in row] for row in rows]
+
+
 class SimpleTableExtractor(TableExtractor):
-    """Extract tables using Tesseract word boxes and adaptive row/column clustering."""
+    """Extract tables using grid lines when present, then OCR word clustering."""
 
     def __init__(self, confidence: float = 0.6) -> None:
         self.confidence = confidence
 
     def extract(self, region: ClassifiedRegion) -> TableExtractionResult:
-        if pytesseract is None:
-            table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
-            return TableExtractionResult(
-                region_id=region.region_id,
-                table_data=table_data,
-                confidence=0.0,
-                format="missing_pytesseract",
-            )
         if not isinstance(region.image_crop, Image.Image):
             table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
             return TableExtractionResult(
@@ -819,8 +1151,43 @@ class SimpleTableExtractor(TableExtractor):
                 format="empty",
             )
 
-        data = pytesseract.image_to_data(region.image_crop, output_type=pytesseract.Output.DICT)
-        words: List[Dict[str, Any]] = []
+        gray = _to_gray_array(region.image_crop)
+        mask = _ink_mask(gray)
+        horizontal, vertical = _grid_boundaries(mask)
+        words: List[OcrWord] = []
+
+        if pytesseract is None:
+            if horizontal and vertical:
+                row_count = len(horizontal) - 1
+                col_count = len(vertical) - 1
+                table_data = _table_data_from_rows(
+                    [["" for _ in range(col_count)] for _ in range(row_count)],
+                    col_count,
+                )
+                return TableExtractionResult(
+                    region_id=region.region_id,
+                    table_data=table_data,
+                    confidence=0.35,
+                    format="grid_no_ocr",
+                )
+            table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
+            return TableExtractionResult(
+                region_id=region.region_id,
+                table_data=table_data,
+                confidence=0.0,
+                format="missing_pytesseract",
+            )
+
+        try:
+            data = pytesseract.image_to_data(region.image_crop, output_type=pytesseract.Output.DICT)
+        except Exception:
+            table_data = TableData(headers=["col1"], rows=[], num_rows=0, num_columns=1)
+            return TableExtractionResult(
+                region_id=region.region_id,
+                table_data=table_data,
+                confidence=0.0,
+                format="tesseract_error",
+            )
         texts = data.get("text", [])
         for idx, text in enumerate(texts):
             if not text or text.strip() == "":
@@ -828,18 +1195,41 @@ class SimpleTableExtractor(TableExtractor):
             conf_val = _normalize_tesseract_conf(_data_value(data, "conf", idx, -1.0))
             if conf_val < 0:
                 continue
+            left = int(_data_value(data, "left", idx, 0))
+            top = int(_data_value(data, "top", idx, 0))
+            width = int(_data_value(data, "width", idx, 0))
+            height = int(_data_value(data, "height", idx, 0))
+            block_num = int(_data_value(data, "block_num", idx, 0))
+            par_num = int(_data_value(data, "par_num", idx, 0))
+            line_num = int(_data_value(data, "line_num", idx, 0))
             words.append(
                 {
                     "text": text.strip(),
-                    "left": int(_data_value(data, "left", idx, 0)),
-                    "top": int(_data_value(data, "top", idx, 0)),
-                    "width": int(_data_value(data, "width", idx, 0)),
-                    "height": int(_data_value(data, "height", idx, 0)),
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
                     "conf": conf_val,
-                    "block": int(_data_value(data, "block_num", idx, 0)),
-                    "par": int(_data_value(data, "par_num", idx, 0)),
-                    "line": int(_data_value(data, "line_num", idx, 0)),
+                    "row_key": (block_num, par_num, line_num),
                 }
+            )
+
+        if horizontal and vertical:
+            grid_rows = _assign_words_to_grid(words, horizontal, vertical)
+            table_data = _table_data_from_rows(grid_rows, len(vertical) - 1)
+            mean_word_conf = float(np.mean([word["conf"] for word in words])) if words else 0.0
+            confidence = min(
+                0.95,
+                max(
+                    self.confidence,
+                    mean_word_conf * 0.85 + 0.12 + (0.03 * min(table_data.num_rows or 0, 4)),
+                ),
+            )
+            return TableExtractionResult(
+                region_id=region.region_id,
+                table_data=table_data,
+                confidence=confidence,
+                format="tesseract_grid",
             )
 
         if not words:
@@ -868,35 +1258,15 @@ class SimpleTableExtractor(TableExtractor):
                 [float(np.mean(values)) if values else 0.0 for values in conf_cells]
             )
 
-        header_cells: List[str] = []
-        data_rows = rows
-        data_confidences = row_confidences
-        if rows and _is_header_candidate(rows[0]):
-            header_cells = _unique_headers(rows[0])
-            data_rows = rows[1:]
-            data_confidences = row_confidences[1:]
-        else:
-            header_cells = [f"col{idx+1}" for idx in range(len(centers))]
-
-        row_dicts = [
-            {header: row[idx] if idx < len(row) else "" for idx, header in enumerate(header_cells)}
-            for row in data_rows
-        ]
-
-        table_data = TableData(
-            headers=header_cells,
-            rows=row_dicts,
-            num_rows=len(row_dicts),
-            num_columns=len(header_cells),
-        )
+        table_data = _table_data_from_rows(rows, len(centers))
         observed_conf = [
             conf
-            for row in data_confidences
+            for row in row_confidences
             for conf in row
             if conf > 0
         ] or [float(word.get("conf", 0.0)) for word in words]
         mean_word_conf = float(np.mean(observed_conf)) if observed_conf else 0.0
-        structure_bonus = 0.08 if len(header_cells) > 1 and len(rows) > 1 else 0.0
+        structure_bonus = 0.08 if len(table_data.headers) > 1 and len(rows) > 1 else 0.0
         confidence = min(0.95, max(self.confidence, mean_word_conf * 0.85 + structure_bonus))
         return TableExtractionResult(
             region_id=region.region_id,

@@ -1,6 +1,6 @@
 """HTTP-friendly helpers that wrap the ingest/query primitives.
 
-These utilities keep a minimal dependency footprint while providing a
+These utilities keep a small dependency footprint while providing a
 straightforward way for web handlers (FastAPI, Flask, Lambda, etc.) to:
 
 - Validate incoming JSON bodies against the v0 schemas,
@@ -8,9 +8,9 @@ straightforward way for web handlers (FastAPI, Flask, Lambda, etc.) to:
 - Emit public response payloads that conform to the canonical schemas.
 
 The goal is to avoid duplicating validation/mapping glue across services while
-still supporting the lightweight async job status flow used by the bundled
-FastAPI app. For persistent queues, workers, tenant policy, and audit logs, use
-``zocr.service.app``.
+supporting the lightweight async job status flow used by the bundled FastAPI app.
+For persistent jobs, auth, quotas, Redis workers, and artifact downloads, use the
+reference service in :mod:`zocr.service.app`.
 """
 from __future__ import annotations
 

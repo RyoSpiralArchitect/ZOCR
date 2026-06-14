@@ -16,6 +16,7 @@ venv/
 
 # Local pipeline outputs
 out*/
+notes/
 
 # Local API/job storage (optional)
 data/
