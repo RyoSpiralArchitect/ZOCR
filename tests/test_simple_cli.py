@@ -1,3 +1,5 @@
+import json
+
 from PIL import Image
 
 from zocr.ocr_pipeline import mocks
@@ -33,3 +35,46 @@ def test_cli_runs_with_mock_components(tmp_path):
     payload = out_path.read_text(encoding="utf-8")
     assert "doc-123" in payload
     assert "text-1" in payload
+
+
+def test_cli_processes_input_directory_with_mock_components(tmp_path):
+    input_dir = tmp_path / "pages"
+    input_dir.mkdir()
+    Image.new("RGB", (10, 10), color="white").save(input_dir / "page-2.png")
+    Image.new("RGB", (10, 10), color="white").save(input_dir / "page-1.png")
+    out_path = tmp_path / "out.json"
+
+    cli.main([
+        "--input-dir",
+        input_dir.as_posix(),
+        "--out",
+        out_path.as_posix(),
+        "--use-mocks",
+        "--document-id",
+        "dir-doc",
+    ])
+
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert [page["document_id"] for page in payload] == ["dir-doc", "dir-doc"]
+    assert [page["page_number"] for page in payload] == [1, 2]
+
+
+def test_cli_processes_batch_directory_with_mock_components(tmp_path):
+    batch_dir = tmp_path / "batch"
+    for name in ("doc-a", "doc-b"):
+        doc_dir = batch_dir / name
+        doc_dir.mkdir(parents=True)
+        Image.new("RGB", (10, 10), color="white").save(doc_dir / "page.png")
+    out_path = tmp_path / "batch.json"
+
+    cli.main([
+        "--batch-dir",
+        batch_dir.as_posix(),
+        "--out",
+        out_path.as_posix(),
+        "--use-mocks",
+    ])
+
+    payload = out_path.read_text(encoding="utf-8")
+    assert '"document_id": "doc-a"' in payload
+    assert '"document_id": "doc-b"' in payload

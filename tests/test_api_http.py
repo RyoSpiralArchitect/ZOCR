@@ -39,6 +39,34 @@ def test_ingest_request_round_trip(tmp_path):
     assert public_payload["status"] == "queued"
 
 
+def test_ingest_request_parses_async_option():
+    payload = {
+        "tenant_id": "t-http",
+        "files": [{"id": "f1", "uri": "https://example.com/demo.pdf"}],
+        "options": {"async": True},
+    }
+
+    request = api_http.ingest_request_from_payload(payload)
+
+    assert request.async_mode is True
+
+
+def test_job_status_from_payload(tmp_path):
+    job_dir = Path(tmp_path) / "t-http" / "episode_ready"
+    job_dir.mkdir(parents=True)
+    (job_dir / "job_status.json").write_text(
+        '{"job_id": "episode_ready", "tenant_id": "t-http", "status": "completed"}',
+        encoding="utf-8",
+    )
+
+    status = api_http.job_status_from_payload(
+        {"tenant_id": "t-http", "job_id": "episode_ready"},
+        base_dir=str(tmp_path),
+    )
+
+    assert status["status"] == "completed"
+
+
 def test_query_request_round_trip(tmp_path):
     job_dir = Path(tmp_path) / "episode_ready"
     manifest_dir = job_dir / "rag"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
@@ -22,6 +23,7 @@ from . import (
     DummyTableExtractor,
     DummyVLLM,
     FullPageSegmenter,
+    HttpVLLM,
     MockAggregator,
     MockInputHandler,
     MockRegionClassifier,
@@ -75,7 +77,11 @@ def _load_batch_documents(
     return documents
 
 
-def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
+def build_document_pipeline(
+    *,
+    use_mocks: bool = False,
+    vllm_endpoint: str | None = None,
+) -> DocumentPipeline:
     segmenter = MockSegmenter() if use_mocks else FullPageSegmenter()
     classifier = MockRegionClassifier() if use_mocks else AspectRatioRegionClassifier()
     text_ocr = (
@@ -83,7 +89,8 @@ def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
         if use_mocks
         else TwoStageTextOCR(primary=ToyRuntimeTextOCR(), fallback=TesseractTextOCR())
     )
-    vllm = MockVLLM() if use_mocks else DummyVLLM()
+    endpoint = vllm_endpoint or os.environ.get("ZOCR_VLLM_ENDPOINT")
+    vllm = MockVLLM() if use_mocks else (HttpVLLM(endpoint) if endpoint else DummyVLLM())
     table_extractor = MockTableExtractor() if use_mocks else DummyTableExtractor()
     aggregator = MockAggregator() if use_mocks else SimpleAggregator()
 
@@ -134,6 +141,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use mock components (no external dependencies) for fast smoke tests",
     )
+    parser.add_argument(
+        "--vllm-endpoint",
+        help="HTTP JSON endpoint for image-region captioning (falls back to ZOCR_VLLM_ENDPOINT)",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -143,7 +154,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not any([args.images, args.pdf, args.input_dir, args.batch_dir]):
         raise SystemExit("Provide --images, --pdf, --input-dir, or --batch-dir")
 
-    pipeline = build_document_pipeline(use_mocks=args.use_mocks)
+    pipeline = build_document_pipeline(use_mocks=args.use_mocks, vllm_endpoint=args.vllm_endpoint)
 
     payload = []
     if args.images:
