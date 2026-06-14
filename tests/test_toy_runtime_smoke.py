@@ -462,6 +462,13 @@ def test_export_jsonl_with_ocr_smoke(tmp_path) -> None:
     )
     assert n == 0
     assert out_path.exists()
+    quality_path = tmp_path / "out.jsonl.quality.json"
+    assert quality_path.exists()
+    quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    assert quality["schema"] == "zocr.export_quality.v1"
+    assert quality["status"] == "pass"
+    stats = toy_runtime.last_export_stats()
+    assert stats["quality"]["artifacts"]["quality_json"] == str(quality_path)
 
 
 def test_infer_row_bands_from_projection_detects_rows() -> None:
@@ -524,3 +531,62 @@ def test_export_uses_row_projection_when_undersegmented(tmp_path) -> None:
     lines = out_path.read_text(encoding="utf-8").strip().splitlines()
     assert n == 10
     assert len(lines) == 10
+
+
+def test_export_quality_report_flags_low_confidence(tmp_path) -> None:
+    from zocr.consensus import toy_runtime
+
+    x1, y1, x2, y2 = 10, 10, 210, 210
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (220, 220), (255, 255, 255)).save(img_path)
+
+    doc_path = tmp_path / "doc.zocr.json"
+    doc_path.write_text(
+        json.dumps(
+            {
+                "doc_id": "doc",
+                "pages": [
+                    {
+                        "index": 0,
+                        "tables": [
+                            {
+                                "bbox": [x1, y1, x2, y2],
+                                "dbg": {
+                                    "col_bounds": [0, 100, 200],
+                                    "row_bands_rel": [(0, 40), (40, 80)],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out_path = tmp_path / "out.jsonl"
+    n = toy_runtime.export_jsonl_with_ocr(
+        str(doc_path),
+        str(img_path),
+        str(out_path),
+        ocr_engine="toy",
+        contextual=False,
+    )
+    assert n == 4
+
+    quality_path = tmp_path / "out.jsonl.quality.json"
+    quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    assert quality["status"] == "fail"
+    failed_gates = {gate["name"] for gate in quality["gates"] if gate["status"] == "fail"}
+    assert "low_conf_ratio" in failed_gates
+    assert quality["summary"]["records"] == 4
+    assert quality["summary"]["low_conf_ratio"] == 1.0
+
+    signals_path = tmp_path / "out.jsonl.signals.json"
+    signals = json.loads(signals_path.read_text(encoding="utf-8"))
+    assert signals["quality_json"] == str(quality_path)
+    assert signals["quality_status"] == "fail"
+    assert signals["review_reasons"]["low_conf"] == 4
+
+    stats = toy_runtime.last_export_stats()
+    assert stats["quality"]["status"] == "fail"

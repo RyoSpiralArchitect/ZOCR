@@ -22,6 +22,7 @@ from statistics import median
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from . import runtime as _runtime
+from .export_quality import build_export_quality_report
 
 np = _runtime.np
 Image = _runtime.Image
@@ -7469,6 +7470,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
     date_cells_detected = 0
     date_cells_by_role: Counter = Counter()
     date_precision_counts: Counter = Counter()
+    review_reason_counts: Counter = Counter()
     surprisal_threshold = (
         float(_NGRAM_SURPRISAL_REVIEW_THRESHOLD)
         if _NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0
@@ -7868,6 +7870,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if high_surprisal:
                             review_reasons.append("high_surprisal")
                             surprisal_samples += 1
+                        for review_reason in review_reasons:
+                            review_reason_counts[review_reason] += 1
                         trace_id = f"page={pidx},table={ti},row={r},col={c}"
                         has_currency = ("currency" in kws) or any(
                             sym in (raw_txt or "") for sym in ["¥", "円", "$"]
@@ -8008,6 +8012,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
     }
     if missing_page_images:
         summary_payload["missing_pages"] = int(len(missing_page_images))
+    if review_reason_counts:
+        summary_payload["review_reasons"] = dict(review_reason_counts)
     if surprisal_threshold > 0.0:
         summary_payload["surprisal_threshold"] = float(surprisal_threshold)
     try:
@@ -8050,6 +8056,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "force_numeric": bool(_FORCE_NUMERIC),
         "postprocess_policy": resolved_policy.name,
         "flush_every": int(flush_every),
+        "max_cells": int(max_cells),
+        "truncated": bool(stop_due_to_limit),
     }
     if date_cells_detected or date_columns_total:
         export_stats["date_fields"] = {
@@ -8184,6 +8192,29 @@ def export_jsonl_with_ocr(doc_json_path: str,
             },
             "attempts": len(motion_prior_attempts),
         }
+    quality_path = out_jsonl_path + ".quality.json"
+    quality_report = build_export_quality_report(
+        export_stats,
+        summary_payload,
+        jsonl_path=out_jsonl_path,
+        signals_path=signals_path,
+        quality_path=quality_path,
+    )
+    export_stats["quality"] = quality_report
+    summary_payload["quality_json"] = quality_path
+    summary_payload["quality_status"] = quality_report.get("status")
+    summary_payload["quality_score"] = quality_report.get("score")
+    try:
+        with open(quality_path, "w", encoding="utf-8") as fw_quality:
+            json.dump(_json_ready(quality_report), fw_quality, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        export_stats["quality_write_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            with open(signals_path, "w", encoding="utf-8") as fw_sig:
+                json.dump(_json_ready(summary_payload), fw_sig, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
     global _LAST_EXPORT_STATS
     _LAST_EXPORT_STATS = export_stats
     for tmpdir in temp_dirs_to_cleanup:
