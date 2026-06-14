@@ -46,6 +46,7 @@ def _print_help() -> None:
 
         Examples:
           python -m zocr run --input demo --snapshot --seed 12345
+          python -m zocr simple --input-dir pages/ --outdir out/simple-run
           python -m zocr consensus --demo --out out_cc
           python -m zocr core query --jsonl out/doc.mm.jsonl --index out/bm25.pkl --q "total amount"
           python -m zocr serve --host 127.0.0.1 --port 8000

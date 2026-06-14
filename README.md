@@ -147,14 +147,14 @@ uvicorn 'zocr.api_app:create_app' --factory --host 127.0.0.1 --port 8010
 curl -H "X-API-Key: change-me" \
   'http://127.0.0.1:8010/jobs/<job_id>?tenant_id=<tenant_id>'
 
-# Lightweight OCR pipeline: single images, PDFs, image directories, or batches.
-python -m zocr.ocr_pipeline.cli --images page1.png page2.png --out doc.json
-python -m zocr.ocr_pipeline.cli --input-dir pages/ --out doc.json
-python -m zocr.ocr_pipeline.cli --batch-dir batches/ --out batch.json
+# Lightweight OCR pipeline: write a handoff folder from images, PDFs, dirs, or batches.
+python -m zocr simple --images page1.png page2.png --outdir out/simple-run
+python -m zocr simple --input-dir pages/ --outdir out/simple-run
+python -m zocr simple --batch-dir batches/ --outdir out/simple-batch
 
 # Optional external VLM endpoint for image-region captions.
 export ZOCR_VLLM_ENDPOINT="http://127.0.0.1:9000/caption"
-python -m zocr.ocr_pipeline.cli --input-dir pages/ --out doc.json
+python -m zocr simple --input-dir pages/ --outdir out/with-vlm
 ```
 
 ## Validation / 検証
@@ -170,17 +170,23 @@ directory of page images, or a batch directory whose subdirectories are treated
 as separate documents:
 
 ```bash
-python -m zocr.ocr_pipeline.cli --images page1.png page2.png --out result.json
-python -m zocr.ocr_pipeline.cli --pdf report.pdf --document-id report-001
-python -m zocr.ocr_pipeline.cli --input-dir pages/ --recursive --pattern "*.png"
-python -m zocr.ocr_pipeline.cli --batch-dir batches/ --out batch-result.json
+python -m zocr simple --images page1.png page2.png --outdir out/simple-run
+python -m zocr simple --pdf report.pdf --document-id report-001 --outdir out/report-001
+python -m zocr simple --input-dir pages/ --recursive --pattern "*.png" --outdir out/pages
+python -m zocr simple --batch-dir batches/ --outdir out/batch
 ```
+
+Each `--outdir` run writes `pages.json` for the complete page payload,
+`summary.json` for document/page/region counts, `regions.jsonl` for a
+scan-friendly region inventory, and `manifest.json` as the stable handoff entry
+point. Pass `--out result.json` as well when a single legacy JSON file is still
+needed; pass `--out -` to keep machine-readable JSON on stdout.
 
 The default lightweight stack is centered on `ZocrRuntimeOCR`, the local
 glyph-runtime OCR engine that grew out of the legacy `ToyRuntimeTextOCR` name.
-Image-like regions use `SimpleVisualDescriptor`, an offline descriptor rather
-than a provider-backed VLM; external VLMs should sit beside this path as
-optional reviewers/captioners instead of replacing the ZOCR-native read.
+Image-like regions use `SimpleVisualDescriptor` by default, while
+`--vllm-endpoint` / `ZOCR_VLLM_ENDPOINT` can attach a provider-backed captioner
+without replacing the ZOCR-native read.
 
 ## Bench / ベンチ
 ```bash

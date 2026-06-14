@@ -82,6 +82,65 @@ def test_cli_runs_batch_dir_with_mock_components(tmp_path):
     assert "doc-b" in payload
 
 
+def test_cli_writes_handoff_run_folder_with_mock_components(tmp_path, capsys):
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (10, 10), color="white").save(img_path)
+    outdir = tmp_path / "run"
+
+    cli.main([
+        "--images",
+        img_path.as_posix(),
+        "--outdir",
+        outdir.as_posix(),
+        "--use-mocks",
+        "--document-id",
+        "handoff-doc",
+    ])
+
+    captured = capsys.readouterr()
+    assert "ZOCR simple run complete" in captured.out
+    assert "manifest_json" in captured.out
+
+    pages = json.loads((outdir / "pages.json").read_text(encoding="utf-8"))
+    summary = json.loads((outdir / "summary.json").read_text(encoding="utf-8"))
+    manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))
+    regions = [
+        json.loads(line)
+        for line in (outdir / "regions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert pages[0]["document_id"] == "handoff-doc"
+    assert summary["schema"] == "zocr.simple_run.v1"
+    assert summary["totals"]["documents"] == 1
+    assert summary["totals"]["pages"] == 1
+    assert summary["totals"]["regions"] == 3
+    assert manifest["artifacts"]["pages_json"].endswith("pages.json")
+    assert {row["type"] for row in regions} == {"text", "image", "table"}
+
+
+def test_cli_outdir_and_stdout_json_keep_summary_on_stderr(tmp_path, capsys):
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (10, 10), color="white").save(img_path)
+    outdir = tmp_path / "run"
+
+    cli.main([
+        "--images",
+        img_path.as_posix(),
+        "--out",
+        "-",
+        "--outdir",
+        outdir.as_posix(),
+        "--use-mocks",
+        "--document-id",
+        "stdout-doc",
+    ])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload[0]["document_id"] == "stdout-doc"
+    assert "ZOCR simple run complete" in captured.err
+
+
 def test_cli_rejects_multiple_input_modes(tmp_path):
     img_path = tmp_path / "page.png"
     Image.new("RGB", (10, 10), color="white").save(img_path)
