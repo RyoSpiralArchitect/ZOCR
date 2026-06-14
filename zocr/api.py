@@ -9,8 +9,10 @@ existing orchestrator. It provides two helpers:
   return a lightweight response envelope ready to send to a downstream RAG/LLM
   stack.
 
-Both functions are synchronous wrappers so that they can be called directly from
-API or CLI glue code before a richer async/job manager is introduced.
+The thin helper can run inline or enqueue a background thread for lightweight
+HTTP/CLI deployments. The production service in :mod:`zocr.service.app` adds
+persistent queues, tenant policy, and worker orchestration on top of the same
+artifact layout.
 """
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ __all__ = [
     "QueryResult",
     "ingest_job",
     "query_job",
+    "get_job_status",
     "ingest_response_payload_v0",
     "query_response_payload_v0",
     "validate_ingest_request_payload",
@@ -366,6 +369,34 @@ def ingest_job(request: IngestRequest) -> IngestResult:
         error=status_payload.get("error"),
         status_path=str(_status_path(outdir)),
     )
+
+
+def get_job_status(
+    *,
+    job_id: str,
+    tenant_id: str,
+    base_dir: str = "episodes",
+) -> Dict[str, Any]:
+    """Return a normalized status payload for a previously created job."""
+
+    safe_job_id = _safe_segment(job_id, "job_id")
+    safe_tenant_id = _safe_segment(tenant_id, "tenant_id")
+    job_dir = _job_root(base_dir, safe_tenant_id, safe_job_id)
+    payload = _read_job_status(job_dir)
+    if not payload:
+        return {
+            "job_id": safe_job_id,
+            "tenant_id": safe_tenant_id,
+            "status": "missing",
+            "outdir": str(job_dir),
+            "artifacts": {},
+        }
+    payload = dict(payload)
+    payload.setdefault("job_id", safe_job_id)
+    payload.setdefault("tenant_id", safe_tenant_id)
+    payload.setdefault("status", "pending")
+    payload.setdefault("outdir", str(job_dir))
+    return payload
 
 
 def _load_json(path: Path) -> Dict[str, Any]:

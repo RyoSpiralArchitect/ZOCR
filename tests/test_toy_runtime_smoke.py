@@ -45,6 +45,93 @@ def test_match_glyph_respects_allowed_chars() -> None:
     assert restricted_conf >= 0.52
 
 
+def test_select_glyph_candidates_expands_when_margin_is_tight() -> None:
+    from zocr.consensus import toy_runtime
+
+    scored = [
+        toy_runtime._GlyphCandidateScore("A", 0.810, 0.845, 0.31),
+        toy_runtime._GlyphCandidateScore("B", 0.804, 0.838, 0.32),
+        toy_runtime._GlyphCandidateScore("C", 0.799, 0.831, 0.33),
+        toy_runtime._GlyphCandidateScore("D", 0.771, 0.805, 0.37),
+    ]
+
+    selected = toy_runtime._select_glyph_candidates(scored, threshold=0.6, top_limit=1)
+
+    assert [glyph for glyph, _ in selected[:3]] == ["A", "B", "C"]
+    assert len(selected) >= 3
+
+
+def test_select_glyph_candidates_keeps_ambiguous_group_members() -> None:
+    from zocr.consensus import toy_runtime
+
+    scored = [
+        toy_runtime._GlyphCandidateScore("0", 0.83, 0.86, 0.22),
+        toy_runtime._GlyphCandidateScore("X", 0.72, 0.75, 0.91),
+        toy_runtime._GlyphCandidateScore("O", 0.66, 0.69, 0.29),
+        toy_runtime._GlyphCandidateScore("D", 0.64, 0.67, 0.31),
+    ]
+
+    selected = toy_runtime._select_glyph_candidates(scored, threshold=0.6, top_limit=1)
+    selected_chars = [glyph for glyph, _ in selected]
+
+    assert "0" in selected_chars
+    assert "O" in selected_chars
+    assert "D" in selected_chars
+
+
+def test_select_glyph_candidates_rescues_feature_similar_shapes() -> None:
+    from zocr.consensus import toy_runtime
+
+    scored = [
+        toy_runtime._GlyphCandidateScore("A", 0.84, 0.87, 0.20),
+        toy_runtime._GlyphCandidateScore("C", 0.74, 0.78, 0.86),
+        toy_runtime._GlyphCandidateScore("B", 0.66, 0.71, 0.24),
+    ]
+
+    selected = toy_runtime._select_glyph_candidates(scored, threshold=0.6, top_limit=1)
+    selected_chars = [glyph for glyph, _ in selected]
+
+    assert selected_chars == ["A", "B"]
+
+
+def test_compute_glyph_features_tracks_centroid_and_balance() -> None:
+    from zocr.consensus import toy_runtime
+
+    arr = toy_runtime.np.zeros((6, 6), dtype=toy_runtime.np.float32)
+    arr[:2, :2] = 1.0
+
+    feats = toy_runtime._compute_glyph_features_from_array(arr)
+
+    assert feats["center_x"] < 0.35
+    assert feats["center_y"] < 0.35
+    assert feats["h_balance"] < 0.0
+    assert feats["v_balance"] < 0.0
+    assert feats["row_peak"] > feats["density"]
+    assert feats["col_peak"] > feats["density"]
+
+
+def test_glyph_feature_distance_prefers_similar_layouts() -> None:
+    from zocr.consensus import toy_runtime
+
+    left_top = toy_runtime.np.zeros((6, 6), dtype=toy_runtime.np.float32)
+    left_top[:2, :2] = 1.0
+    left_top_wide = toy_runtime.np.zeros((6, 6), dtype=toy_runtime.np.float32)
+    left_top_wide[:2, :3] = 1.0
+    right_bottom = toy_runtime.np.zeros((6, 6), dtype=toy_runtime.np.float32)
+    right_bottom[4:, 4:] = 1.0
+
+    base_feats = toy_runtime._compute_glyph_features_from_array(left_top)
+    near_feats = toy_runtime._compute_glyph_features_from_array(left_top_wide)
+    far_feats = toy_runtime._compute_glyph_features_from_array(right_bottom)
+
+    near = toy_runtime._glyph_feature_distance(base_feats, near_feats)
+    far = toy_runtime._glyph_feature_distance(base_feats, far_feats)
+
+    assert near["centroid_delta"] < far["centroid_delta"]
+    assert near["balance_delta"] < far["balance_delta"]
+    assert near["distance"] < far["distance"]
+
+
 def test_text_from_binary_cache_respects_allowed_chars() -> None:
     from zocr.consensus import toy_runtime
 
@@ -157,6 +244,197 @@ def test_template_library_contains_ascii_presets() -> None:
     for token in ("item", "qty", "unit price", "amount", "total"):
         assert token in toy_runtime._TOKEN_TEMPLATE_LIBRARY
         assert toy_runtime._TOKEN_TEMPLATE_LIBRARY[token]
+
+
+def test_segmentation_candidates_keep_split_and_unsplit_variants() -> None:
+    from zocr.consensus import toy_runtime
+
+    bw = toy_runtime.np.zeros((12, 14), dtype=toy_runtime.np.uint8)
+    bw[2:10, 1:4] = 255
+    bw[2:10, 8:11] = 255
+    bw[6, 4:8] = 255
+    bbox = (1, 2, 11, 10, float(toy_runtime.np.count_nonzero(bw[2:10, 1:11])))
+    baseline = toy_runtime._BaselineStats(
+        baseline=10.0,
+        xheight=8.0,
+        ascender=8.0,
+        descender=1.0,
+        avg_width=3.0,
+        avg_height=8.0,
+        stroke_density=0.42,
+        aspect_median=0.4,
+    )
+
+    candidates = toy_runtime._build_segmentation_sequence_candidates(bw, [bbox], baseline, beam_limit=4)
+    lengths = {len(seq) for seq in candidates}
+
+    assert 1 in lengths
+    assert 2 in lengths
+
+
+def test_decode_component_sequence_uses_glyph_beam_rerank() -> None:
+    from zocr.consensus import toy_runtime
+
+    bw = toy_runtime.np.zeros((2, 4), dtype=toy_runtime.np.uint8)
+    bw[:, :2] = toy_runtime.np.asarray([[255, 0], [0, 255]], dtype=toy_runtime.np.uint8)
+    bw[:, 2:] = toy_runtime.np.asarray([[0, 255], [255, 0]], dtype=toy_runtime.np.uint8)
+    boxes = [(0, 0, 2, 2, 2.0), (2, 0, 4, 2, 2.0)]
+
+    old_match = toy_runtime._match_glyph_candidates
+    old_quality = toy_runtime._toy_text_quality
+    old_topk = toy_runtime._TOY_GLYPH_CANDIDATE_TOPK
+    old_beam = toy_runtime._TOY_GLYPH_BEAM
+    calls = {"count": 0}
+
+    def fake_match(_patch, _atlas, allowed_chars=None, top_k=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return [("X", 0.93), ("A", 0.91)]
+        return [("Y", 0.94), ("B", 0.92)]
+
+    def fake_quality(text: str):
+        if text == "AB":
+            return 1.3, {"reason": "beam"}
+        return 0.6, {"reason": "base"}
+
+    try:
+        toy_runtime._match_glyph_candidates = fake_match
+        toy_runtime._toy_text_quality = fake_quality
+        toy_runtime._TOY_GLYPH_CANDIDATE_TOPK = 2
+        toy_runtime._TOY_GLYPH_BEAM = 2
+
+        candidate = toy_runtime._decode_component_sequence(bw, boxes, allowed_chars="ABXY")
+
+        assert candidate.text == "AB"
+        assert [glyph.ch for glyph in candidate.glyphs] == ["A", "B"]
+    finally:
+        toy_runtime._match_glyph_candidates = old_match
+        toy_runtime._toy_text_quality = old_quality
+        toy_runtime._TOY_GLYPH_CANDIDATE_TOPK = old_topk
+        toy_runtime._TOY_GLYPH_BEAM = old_beam
+
+
+def test_observe_token_template_requires_repeated_support() -> None:
+    from zocr.consensus import toy_runtime
+
+    token = "ZocrDiscoveryAlpha42"
+    bmp = toy_runtime._render_template_bitmap(token)
+    assert bmp is not None
+    arr = toy_runtime.np.asarray(bmp, dtype=toy_runtime.np.uint8)
+
+    old_min_support = toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT
+    old_min_conf = toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_CONF
+    old_min_quality = toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_QUALITY
+    old_review_state = toy_runtime.OrderedDict()
+    for key, value in toy_runtime._TOKEN_TEMPLATE_REVIEW_STATE.items():
+        copied = dict(value)
+        variants = value.get("variants")
+        if isinstance(variants, toy_runtime.deque):
+            copied["variants"] = toy_runtime.deque(list(variants), maxlen=variants.maxlen)
+        old_review_state[key] = copied
+    old_stats = dict(toy_runtime._GLYPH_RUNTIME_STATS)
+    old_template_state = dict(toy_runtime._TEMPLATE_CACHE_STATE)
+    had_token = token in toy_runtime._TOKEN_TEMPLATE_LIBRARY
+    old_token_variants = toy_runtime.deque(
+        list(toy_runtime._TOKEN_TEMPLATE_LIBRARY.get(token, [])),
+        maxlen=toy_runtime._TOKEN_TEMPLATE_MAX_VARIANTS,
+    )
+    try:
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT = 2
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_CONF = 0.0
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_QUALITY = 0.0
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_STATE.clear()
+        toy_runtime._GLYPH_RUNTIME_STATS.clear()
+        toy_runtime._TOKEN_TEMPLATE_LIBRARY.pop(token, None)
+        toy_runtime._TEMPLATE_CACHE_STATE["dirty"] = False
+
+        toy_runtime._observe_token_template(token, arr, confidence=0.95, quality=1.0)
+        assert token not in toy_runtime._TOKEN_TEMPLATE_LIBRARY
+        assert len(toy_runtime._TOKEN_TEMPLATE_REVIEW_STATE) == 1
+
+        toy_runtime._observe_token_template(token, arr, confidence=0.95, quality=1.0)
+        assert token in toy_runtime._TOKEN_TEMPLATE_LIBRARY
+        assert len(toy_runtime._TOKEN_TEMPLATE_REVIEW_STATE) == 0
+        match_token, match_conf = toy_runtime._match_token_template_from_cache(arr)
+        assert match_token == token
+        assert match_conf >= 0.45
+        assert toy_runtime._GLYPH_RUNTIME_STATS["template_review_accepted"] >= 1.0
+        assert toy_runtime._GLYPH_RUNTIME_STATS["template_discovered"] >= 1.0
+    finally:
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT = old_min_support
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_CONF = old_min_conf
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_MIN_QUALITY = old_min_quality
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_STATE.clear()
+        toy_runtime._TOKEN_TEMPLATE_REVIEW_STATE.update(old_review_state)
+        toy_runtime._GLYPH_RUNTIME_STATS.clear()
+        toy_runtime._GLYPH_RUNTIME_STATS.update(old_stats)
+        toy_runtime._TEMPLATE_CACHE_STATE.clear()
+        toy_runtime._TEMPLATE_CACHE_STATE.update(old_template_state)
+        if had_token:
+            toy_runtime._TOKEN_TEMPLATE_LIBRARY[token] = old_token_variants
+        else:
+            toy_runtime._TOKEN_TEMPLATE_LIBRARY.pop(token, None)
+
+
+def test_generic_postprocess_policy_disables_table_adapters() -> None:
+    from zocr.consensus import toy_runtime
+
+    policy = toy_runtime._resolve_toy_postprocess_policy("generic", contextual=True)
+    assert policy.name == "generic"
+    assert not policy.use_header_charset_hints
+    assert not policy.use_numeric_headers
+    assert not policy.use_date_headers
+    assert not policy.use_schema_rectifier
+    assert not policy.use_footer_reflow
+    assert not policy.use_comma_restore
+
+
+def test_adapt_glyph_requires_review_support() -> None:
+    from zocr.consensus import toy_runtime
+
+    sample = toy_runtime._GLYPH_ATLAS["Z"][0]
+    arr = toy_runtime.np.zeros((sample.height + 1, sample.width + 1), dtype=toy_runtime.np.uint8)
+    arr[1:, 1:] = toy_runtime.np.asarray(sample, dtype=toy_runtime.np.uint8)
+    candidate = Image.fromarray(arr)
+
+    old_min_support = toy_runtime._GLYPH_REVIEW_MIN_SUPPORT
+    old_min_conf = toy_runtime._GLYPH_REVIEW_MIN_CONF
+    old_review_state = toy_runtime.OrderedDict(
+        (key, dict(value)) for key, value in toy_runtime._GLYPH_REVIEW_STATE.items()
+    )
+    old_stats = dict(toy_runtime._GLYPH_RUNTIME_STATS)
+    had_test_char = "@" in toy_runtime._GLYPH_ATLAS
+    old_test_char = list(toy_runtime._GLYPH_ATLAS.get("@", []))
+    old_test_feats = dict(toy_runtime._GLYPH_FEATS.get("@", {}))
+    try:
+        toy_runtime._GLYPH_REVIEW_MIN_SUPPORT = 2
+        toy_runtime._GLYPH_REVIEW_MIN_CONF = 0.0
+        toy_runtime._GLYPH_REVIEW_STATE.clear()
+        toy_runtime._GLYPH_RUNTIME_STATS.clear()
+        toy_runtime._GLYPH_ATLAS.pop("@", None)
+        toy_runtime._GLYPH_FEATS.pop("@", None)
+
+        toy_runtime._adapt_glyph("@", candidate, conf=0.95)
+        assert "@" not in toy_runtime._GLYPH_ATLAS
+        assert len(toy_runtime._GLYPH_REVIEW_STATE) == 1
+
+        toy_runtime._adapt_glyph("@", candidate, conf=0.95)
+        assert "@" in toy_runtime._GLYPH_ATLAS
+        assert len(toy_runtime._GLYPH_ATLAS["@"]) == 1
+        assert toy_runtime._GLYPH_RUNTIME_STATS["review_accepted"] >= 1.0
+    finally:
+        toy_runtime._GLYPH_REVIEW_MIN_SUPPORT = old_min_support
+        toy_runtime._GLYPH_REVIEW_MIN_CONF = old_min_conf
+        toy_runtime._GLYPH_REVIEW_STATE.clear()
+        toy_runtime._GLYPH_REVIEW_STATE.update(old_review_state)
+        toy_runtime._GLYPH_RUNTIME_STATS.clear()
+        toy_runtime._GLYPH_RUNTIME_STATS.update(old_stats)
+        if had_test_char:
+            toy_runtime._GLYPH_ATLAS["@"] = old_test_char
+            toy_runtime._GLYPH_FEATS["@"] = old_test_feats
+        else:
+            toy_runtime._GLYPH_ATLAS.pop("@", None)
+            toy_runtime._GLYPH_FEATS.pop("@", None)
 
 
 def test_contextual_variants_do_not_hallucinate_from_question_mark() -> None:

@@ -76,6 +76,22 @@ def test_full_page_segmenter_splits_separated_components():
     assert regions[0].bounding_box.x < regions[1].bounding_box.x
 
 
+def test_full_page_segmenter_splits_two_column_layout():
+    image = Image.new("RGB", (220, 120), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 20, 75, 100), fill="black")
+    draw.rectangle((145, 20, 200, 100), fill="black")
+    page = PageInput(document_id="doc-columns", page_number=1, image=image)
+
+    segmenter = FullPageSegmenter(min_region_fraction=0.04, min_gap_fraction=0.03)
+    regions = segmenter.segment(page)
+
+    assert len(regions) == 2
+    assert regions[0].bounding_box.x < regions[1].bounding_box.x
+    assert regions[0].bounding_box.width < 90
+    assert regions[1].bounding_box.width < 90
+
+
 def test_full_page_segmenter_handles_solid_dark_crop():
     image = Image.new("RGB", (40, 30), "black")
     page = PageInput(document_id="doc-dark", page_number=1, image=image)
@@ -128,6 +144,31 @@ def test_simple_vllm_remains_legacy_alias():
     assert isinstance(SimpleVLLM(), SimpleVisualDescriptor)
 
 
+def test_simple_vllm_uses_provider_result_when_available():
+    region = ClassifiedRegion(
+        region_id="img-1",
+        bounding_box=BoundingBox(x=0, y=0, width=40, height=30),
+        classification=RegionType.IMAGE,
+        confidence=0.9,
+        reading_order=0,
+        image_crop=Image.new("RGB", (40, 30), "white"),
+    )
+
+    vllm = SimpleVLLM(
+        captioner=lambda _region: {
+            "caption": "wiring diagram with labeled terminals",
+            "confidence": 0.88,
+            "detected_objects": ["terminal"],
+        }
+    )
+
+    result = vllm.describe(region)
+
+    assert result.caption == "wiring diagram with labeled terminals"
+    assert result.confidence == 0.88
+    assert result.detected_objects == ["terminal"]
+
+
 def test_simple_table_extractor_uses_grid_lines(monkeypatch):
     image = Image.new("RGB", (120, 80), "white")
     draw = ImageDraw.Draw(image)
@@ -171,6 +212,44 @@ def test_simple_table_extractor_uses_grid_lines(monkeypatch):
     assert result.format == "tesseract_grid"
     assert result.table_data.headers == ["Name", "Qty"]
     assert result.table_data.rows == [{"Name": "Bolt", "Qty": "4"}]
+
+
+def test_table_extractor_clusters_rows_and_columns_without_grid(monkeypatch):
+    class FakeOutput:
+        DICT = object()
+
+    class FakeTesseract:
+        Output = FakeOutput
+
+        @staticmethod
+        def image_to_data(_image, output_type):  # noqa: ANN001
+            assert output_type is FakeOutput.DICT
+            return {
+                "text": ["Item", "Qty", "Price", "Bolt", "2", "$10"],
+                "conf": ["93", "91", "92", "89", "95", "90"],
+                "left": [10, 90, 150, 10, 90, 150],
+                "top": [10, 10, 10, 35, 35, 35],
+                "width": [34, 28, 42, 34, 12, 28],
+                "height": [10, 10, 10, 10, 10, 10],
+                "line_num": [1, 1, 1, 2, 2, 2],
+            }
+
+    monkeypatch.setattr(simple_module, "pytesseract", FakeTesseract)
+    region = ClassifiedRegion(
+        region_id="table-1",
+        bounding_box=BoundingBox(x=0, y=0, width=220, height=80),
+        classification=RegionType.TABLE,
+        confidence=0.9,
+        reading_order=0,
+        image_crop=Image.new("RGB", (220, 80), "white"),
+    )
+
+    result = SimpleTableExtractor().extract(region)
+
+    assert result.format == "tesseract_grid"
+    assert result.table_data.headers == ["Item", "Qty", "Price"]
+    assert result.table_data.rows == [{"Item": "Bolt", "Qty": "2", "Price": "$10"}]
+    assert result.confidence >= 0.8
 
 
 def test_simple_table_extractor_returns_error_format_when_tesseract_fails(monkeypatch):

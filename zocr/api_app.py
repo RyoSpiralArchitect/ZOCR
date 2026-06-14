@@ -10,19 +10,20 @@ tenant auth, quotas, Redis workers, or artifact downloads should use
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Iterable, Tuple
 
 import anyio
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from jsonschema import Draft202012Validator, ValidationError
 
-from zocr.api_http import ingest_from_payload, query_from_payload
+from zocr.api_http import ingest_from_payload, job_status_from_payload, query_from_payload
 from zocr.api_spec import INGEST_REQUEST_SCHEMA_V0, QUERY_REQUEST_SCHEMA_V0
 
 __all__ = ["create_app"]
 
 Runner = Callable[[Dict[str, Any]], Tuple[Dict[str, Any], Dict[str, Any]]]
+StatusReader = Callable[[str, str], Dict[str, Any]]
 
 _DEFAULT_RATE_LIMIT_PER_MIN = 60
 _DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -55,6 +56,14 @@ def _wrap_validation_errors(fn: Runner) -> Runner:
     return _wrapped
 
 
+def _api_key_set(raw_keys: Iterable[str] | None) -> set[str]:
+    keys = raw_keys
+    if keys is None:
+        env_value = os.environ.get("ZOCR_API_KEYS", "")
+        keys = [item.strip() for item in env_value.split(",")]
+    return {key for key in keys if key}
+
+
 def create_app(
     *,
     out_root: str = "episodes",
@@ -64,6 +73,9 @@ def create_app(
     pipeline_kwargs: Dict[str, Any] | None = None,
     ingest_runner: Runner | None = None,
     query_runner: Runner | None = None,
+    status_reader: StatusReader | None = None,
+    status_base_dir: str | None = None,
+    api_keys: Iterable[str] | None = None,
     rate_limit_per_minute: int = _DEFAULT_RATE_LIMIT_PER_MIN,
     max_body_bytes: int = _DEFAULT_MAX_BODY_BYTES,
     request_timeout_s: float = _DEFAULT_REQUEST_TIMEOUT_S,
@@ -87,15 +99,26 @@ def create_app(
     query_cb: Runner = query_runner or (
         lambda payload: query_from_payload(payload, base_dir=base_dir)
     )
+    status_cb: StatusReader = status_reader or (
+        lambda tenant_id, job_id: job_status_from_payload(
+            {"tenant_id": tenant_id, "job_id": job_id},
+            base_dir=status_base_dir or out_root,
+        )
+    )
 
     app = FastAPI(title="ZOCR API", version="0.1.0")
     limiter = _RateLimiter(limit_per_minute=rate_limit_per_minute)
+    accepted_api_keys = _api_key_set(api_keys)
 
     @app.middleware("http")
     async def _limits_middleware(request: Request, call_next):
         client = request.client.host if request.client else "unknown"
         if not limiter.allow(client, anyio.current_time()):
             return JSONResponse(status_code=429, content={"detail": "rate limit exceeded"})
+        if accepted_api_keys and request.url.path != "/healthz":
+            supplied = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+            if supplied not in accepted_api_keys:
+                return JSONResponse(status_code=401, content={"detail": "invalid api key"})
         if request.headers.get("content-length"):
             try:
                 length = int(request.headers["content-length"])
@@ -118,6 +141,18 @@ def create_app(
                 errors.append(f"{path}: {exc}")
         status = "ok" if not errors else "degraded"
         return {"status": status, "errors": errors}
+
+    @app.get("/jobs/{job_id}")
+    async def job_status(job_id: str, tenant_id: str):
+        try:
+            payload = await anyio.to_thread.run_sync(status_cb, tenant_id, job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # pragma: no cover - defensive
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if payload.get("status") == "missing":
+            raise HTTPException(status_code=404, detail="job not found")
+        return payload
 
     @app.post("/ingest")
     async def ingest(payload: Dict[str, Any]):

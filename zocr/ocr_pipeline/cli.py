@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
@@ -21,6 +22,7 @@ from . import (
     DocumentPipeline,
     DummyTableExtractor,
     FullPageSegmenter,
+    HttpVLLM,
     MockAggregator,
     MockInputHandler,
     MockRegionClassifier,
@@ -94,11 +96,16 @@ def _build_default_text_ocr() -> TextOCR:
     )
 
 
-def build_document_pipeline(*, use_mocks: bool = False) -> DocumentPipeline:
+def build_document_pipeline(
+    *,
+    use_mocks: bool = False,
+    vllm_endpoint: str | None = None,
+) -> DocumentPipeline:
     segmenter = MockSegmenter() if use_mocks else FullPageSegmenter()
     classifier = MockRegionClassifier() if use_mocks else AspectRatioRegionClassifier()
     text_ocr = MockTextOCR() if use_mocks else _build_default_text_ocr()
-    vllm = MockVLLM() if use_mocks else SimpleVisualDescriptor()
+    endpoint = vllm_endpoint or os.environ.get("ZOCR_VLLM_ENDPOINT")
+    vllm = MockVLLM() if use_mocks else (HttpVLLM(endpoint) if endpoint else SimpleVisualDescriptor())
     table_extractor = MockTableExtractor() if use_mocks else DummyTableExtractor()
     aggregator = MockAggregator() if use_mocks else SimpleAggregator()
 
@@ -149,6 +156,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use mock components (no external dependencies) for fast smoke tests",
     )
+    parser.add_argument(
+        "--vllm-endpoint",
+        help="HTTP JSON endpoint for image-region captioning (falls back to ZOCR_VLLM_ENDPOINT)",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -166,7 +177,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if sum(selected_inputs) > 1:
         raise SystemExit("Provide exactly one of --images, --pdf, --input-dir, or --batch-dir")
 
-    pipeline = build_document_pipeline(use_mocks=args.use_mocks)
+    pipeline = build_document_pipeline(use_mocks=args.use_mocks, vllm_endpoint=args.vllm_endpoint)
 
     payload = []
     if args.images:

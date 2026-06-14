@@ -415,6 +415,26 @@ class _LexicalBoostConfig(_ConfidenceBoostConfig):
     min_quality: float = 0.85
 
 
+@dataclass(frozen=True)
+class ToyPostprocessPolicy:
+    name: str
+    use_header_charset_hints: bool = True
+    use_numeric_headers: bool = True
+    use_date_headers: bool = True
+    use_schema_rectifier: bool = True
+    use_footer_reflow: bool = True
+    use_comma_restore: bool = True
+
+    @property
+    def needs_headers(self) -> bool:
+        return bool(
+            self.use_header_charset_hints
+            or self.use_numeric_headers
+            or self.use_date_headers
+            or self.use_comma_restore
+        )
+
+
 try:  # pragma: no cover - optional orchestrator helper
     from ..orchestrator.prior import estimate_sigma_px as _estimate_sigma_px  # type: ignore
 except Exception:  # pragma: no cover - fallback when orchestrator is unavailable
@@ -499,6 +519,48 @@ def _motion_prior_cfg_from_env() -> MotionPriorCfg:
         except Exception:
             pass
     return cfg
+
+
+def _default_postprocess_policy_name() -> str:
+    for env_name in ("ZOCR_TOY_POSTPROCESS_POLICY", "ZOCR_TOY_POLICY", "ZOCR_EXPORT_POLICY"):
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        token = raw.strip().lower()
+        if token:
+            return token
+    return "table"
+
+
+def _resolve_toy_postprocess_policy(
+    name: Optional[str] = None,
+    *,
+    contextual: bool = True,
+) -> ToyPostprocessPolicy:
+    token = (name or _default_postprocess_policy_name()).strip().lower()
+    if not token:
+        token = "table"
+    if token in {"generic", "plain", "ocr", "core"}:
+        return ToyPostprocessPolicy(
+            name="generic",
+            use_header_charset_hints=False,
+            use_numeric_headers=False,
+            use_date_headers=False,
+            use_schema_rectifier=False,
+            use_footer_reflow=False,
+            use_comma_restore=False,
+        )
+    if token in {"balanced", "hybrid", "adaptive"}:
+        return ToyPostprocessPolicy(
+            name="balanced",
+            use_header_charset_hints=bool(contextual),
+            use_numeric_headers=bool(contextual),
+            use_date_headers=bool(contextual),
+            use_schema_rectifier=False,
+            use_footer_reflow=False,
+            use_comma_restore=bool(contextual),
+        )
+    return ToyPostprocessPolicy(name="table")
 
 
 def _blank_skip_cfg_from_env() -> _BlankSkipConfig:
@@ -984,6 +1046,36 @@ def _glyph_pending_trim(limit: int) -> None:
         _GLYPH_RUNTIME_PENDING.popleft()
 
 
+def _glyph_review_trim(limit: int) -> None:
+    if limit <= 0:
+        if _GLYPH_REVIEW_STATE:
+            _GLYPH_REVIEW_STATE.clear()
+        return
+    while len(_GLYPH_REVIEW_STATE) > limit:
+        _GLYPH_REVIEW_STATE.popitem(last=False)
+
+
+def _glyph_review_signature(arr: "np.ndarray") -> Tuple[Optional[str], Optional["np.ndarray"]]:
+    try:
+        arr_u8 = np.asarray(arr, dtype=np.uint8)
+    except Exception:
+        return None, None
+    if arr_u8.ndim != 2 or arr_u8.size == 0:
+        return None, None
+    try:
+        img = Image.fromarray(arr_u8)
+        canonical = _resize_keep_ar(
+            img,
+            _GLYPH_REVIEW_CANONICAL_SIZE[0],
+            _GLYPH_REVIEW_CANONICAL_SIZE[1],
+        )
+        norm = (np.asarray(canonical, dtype=np.uint8) > 32).astype(np.uint8) * 255
+    except Exception:
+        return None, None
+    digest = hashlib.sha1(norm.tobytes()).hexdigest()
+    return digest, norm
+
+
 def _glyph_runtime_lookup(sig: Optional[Tuple[int, int, str]]) -> Optional[Tuple[str, float]]:
     if sig is None:
         _GLYPH_RUNTIME_STATS["cache_miss"] += 1.0
@@ -1016,6 +1108,102 @@ def _glyph_runtime_store(sig: Optional[Tuple[int, int, str]], text: str, conf: f
         pass
     _glyph_runtime_trim(_GLYPH_RUNTIME_CACHE_LIMIT)
     _GLYPH_RUNTIME_STATS["cache_size"] = float(len(_GLYPH_RUNTIME_CACHE))
+
+
+def _learn_glyph_variant(ch: str, img: "Image.Image") -> bool:
+    if not ch or img is None:
+        return False
+    try:
+        arr = np.asarray(img.convert("L"), dtype=np.uint8)
+    except Exception:
+        return False
+    if arr.size == 0:
+        return False
+    atlas_list = _GLYPH_ATLAS.setdefault(ch, [])
+    for tpl in atlas_list:
+        try:
+            if np.array_equal(np.asarray(tpl, dtype=np.uint8), arr):
+                return False
+        except Exception:
+            continue
+    atlas_list.append(Image.fromarray(arr))
+    if len(atlas_list) > _GLYPH_VARIANT_LIMIT:
+        atlas_list.pop(0)
+    feats = _compute_glyph_features_from_array(arr)
+    _blend_glyph_features(ch, feats)
+    _GLYPH_RUNTIME_STATS["learned_variants"] += 1.0
+    if _GLYPH_RUNTIME_PENDING:
+        _glyph_runtime_replay()
+    return True
+
+
+def _review_glyph_candidate(ch: str, img: "Image.Image", conf: float) -> bool:
+    if not ch or img is None:
+        return False
+    try:
+        arr_u8 = np.asarray(img.convert("L"), dtype=np.uint8)
+    except Exception:
+        return False
+    if arr_u8.size == 0:
+        return False
+    if _GLYPH_REVIEW_MIN_SUPPORT <= 1:
+        accepted = _learn_glyph_variant(ch, img)
+        if accepted:
+            _GLYPH_RUNTIME_STATS["review_accepted"] += 1.0
+        return accepted
+    review_sig, review_norm = _glyph_review_signature(arr_u8)
+    if not review_sig:
+        return False
+    rec = _GLYPH_REVIEW_STATE.get(review_sig)
+    first_conflict = False
+    if rec is None:
+        rec = {
+            "chars": {},
+            "accepted": False,
+            "conflicted": False,
+            "sample": None,
+            "sample_conf": 0.0,
+        }
+        _GLYPH_REVIEW_STATE[review_sig] = rec
+    else:
+        try:
+            _GLYPH_REVIEW_STATE.move_to_end(review_sig)
+        except Exception:
+            pass
+    char_stats = rec.setdefault("chars", {}).setdefault(ch, {"count": 0, "conf_sum": 0.0})
+    char_stats["count"] = int(char_stats.get("count", 0) + 1)
+    char_stats["conf_sum"] = float(char_stats.get("conf_sum", 0.0) + float(conf))
+    if float(conf) >= float(rec.get("sample_conf", 0.0)):
+        rec["sample"] = arr_u8.tolist()
+        rec["sample_conf"] = float(conf)
+    if len(rec.get("chars", {})) > 1 and not rec.get("conflicted"):
+        rec["conflicted"] = True
+        first_conflict = True
+    _glyph_review_trim(_GLYPH_REVIEW_STATE_LIMIT)
+    _GLYPH_RUNTIME_STATS["review_pending"] = float(len(_GLYPH_REVIEW_STATE))
+    if review_norm is not None:
+        _GLYPH_RUNTIME_STATS["review_variants"] = float(len(_GLYPH_REVIEW_STATE))
+    if first_conflict:
+        _GLYPH_RUNTIME_STATS["review_conflicts"] += 1.0
+        return False
+    if rec.get("accepted") or rec.get("conflicted"):
+        return False
+    support = int(char_stats.get("count", 0))
+    avg_conf = float(char_stats.get("conf_sum", 0.0) / float(max(1, support)))
+    if support < _GLYPH_REVIEW_MIN_SUPPORT or avg_conf < _GLYPH_REVIEW_MIN_CONF:
+        return False
+    sample_payload = rec.get("sample")
+    learn_img = img
+    if isinstance(sample_payload, list):
+        try:
+            learn_img = Image.fromarray(np.asarray(sample_payload, dtype=np.uint8))
+        except Exception:
+            learn_img = img
+    accepted = _learn_glyph_variant(ch, learn_img)
+    if accepted:
+        rec["accepted"] = True
+        _GLYPH_RUNTIME_STATS["review_accepted"] += 1.0
+    return accepted
 
 
 def _glyph_pending_enqueue(sig: Optional[Tuple[int, int, str]], arr: "np.ndarray", baseline_conf: float) -> None:
@@ -1085,8 +1273,19 @@ if not (_NGRAM_SURPRISAL_REVIEW_THRESHOLD > 0.0):
 
 _GLYPH_RUNTIME_CACHE_LIMIT = int(os.environ.get("ZOCR_GLYPH_CACHE_LIMIT", "384") or 0)
 _GLYPH_RUNTIME_PENDING_LIMIT = int(os.environ.get("ZOCR_GLYPH_PENDING_LIMIT", "256") or 0)
+_GLYPH_REVIEW_STATE_LIMIT = int(os.environ.get("ZOCR_GLYPH_REVIEW_LIMIT", "512") or 0)
+_GLYPH_REVIEW_MIN_SUPPORT = max(
+    1,
+    int(os.environ.get("ZOCR_GLYPH_REVIEW_MIN_SUPPORT", "2") or 0),
+)
+try:
+    _GLYPH_REVIEW_MIN_CONF = float(os.environ.get("ZOCR_GLYPH_REVIEW_MIN_CONF", "0.72") or 0.0)
+except Exception:
+    _GLYPH_REVIEW_MIN_CONF = 0.72
+_GLYPH_REVIEW_CANONICAL_SIZE = (18, 18)
 _GLYPH_RUNTIME_CACHE: "OrderedDict[Tuple[int, int, str], Dict[str, Any]]" = OrderedDict()
 _GLYPH_RUNTIME_PENDING: "deque[Dict[str, Any]]" = deque()
+_GLYPH_REVIEW_STATE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _GLYPH_RUNTIME_STATS: Dict[str, float] = defaultdict(float)
 
 
@@ -1116,6 +1315,8 @@ def reset_toy_recognition_stats() -> None:
     _GLYPH_RUNTIME_STATS.clear()
     _GLYPH_RUNTIME_STATS["cache_size"] = float(len(_GLYPH_RUNTIME_CACHE))
     _GLYPH_RUNTIME_STATS["pending_records"] = float(len(_GLYPH_RUNTIME_PENDING))
+    _GLYPH_RUNTIME_STATS["review_pending"] = float(len(_GLYPH_REVIEW_STATE))
+    _GLYPH_RUNTIME_STATS["template_review_pending"] = float(len(_TOKEN_TEMPLATE_REVIEW_STATE))
 
 
 def _record_toy_recognition(
@@ -1184,13 +1385,27 @@ def toy_recognition_stats(reset: bool = False) -> Dict[str, Any]:
     result["runtime_replay_attempts"] = int(_GLYPH_RUNTIME_STATS.get("replay_attempts", 0))
     result["runtime_replay_improved"] = int(_GLYPH_RUNTIME_STATS.get("replay_improved", 0))
     result["learned_variants"] = int(_GLYPH_RUNTIME_STATS.get("learned_variants", 0))
+    result["review_pending"] = int(len(_GLYPH_REVIEW_STATE))
+    result["review_conflicts"] = int(_GLYPH_RUNTIME_STATS.get("review_conflicts", 0))
+    result["review_accepted"] = int(_GLYPH_RUNTIME_STATS.get("review_accepted", 0))
+    result["review_min_support"] = int(_GLYPH_REVIEW_MIN_SUPPORT)
+    result["review_min_conf"] = float(_GLYPH_REVIEW_MIN_CONF)
     result["lexical_penalties"] = int(_GLYPH_RUNTIME_STATS.get("lexical_penalty", 0))
     result["tess_dictionary_boosts"] = int(_GLYPH_RUNTIME_STATS.get("tess_dictionary_boosts", 0))
     result["tess_unknown_hits"] = int(_GLYPH_RUNTIME_STATS.get("tess_unknown_hits", 0))
     result["tess_bigram_penalties"] = int(_GLYPH_RUNTIME_STATS.get("tess_bigram_penalties", 0))
     result["baseline_splits"] = int(_GLYPH_RUNTIME_STATS.get("baseline_splits", 0))
+    result["segmentation_hypotheses"] = int(_GLYPH_RUNTIME_STATS.get("segmentation_hypotheses", 0))
+    result["segmentation_alt_selected"] = int(_GLYPH_RUNTIME_STATS.get("segmentation_alt_selected", 0))
+    result["fragment_merges"] = int(_GLYPH_RUNTIME_STATS.get("fragment_merges", 0))
     result["template_matches"] = int(_GLYPH_RUNTIME_STATS.get("template_matches", 0))
     result["template_observed"] = int(_GLYPH_RUNTIME_STATS.get("template_observed", 0))
+    result["template_review_pending"] = int(len(_TOKEN_TEMPLATE_REVIEW_STATE))
+    result["template_review_accepted"] = int(_GLYPH_RUNTIME_STATS.get("template_review_accepted", 0))
+    result["template_discovered"] = int(_GLYPH_RUNTIME_STATS.get("template_discovered", 0))
+    result["template_review_min_support"] = int(_TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT)
+    result["template_review_min_conf"] = float(_TOKEN_TEMPLATE_REVIEW_MIN_CONF)
+    result["template_review_min_quality"] = float(_TOKEN_TEMPLATE_REVIEW_MIN_QUALITY)
     result["template_cache_hits"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_hits", 0))
     result["template_cache_misses"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_misses", 0))
     result["template_cache_variants"] = int(_GLYPH_RUNTIME_STATS.get("template_cache_variants", 0))
@@ -1249,6 +1464,12 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
             "style_var": 0.0,
             "radial_inner": 0.0,
             "radial_outer": 0.0,
+            "center_x": 0.5,
+            "center_y": 0.5,
+            "h_balance": 0.0,
+            "v_balance": 0.0,
+            "row_peak": 0.0,
+            "col_peak": 0.0,
             "count": 0,
         }
     if arr_f.max() > 1.5:
@@ -1263,11 +1484,32 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
         col_profile = arr_f.mean(axis=0)
         style_var = float(np.var(row_profile) + np.var(col_profile))
     else:
+        row_profile = np.asarray([float(arr_f.mean())], dtype=np.float32)
+        col_profile = np.asarray([float(arr_f.mean())], dtype=np.float32)
         style_var = 0.0
     inner_ring = 0.0
     outer_ring = 0.0
+    center_x = 0.5
+    center_y = 0.5
+    h_balance = 0.0
+    v_balance = 0.0
+    row_peak = float(row_profile.max()) if row_profile.size else 0.0
+    col_peak = float(col_profile.max()) if col_profile.size else 0.0
     if arr_f.ndim == 2 and arr_f.size:
         inner_ring, outer_ring = _radial_signature(arr_f)
+        mass = float(arr_f.sum())
+        if mass > 1e-6:
+            yy, xx = np.mgrid[0:h, 0:w]
+            center_x = float(((xx + 0.5) * arr_f).sum() / (mass * float(max(1, w))))
+            center_y = float(((yy + 0.5) * arr_f).sum() / (mass * float(max(1, h))))
+            half_w = max(1, w // 2)
+            half_h = max(1, h // 2)
+            left_mass = float(arr_f[:, :half_w].sum())
+            right_mass = float(arr_f[:, half_w:].sum())
+            top_mass = float(arr_f[:half_h, :].sum())
+            bottom_mass = float(arr_f[half_h:, :].sum())
+            h_balance = float((right_mass - left_mass) / mass)
+            v_balance = float((bottom_mass - top_mass) / mass)
     return {
         "aspect": aspect,
         "density": density,
@@ -1275,6 +1517,12 @@ def _compute_glyph_features_from_array(arr: "np.ndarray") -> Dict[str, float]:
         "style_var": style_var,
         "radial_inner": inner_ring,
         "radial_outer": outer_ring,
+        "center_x": center_x,
+        "center_y": center_y,
+        "h_balance": h_balance,
+        "v_balance": v_balance,
+        "row_peak": row_peak,
+        "col_peak": col_peak,
         "count": 1,
     }
 
@@ -1385,6 +1633,9 @@ def _toy_memory_snapshot_internal() -> Dict[str, Any]:
         "avg_ngram_branching": float(ngram_transitions / ngram_contexts) if ngram_contexts else 0.0,
         "runtime_cache": int(len(_GLYPH_RUNTIME_CACHE)),
         "runtime_pending": int(len(_GLYPH_RUNTIME_PENDING)),
+        "review_pending": int(len(_GLYPH_REVIEW_STATE)),
+        "review_conflicted": int(sum(1 for rec in _GLYPH_REVIEW_STATE.values() if rec.get("conflicted"))),
+        "review_accepted": int(sum(1 for rec in _GLYPH_REVIEW_STATE.values() if rec.get("accepted"))),
     }
     return snapshot
 
@@ -1440,6 +1691,14 @@ def _toy_memory_payload(limit_ngram: int = 48) -> Dict[str, Any]:
             "density": float(feats.get("density", 0.0)),
             "symmetry": float(feats.get("symmetry", 0.0)),
             "style_var": float(feats.get("style_var", 0.0)),
+            "radial_inner": float(feats.get("radial_inner", 0.0)),
+            "radial_outer": float(feats.get("radial_outer", 0.0)),
+            "center_x": float(feats.get("center_x", 0.5)),
+            "center_y": float(feats.get("center_y", 0.5)),
+            "h_balance": float(feats.get("h_balance", 0.0)),
+            "v_balance": float(feats.get("v_balance", 0.0)),
+            "row_peak": float(feats.get("row_peak", 0.0)),
+            "col_peak": float(feats.get("col_peak", 0.0)),
             "count": int(feats.get("count", 1)),
         }
         payload["glyph_feats"][ch] = safe
@@ -1614,6 +1873,14 @@ def load_toy_memory(path: str) -> Dict[str, Any]:
                     "density": float(feats.get("density", 0.0)),
                     "symmetry": float(feats.get("symmetry", 0.0)),
                     "style_var": float(feats.get("style_var", 0.0)),
+                    "radial_inner": float(feats.get("radial_inner", 0.0)),
+                    "radial_outer": float(feats.get("radial_outer", 0.0)),
+                    "center_x": float(feats.get("center_x", 0.5)),
+                    "center_y": float(feats.get("center_y", 0.5)),
+                    "h_balance": float(feats.get("h_balance", 0.0)),
+                    "v_balance": float(feats.get("v_balance", 0.0)),
+                    "row_peak": float(feats.get("row_peak", 0.0)),
+                    "col_peak": float(feats.get("col_peak", 0.0)),
                     "count": int(feats.get("count", len(_GLYPH_ATLAS.get(ch, [])) or 1)),
                 }
                 _GLYPH_FEATS[ch] = safe
@@ -1680,43 +1947,41 @@ def _blend_glyph_features(ch: str, feats: Dict[str, float]) -> None:
             "density": feats.get("density", 0.0),
             "symmetry": feats.get("symmetry", 0.0),
             "style_var": feats.get("style_var", 0.0),
+            "radial_inner": feats.get("radial_inner", 0.0),
+            "radial_outer": feats.get("radial_outer", 0.0),
+            "center_x": feats.get("center_x", 0.5),
+            "center_y": feats.get("center_y", 0.5),
+            "h_balance": feats.get("h_balance", 0.0),
+            "v_balance": feats.get("v_balance", 0.0),
+            "row_peak": feats.get("row_peak", 0.0),
+            "col_peak": feats.get("col_peak", 0.0),
             "count": feats.get("count", 1) or 1,
         },
     )
     count = max(1, int(cur.get("count", 1)))
     new_count = min(_GLYPH_VARIANT_LIMIT, count + 1)
     alpha = 1.0 / float(min(count + 1, _GLYPH_VARIANT_LIMIT))
-    for key in ("aspect", "density", "symmetry", "style_var"):
+    for key in (
+        "aspect",
+        "density",
+        "symmetry",
+        "style_var",
+        "radial_inner",
+        "radial_outer",
+        "center_x",
+        "center_y",
+        "h_balance",
+        "v_balance",
+        "row_peak",
+        "col_peak",
+    ):
         current_val = cur.get(key, feats.get(key, 0.0))
         target_val = feats.get(key, current_val)
         cur[key] = current_val + (target_val - current_val) * alpha
     cur["count"] = new_count
 
-def _adapt_glyph(ch: str, img: "Image.Image") -> None:
-    if not ch or img is None:
-        return
-    try:
-        arr = np.asarray(img.convert("L"), dtype=np.uint8)
-    except Exception:
-        return
-    if arr.size == 0:
-        return
-    atlas_list = _GLYPH_ATLAS.setdefault(ch, [])
-    # avoid duplicates
-    for tpl in atlas_list:
-        try:
-            if np.array_equal(np.asarray(tpl, dtype=np.uint8), arr):
-                return
-        except Exception:
-            continue
-    atlas_list.append(Image.fromarray(arr))
-    if len(atlas_list) > _GLYPH_VARIANT_LIMIT:
-        atlas_list.pop(0)
-    feats = _compute_glyph_features_from_array(arr)
-    _blend_glyph_features(ch, feats)
-    _GLYPH_RUNTIME_STATS["learned_variants"] += 1.0
-    if _GLYPH_RUNTIME_PENDING:
-        _glyph_runtime_replay()
+def _adapt_glyph(ch: str, img: "Image.Image", conf: float = 1.0) -> None:
+    _review_glyph_candidate(ch, img, conf=conf)
 
 def _generate_contextual_variants(text: str) -> Set[str]:
     variants: Set[str] = set()
@@ -2689,6 +2954,19 @@ def _score_candidate_with_context(text: str, base_conf: float) -> float:
             score = max(0.0, score - penalty)
     return min(1.0, score)
 
+
+def _aggregate_glyph_confidences(scores: Sequence[float]) -> float:
+    if not scores:
+        return 0.0
+    raw = np.asarray(scores, dtype=np.float64)
+    if raw.size == 0:
+        return 0.0
+    base = (raw + 1.0) * 0.5
+    mean = base.mean() if base.size else 0.0
+    spread = base.std() if base.size else 0.0
+    adj = (mean - 0.55) / (0.12 + spread * 0.5)
+    return float(1.0 / (1.0 + math.exp(-adj)))
+
 def _contextual_rerank_candidates(candidates: Dict[str, float]) -> Tuple[str, float]:
     if not candidates:
         return "", 0.0
@@ -2909,6 +3187,13 @@ _FORCE_NUMERIC = _env_flag(
     "ZOCR_COERCE_NUMERIC",
     _env_flag("ZOCR_FORCE_NUMERIC", True),
 )
+_TOY_SEGMENTATION_BEAM = max(1, _env_int("ZOCR_SEGMENTATION_BEAM", 6) or 6)
+_TOY_GLYPH_CANDIDATE_TOPK = max(1, _env_int("ZOCR_GLYPH_TOPK", 4) or 4)
+_TOY_GLYPH_BEAM = max(1, _env_int("ZOCR_GLYPH_BEAM", 6) or 6)
+_TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT = max(1, _env_int("ZOCR_TEMPLATE_REVIEW_MIN_SUPPORT", 2) or 2)
+_TOKEN_TEMPLATE_REVIEW_MIN_CONF = max(0.0, min(1.0, _env_float("ZOCR_TEMPLATE_REVIEW_MIN_CONF", 0.72)))
+_TOKEN_TEMPLATE_REVIEW_MIN_QUALITY = max(0.0, _env_float("ZOCR_TEMPLATE_REVIEW_MIN_QUALITY", 0.82))
+_TOKEN_TEMPLATE_REVIEW_MAX_RECORDS = max(32, _env_int("ZOCR_TEMPLATE_REVIEW_MAX_RECORDS", 512) or 512)
 _LAST_EXPORT_STATS: Dict[str, Any] = {}
 
 
@@ -2919,6 +3204,15 @@ def toy_runtime_config() -> Dict[str, Any]:
         "threshold_sweeps": int(_TOY_SWEEPS),
         "glyph_variant_limit": int(_GLYPH_VARIANT_LIMIT),
         "force_numeric": bool(_FORCE_NUMERIC),
+        "segmentation_beam": int(_TOY_SEGMENTATION_BEAM),
+        "glyph_topk": int(_TOY_GLYPH_CANDIDATE_TOPK),
+        "glyph_beam": int(_TOY_GLYPH_BEAM),
+        "default_postprocess_policy": _resolve_toy_postprocess_policy().name,
+        "glyph_review_min_support": int(_GLYPH_REVIEW_MIN_SUPPORT),
+        "glyph_review_min_conf": float(_GLYPH_REVIEW_MIN_CONF),
+        "template_review_min_support": int(_TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT),
+        "template_review_min_conf": float(_TOKEN_TEMPLATE_REVIEW_MIN_CONF),
+        "template_review_min_quality": float(_TOKEN_TEMPLATE_REVIEW_MIN_QUALITY),
     }
 
 
@@ -4690,6 +4984,7 @@ _TOKEN_TEMPLATE_PRESETS = [
     "小計",
     "合計",
 ]
+_TOKEN_TEMPLATE_PRESET_SET = set(_TOKEN_TEMPLATE_PRESETS)
 
 
 def _load_template_font(size: int = 18) -> "ImageFont.ImageFont":
@@ -4771,6 +5066,7 @@ def _init_token_template_library() -> Dict[str, deque]:
 
 
 _TOKEN_TEMPLATE_LIBRARY: Dict[str, deque] = _init_token_template_library()
+_TOKEN_TEMPLATE_REVIEW_STATE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 _TEMPLATE_CACHE_STATE: Dict[str, Any] = {
     "loaded_path": None,
@@ -4778,6 +5074,88 @@ _TEMPLATE_CACHE_STATE: Dict[str, Any] = {
     "autosave": False,
     "dirty": False,
 }
+
+
+def _token_review_trim(limit: int) -> None:
+    if limit <= 0:
+        if _TOKEN_TEMPLATE_REVIEW_STATE:
+            _TOKEN_TEMPLATE_REVIEW_STATE.clear()
+        return
+    while len(_TOKEN_TEMPLATE_REVIEW_STATE) > limit:
+        _TOKEN_TEMPLATE_REVIEW_STATE.popitem(last=False)
+
+
+def _token_review_key(token: str) -> str:
+    normalized = unicodedata.normalize("NFKC", (token or "").strip())
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\s+", " ", normalized)
+    if normalized.isascii():
+        return normalized.lower()
+    return normalized
+
+
+def _resolve_template_token_name(token: str) -> str:
+    normalized = unicodedata.normalize("NFKC", (token or "").strip())
+    if not normalized:
+        return ""
+    key = _token_review_key(normalized)
+    for existing in _TOKEN_TEMPLATE_LIBRARY.keys():
+        if _token_review_key(existing) == key:
+            return existing
+    return normalized
+
+
+def _append_token_template_variant(token: str, norm: "np.ndarray") -> bool:
+    resolved = _resolve_template_token_name(token)
+    if not resolved:
+        return False
+    dq = _TOKEN_TEMPLATE_LIBRARY.get(resolved)
+    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        _TOKEN_TEMPLATE_LIBRARY[resolved] = dq
+    for tpl in dq:
+        try:
+            if tpl.shape == norm.shape and float((norm * tpl).mean()) >= 0.995:
+                return False
+        except Exception:
+            continue
+    dq.append(norm)
+    _TEMPLATE_CACHE_STATE["dirty"] = True
+    _update_template_variant_stats()
+    return True
+
+
+def _promote_reviewed_token_template(key: str, entry: Mapping[str, Any]) -> bool:
+    token = _resolve_template_token_name(str(entry.get("token") or entry.get("last_token") or ""))
+    if not token:
+        return False
+    existed = token in _TOKEN_TEMPLATE_LIBRARY
+    added = 0
+    variants = entry.get("variants")
+    if isinstance(variants, deque):
+        iterable = list(variants)
+    elif isinstance(variants, list):
+        iterable = list(variants)
+    else:
+        iterable = []
+    for norm in iterable:
+        try:
+            arr = np.asarray(norm, dtype=np.float32)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        if _append_token_template_variant(token, arr):
+            added += 1
+    if existed or added > 0:
+        _GLYPH_RUNTIME_STATS["template_review_accepted"] += 1.0
+        if not existed and token not in _TOKEN_TEMPLATE_PRESET_SET:
+            _GLYPH_RUNTIME_STATS["template_discovered"] += 1.0
+        _TOKEN_TEMPLATE_REVIEW_STATE.pop(key, None)
+        _GLYPH_RUNTIME_STATS["template_review_pending"] = float(len(_TOKEN_TEMPLATE_REVIEW_STATE))
+        return True
+    return False
 
 
 def _template_cache_path() -> Optional[str]:
@@ -4926,7 +5304,7 @@ def _autosave_template_cache() -> None:
     _save_token_template_cache(path)
 
 
-def _observe_token_template(token: str, arr: Any) -> None:
+def _observe_token_template(token: str, arr: Any, confidence: float = 1.0, quality: float = 1.0) -> None:
     if not token:
         return
     _ensure_template_cache_loaded()
@@ -4934,13 +5312,62 @@ def _observe_token_template(token: str, arr: Any) -> None:
     norm = _normalize_template_bitmap(arr)
     if norm is None:
         return
-    dq = _TOKEN_TEMPLATE_LIBRARY.get(token)
-    if dq is None or dq.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
-        dq = deque(dq or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
-        _TOKEN_TEMPLATE_LIBRARY[token] = dq
-    dq.append(norm)
-    _TEMPLATE_CACHE_STATE["dirty"] = True
-    _update_template_variant_stats()
+    review_key = _token_review_key(token)
+    if not review_key:
+        return
+    entry = _TOKEN_TEMPLATE_REVIEW_STATE.get(review_key)
+    if entry is None:
+        entry = {
+            "token": _resolve_template_token_name(token),
+            "last_token": unicodedata.normalize("NFKC", token).strip(),
+            "support": 0,
+            "conf_sum": 0.0,
+            "quality_sum": 0.0,
+            "variants": deque(maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS),
+        }
+        _TOKEN_TEMPLATE_REVIEW_STATE[review_key] = entry
+    else:
+        try:
+            _TOKEN_TEMPLATE_REVIEW_STATE.move_to_end(review_key)
+        except Exception:
+            pass
+    entry["last_token"] = unicodedata.normalize("NFKC", token).strip()
+    entry["support"] = int(entry.get("support", 0)) + 1
+    try:
+        conf_value = float(confidence)
+    except Exception:
+        conf_value = 0.0
+    try:
+        quality_value = float(quality)
+    except Exception:
+        quality_value = 0.0
+    entry["conf_sum"] = float(entry.get("conf_sum", 0.0) + max(0.0, min(1.0, conf_value)))
+    entry["quality_sum"] = float(entry.get("quality_sum", 0.0) + max(0.0, quality_value))
+    variants = entry.get("variants")
+    if not isinstance(variants, deque) or variants.maxlen != _TOKEN_TEMPLATE_MAX_VARIANTS:
+        variants = deque(variants or [], maxlen=_TOKEN_TEMPLATE_MAX_VARIANTS)
+        entry["variants"] = variants
+    duplicate = False
+    for tpl in variants:
+        try:
+            if tpl.shape == norm.shape and float((norm * tpl).mean()) >= 0.992:
+                duplicate = True
+                break
+        except Exception:
+            continue
+    if not duplicate:
+        variants.append(norm)
+    _token_review_trim(_TOKEN_TEMPLATE_REVIEW_MAX_RECORDS)
+    _GLYPH_RUNTIME_STATS["template_review_pending"] = float(len(_TOKEN_TEMPLATE_REVIEW_STATE))
+    support = int(entry.get("support", 0))
+    avg_conf = float(entry.get("conf_sum", 0.0)) / float(max(1, support))
+    avg_quality = float(entry.get("quality_sum", 0.0)) / float(max(1, support))
+    if (
+        support >= _TOKEN_TEMPLATE_REVIEW_MIN_SUPPORT
+        and avg_conf >= _TOKEN_TEMPLATE_REVIEW_MIN_CONF
+        and avg_quality >= _TOKEN_TEMPLATE_REVIEW_MIN_QUALITY
+    ):
+        _promote_reviewed_token_template(review_key, entry)
 
 
 def _match_token_template_from_cache(arr: Any) -> Tuple[str, float]:
@@ -5054,6 +5481,22 @@ def _decide_template_override(
             return "quality"
     return ""
 
+@dataclass(frozen=True)
+class _GlyphCandidateScore:
+    ch: str
+    conf: float
+    raw_conf: float
+    feature_distance: float
+    aspect_delta: float = 0.0
+    density_delta: float = 0.0
+    symmetry_delta: float = 0.0
+    radial_delta: float = 0.0
+    style_delta: float = 0.0
+    centroid_delta: float = 0.0
+    balance_delta: float = 0.0
+    projection_delta: float = 0.0
+
+
 def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     if dx == 0 and dy == 0:
         return arr
@@ -5068,7 +5511,186 @@ def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
         out[:, dx:] = 0
     return out
 
-def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None):
+
+def _glyph_match_threshold(allowed: Optional[Set[str]]) -> float:
+    threshold = 0.52
+    if allowed is None:
+        return 0.6
+    count = len(allowed)
+    if count <= 6:
+        threshold = 0.52
+    elif count <= 14:
+        threshold = 0.55
+    elif count <= 32:
+        threshold = 0.58
+    else:
+        threshold = 0.6
+    return threshold
+
+
+def _glyph_feature_distance(
+    cell_feats: Mapping[str, float],
+    glyph_feats: Mapping[str, float],
+) -> Dict[str, float]:
+    aspect_delta = abs(
+        math.log((float(cell_feats.get("aspect", 1.0)) + 1e-3) / (float(glyph_feats.get("aspect", 1.0)) + 1e-3))
+    )
+    density_delta = abs(float(cell_feats.get("density", 0.0)) - float(glyph_feats.get("density", 0.0)))
+    symmetry_delta = abs(float(cell_feats.get("symmetry", 0.0)) - float(glyph_feats.get("symmetry", 0.0)))
+    style_delta = abs(float(cell_feats.get("style_var", 0.0)) - float(glyph_feats.get("style_var", 0.0)))
+    radial_delta = abs(float(cell_feats.get("radial_inner", 0.0)) - float(glyph_feats.get("radial_inner", 0.0))) + abs(
+        float(cell_feats.get("radial_outer", 0.0)) - float(glyph_feats.get("radial_outer", 0.0))
+    )
+    centroid_delta = abs(float(cell_feats.get("center_x", 0.5)) - float(glyph_feats.get("center_x", 0.5))) + abs(
+        float(cell_feats.get("center_y", 0.5)) - float(glyph_feats.get("center_y", 0.5))
+    )
+    balance_delta = abs(float(cell_feats.get("h_balance", 0.0)) - float(glyph_feats.get("h_balance", 0.0))) + abs(
+        float(cell_feats.get("v_balance", 0.0)) - float(glyph_feats.get("v_balance", 0.0))
+    )
+    projection_delta = abs(float(cell_feats.get("row_peak", 0.0)) - float(glyph_feats.get("row_peak", 0.0))) + abs(
+        float(cell_feats.get("col_peak", 0.0)) - float(glyph_feats.get("col_peak", 0.0))
+    )
+    distance = (
+        aspect_delta * 0.72
+        + density_delta * 1.35
+        + symmetry_delta * 0.45
+        + style_delta * 0.32
+        + radial_delta * 0.82
+        + centroid_delta * 1.15
+        + balance_delta * 0.68
+        + projection_delta * 0.62
+    )
+    return {
+        "aspect_delta": float(aspect_delta),
+        "density_delta": float(density_delta),
+        "symmetry_delta": float(symmetry_delta),
+        "style_delta": float(style_delta),
+        "radial_delta": float(radial_delta),
+        "centroid_delta": float(centroid_delta),
+        "balance_delta": float(balance_delta),
+        "projection_delta": float(projection_delta),
+        "distance": float(distance),
+    }
+
+
+def _ambiguous_glyph_group(ch: str) -> Set[str]:
+    if not ch:
+        return set()
+    group: Set[str] = set()
+    queue: List[str] = [str(ch)]
+    while queue:
+        current = queue.pop()
+        if current in group:
+            continue
+        group.add(current)
+        for alt in _AMBIGUOUS_CHAR_MAP.get(current, ()):
+            if alt not in group:
+                queue.append(str(alt))
+        for src, targets in _AMBIGUOUS_CHAR_MAP.items():
+            if current in targets and src not in group:
+                queue.append(str(src))
+    return group
+
+
+def _select_glyph_candidates(
+    scored: Sequence[_GlyphCandidateScore],
+    threshold: float,
+    top_limit: int,
+) -> List[Tuple[str, float]]:
+    if not scored:
+        return [("?", 0.0)]
+    ranked = sorted(
+        (
+            candidate
+            for candidate in scored
+            if candidate.ch
+        ),
+        key=lambda item: (item.conf, item.raw_conf, -item.feature_distance),
+        reverse=True,
+    )
+    if not ranked:
+        return [("?", 0.0)]
+    best = ranked[0]
+    if best.conf < threshold:
+        return [("?", float(best.conf))]
+    second_conf = float(ranked[1].conf) if len(ranked) > 1 else max(0.0, float(best.conf) - 0.2)
+    margin = float(best.conf - second_conf)
+    dynamic_limit = max(1, int(top_limit))
+    if len(ranked) > dynamic_limit:
+        if margin <= 0.015:
+            dynamic_limit = min(len(ranked), dynamic_limit + 4)
+        elif margin <= 0.03:
+            dynamic_limit = min(len(ranked), dynamic_limit + 3)
+        elif margin <= 0.05:
+            dynamic_limit = min(len(ranked), dynamic_limit + 2)
+        elif margin <= 0.08:
+            dynamic_limit = min(len(ranked), dynamic_limit + 1)
+    floor = max(0.3, threshold - 0.12)
+    gap_allow = 0.08
+    if margin <= 0.03:
+        gap_allow = 0.18
+    elif margin <= 0.06:
+        gap_allow = 0.14
+    elif margin <= 0.1:
+        gap_allow = 0.11
+    selected: Dict[str, _GlyphCandidateScore] = {}
+    for candidate in ranked:
+        if len(selected) >= dynamic_limit:
+            break
+        if candidate.conf < floor and (best.conf - candidate.conf) > gap_allow:
+            continue
+        selected.setdefault(candidate.ch, candidate)
+    if not selected:
+        selected[best.ch] = best
+    ambiguous_group = _ambiguous_glyph_group(best.ch)
+    ambiguous_floor = max(floor - 0.05, float(best.conf) - 0.2)
+    for candidate in ranked:
+        if candidate.ch in selected:
+            continue
+        if candidate.ch not in ambiguous_group:
+            continue
+        if candidate.conf < ambiguous_floor:
+            continue
+        selected[candidate.ch] = candidate
+    rescue_budget = 0
+    if margin <= 0.02:
+        rescue_budget = 2
+    elif margin <= 0.05:
+        rescue_budget = 1
+    else:
+        rescue_budget = 1 if dynamic_limit <= top_limit else 0
+    rescue_floor = max(floor, float(best.conf) - 0.22)
+    rescue_raw_floor = max(0.32, float(best.raw_conf) - 0.18)
+    rescue_feature_limit = max(0.22, float(best.feature_distance) + 0.18)
+    rescued = 0
+    for candidate in sorted(ranked[1:], key=lambda item: (item.feature_distance, -item.conf, -item.raw_conf)):
+        if rescued >= rescue_budget:
+            break
+        if candidate.ch in selected:
+            continue
+        if candidate.feature_distance > rescue_feature_limit:
+            continue
+        if candidate.conf < rescue_floor and candidate.raw_conf < rescue_raw_floor:
+            continue
+        selected[candidate.ch] = candidate
+        rescued += 1
+    final_limit = min(len(ranked), dynamic_limit + len(ambiguous_group) + rescue_budget)
+    chosen = [
+        (candidate.ch, float(candidate.conf))
+        for candidate in ranked
+        if candidate.ch in selected
+    ]
+    if not chosen:
+        chosen = [(best.ch, float(best.conf))]
+    return chosen[:final_limit]
+
+
+def _match_glyph_candidates(
+    cell_bin,
+    atlas,
+    allowed_chars: Optional[Sequence[str]] = None,
+    top_k: Optional[int] = None,
+) -> List[Tuple[str, float]]:
     # try best correlation over atlas with light shift tolerance and feature penalties
     cw, ch = cell_bin.size
     if cw < 12 or ch < 12:
@@ -5080,27 +5702,17 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
     import numpy as _np
     cell_u8 = _np.asarray(cell_bin, dtype=_np.uint8)
     if cell_u8.size == 0:
-        return "", 0.0
+        return [("?", 0.0)]
     cell_mask = (cell_u8 > 32).astype(_np.float32)
     if float(cell_mask.mean()) <= 1e-4:
         cell_mask = (cell_u8 > 0).astype(_np.float32)
     cell_norm = (cell_mask - cell_mask.mean()) / (cell_mask.std() + 1e-6)
-    cell_density = float(cell_mask.mean())
-    cell_aspect = float(cw) / float(ch or 1)
-    cell_scaled = cell_mask
-    cell_inner = 0.0
-    cell_outer = 0.0
-    if cell_scaled.ndim == 2 and cell_scaled.size:
-        row_profile = cell_scaled.mean(axis=1)
-        col_profile = cell_scaled.mean(axis=0)
-        cell_style = float(_np.var(row_profile) + _np.var(col_profile))
-        cell_inner, cell_outer = _radial_signature(cell_scaled)
-    else:
-        cell_style = 0.0
+    cell_feats = _compute_glyph_features_from_array(cell_mask)
     allowed: Optional[Set[str]] = None
     if allowed_chars:
         allowed = {str(ch) for ch in allowed_chars if str(ch)}
-    best_ch, best_score = "", -1.0
+    top_limit = max(1, int(top_k or _TOY_GLYPH_CANDIDATE_TOPK))
+    scored: List[_GlyphCandidateScore] = []
     for ch_key, tpl in atlas.items():
         if allowed is not None and ch_key not in allowed:
             continue
@@ -5127,46 +5739,67 @@ def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None)
         if variant_best < -0.5:
             continue
         feats = _GLYPH_FEATS.get(ch_key, {})
-        glyph_aspect = feats.get("aspect", 1.0) or 1.0
-        glyph_density = feats.get("density", 0.5)
-        glyph_sym = feats.get("symmetry", 0.0)
-        glyph_style = feats.get("style_var", 0.0)
-        glyph_inner = feats.get("radial_inner", cell_inner)
-        glyph_outer = feats.get("radial_outer", cell_outer)
-        aspect_penalty = math.exp(-abs(math.log((cell_aspect + 1e-3)/(glyph_aspect + 1e-3))) * 0.75)
-        density_penalty = 1.0 - min(0.4, abs(cell_density - glyph_density) * 1.6)
-        if glyph_sym > 0.5:
-            sym_cell = float(1.0 - _np.mean(_np.abs(cell_mask - _np.flip(cell_mask, axis=1))))
-            symmetry_penalty = 0.8 + 0.2 * max(0.0, sym_cell)
-        else:
-            symmetry_penalty = 1.0
-        style_penalty = 1.0 - min(0.35, abs(cell_style - glyph_style) * 0.8)
-        radial_penalty = 1.0 - min(0.3, abs(cell_inner - glyph_inner) * 1.2 + abs(cell_outer - glyph_outer) * 0.9)
+        feature_diag = _glyph_feature_distance(cell_feats, feats)
+        aspect_delta = float(feature_diag["aspect_delta"])
+        density_delta = float(feature_diag["density_delta"])
+        symmetry_delta = float(feature_diag["symmetry_delta"])
+        style_delta = float(feature_diag["style_delta"])
+        radial_delta = float(feature_diag["radial_delta"])
+        centroid_delta = float(feature_diag["centroid_delta"])
+        balance_delta = float(feature_diag["balance_delta"])
+        projection_delta = float(feature_diag["projection_delta"])
+        aspect_penalty = math.exp(-aspect_delta * 0.75)
+        density_penalty = 1.0 - min(0.4, density_delta * 1.6)
+        symmetry_penalty = 1.0 - min(0.22, symmetry_delta * 0.4)
+        style_penalty = 1.0 - min(0.35, style_delta * 0.8)
+        radial_penalty = 1.0 - min(0.3, radial_delta * 0.9)
+        centroid_penalty = 1.0 - min(0.24, centroid_delta * 0.7)
+        balance_penalty = 1.0 - min(0.18, balance_delta * 0.3)
+        projection_penalty = 1.0 - min(0.18, projection_delta * 0.42)
+        raw_conf = float((variant_best + 1.0) / 2.0)
         variant_best *= (
             aspect_penalty
             * max(0.4, density_penalty)
-            * symmetry_penalty
+            * max(0.72, symmetry_penalty)
             * max(0.45, style_penalty)
             * max(0.5, radial_penalty)
+            * max(0.72, centroid_penalty)
+            * max(0.78, balance_penalty)
+            * max(0.8, projection_penalty)
         )
-        if variant_best > best_score:
-            best_score = variant_best
-            best_ch = ch_key
-    conf = (best_score + 1.0) / 2.0
-    threshold = 0.52
-    if allowed is None:
-        threshold = 0.6
-    else:
-        count = len(allowed)
-        if count <= 6:
-            threshold = 0.52
-        elif count <= 14:
-            threshold = 0.55
-        elif count <= 32:
-            threshold = 0.58
-        else:
-            threshold = 0.6
-    return (best_ch if conf >= threshold else "?"), float(conf)
+        scored.append(
+            _GlyphCandidateScore(
+                ch=str(ch_key),
+                conf=float((variant_best + 1.0) / 2.0),
+                raw_conf=raw_conf,
+                feature_distance=float(feature_diag["distance"]),
+                aspect_delta=aspect_delta,
+                density_delta=density_delta,
+                symmetry_delta=symmetry_delta,
+                radial_delta=radial_delta,
+                style_delta=style_delta,
+                centroid_delta=centroid_delta,
+                balance_delta=balance_delta,
+                projection_delta=projection_delta,
+            )
+        )
+    if not scored:
+        return [("?", 0.0)]
+    threshold = _glyph_match_threshold(allowed)
+    return _select_glyph_candidates(scored, threshold=threshold, top_limit=top_limit)
+
+
+def _match_glyph(cell_bin, atlas, allowed_chars: Optional[Sequence[str]] = None):
+    candidates = _match_glyph_candidates(
+        cell_bin,
+        atlas,
+        allowed_chars=allowed_chars,
+        top_k=1,
+    )
+    if not candidates:
+        return "", 0.0
+    ch, conf = candidates[0]
+    return str(ch), float(conf)
 
 def _otsu_threshold_toy(arr):
     import numpy as _np
@@ -5240,6 +5873,26 @@ class _BaselineStats:
     aspect_median: float = 1.0
 
 
+@dataclass
+class _GlyphDecodeHit:
+    bbox: Tuple[int, int, int, int, float]
+    arr: Any
+    sig: Optional[Tuple[int, int, str]]
+    ch: str
+    score: float
+
+
+@dataclass
+class _TextDecodeCandidate:
+    text: str
+    conf: float
+    effective_conf: float
+    quality: float
+    score: float
+    boxes: List[Tuple[int, int, int, int, float]] = field(default_factory=list)
+    glyphs: List[_GlyphDecodeHit] = field(default_factory=list)
+
+
 def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) -> Optional[_BaselineStats]:
     if not boxes:
         return None
@@ -5281,6 +5934,329 @@ def _estimate_baseline_stats(boxes: Sequence[Tuple[int, int, int, int, float]]) 
         stroke_density=density,
         aspect_median=aspect,
     )
+
+
+def _sort_component_boxes(
+    boxes: Sequence[Tuple[int, int, int, int, float]]
+) -> List[Tuple[int, int, int, int, float]]:
+    return sorted(
+        (
+            (int(b[0]), int(b[1]), int(b[2]), int(b[3]), float(b[4]))
+            for b in boxes
+            if len(b) >= 5 and int(b[2]) > int(b[0]) and int(b[3]) > int(b[1])
+        ),
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+    )
+
+
+def _box_sequence_key(boxes: Sequence[Tuple[int, int, int, int, float]]) -> Tuple[Tuple[int, int, int, int], ...]:
+    return tuple((int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in _sort_component_boxes(boxes))
+
+
+def _glyph_sequence_geometry_score(
+    boxes: Sequence[Tuple[int, int, int, int, float]],
+    baseline: Optional[_BaselineStats],
+) -> float:
+    if not boxes:
+        return 0.0
+    if baseline is None:
+        return 1.0
+    target_w = float(max(2.0, baseline.avg_width or baseline.xheight or 12.0))
+    target_h = float(max(4.0, baseline.avg_height or baseline.xheight or 12.0))
+    total = 0.0
+    for x1, y1, x2, y2, _ in boxes:
+        w = float(max(1, x2 - x1))
+        h = float(max(1, y2 - y1))
+        w_delta = abs(math.log((w + 1.0) / (target_w + 1.0)))
+        h_delta = abs(math.log((h + 1.0) / (target_h + 1.0)))
+        total += max(0.4, 1.0 - 0.28 * w_delta - 0.18 * h_delta)
+    return float(total / float(max(1, len(boxes))))
+
+
+def _component_variant_prior(
+    variant: Sequence[Tuple[int, int, int, int, float]],
+    baseline: Optional[_BaselineStats],
+    reference: Tuple[int, int, int, int, float],
+) -> float:
+    if not variant:
+        return -1.0
+    raw_score = _glyph_sequence_geometry_score([reference], baseline)
+    variant_score = _glyph_sequence_geometry_score(variant, baseline)
+    split_bonus = 0.0
+    if len(variant) > 1:
+        ref_w = float(max(1, reference[2] - reference[0]))
+        avg_child_w = float(sum(max(1, box[2] - box[0]) for box in variant)) / float(len(variant))
+        if avg_child_w > 0:
+            split_bonus = max(0.0, min(0.18, math.log((ref_w + 1.0) / (avg_child_w + 1.0)) * 0.08))
+    return float(variant_score - raw_score - 0.02 * max(0, len(variant) - 1) + split_bonus)
+
+
+def _build_text_decode_candidate(
+    text: str,
+    scores: Sequence[float],
+    glyphs: Sequence[_GlyphDecodeHit],
+    boxes: Sequence[Tuple[int, int, int, int, float]],
+    baseline: Optional[_BaselineStats],
+) -> _TextDecodeCandidate:
+    normalized_boxes = list(_sort_component_boxes(boxes))
+    glyph_list = list(glyphs)
+    if not text:
+        return _TextDecodeCandidate("", 0.0, 0.0, 0.0, 0.0, boxes=normalized_boxes, glyphs=glyph_list)
+    conf = _aggregate_glyph_confidences(scores)
+    quality, _ = _toy_text_quality(text)
+    effective_conf = _score_candidate_with_context(text, float(conf))
+    geometry = _glyph_sequence_geometry_score(normalized_boxes, baseline)
+    unknown_ratio = float(sum(1 for glyph in glyph_list if not glyph.ch or glyph.ch == "?")) / float(max(1, len(glyph_list)))
+    score = (
+        effective_conf
+        * max(0.25, min(1.4, quality))
+        * max(0.45, geometry)
+        * max(0.2, 1.0 - 0.55 * unknown_ratio)
+    )
+    return _TextDecodeCandidate(
+        text,
+        float(conf),
+        float(effective_conf),
+        float(quality),
+        float(score),
+        boxes=normalized_boxes,
+        glyphs=glyph_list,
+    )
+
+
+def _commit_text_decode_candidate(
+    candidate: _TextDecodeCandidate,
+    allowed_chars: Optional[Sequence[str]] = None,
+) -> None:
+    allowed_set: Optional[Set[str]] = None
+    if allowed_chars:
+        allowed_set = {str(ch) for ch in allowed_chars if str(ch)}
+    for glyph in candidate.glyphs:
+        sig = glyph.sig
+        arr = glyph.arr
+        ch = glyph.ch
+        score = float(glyph.score)
+        if sig is not None and allowed_set is None:
+            _glyph_runtime_store(sig, ch, score)
+        if sig is not None and (not ch or ch == "?" or score < 0.6):
+            _glyph_pending_enqueue(sig, arr, score)
+        if allowed_set is None and ch and ch != "?" and score > 0.6:
+            try:
+                patch_img = Image.fromarray(np.asarray(arr, dtype=np.uint8))
+            except Exception:
+                patch_img = None
+            if patch_img is not None:
+                _adapt_glyph(ch, patch_img, conf=score)
+
+
+def _build_segmentation_sequence_candidates(
+    bw: "np.ndarray",
+    boxes: Sequence[Tuple[int, int, int, int, float]],
+    baseline: Optional[_BaselineStats],
+    beam_limit: Optional[int] = None,
+) -> List[List[Tuple[int, int, int, int, float]]]:
+    ordered_boxes = _sort_component_boxes(boxes)
+    if not ordered_boxes:
+        return []
+    beam = max(1, int(beam_limit or _TOY_SEGMENTATION_BEAM))
+    default_sequence: List[Tuple[int, int, int, int, float]] = []
+    option_groups: List[List[Tuple[List[Tuple[int, int, int, int, float]], float]]] = []
+    for bbox in ordered_boxes:
+        raw_variant = [bbox]
+        refined_variant = _sort_component_boxes(_refine_component_segments(bw, bbox, baseline=baseline))
+        if not refined_variant:
+            refined_variant = raw_variant
+        default_sequence.extend(refined_variant)
+        options: List[Tuple[List[Tuple[int, int, int, int, float]], float]] = [(raw_variant, 0.0)]
+        raw_key = _box_sequence_key(raw_variant)
+        refined_key = _box_sequence_key(refined_variant)
+        if refined_key and refined_key != raw_key:
+            options.append((refined_variant, _component_variant_prior(refined_variant, baseline, bbox)))
+            local_merged = _sort_component_boxes(_merge_glyph_fragments(refined_variant, baseline))
+            merged_key = _box_sequence_key(local_merged)
+            if merged_key and merged_key != raw_key and merged_key != refined_key:
+                options.append((local_merged, _component_variant_prior(local_merged, baseline, bbox)))
+        options.sort(key=lambda item: (item[1], -len(item[0])), reverse=True)
+        option_groups.append(options[:3])
+    default_sequence = _sort_component_boxes(default_sequence)
+    default_merged = _sort_component_boxes(_merge_glyph_fragments(default_sequence, baseline))
+    if default_merged and len(default_merged) <= len(default_sequence):
+        default_sequence = default_merged
+    sequences: List[List[Tuple[int, int, int, int, float]]] = [default_sequence, ordered_boxes]
+    beam_state: List[Tuple[List[Tuple[int, int, int, int, float]], float]] = [([], 0.0)]
+    for options in option_groups:
+        expanded: Dict[Tuple[Tuple[int, int, int, int], ...], Tuple[List[Tuple[int, int, int, int, float]], float]] = {}
+        for seq, prior in beam_state:
+            for variant, variant_prior in options:
+                merged_seq = _sort_component_boxes([*seq, *variant])
+                key = _box_sequence_key(merged_seq)
+                if not key:
+                    continue
+                score = float(prior + variant_prior)
+                previous = expanded.get(key)
+                if previous is None or score > previous[1]:
+                    expanded[key] = (merged_seq, score)
+        beam_state = sorted(
+            expanded.values(),
+            key=lambda item: (item[1], -len(item[0])),
+            reverse=True,
+        )[:beam]
+    for seq, _ in beam_state:
+        normalized = _sort_component_boxes(seq)
+        if normalized:
+            sequences.append(normalized)
+            merged = _sort_component_boxes(_merge_glyph_fragments(normalized, baseline))
+            if merged and _box_sequence_key(merged) != _box_sequence_key(normalized):
+                sequences.append(merged)
+    unique: List[List[Tuple[int, int, int, int, float]]] = []
+    seen: Set[Tuple[Tuple[int, int, int, int], ...]] = set()
+    for seq in sequences:
+        key = _box_sequence_key(seq)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(_sort_component_boxes(seq))
+        if len(unique) >= beam + 2:
+            break
+    return unique
+
+
+def _decode_component_sequence(
+    bw: "np.ndarray",
+    boxes: Sequence[Tuple[int, int, int, int, float]],
+    allowed_chars: Optional[Sequence[str]] = None,
+    baseline: Optional[_BaselineStats] = None,
+    glyph_candidate_cache: Optional[Dict[Tuple[int, int, str], List[Tuple[str, float]]]] = None,
+    commit_learning: bool = False,
+) -> _TextDecodeCandidate:
+    atlas = _GLYPH_ATLAS
+    ordered_boxes = _sort_component_boxes(boxes)
+    if not ordered_boxes:
+        return _TextDecodeCandidate("", 0.0, 0.0, 0.0, 0.0, boxes=[], glyphs=[])
+    component_options: List[List[_GlyphDecodeHit]] = []
+    for (x1, y1, x2, y2, area) in ordered_boxes:
+        sub = bw[y1:y2, x1:x2]
+        if sub.size == 0:
+            continue
+        try:
+            arr = np.asarray(sub, dtype=np.uint8)
+        except Exception:
+            arr = sub
+        sig = _glyph_signature(arr)
+        if sig is not None and glyph_candidate_cache is not None and sig in glyph_candidate_cache:
+            candidates = list(glyph_candidate_cache[sig])
+        else:
+            try:
+                patch = Image.fromarray(np.asarray(arr, dtype=np.uint8))
+            except Exception:
+                patch = Image.fromarray(sub)
+            candidates = _match_glyph_candidates(
+                patch,
+                atlas,
+                allowed_chars=allowed_chars,
+                top_k=_TOY_GLYPH_CANDIDATE_TOPK,
+            )
+            if sig is not None and glyph_candidate_cache is not None:
+                glyph_candidate_cache[sig] = list(candidates)
+        hits = [
+            _GlyphDecodeHit(
+                bbox=(int(x1), int(y1), int(x2), int(y2), float(area)),
+                arr=arr,
+                sig=sig,
+                ch=str(ch),
+                score=float(sc),
+            )
+            for ch, sc in candidates
+            if ch
+        ]
+        if not hits:
+            hits = [
+                _GlyphDecodeHit(
+                    bbox=(int(x1), int(y1), int(x2), int(y2), float(area)),
+                    arr=arr,
+                    sig=sig,
+                    ch="?",
+                    score=0.0,
+                )
+            ]
+        component_options.append(hits)
+    if not component_options:
+        return _TextDecodeCandidate("", 0.0, 0.0, 0.0, 0.0, boxes=ordered_boxes, glyphs=[])
+    beam_limit = max(1, int(_TOY_GLYPH_BEAM))
+    states: List[Dict[str, Any]] = [{
+        "text": "",
+        "scores": [],
+        "glyphs": [],
+        "candidate": _TextDecodeCandidate("", 0.0, 0.0, 0.0, 0.0, boxes=[], glyphs=[]),
+    }]
+    for idx, hits in enumerate(component_options):
+        expanded: Dict[str, Dict[str, Any]] = {}
+        active_boxes = ordered_boxes[: idx + 1]
+        for state in states:
+            prev_text = str(state.get("text") or "")
+            prev_scores = list(state.get("scores") or [])
+            prev_glyphs = list(state.get("glyphs") or [])
+            for hit in hits:
+                if not hit.ch:
+                    continue
+                new_text = prev_text + hit.ch
+                new_scores = [*prev_scores, float(hit.score)]
+                new_glyphs = [*prev_glyphs, hit]
+                candidate = _build_text_decode_candidate(new_text, new_scores, new_glyphs, active_boxes, baseline)
+                previous = expanded.get(new_text)
+                if previous is None:
+                    expanded[new_text] = {
+                        "text": new_text,
+                        "scores": new_scores,
+                        "glyphs": new_glyphs,
+                        "candidate": candidate,
+                    }
+                    continue
+                prev_candidate = previous.get("candidate")
+                if not isinstance(prev_candidate, _TextDecodeCandidate) or (
+                    candidate.score,
+                    candidate.effective_conf,
+                    candidate.conf,
+                ) > (
+                    prev_candidate.score,
+                    prev_candidate.effective_conf,
+                    prev_candidate.conf,
+                ):
+                    expanded[new_text] = {
+                        "text": new_text,
+                        "scores": new_scores,
+                        "glyphs": new_glyphs,
+                        "candidate": candidate,
+                    }
+        if not expanded:
+            return _TextDecodeCandidate("", 0.0, 0.0, 0.0, 0.0, boxes=ordered_boxes, glyphs=[])
+        states = sorted(
+            expanded.values(),
+            key=lambda item: (
+                item["candidate"].score,
+                item["candidate"].effective_conf,
+                item["candidate"].conf,
+            ),
+            reverse=True,
+        )[:beam_limit]
+    best_state = max(
+        states,
+        key=lambda item: (
+            item["candidate"].score,
+            item["candidate"].effective_conf,
+            item["candidate"].conf,
+        ),
+    )
+    final_candidate = _build_text_decode_candidate(
+        str(best_state.get("text") or ""),
+        list(best_state.get("scores") or []),
+        list(best_state.get("glyphs") or []),
+        ordered_boxes,
+        baseline,
+    )
+    if commit_learning:
+        _commit_text_decode_candidate(final_candidate, allowed_chars=allowed_chars)
+    return final_candidate
 
 
 def _segment_component_bbox(
@@ -5522,67 +6498,49 @@ def _text_from_binary(bw, allowed_chars: Optional[Sequence[str]] = None):
     baseline_stats = _estimate_baseline_stats(baseline_candidates) if baseline_candidates else None
     if baseline_stats is None:
         baseline_stats = _estimate_baseline_stats(cc)
-    refined: List[Tuple[int, int, int, int, float]] = []
-    for bbox in cc:
-        refined.extend(_refine_component_segments(bw, bbox, baseline=baseline_stats))
-    if not refined:
-        refined = cc
-    refined.sort(key=lambda b: b[0])
-    merged = _merge_glyph_fragments(refined, baseline_stats)
-    if len(merged) < len(refined):
-        _GLYPH_RUNTIME_STATS["fragment_merges"] += float(len(refined) - len(merged))
-        refined = merged
-    atlas = _GLYPH_ATLAS
-    text = []
-    scores = []
-    for (x1, y1, x2, y2, _) in refined:
-        sub = bw[y1:y2, x1:x2]
-        if sub.size == 0:
-            continue
-        try:
-            arr = np.asarray(sub, dtype=np.uint8)
-        except Exception:
-            arr = sub
-        sig = _glyph_signature(arr)
-        cached = _glyph_runtime_lookup(sig)
-        if cached is not None and allowed_set is not None:
-            try:
-                cached_ch = cached[0]
-            except Exception:
-                cached_ch = ""
-            if cached_ch not in allowed_set:
-                cached = None
-        if cached is not None:
-            ch, sc = cached
-        else:
-            try:
-                patch = Image.fromarray(np.asarray(arr, dtype=np.uint8))
-            except Exception:
-                patch = Image.fromarray(sub)
-            ch, sc = _match_glyph(patch, atlas, allowed_chars=allowed_chars)
-            if allowed_set is None:
-                _glyph_runtime_store(sig, ch, sc)
-            if not ch or ch == "?" or sc < 0.6:
-                _glyph_pending_enqueue(sig, arr, sc)
-        if allowed_set is None and ch and ch != "?" and sc > 0.6:
-            try:
-                patch_img = Image.fromarray(np.asarray(arr, dtype=np.uint8))
-            except Exception:
-                patch_img = None
-            if patch_img is not None:
-                _adapt_glyph(ch, patch_img)
-        if ch:
-            text.append(ch)
-            scores.append(sc)
-    if not text:
+    segmentation_candidates = _build_segmentation_sequence_candidates(
+        bw,
+        cc,
+        baseline_stats,
+        beam_limit=_TOY_SEGMENTATION_BEAM,
+    )
+    if not segmentation_candidates:
+        segmentation_candidates = [_sort_component_boxes(cc)]
+    _GLYPH_RUNTIME_STATS["segmentation_hypotheses"] += float(len(segmentation_candidates))
+    glyph_candidate_cache: Dict[Tuple[int, int, str], List[Tuple[str, float]]] = {}
+    decoded = [
+        _decode_component_sequence(
+            bw,
+            seq,
+            allowed_chars=allowed_chars,
+            baseline=baseline_stats,
+            glyph_candidate_cache=glyph_candidate_cache,
+            commit_learning=False,
+        )
+        for seq in segmentation_candidates
+    ]
+    decoded = [candidate for candidate in decoded if candidate.text]
+    if not decoded:
         return "", 0.0
-    raw = np.asarray(scores, dtype=np.float64)
-    base = (raw + 1.0) * 0.5
-    mean = base.mean() if base.size else 0.0
-    spread = base.std() if base.size else 0.0
-    adj = (mean - 0.55) / (0.12 + spread * 0.5)
-    conf = 1.0 / (1.0 + math.exp(-adj)) if base.size else 0.0
-    return "".join(text), float(conf)
+    best_candidate = max(
+        decoded,
+        key=lambda item: (
+            item.score,
+            item.effective_conf,
+            item.quality,
+            -len(item.boxes),
+        ),
+    )
+    if len(segmentation_candidates) > 1:
+        default_key = _box_sequence_key(segmentation_candidates[0])
+        if _box_sequence_key(best_candidate.boxes) != default_key:
+            _GLYPH_RUNTIME_STATS["segmentation_alt_selected"] += 1.0
+    if best_candidate.boxes:
+        default_seq = segmentation_candidates[0]
+        if len(best_candidate.boxes) < len(default_seq):
+            _GLYPH_RUNTIME_STATS["fragment_merges"] += float(len(default_seq) - len(best_candidate.boxes))
+    _commit_text_decode_candidate(best_candidate, allowed_chars=allowed_chars)
+    return best_candidate.text, float(best_candidate.conf)
 
 
 def _shadow_correct_array(arr: "np.ndarray") -> "np.ndarray":
@@ -5844,7 +6802,7 @@ def toy_ocr_text_from_cell(
                 and final_quality >= observe_min_quality
                 and len(final_text) <= observe_max_len
             ):
-                _observe_token_template(final_text, ref_bitmap)
+                _observe_token_template(final_text, ref_bitmap, confidence=bounded_conf, quality=final_quality)
                 _GLYPH_RUNTIME_STATS["template_observed"] += 1.0
         return final_text, bounded_conf
     return "", 0.0
@@ -6113,7 +7071,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                           source_images: Union[str, Sequence[str], Mapping[int, str]],
                           out_jsonl_path: str,
                           ocr_engine: str = "toy", contextual: bool = True,
-                          ocr_min_conf: float = 0.58) -> int:
+                          ocr_min_conf: float = 0.58,
+                          postprocess_policy: Optional[str] = None) -> int:
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     page_lookup: Dict[int, str] = {}
@@ -6217,6 +7176,10 @@ def export_jsonl_with_ocr(doc_json_path: str,
     doc_dir = os.path.dirname(os.path.abspath(doc_json_path))
     image_cache: Dict[str, Image.Image] = {}
     ocr_runner = _resolve_ocr_backend(ocr_engine)
+    resolved_policy = _resolve_toy_postprocess_policy(
+        postprocess_policy,
+        contextual=contextual,
+    )
     doc_image_inventory: Optional[Dict[str, List[str]]] = None
 
     def _ensure_doc_inventory() -> Dict[str, List[str]]:
@@ -6647,12 +7610,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 col_charset_hints: List[Optional[str]] = []
                 html_headers: List[str] = []
                 toy_runner = ocr_runner is toy_ocr_text_from_cell
-                if toy_runner:
+                if toy_runner and resolved_policy.needs_headers:
                     html_headers = _table_headers_from_html(t.get("html"))
                     if html_headers:
-                        col_charset_hints = _column_charset_hints(html_headers)
-                        if not col_charset_hints:
-                            col_charset_hints = _heuristic_column_charset_hints(html_headers)
+                        if resolved_policy.use_header_charset_hints:
+                            col_charset_hints = _column_charset_hints(html_headers)
+                            if not col_charset_hints:
+                                col_charset_hints = _heuristic_column_charset_hints(html_headers)
                         if col_charset_hints and len(col_charset_hints) != C:
                             if len(col_charset_hints) < C:
                                 col_charset_hints.extend([None for _ in range(C - len(col_charset_hints))])
@@ -6701,7 +7665,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         if max_cells and cells_done >= max_cells:
                             stop_due_to_limit = True
                             break
-                    if r == 0 and not col_charset_hints:
+                    if r == 0 and resolved_policy.use_header_charset_hints and not col_charset_hints:
                         headers_sample = grid_text[0] if grid_text else []
                         col_charset_hints = _column_charset_hints(headers_sample)
                         if not col_charset_hints:
@@ -6732,7 +7696,9 @@ def export_jsonl_with_ocr(doc_json_path: str,
                     ):
                         prior_cache_writes += 1
                         prior_cache_seed = list(mids)
-                schema_adjust = _rectify_item_qty_amount_schema(grid_text, grid_conf, col_bounds)
+                schema_adjust = None
+                if resolved_policy.use_schema_rectifier:
+                    schema_adjust = _rectify_item_qty_amount_schema(grid_text, grid_conf, col_bounds)
                 if schema_adjust:
                     grid_text, grid_conf, col_bounds, schema_meta = schema_adjust
                     C = max(1, len(col_bounds) - 1)
@@ -6767,51 +7733,58 @@ def export_jsonl_with_ocr(doc_json_path: str,
                 footer_rows: Set[int] = set()
                 fallback_notes: Dict[Tuple[int, int], str] = {}
                 restore_headers = html_headers if html_headers and len(html_headers) == C else (grid_text[0] if grid_text else [])
-                restored = _restore_digit_commas_by_headers(
-                    restore_headers,
-                    grid_text,
-                    grid_conf=grid_conf,
-                    col_charset_hints=col_charset_hints,
-                    fallback_notes=fallback_notes,
-                )
+                restored = 0
+                if resolved_policy.use_comma_restore:
+                    restored = _restore_digit_commas_by_headers(
+                        restore_headers,
+                        grid_text,
+                        grid_conf=grid_conf,
+                        col_charset_hints=col_charset_hints,
+                        fallback_notes=fallback_notes,
+                    )
                 if restored:
                     comma_restored_cells += int(restored)
-                for r in range(R):
-                    if _is_total_row(grid_text[r]):
-                        total_rows_seen += 1
-                        footer_rows.add(r)
-                        target_col = C - 1 if C > 0 else 0
-                        if C > 0 and _relocate_total_amount(grid_text[r], grid_conf[r], target_col):
-                            fallback_notes[(r, target_col)] = "total_realign"
-                            total_rows_reflowed += 1
-                        has_numeric = any(_NUMERIC_RX.search(grid_text[r][c] or "") for c in range(C))
-                        if not has_numeric and C > 0:
-                            total_rows_ocr_attempts += 1
-                            target_col = C-1
-                            cy1, cy2 = row_bands[r]
-                            cx1 = x1 + col_bounds[target_col]
-                            cx2 = x1 + col_bounds[target_col+1] + pad_edge_x * 2
-                            crop = page_image.crop((
-                                max(0, cx1 - pad_inner_x),
-                                max(0, cy1 - pad_y),
-                                min(page_w, cx2),
-                                min(page_h, cy2 + pad_y)
-                            ))
-                            alt_txt, alt_conf = ocr_runner(crop)
-                            m = _NUMERIC_RX.search(alt_txt or "")
-                            if m:
-                                grid_text[r][target_col] = m.group(0)
-                                grid_conf[r][target_col] = max(
-                                    grid_conf[r][target_col], _normalize_confidence(alt_conf)
-                                )
-                                fallback_notes[(r, target_col)] = "footer_band"
+                if resolved_policy.use_footer_reflow:
+                    for r in range(R):
+                        if _is_total_row(grid_text[r]):
+                            total_rows_seen += 1
+                            footer_rows.add(r)
+                            target_col = C - 1 if C > 0 else 0
+                            if C > 0 and _relocate_total_amount(grid_text[r], grid_conf[r], target_col):
+                                fallback_notes[(r, target_col)] = "total_realign"
                                 total_rows_reflowed += 1
-                                total_rows_ocr_success += 1
+                            has_numeric = any(_NUMERIC_RX.search(grid_text[r][c] or "") for c in range(C))
+                            if not has_numeric and C > 0:
+                                total_rows_ocr_attempts += 1
+                                target_col = C-1
+                                cy1, cy2 = row_bands[r]
+                                cx1 = x1 + col_bounds[target_col]
+                                cx2 = x1 + col_bounds[target_col+1] + pad_edge_x * 2
+                                crop = page_image.crop((
+                                    max(0, cx1 - pad_inner_x),
+                                    max(0, cy1 - pad_y),
+                                    min(page_w, cx2),
+                                    min(page_h, cy2 + pad_y)
+                                ))
+                                alt_txt, alt_conf = ocr_runner(crop)
+                                m = _NUMERIC_RX.search(alt_txt or "")
+                                if m:
+                                    grid_text[r][target_col] = m.group(0)
+                                    grid_conf[r][target_col] = max(
+                                        grid_conf[r][target_col], _normalize_confidence(alt_conf)
+                                    )
+                                    fallback_notes[(r, target_col)] = "footer_band"
+                                    total_rows_reflowed += 1
+                                    total_rows_ocr_success += 1
                 # contextual one-liners
                 headers = grid_text[0] if grid_text else []
-                header_fields = _numeric_header_kinds(headers, grid_text)
-                inferred_columns = _NUMERIC_HEADER_INFERRED_LAST
-                date_roles = _date_header_roles(headers)
+                header_fields = (
+                    _numeric_header_kinds(headers, grid_text)
+                    if resolved_policy.use_numeric_headers
+                    else []
+                )
+                inferred_columns = _NUMERIC_HEADER_INFERRED_LAST if resolved_policy.use_numeric_headers else 0
+                date_roles = _date_header_roles(headers) if resolved_policy.use_date_headers else []
                 if date_roles and any(date_roles):
                     date_tables += 1
                     for role in date_roles:
@@ -6829,7 +7802,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                         for kind in header_fields:
                             if kind:
                                 numeric_columns_by_kind[kind] += 1
-                if contextual:
+                if contextual and resolved_policy.use_numeric_headers:
                     _enforce_numeric_by_headers(headers, grid_text)
                 for r in range(R):
                     for c in range(C):
@@ -7075,6 +8048,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "numeric": numeric_stats,
         "toy_runtime": runtime_state,
         "force_numeric": bool(_FORCE_NUMERIC),
+        "postprocess_policy": resolved_policy.name,
         "flush_every": int(flush_every),
     }
     if date_cells_detected or date_columns_total:

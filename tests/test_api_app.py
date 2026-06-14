@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 from fastapi.testclient import TestClient
 
@@ -60,3 +61,39 @@ def test_invalid_ingest_payload_returns_400():
     resp = client.post("/ingest", json={"tenant_id": "missing_files"})
     assert resp.status_code == 400
     assert "'files'" in resp.json()["detail"]
+
+
+def test_app_api_key_guard_and_job_status(tmp_path):
+    tenant_dir = tmp_path / "acme" / "job-123"
+    tenant_dir.mkdir(parents=True)
+    (tenant_dir / "job_status.json").write_text(
+        json.dumps({"job_id": "job-123", "tenant_id": "acme", "status": "completed"}),
+        encoding="utf-8",
+    )
+    app = create_app(
+        ingest_runner=_ingest_response,
+        query_runner=_query_response,
+        out_root=str(tmp_path),
+        api_keys=["secret"],
+    )
+    client = TestClient(app)
+
+    unauthorized = client.get("/jobs/job-123?tenant_id=acme")
+    assert unauthorized.status_code == 401
+
+    authorized = client.get("/jobs/job-123?tenant_id=acme", headers={"X-API-Key": "secret"})
+    assert authorized.status_code == 200
+    assert authorized.json()["status"] == "completed"
+
+
+def test_app_missing_job_status_returns_404(tmp_path):
+    app = create_app(
+        ingest_runner=_ingest_response,
+        query_runner=_query_response,
+        out_root=str(tmp_path),
+    )
+    client = TestClient(app)
+
+    resp = client.get("/jobs/missing?tenant_id=acme")
+
+    assert resp.status_code == 404

@@ -139,6 +139,24 @@ curl -H "X-API-Key: $ZOCR_API_KEY" -F "file=@your.pdf" \
   "http://127.0.0.1:8000/v1/run?domain=invoice"
 ```
 
+### Lightweight API and OCR pipeline
+```bash
+# Thin JSON API: supports async ingest status and optional API key guard.
+export ZOCR_API_KEYS="change-me"
+uvicorn 'zocr.api_app:create_app' --factory --host 127.0.0.1 --port 8010
+curl -H "X-API-Key: change-me" \
+  'http://127.0.0.1:8010/jobs/<job_id>?tenant_id=<tenant_id>'
+
+# Lightweight OCR pipeline: single images, PDFs, image directories, or batches.
+python -m zocr.ocr_pipeline.cli --images page1.png page2.png --out doc.json
+python -m zocr.ocr_pipeline.cli --input-dir pages/ --out doc.json
+python -m zocr.ocr_pipeline.cli --batch-dir batches/ --out batch.json
+
+# Optional external VLM endpoint for image-region captions.
+export ZOCR_VLLM_ENDPOINT="http://127.0.0.1:9000/caption"
+python -m zocr.ocr_pipeline.cli --input-dir pages/ --out doc.json
+```
+
 ## Validation / 検証
 ```bash
 # Validate an outdir (creates zocr.manifest.json if missing)
