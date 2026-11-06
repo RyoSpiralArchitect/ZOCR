@@ -34,6 +34,35 @@ are local browser state until exported; they do not alter or publish artifacts.
 Execution status is separate from `quality_status` and the downstream
 `publication_status` recommendation. Diagnostic downloads remain available.
 
+## Server-side review ledger
+
+- `POST /v1/reviews` accepts `{"job_a":"<job id>","job_b":"<job id>"}` and
+  creates a tenant-local snapshot from completed, manifest-verified source jobs.
+  It requires `zocr.jobs.write`.
+- `GET /v1/reviews/{review_id}` and `/history` require `zocr.jobs.read`.
+- `POST /v1/reviews/{review_id}/decisions` requires `zocr.reviews.approve`
+  (included in the admin role). Submit `submission_id`, `expected_revision`,
+  matching `source_hashes`, and a nonempty `decisions` list. Each decision needs
+  an existing `event_id`, `status`, and a reason. Statuses are `approved`,
+  `rejected`, `needs_review`, or `corrected`. A corrected cell also requires
+  `"correction":{"side":"b","text":"corrected value"}` (side may be `a`).
+- Import the decisions and source hashes from a local HTML export, but use the
+  server review's event IDs and current revision. The server records the
+  authenticated principal, not a client-supplied reviewer name or timestamp.
+- Reusing a submission ID with identical content is idempotent. A stale revision,
+  changed source, or reused ID with different content returns 409. Unknown events
+  and malformed decisions return 422. Other tenants' reviews return 404.
+- Every accepted revision retains earlier decisions and a hash-linked history.
+  Corrections do not mutate OCR output. This is an application-level audit trail,
+  not WORM storage or a cryptographic defense against privileged DB administrators.
+  With authentication disabled, the actor is explicitly unauthenticated.
+  Review snapshots retain hashes and extracted events; they do not pin source
+  jobs against deletion/retention. Archive original evidence separately when needed.
+- Distributed deployments require PostgreSQL metadata and one authoritative
+  primary. Local metadata/reviews require durable shared filesystem coordination.
+  Run normal schema initialization/migrations to create `zocr_document_reviews`;
+  deployments with auto-initialization disabled must provision it explicitly.
+
 ## 入力要件 / Input expectations / Entrées attendues
 - **`cells.jsonl`**
   - **[JA]** 必須。`page` / `table_index` / `row` / `col` / `text` / `filters` / `trace_id` などを持つセル記録。

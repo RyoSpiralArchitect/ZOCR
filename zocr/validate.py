@@ -132,7 +132,7 @@ def _validate_jsonl(path: Path, *, max_lines: int) -> Tuple[List[str], List[str]
     try:
         with path.open("r", encoding="utf-8") as f:
             for idx, line in enumerate(f):
-                if idx >= max_lines:
+                if max_lines > 0 and idx >= max_lines:
                     break
                 line = line.strip()
                 if not line:
@@ -143,7 +143,7 @@ def _validate_jsonl(path: Path, *, max_lines: int) -> Tuple[List[str], List[str]
                     errors.append(f"{path.name}: invalid JSONL at line {idx+1}: {exc}")
                     break
                 if not isinstance(payload, dict):
-                    warnings.append(f"{path.name}: JSONL line {idx+1} is not an object")
+                    errors.append(f"{path.name}: JSONL line {idx+1} is not an object")
                     break
     except FileNotFoundError:
         errors.append(f"{path.name}: missing")

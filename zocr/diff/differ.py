@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import io
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,13 +27,13 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 # --------- ユーティリティ ---------
-def load_jsonl(path: Path, *, strict: bool = True) -> List[dict]:
+def load_jsonl(path: Path, *, strict: bool = True, cells: bool = False, data: bytes | None = None) -> List[dict]:
     items: List[dict] = []
     if not path.exists():
         if strict:
             raise FileNotFoundError(path)
         return items
-    with path.open("r", encoding="utf-8") as f:
+    with io.StringIO((data if data is not None else path.read_bytes()).decode("utf-8")) as f:
         for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -40,12 +42,19 @@ def load_jsonl(path: Path, *, strict: bool = True) -> List[dict]:
                 record = json.loads(line)
                 if not isinstance(record, dict):
                     raise ValueError(f"{path}:{line_number}: Expected a JSON object")
+                if cells:
+                    try:
+                        to_cell(record)
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        raise ValueError(f"{path}:{line_number}: Invalid cell coordinates or metadata") from exc
                 items.append(record)
             except json.JSONDecodeError as exc:
                 if strict:
                     raise ValueError(f"{path}:{line_number}: Invalid JSON") from exc
                 # 壊れた行は無視（必要ならログする）
                 continue
+    if cells and not items:
+        raise ValueError(f"{path}: empty cell input cannot verify a document comparison")
     return items
 
 
@@ -56,12 +65,15 @@ def norm_text(x: Optional[str]) -> str:
 
 
 def try_number(x: Any) -> Optional[float]:
+    if isinstance(x, bool):
+        return None
     if isinstance(x, (int, float)):
-        return float(x)
+        return float(x) if math.isfinite(x) else None
     if isinstance(x, str):
         s = x.replace(",", "").replace("¥", "").replace("$", "").strip()
         try:
-            return float(s)
+            value = float(s)
+            return value if math.isfinite(value) else None
         except ValueError:
             return None
     return None
@@ -129,7 +141,7 @@ def to_cell(rec: dict) -> Cell:
         header = rec["headers"][col]
     meta = rec.get("meta") or {}
     filters = rec.get("filters", {}) or rec.get("norm", {}) or meta.get("filters") or {}
-    trace_id = rec.get("trace_id") or meta.get("trace_id")
+    trace_id = rec.get("trace_id") or meta.get("trace_id") or meta.get("trace")
     return Cell(page, table_index, row, col, text, header, filters, trace_id,
                 source_evidence(rec), str(rec.get("doc_id") or ""))
 
@@ -151,6 +163,7 @@ class TableView:
     column_signatures: Dict[int, str]
     page: int
     table_index: int
+    doc_id: str = ""
 
 
 @dataclass
@@ -165,6 +178,7 @@ class SectionEntry:
 def table_context(table: TableView) -> Dict[str, Any]:
     return {
         "table_id": table.id_hint,
+        "doc_id": table.doc_id,
         "table_page": table.page,
         "table_index": table.table_index,
         "table_rows": len(table.row_keys),
@@ -228,7 +242,7 @@ def build_tables(cells: List[Cell]) -> Dict[str, TableView]:
         for col in range(max_col + 1):
             if headers_by_col[col]:
                 vals = headers_by_col[col]
-                headers.append(max(set(vals), key=vals.count))
+                headers.append(max(sorted(set(vals)), key=vals.count))
             else:
                 headers.append(f"col{col}")
 
@@ -306,6 +320,7 @@ def build_tables(cells: List[Cell]) -> Dict[str, TableView]:
             column_signatures=column_signatures,
             page=page,
             table_index=t_idx,
+            doc_id=doc_id,
         )
     return tables
 
@@ -342,20 +357,30 @@ def build_sections(path: Optional[Path]) -> List[SectionEntry]:
 
 # --------- マッチング ---------
 def match_tables(A: Dict[str, TableView], B: Dict[str, TableView]) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
-    unmatched_B = set(B.keys())
-    pairs: List[Tuple[str, str]] = []
-    for a_id, a in A.items():
-        best, best_s = None, -1.0
-        for b_id in unmatched_B:
-            s = jaccard(a.headers, B[b_id].headers)
-            if s > best_s:
-                best, best_s = b_id, s
-        if best is not None and best_s >= 0.30:
+    unmatched_B = sorted(B)
+    pairs: List[Tuple[str, str]] = [(key, key) for key in sorted(A.keys() & B.keys())]
+    for _, key in pairs:
+        unmatched_B.remove(key)
+    matched_a = {pair[0] for pair in pairs}
+    docs_a, docs_b = {table.doc_id for table in A.values()}, {table.doc_id for table in B.values()}
+    single_version_pair = len(docs_a) == len(docs_b) == 1
+    for a_id in sorted(A):
+        if a_id in matched_a:
+            continue
+        a = A[a_id]
+        candidates = [key for key in unmatched_B if B[key].doc_id == a.doc_id or single_version_pair]
+        best, best_score = None, (-1.0, False, False)
+        for b_id in candidates:
+            b = B[b_id]
+            score = (jaccard(a.headers, b.headers), a.page == b.page and a.table_index == b.table_index,
+                     a.page == b.page)
+            if score > best_score:
+                best, best_score = b_id, score
+        if best is not None and best_score[0] >= 0.30:
             pairs.append((a_id, best))
             unmatched_B.remove(best)
-    removed = [a_id for a_id in A.keys() if a_id not in {p[0] for p in pairs}]
-    added = list(unmatched_B)
-    return pairs, added, removed
+    removed = [key for key in sorted(A) if key not in {pair[0] for pair in pairs}]
+    return pairs, unmatched_B, removed
 
 
 def column_similarity(a: TableView, b: TableView, ai: int, bi: int) -> float:
@@ -531,10 +556,10 @@ class SemanticDiffer:
         if a_txt == b_txt:
             return None
 
-        a_num = next((a.filters[key] for key in ("amount", "qty", "rate")
-                      if a.filters.get(key) is not None), try_number(a_txt))
-        b_num = next((b.filters[key] for key in ("amount", "qty", "rate")
-                      if b.filters.get(key) is not None), try_number(b_txt))
+        a_num = next((value for key in ("amount", "qty", "rate")
+                      if (value := try_number(a.filters.get(key))) is not None), try_number(a_txt))
+        b_num = next((value for key in ("amount", "qty", "rate")
+                      if (value := try_number(b.filters.get(key))) is not None), try_number(b_txt))
 
         numeric_delta = relative_delta = None
         sim = str_sim(a_txt, b_txt)
@@ -734,8 +759,9 @@ class SemanticDiffer:
         sections_a: Optional[Path] = None,
         sections_b: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        A = [to_cell(x) for x in load_jsonl(cells_a)]
-        B = [to_cell(x) for x in load_jsonl(cells_b)]
+        raw_a, raw_b = cells_a.read_bytes(), cells_b.read_bytes()
+        A = [to_cell(x) for x in load_jsonl(cells_a, cells=True, data=raw_a)]
+        B = [to_cell(x) for x in load_jsonl(cells_b, cells=True, data=raw_b)]
         tables_a = build_tables(A)
         tables_b = build_tables(B)
 
@@ -779,5 +805,7 @@ class SemanticDiffer:
         section_summary = summarize_section_events(events)
         if section_summary:
             summary["section_summary"] = section_summary
-        review = annotate_review(events, cells_a, cells_b)
+        review = annotate_review(events, cells_a, cells_b, source_hashes={
+            "a": hashlib.sha256(raw_a).hexdigest(), "b": hashlib.sha256(raw_b).hexdigest(),
+        })
         return {"events": events, "summary": summary, "review": review}

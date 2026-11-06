@@ -41,3 +41,71 @@ jobs:
         run: |
           docker run --rm zocr-suite:ci zocr --version
           docker run --rm zocr-suite:ci zocr validate --help
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4.2
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      postgres:
+        image: postgres:16.6
+        env:
+          POSTGRES_USER: zocr_test
+          POSTGRES_PASSWORD: local_test_only
+          POSTGRES_DB: zocr_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U zocr_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      s3:
+        image: motoserver/moto:5.0.28
+        ports:
+          - 5000/tcp
+    env:
+      ZOCR_TEST_BROWSER: "1"
+      ZOCR_TEST_DOCKER_FAILOVER: "1"
+      PLAYWRIGHT_SKIP_BROWSER_GC: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install integration dependencies
+        run: |
+          python -m pip install uv==0.7.19
+          uv pip install --system --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" -e ".[dev,api,api_saas,multimodal,parquet,pdf,ocr_tess]" playwright==1.56.0
+          python -m playwright install --with-deps chromium
+      - name: Build and start pinned official MinIO source
+        run: |
+          docker build -f tests/fixtures/minio.Dockerfile -t zocr-minio-test .
+          docker run -d --name zocr-ci-minio -e MINIO_ROOT_USER=zocr_test -e MINIO_ROOT_PASSWORD=zocr_test_local_only -e MINIO_BROWSER=off -p 127.0.0.1::9000 zocr-minio-test
+          endpoint="$(docker port zocr-ci-minio 9000/tcp)"
+          echo "ZOCR_TEST_MINIO_URL=http://${endpoint}" >> "$GITHUB_ENV"
+      - name: Test real services, PDF extraction and review browser
+        env:
+          ZOCR_TEST_REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports['6379'] }}/0
+          ZOCR_TEST_POSTGRES_URL: postgresql://zocr_test:local_test_only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/zocr_test
+          ZOCR_TEST_S3_URL: http://127.0.0.1:${{ job.services.s3.ports['5000'] }}
+        run: python -m pytest -q -rs
+
+  windows-execution:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install uv==0.7.19
+          $cutoff = (Get-Date).ToUniversalTime().AddDays(-7).ToString("yyyy-MM-ddTHH:mm:ssZ")
+          uv pip install --system --exclude-newer $cutoff -e ".[dev,api]"
+      - name: Verify native job isolation and fencing
+        run: python -m pytest -q -rs tests/test_windows_executor.py tests/test_execution_reliability.py tests/test_fenced_publication.py

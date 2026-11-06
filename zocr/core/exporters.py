@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .confidence import record_confidence
 from .domains import DOMAIN_ALIAS, DOMAIN_SUGGESTED_QUERIES
 
 __all__ = ["sql_export", "export_rag_bundle", "_build_trace", "_fact_tag"]
@@ -67,6 +69,8 @@ def sql_export(jsonl: str, outdir: str, prefix: str = "invoice") -> Dict[str, st
         "observed_text",
         "synthetic",
         "derived_fields",
+        "structure_confidence",
+        "synthetic_role",
     ]
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as fw:
         wr = csv.writer(fw)
@@ -104,7 +108,7 @@ def sql_export(jsonl: str, outdir: str, prefix: str = "invoice") -> Dict[str, st
                         y1,
                         x2,
                         y2,
-                        meta.get("confidence"),
+                        record_confidence(ob).get("ocr"),
                         meta.get("low_conf"),
                         meta.get("phash64"),
                         meta.get("lambda_shape"),
@@ -113,6 +117,8 @@ def sql_export(jsonl: str, outdir: str, prefix: str = "invoice") -> Dict[str, st
                         meta.get("observed_text", None if meta.get("synthetic") else ob.get("text")),
                         bool(meta.get("synthetic", False)),
                         json.dumps(meta.get("derived_fields", {}), ensure_ascii=False),
+                        record_confidence(ob).get("structure"),
+                        meta.get("synthetic_role"),
                     ]
                 )
     schema = f"""
@@ -123,7 +129,8 @@ CREATE TABLE IF NOT EXISTS {prefix}_cells (
   postal_code TEXT, phone TEXT, tax_rate REAL, qty BIGINT, unit TEXT, subtotal BIGINT, tax_amount BIGINT, corporate_id TEXT,
   bbox_x1 INT, bbox_y1 INT, bbox_x2 INT, bbox_y2 INT,
   confidence REAL, low_conf BOOLEAN, phash64 BIGINT, lambda_shape REAL, trace TEXT,
-  evidence_kind TEXT, observed_text TEXT, synthetic BOOLEAN, derived_fields TEXT
+  evidence_kind TEXT, observed_text TEXT, synthetic BOOLEAN, derived_fields TEXT,
+  structure_confidence REAL, synthetic_role TEXT
 );
 -- COPY {prefix}_cells FROM '{csv_path}' WITH CSV HEADER;
 """
@@ -238,6 +245,12 @@ def export_rag_bundle(
     ) as fw:
         for line in fr:
             ob = json.loads(line)
+            image_path = ob.get("image_path")
+            if isinstance(image_path, str):
+                image = Path(image_path).resolve()
+                root = Path(jsonl).resolve().parent
+                if Path(outdir).resolve() == root / "rag" and image.is_relative_to(root / "evidence"):
+                    ob["image_path"] = image.relative_to(root).as_posix()
             fw.write(json.dumps(ob, ensure_ascii=False) + "\n")
             doc_ids.add(ob.get("doc_id"))
             lang = (ob.get("meta") or {}).get("lang")

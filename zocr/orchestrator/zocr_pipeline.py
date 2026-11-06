@@ -35,7 +35,8 @@ from .history import load_history, print_history, read_meta, read_summary
 from .reporting import generate_report
 from .resume import prepare_resume, reusable_steps, step_integrity
 from ..artifacts.manifest import write_manifest as _write_manifest
-from ..artifacts.quality import quality_summary
+from ..artifacts.quality import quality_summary, write_final_quality
+from ..utils.formats import IMAGE_EXTENSIONS
 from ..diff.review import render_review
 from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
@@ -280,7 +281,8 @@ class MetaIntentPayload(TypedDict, total=False):
 
 
 _EPISODE_CONTEXT: Dict[str, Any] = {}
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+
+_IMAGE_EXTS = IMAGE_EXTENSIONS
 _INPUT_ENUM_FILE_EXCLUDES: Tuple[str, ...] = (
     "*.microscope.*",
     "*.xray*",
@@ -4456,7 +4458,7 @@ def _patched_run_full_pipeline(
     toy_self_correction_details: Optional[Dict[str, Any]] = None
     toy_triggered = False
     toy_executed = False
-    if learning_jsonl_path and toy_snapshot is not None:
+    if learning_jsonl_path and toy_snapshot is not None and not toy_lite:
         toy_triggered, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
         if toy_triggered:
             plan = toy_self_correction_details.get("plan") if isinstance(toy_self_correction_details, dict) else None
@@ -5003,9 +5005,12 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] bandit update skipped: {exc}")
 
+    write_final_quality(outdir, min_confidence=float(prof.get("ocr_min_conf", .58)),
+                        export_complete="export_skipped" not in (summary.get("rag_bundle_status") or {}).get("issues", []))
     summary.update(quality_summary(outdir))
     _finalize_episode(outdir, summary)
 
+    summary["manifest_json"] = str(Path(outdir) / "zocr.manifest.json")
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
     try:
@@ -5013,10 +5018,7 @@ def _patched_run_full_pipeline(
     except Exception as e:
         print("Report generation skipped:", e)
     try:
-        manifest_path = _write_manifest(outdir, summary=summary, inputs=inputs)
-        summary["manifest_json"] = str(manifest_path)
-        with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
+        _write_manifest(outdir, summary=summary, inputs=inputs)
     except Exception as exc:
         print("[WARN] Manifest generation skipped:", exc)
     set_stage_trace_sink(None)

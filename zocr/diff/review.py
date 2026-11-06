@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..artifacts.quality import quality_summary
+from ..core.confidence import record_confidence
 
 
 def source_evidence(record: dict[str, Any]) -> dict[str, Any]:
@@ -18,9 +19,12 @@ def source_evidence(record: dict[str, Any]) -> dict[str, Any]:
         "doc_id": record.get("doc_id"), "page": record.get("page"),
         "row": record.get("row"), "col": record.get("col"),
         "bbox": record.get("bbox"), "image_path": record.get("image_path") or meta.get("image_path"),
-        "trace_id": record.get("trace_id") or meta.get("trace_id"),
-        "text": record.get("text"), "observed_text": meta.get("observed_text", record.get("text")),
-        "confidence": record.get("confidence", meta.get("confidence")),
+        "trace_id": record.get("trace_id") or meta.get("trace_id") or meta.get("trace"),
+        "text": record.get("text"),
+        "observed_text": meta.get("observed_text", None if meta.get("synthetic") else record.get("text")),
+        "confidence": record_confidence(record),
+        "synthetic": bool(meta.get("synthetic")),
+        "synthetic_role": meta.get("synthetic_role"),
         "evidence_kind": meta.get("evidence_kind", "inferred" if meta.get("synthetic") else "observed"),
     }
 
@@ -29,10 +33,12 @@ def run_root(cells: Path) -> Path:
     return cells.parent.parent if cells.parent.name == "rag" else cells.parent
 
 
-def annotate_review(events: list[dict], cells_a: Path, cells_b: Path) -> dict[str, Any]:
-    hashes = {side: hashlib.sha256(path.read_bytes()).hexdigest() for side, path in (("a", cells_a), ("b", cells_b))}
+def annotate_review(events: list[dict], cells_a: Path, cells_b: Path, *,
+                    source_hashes: dict[str, str] | None = None) -> dict[str, Any]:
+    hashes = source_hashes or {side: hashlib.sha256(path.read_bytes()).hexdigest() for side, path in (("a", cells_a), ("b", cells_b))}
     qualities = {side: quality_summary(run_root(path))["quality_status"] for side, path in (("a", cells_a), ("b", cells_b))}
-    for event in events:
+    for index, event in enumerate(events):
+        event.pop("event_id", None)
         evidence = event.get("evidence", {})
         reasons = []
         low_confidence = False
@@ -45,7 +51,7 @@ def annotate_review(events: list[dict], cells_a: Path, cells_b: Path) -> dict[st
                     confidence = confidence.get("ocr")
                 if not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
                     reasons.append(f"unknown_confidence_{side}")
-                elif confidence < .55:
+                elif confidence < .58:
                     low_confidence = True
                     reasons.append(f"low_confidence_{side}")
                 if cell.get("evidence_kind") != "observed":
@@ -59,7 +65,9 @@ def annotate_review(events: list[dict], cells_a: Path, cells_b: Path) -> dict[st
             "classification": "possible_ocr_change" if low_confidence else "unverified_change",
             "reasons": sorted(set(reasons)),
         }
-        identity = json.dumps({"sources": hashes, "event": event}, ensure_ascii=False, sort_keys=True)
+        identity = json.dumps({"sources": hashes, "index": index,
+                               "event": {key: value for key, value in event.items() if key != "review"}},
+                              ensure_ascii=False, sort_keys=True)
         event["event_id"] = hashlib.sha256(identity.encode()).hexdigest()
     return {"schema": "zocr.diff_review.v1", "source_hashes": hashes, "source_quality": qualities,
             "pending": len(events), "policy": "Changes require human verification against source evidence."}

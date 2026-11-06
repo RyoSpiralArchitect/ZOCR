@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -17,6 +18,18 @@ class JobPaths:
     input_dir: Path
     out_dir: Path
     artifacts_zip: Path
+
+
+def result_paths(store, job_id: str, job: dict) -> JobPaths:
+    paths = store.job_paths(job_id)
+    token = job.get("execution_token")
+    if token is None:
+        return paths
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("Invalid execution token")
+    attempt = paths.root / "attempts" / token
+    return JobPaths(root=paths.root, job_json=paths.job_json, input_dir=paths.input_dir,
+                    out_dir=attempt / "out", artifacts_zip=attempt / "artifacts.zip")
 
 
 @dataclass(frozen=True)
@@ -113,6 +126,8 @@ class LocalJobStore:
         return path.exists() and path.is_file()
 
     def ensure_local_file(self, path: Path, *, force: bool = False) -> Path:
+        if not path.is_file():
+            raise FileNotFoundError(path)
         return path
 
     def persist_file(self, path: Path) -> None:
@@ -177,8 +192,11 @@ class S3JobStore:
         return self._local.job_paths(job_id)
 
     def _key_for(self, path: Path) -> str:
-        rel = path.relative_to(self.jobs_dir)
-        return f"{self._base_prefix}/{rel.as_posix()}"
+        if path.is_relative_to(self.jobs_dir):
+            return f"{self._base_prefix}/{path.relative_to(self.jobs_dir).as_posix()}"
+        reviews = self.storage_dir / "reviews"
+        rel = path.relative_to(reviews)
+        return f"{self._base_prefix.removesuffix('/jobs')}/reviews/{rel.as_posix()}"
 
     def _is_missing_error(self, exc: Exception) -> bool:
         if not isinstance(exc, self._client_error):
