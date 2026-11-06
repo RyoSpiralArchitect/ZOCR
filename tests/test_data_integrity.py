@@ -88,6 +88,7 @@ def test_job_fails_when_required_artifact_cannot_be_created(tmp_path, monkeypatc
     out = root / "out"
     out.mkdir(parents=True)
     store = MagicMock()
+    store.storage_dir = tmp_path
     store.job_paths.return_value = SimpleNamespace(
         root=root, input_dir=root / "input", out_dir=out,
         artifacts_zip=root / "artifacts.zip",

@@ -71,7 +71,11 @@ def main() -> None:
     logger.setLevel(getattr(logging, log_level, logging.INFO))
     logger.propagate = False
 
-    from zocr.orchestrator.zocr_pipeline import run_full_pipeline
+    from .executor import execute_pipeline
+
+    def run_full_pipeline(**kwargs):
+        timeout_sec = float(os.environ.get("ZOCR_API_RUN_TIMEOUT_SEC") or "900")
+        return execute_pipeline(timeout_sec=timeout_sec, **kwargs)
 
     storage_backend, job_store = build_job_store()
     metadata_backend, job_repository = build_job_repository(job_store)
@@ -102,14 +106,19 @@ def main() -> None:
             queue.ack(group=queue_settings.group, message_id=message_id)
             return
         tenant_id = tenant_id or default_tenant or "default"
-        status, error, duration = process_job(
-            job_id=job_id,
-            tenant_id=tenant_id,
-            job_store=job_store,
-            job_repository=job_repository,
-            run_full_pipeline=run_full_pipeline,
-        )
-        queue.ack(group=queue_settings.group, message_id=message_id)
+        with queue.keep_alive(
+            group=queue_settings.group, consumer=consumer, message_id=message_id,
+            interval=max(0.01, args.claim_idle_ms / 3000.0),
+        ):
+            status, error, duration = process_job(
+                job_id=job_id,
+                tenant_id=tenant_id,
+                job_store=job_store,
+                job_repository=job_repository,
+                run_full_pipeline=run_full_pipeline,
+            )
+        if status != "busy":
+            queue.ack(group=queue_settings.group, message_id=message_id)
         _log(
             logger,
             log_format,
@@ -140,14 +149,15 @@ def main() -> None:
                 if args.once:
                     return
 
+    claim_cursor = "0-0"
     try:
         while True:
             if args.claim_idle_ms > 0:
-                _next_cursor, claimed = queue.claim_stale(
+                claim_cursor, claimed = queue.claim_stale(
                     group=queue_settings.group,
                     consumer=consumer,
                     min_idle_ms=args.claim_idle_ms,
-                    start_id="0-0",
+                    start_id=claim_cursor,
                     count=args.claim_count,
                 )
                 for message_id, payload in claimed:

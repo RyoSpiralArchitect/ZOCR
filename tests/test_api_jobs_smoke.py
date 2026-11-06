@@ -311,6 +311,7 @@ def test_jobs_lifecycle_smoke(monkeypatch, tmp_path) -> None:
         return summary
 
     monkeypatch.setattr(pipeline, "run_full_pipeline", fake_run_full_pipeline, raising=True)
+    monkeypatch.setattr("zocr.service.app.execute_pipeline", fake_run_full_pipeline)
     storage_dir = tmp_path / "store"
     monkeypatch.setenv("ZOCR_API_STORAGE_DIR", str(storage_dir))
     monkeypatch.setenv("ZOCR_API_JOBS_RESUME_ON_STARTUP", "0")
@@ -439,6 +440,7 @@ def test_jobs_tenant_isolation_smoke(monkeypatch, tmp_path) -> None:
         return {"inputs": inputs}
 
     monkeypatch.setattr(pipeline, "run_full_pipeline", fake_run_full_pipeline, raising=True)
+    monkeypatch.setattr("zocr.service.app.execute_pipeline", fake_run_full_pipeline)
     monkeypatch.setenv("ZOCR_API_STORAGE_DIR", str(tmp_path / "store"))
     monkeypatch.setenv("ZOCR_API_MULTI_TENANT_ENABLED", "1")
     monkeypatch.delenv("ZOCR_API_DEFAULT_TENANT", raising=False)

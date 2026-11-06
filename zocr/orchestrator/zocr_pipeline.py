@@ -33,6 +33,7 @@ from .plugins import PLUGINS, call_stage, describe_plugins, register_stage
 from .prior import PriorBandit, normalize_headers_to_signature, decide_success
 from .history import load_history, print_history, read_meta, read_summary
 from .reporting import generate_report
+from .resume import prepare_resume, reusable_steps, step_integrity
 from ..artifacts.manifest import write_manifest as _write_manifest
 from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
@@ -508,22 +509,15 @@ def _apply_domain_defaults(prof: Dict[str, Any], domain: Optional[str]) -> None:
     prof.setdefault("domain", domain)
     if prof.get("w_bm25") is None:
         prof["w_bm25"] = 1.0
-def _read_ok_steps(outdir: str) -> set:
-    path = os.path.join(outdir, "pipeline_history.jsonl")
-    done = set()
-    if not os.path.exists(path): return done
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                ob = json.loads(line)
-                if ob.get("ok"):
-                    done.add(ob.get("name") or ob.get("step"))
-            except Exception:
-                pass
-    return done
+def _read_ok_steps(outdir: str, signature: str) -> set:
+    return reusable_steps(outdir, signature)
 
 def _append_hist(outdir: str, rec: dict):
     rec = dict(rec)
+    identity_path = Path(outdir) / "resume_identity.json"
+    if identity_path.is_file():
+        rec["run_fingerprint"] = json.loads(identity_path.read_text(encoding="utf-8"))["fingerprint"]
+        rec["output_hashes"] = step_integrity(outdir, rec.get("name") or rec.get("step"))
     rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if _EPISODE_CONTEXT.get("id"):
         rec.setdefault("episode_id", _EPISODE_CONTEXT.get("id"))
@@ -3322,6 +3316,8 @@ def _patched_run_full_pipeline(
     debug_cells: Optional[bool] = None,
     debug_cells_per_page: Optional[int] = None,
 ) -> Dict[str, Any]:
+    ensure_dir(outdir)
+    resume_signature = prepare_resume(outdir, dict(locals()))
     if sweeps_fixed is not None and sweeps_fixed > 0:
         toy_sweeps = int(sweeps_fixed)
         os.environ["ZOCR_TOY_SWEEPS"] = str(toy_sweeps)
@@ -3387,7 +3383,7 @@ def _patched_run_full_pipeline(
     else:
         os.environ.pop("ZOCR_PIPELINE_SNAPSHOT", None)
 
-    ok = _read_ok_steps(outdir) if resume else set()
+    ok = _read_ok_steps(outdir, resume_signature) if resume else set()
 
     toy_memory_path = _resolve_toy_memory_path(outdir)
     toy_memory_info_load = zocr_onefile_consensus.load_toy_memory(toy_memory_path)
