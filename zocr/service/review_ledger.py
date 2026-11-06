@@ -158,8 +158,9 @@ class ReviewLedger:
                 decision = {"event_id": event_id, "status": status, "reason": reason.strip()}
                 if status == "corrected":
                     correction = supplied_decision.get("correction")
-                    if (events[event_id].get("type") != "cell_updated" or not isinstance(correction, dict)
+                    if (events[event_id].get("type") not in {"cell_updated", "source_observation"} or not isinstance(correction, dict)
                             or not isinstance(correction.get("side"), str) or correction["side"] not in {"a", "b"}
+                            or (events[event_id].get("type") == "source_observation" and not events[event_id].get("evidence", {}).get(correction["side"]))
                             or not isinstance(correction.get("text"), str) or len(correction["text"]) > 20000):
                         raise ValueError("Cell correction requires side and bounded text")
                     decision["correction"] = {"side": correction["side"], "text": correction["text"]}

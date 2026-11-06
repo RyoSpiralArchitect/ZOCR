@@ -1193,6 +1193,7 @@ def _collect_pages(
     exclude_segments: Optional[Sequence[str]] = None,
     exclude_files: Optional[Sequence[str]] = None,
     exclude_paths: Optional[Sequence[str]] = None,
+    pdf_sources: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[str]:
     pages: List[str] = []
     allowed_exts = _IMAGE_EXTS | {".pdf"}
@@ -1200,10 +1201,12 @@ def _collect_pages(
     file_patterns = tuple(pat.lower() for pat in (exclude_files or _INPUT_ENUM_FILE_EXCLUDES))
     path_patterns = tuple(pat.lower() for pat in (exclude_paths or _INPUT_ENUM_PATH_EXCLUDES))
 
-    def _should_skip(path: str) -> bool:
+    def _should_skip(path: str, *, explicit_file: bool = False) -> bool:
         if not path:
             return False
         p = Path(path)
+        if explicit_file and p.suffix.lower() in allowed_exts:
+            return False
         norm_path = str(p).replace("\\", "/").lower()
         for pat in path_patterns:
             if fnmatch.fnmatch(norm_path, pat):
@@ -1224,13 +1227,23 @@ def _collect_pages(
                         return True
         return False
 
-    def _append_file(full: str) -> None:
-        if _should_skip(full):
+    def _append_file(full: str, *, explicit_file: bool = False) -> None:
+        if _should_skip(full, explicit_file=explicit_file):
             return
         ext = os.path.splitext(full)[1].lower()
         if ext == ".pdf":
+            from ..artifacts.manifest import _sha256_file
             try:
-                pages.extend(zocr_onefile_consensus.pdf_to_images_via_poppler(full, dpi=dpi))
+                digest = _sha256_file(Path(full))
+                rendered = zocr_onefile_consensus.pdf_to_images_via_poppler(full, dpi=dpi)
+                if _sha256_file(Path(full)) != digest:
+                    raise ValueError("PDF source changed during rendering")
+                if pdf_sources is not None:
+                    for index, image_path in enumerate(rendered):
+                        pdf_sources[os.path.abspath(image_path)] = {
+                            "path": os.path.abspath(full), "source_page": index, "sha256": digest,
+                        }
+                pages.extend(rendered)
             except Exception as e:
                 raise RuntimeError(f"PDF rasterization failed for {full}: {e}")
             return
@@ -1263,14 +1276,14 @@ def _collect_pages(
         if os.path.isdir(path):
             _handle_directory(path)
             return
-        if _should_skip(path):
+        if _should_skip(path, explicit_file=True):
             return
         if not os.path.exists(path):
             ext = os.path.splitext(path)[1].lower()
             if ext in allowed_exts:
                 pages.append(path)
             return
-        _append_file(path)
+        _append_file(path, explicit_file=True)
 
     for raw in inputs:
         candidates = [raw]
@@ -3400,6 +3413,7 @@ def _patched_run_full_pipeline(
         zocr_onefile_consensus.reset_toy_recognition_stats()
 
     demo_requested = len(inputs) == 1 and inputs[0].lower() == "demo"
+    pdf_sources: Dict[str, Dict[str, Any]] = {}
 
     def _dedup_pages_list(items: List[str], require_exists: bool) -> List[str]:
         filtered: List[str] = []
@@ -3426,6 +3440,7 @@ def _patched_run_full_pipeline(
                 real_demo_targets,
                 dpi=dpi,
                 recursive=not topdir_only,
+                pdf_sources=pdf_sources,
             )
             if real_demo_targets
             else []
@@ -3445,6 +3460,7 @@ def _patched_run_full_pipeline(
             inputs,
             dpi=dpi,
             recursive=not topdir_only,
+            pdf_sources=pdf_sources,
         )
         pages = _dedup_pages_list(pages, require_exists=False)
         annos = [None] * len(pages)
@@ -3461,6 +3477,17 @@ def _patched_run_full_pipeline(
         return {"status": "dry_run", "files": list(pages)}
 
     page_images = {idx: page for idx, page in enumerate(pages)}
+    native_pages: Dict[int, Dict[str, Any]] = {}
+    if pdf_sources:
+        from ..ingest.native_pdf import extract_native_page
+        for index, image_path in page_images.items():
+            source = pdf_sources.get(os.path.abspath(image_path))
+            if source is not None:
+                with Image.open(image_path) as image:
+                    native_pages[index] = extract_native_page(
+                        source["path"], source["source_page"], image, outdir,
+                        page_number=index, expected_sha256=source["sha256"],
+                    )
 
     table_params: Dict[str, Any] = {}
     table_autocalib_status: Optional[Dict[str, Any]] = None
@@ -3698,6 +3725,13 @@ def _patched_run_full_pipeline(
         },
         "ingest_signature": ingest_signature,
     }
+    if native_pages:
+        summary["pdf_native"] = {str(index): {
+            "route": plan["route"], "reason": plan["reason"],
+            "source_sha256": plan["source_sha256"], "text_regions": len(plan["records"]),
+            "ocr_regions": plan["ocr_regions"],
+            "export_route": "native" if plan["route"] == "native" else "raster",
+        } for index, plan in native_pages.items()}
     bandit: Optional[PriorBandit] = None
     bandit_action: Optional[str] = None
     bandit_signature: Optional[str] = None
@@ -4242,6 +4276,23 @@ def _patched_run_full_pipeline(
                 "headers_source": headers_source,
                 "state": bandit_state_path,
             }
+        if export_ocr_engine.lower().split(":", 1)[0] == "vision":
+            from ..consensus.vision import VisionRecognizer
+            from ..ingest.document_recognition import prepare_image_pages
+            if any(native_pages.get(index, {}).get("route") != "native" for index in page_images):
+                extra = export_ocr_engine.partition(":")[2]
+                languages = tuple(extra.split(",")) if extra else ("ja-JP", "en-US")
+                with VisionRecognizer(languages=languages) as recognizer:
+                    native_pages = prepare_image_pages(page_images, native_pages, outdir, recognizer=recognizer,
+                                                       source_documents=pdf_sources, requested_language=languages[0])
+            summary["document_ocr"] = {str(index): {"route": plan["route"], "records": len(plan["records"])}
+                                       for index, plan in native_pages.items()}
+        for index, plan in native_pages.items():
+            if plan["route"] == "mixed":
+                from ..ingest.native_pdf import mark_unrecognized_images
+                native_pages[index] = mark_unrecognized_images(plan)
+            if str(index) in summary.get("pdf_native", {}):
+                summary["pdf_native"][str(index)]["export_route"] = native_pages[index]["route"]
         ocr_min_conf = float(prof.get("ocr_min_conf", 0.58))
         r = _safe_step(
             f"Export (engine={export_ocr_engine})",
@@ -4252,6 +4303,7 @@ def _patched_run_full_pipeline(
             export_ocr_engine,
             True,
             ocr_min_conf,
+            **({"native_pages": native_pages} if native_pages else {}),
         )
         _append_hist(outdir, r)
         if not r.get("ok"):
@@ -5005,6 +5057,11 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] bandit update skipped: {exc}")
 
+    if pdf_sources:
+        from ..artifacts.manifest import _sha256_file
+        for source in pdf_sources.values():
+            if _sha256_file(Path(source["path"])) != source["sha256"]:
+                raise RuntimeError("PDF input changed before artifact publication")
     write_final_quality(outdir, min_confidence=float(prof.get("ocr_min_conf", .58)),
                         export_complete="export_skipped" not in (summary.get("rag_bundle_status") or {}).get("issues", []))
     summary.update(quality_summary(outdir))

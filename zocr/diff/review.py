@@ -26,6 +26,11 @@ def source_evidence(record: dict[str, Any]) -> dict[str, Any]:
         "synthetic": bool(meta.get("synthetic")),
         "synthetic_role": meta.get("synthetic_role"),
         "evidence_kind": meta.get("evidence_kind", "inferred" if meta.get("synthetic") else "observed"),
+        "record_kind": meta.get("record_kind", "cell"), "source_kind": meta.get("source_kind", "image_ocr"),
+        "source_sha256": meta.get("source_sha256"), "source_page": meta.get("source_page"),
+        "pdf_bbox": meta.get("pdf_bbox"), "page_rotation": meta.get("page_rotation"),
+        "recognition_status": meta.get("recognition_status"), "abstention_reasons": meta.get("abstention_reasons", []),
+        "confidence_calibration": meta.get("confidence_calibration", "unverified"),
     }
 
 

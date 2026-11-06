@@ -6854,13 +6854,12 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
 
         runner = _fast_runner
     elif engine_key in ("toy", "mock", "demo"):
+        if extra and extra.lower() != "ascii":
+            raise ValueError("Toy OCR cannot certify the requested language; select a compatible OCR provider")
         runner = toy_ocr_text_from_cell
     elif engine_key.startswith("tess"):
         if pytesseract is None or _PYTESS_OUTPUT is None:
-            if cache_key not in _OCR_BACKEND_WARNED:
-                print("[WARN] pytesseract not available; falling back to toy OCR")
-                _OCR_BACKEND_WARNED.add(cache_key)
-            runner = toy_ocr_text_from_cell
+            raise RuntimeError("Requested Tesseract OCR is unavailable or disabled; no fallback was selected")
         else:
             lang = extra or os.environ.get("ZOCR_TESS_LANG", os.environ.get("TESS_LANG", "jpn+eng"))
             psm = os.environ.get("ZOCR_TESS_PSM", "6")
@@ -6922,18 +6921,12 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
             runner = _tesseract_runner
     elif engine_key.startswith("easy"):
         if np is None:
-            if cache_key not in _OCR_BACKEND_WARNED:
-                print("[WARN] easyocr requested but numpy is unavailable; falling back to toy OCR")
-                _OCR_BACKEND_WARNED.add(cache_key)
-            runner = toy_ocr_text_from_cell
+            raise RuntimeError("Requested EasyOCR requires numpy; no fallback was selected")
         else:
             try:
                 import easyocr  # type: ignore
-            except Exception:
-                if cache_key not in _OCR_BACKEND_WARNED:
-                    print("[WARN] easyocr not available; falling back to toy OCR")
-                    _OCR_BACKEND_WARNED.add(cache_key)
-                runner = toy_ocr_text_from_cell
+            except Exception as exc:
+                raise RuntimeError("Requested EasyOCR is unavailable; no fallback was selected") from exc
             else:
                 langs_raw = extra or os.environ.get("ZOCR_EASYOCR_LANGS", "ja,en")
                 langs = [tok.strip() for tok in langs_raw.split(",") if tok.strip()]
@@ -6980,10 +6973,7 @@ def _resolve_ocr_backend(name: Optional[str]) -> Callable[["Image.Image"], Tuple
 
                 runner = _easyocr_runner
     else:
-        if cache_key not in _OCR_BACKEND_WARNED:
-            print(f"[WARN] Unknown OCR engine '{name}', falling back to toy OCR")
-            _OCR_BACKEND_WARNED.add(cache_key)
-        runner = toy_ocr_text_from_cell
+        raise ValueError(f"Unsupported OCR backend: {name!r}; no fallback was selected")
 
     _OCR_BACKEND_CACHE[cache_key] = runner
     return runner
@@ -7088,7 +7078,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
                           out_jsonl_path: str,
                           ocr_engine: str = "toy", contextual: bool = True,
                           ocr_min_conf: float = 0.58,
-                          postprocess_policy: Optional[str] = None) -> int:
+                          postprocess_policy: Optional[str] = None,
+                          native_pages: Optional[Mapping[int, dict]] = None) -> int:
     with open(doc_json_path, "r", encoding="utf-8") as f:
         doc = json.load(f)
     page_lookup: Dict[int, str] = {}
@@ -7191,7 +7182,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
         default_image_path = seq[0] if seq else None
     doc_dir = os.path.dirname(os.path.abspath(doc_json_path))
     image_cache: Dict[str, Image.Image] = {}
-    ocr_runner = _resolve_ocr_backend(ocr_engine)
+    ocr_runner = None
     resolved_policy = _resolve_toy_postprocess_policy(
         postprocess_policy,
         contextual=contextual,
@@ -7470,6 +7461,11 @@ def export_jsonl_with_ocr(doc_json_path: str,
     surprisal_samples = 0
     stats_start = time.time()
     pages_processed = 0
+    native_pages_processed = 0
+    native_records_written = 0
+    image_records_written = 0
+    unrecognized_image_regions = 0
+    abstained_records = 0
     tables_processed = 0
     total_cells = 0
     forced_cells = 0
@@ -7528,6 +7524,38 @@ def export_jsonl_with_ocr(doc_json_path: str,
             archived_image_path = archive_page_image(page_image, os.path.dirname(os.path.abspath(out_jsonl_path)))
             page_w, page_h = page_image.size
             page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
+            native = (native_pages or {}).get(enum_idx)
+            if native and native.get("route") == "mixed":
+                from ..ingest.native_pdf import mark_unrecognized_images
+                native = mark_unrecognized_images(native)
+            if native and native.get("route") in {"native", "vision", "mixed_vision", "mixed_unrecognized"} and native.get("records"):
+                native_pages_processed += int(any(record.get("meta", {}).get("source_kind") == "pdf_text_layer"
+                                                  for record in native["records"]))
+                for record in native["records"]:
+                    if max_cells and cells_done >= max_cells:
+                        stop_due_to_limit = True
+                        break
+                    meta = record.get("meta") or {}
+                    if (record.get("page") != enum_idx or archived_image_path is None
+                            or meta.get("page_image_sha256") != os.path.basename(archived_image_path)[:-4]
+                            or meta.get("source_sha256") != native.get("source_sha256")):
+                        raise ValueError("Native text evidence does not match its source page")
+                    record = {**record, "image_path": archived_image_path}
+                    fw.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    records_written += 1
+                    if meta.get("source_kind") == "pdf_text_layer":
+                        native_records_written += 1
+                    elif meta.get("source_kind") == "image_ocr":
+                        image_records_written += 1
+                    else:
+                        unrecognized_image_regions += 1
+                    abstained_records += int(meta.get("recognition_status") == "abstained")
+                    count += 1
+                    cells_done += 1
+                    total_cells += 1
+                continue
+            if ocr_runner is None:
+                ocr_runner = _resolve_ocr_backend(ocr_engine)
             tables = p.get("tables", []) if isinstance(p, dict) else []
             for ti, t in enumerate(tables):
                 if stop_due_to_limit:
@@ -8076,6 +8104,13 @@ def export_jsonl_with_ocr(doc_json_path: str,
         "max_cells": int(max_cells),
         "truncated": bool(stop_due_to_limit),
     }
+    if native_pages:
+        export_stats["native_pdf"] = {"pages": native_pages_processed, "records": native_records_written,
+                                      "review_required_records": native_records_written,
+                                      "policy": "PDF text observations, not OCR confidence or human-verified truth."}
+    if image_records_written or unrecognized_image_regions:
+        export_stats["document_ocr"] = {"records": image_records_written, "abstained_records": abstained_records,
+                                         "unrecognized_image_regions": unrecognized_image_regions}
     if date_cells_detected or date_columns_total:
         export_stats["date_fields"] = {
             "tables": int(date_tables),
