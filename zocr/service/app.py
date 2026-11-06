@@ -20,6 +20,8 @@ from typing import Any, Dict, Optional
 from .._version import __version__
 from ..artifacts.manifest import MANIFEST_FILENAME, write_manifest
 from ..utils.json_utils import json_ready
+from .executor import execute_pipeline
+from .execution_lock import execution_lock
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _JOB_SCHEMA = "zocr.api_job"
@@ -119,7 +121,6 @@ def create_app():
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("anyio is required (it should be installed with FastAPI).") from exc
 
-    from zocr.orchestrator.zocr_pipeline import run_full_pipeline
     from .auth import AuthError, Principal, RequestAuthContext, build_auth_backend
     from .metadata import build_job_repository, default_tenant_from_env, normalize_tenant_id
     from .policy import (
@@ -837,15 +838,14 @@ def create_app():
                             pass
                     continue
 
-            runner = functools.partial(run_full_pipeline, **kwargs)
-            thread_task = asyncio.create_task(anyio.to_thread.run_sync(runner, abandon_on_cancel=True))
-            waitable = asyncio.shield(thread_task) if ignore_cancel else thread_task
+            runner = functools.partial(execute_pipeline, timeout_sec=run_timeout_sec, **kwargs)
+            thread_task = asyncio.create_task(anyio.to_thread.run_sync(runner))
+            waitable = asyncio.shield(thread_task)
             try:
-                if run_timeout_sec > 0:
-                    return await asyncio.wait_for(waitable, timeout=run_timeout_sec)
                 return await waitable
             except asyncio.CancelledError:
                 if not ignore_cancel:
+                    await asyncio.shield(thread_task)
                     raise
                 current_task = asyncio.current_task()
                 if current_task is not None:
@@ -854,8 +854,6 @@ def create_app():
                             current_task.uncancel()
                     except AttributeError:
                         pass
-                if run_timeout_sec > 0:
-                    return await asyncio.wait_for(asyncio.shield(thread_task), timeout=run_timeout_sec)
                 return await asyncio.shield(thread_task)
         finally:
             if acquired:
@@ -876,10 +874,6 @@ def create_app():
                     continue
                 if job.get("status") not in {"queued", "running"}:
                     continue
-                job["status"] = "queued"
-                job["updated_at"] = _utc_now_iso()
-                job["error"] = None
-                _write_job(job_id, meta.tenant_id, job)
                 _schedule_job(job_id, meta.tenant_id)
         yield
 
@@ -1498,7 +1492,12 @@ def create_app():
         job_key = _tenant_job_key(job_id, tenant_id)
         status = "unknown"
         error: Optional[str] = None
+        claim = execution_lock(job_store, job_repository, job_id, tenant_id)
+        acquired = claim.__enter__()
         try:
+            if not acquired:
+                status = "busy"
+                return
             with anyio.CancelScope(shield=True):
                 paths = _job_paths(job_id)
                 try:
@@ -1506,6 +1505,9 @@ def create_app():
                 except Exception:
                     return
 
+                if job.get("status") in {"succeeded", "failed"}:
+                    status = job["status"]
+                    return
                 now = _utc_now_iso()
                 job["status"] = "running"
                 job["updated_at"] = now
@@ -1602,6 +1604,7 @@ def create_app():
                 job["updated_at"] = _utc_now_iso()
                 _write_job(job_id, tenant_id, job)
         finally:
+            claim.__exit__(None, None, None)
             dt = time.perf_counter() - job_t0
             with metrics_lock:
                 job_completions_total[status] += 1

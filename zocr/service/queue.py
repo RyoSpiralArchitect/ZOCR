@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import logging
+from contextlib import contextmanager
+from threading import Event, Thread
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,7 +39,7 @@ class RedisStreamQueue:
                 "Redis queue requires `redis`. Install with `pip install -e '.[api_redis]'`."
             ) from exc
         self.stream = stream
-        self._client = redis.Redis.from_url(url)
+        self._client = redis.Redis.from_url(url, socket_connect_timeout=5, socket_timeout=30)
         self._response_error = getattr(redis, "ResponseError", Exception)
 
     def ensure_consumer_group(self, group: str) -> None:
@@ -78,6 +81,29 @@ class RedisStreamQueue:
                     mid = str(message_id)
                 items.append((mid, payload))
         return items
+
+    @contextmanager
+    def keep_alive(self, *, group: str, consumer: str, message_id: str, interval: float):
+        stopped = Event()
+
+        def heartbeat():
+            while not stopped.wait(max(0.01, interval)):
+                try:
+                    self._client.xclaim(
+                        self.stream, group, consumer, 0, [message_id], justid=True,
+                    )
+                except Exception as exc:
+                    logging.getLogger("zocr.worker").warning(
+                        "Queue heartbeat failed: %s", type(exc).__name__,
+                    )
+
+        thread = Thread(target=heartbeat, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            thread.join(timeout=31)
 
     def ack(self, *, group: str, message_id: str) -> int:
         return int(self._client.xack(self.stream, group, message_id))

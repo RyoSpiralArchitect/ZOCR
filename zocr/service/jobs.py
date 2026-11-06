@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..artifacts.manifest import write_manifest
+from .execution_lock import execution_lock
 
 
 def _utc_now_iso() -> str:
@@ -50,10 +51,25 @@ def process_job(
     job_repository: Any,
     run_full_pipeline: Callable[..., Any],
 ) -> tuple[str, Optional[str], float]:
+    with execution_lock(job_store, job_repository, job_id, tenant_id) as acquired:
+        if not acquired:
+            return "busy", None, 0.0
+        return _process_claimed_job(
+            job_id=job_id, tenant_id=tenant_id, job_store=job_store,
+            job_repository=job_repository, run_full_pipeline=run_full_pipeline,
+        )
+
+
+def _process_claimed_job(
+    *, job_id: str, tenant_id: str, job_store: Any,
+    job_repository: Any, run_full_pipeline: Callable[..., Any],
+) -> tuple[str, Optional[str], float]:
     t0 = time.perf_counter()
     job = job_repository.read_job(job_id, tenant_id)
     if not isinstance(job, dict):
         return "missing", "Job metadata missing", time.perf_counter() - t0
+    if job.get("status") in {"succeeded", "failed"}:
+        return job["status"], job.get("error"), time.perf_counter() - t0
 
     job["status"] = "running"
     job["updated_at"] = _utc_now_iso()
