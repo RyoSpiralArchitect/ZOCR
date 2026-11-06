@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import glob
+from importlib import metadata
 import json
 import os
 from pathlib import Path
@@ -31,17 +33,26 @@ def prepare_resume(outdir: str, options: dict[str, Any]) -> str:
         for item in value if isinstance(value, list) else [value]:
             if not isinstance(item, str):
                 continue
-            path = Path(item)
-            if path.is_file():
-                inputs[str(path.resolve())] = file_hash(path)
-            elif path.is_dir():
-                for child in sorted(path.rglob("*")):
-                    if child.is_file() and child.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
-                        inputs[str(child.resolve())] = file_hash(child)
+            paths = glob.glob(item, recursive=True) if glob.has_magic(item) else [item]
+            for candidate in paths:
+                path = Path(candidate)
+                if path.is_file():
+                    inputs[str(path.resolve())] = file_hash(path)
+                elif path.is_dir():
+                    for child in sorted(path.rglob("*")):
+                        if child.is_file() and child.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+                            inputs[str(child.resolve())] = file_hash(child)
     code_root = Path(__file__).resolve().parents[1]
     code = {str(path.relative_to(code_root)): file_hash(path) for path in sorted(code_root.rglob("*.py"))}
     environment = {k: v for k, v in os.environ.items() if k.startswith("ZOCR_")}
-    identity = {"options": options, "inputs": inputs, "code": code, "environment": environment}
+    versions = {}
+    for package in ("numpy", "Pillow", "pypdfium2", "pytesseract", "easyocr", "pdfminer.six", "PyMuPDF"):
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = None
+    identity = {"options": options, "inputs": inputs, "code": code, "environment": environment,
+                "engine_versions": versions}
     signature = hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
     path = Path(outdir) / "resume_identity.json"
     path.write_text(json.dumps({"fingerprint": signature}) + "\n", encoding="utf-8")

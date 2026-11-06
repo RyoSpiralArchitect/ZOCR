@@ -13,6 +13,20 @@ from ..artifacts.quality import quality_summary
 from .execution_lock import execution_lock
 
 
+def verify_artifacts(out_dir: Path, archive: Path) -> None:
+    from ..validate import validate_path
+
+    if not (out_dir / "pipeline_summary.json").is_file():
+        raise ValueError("Artifact summary is missing")
+    if validate_path(out_dir, strict=False, max_jsonl_lines=0, write_manifest_flag=False):
+        raise ValueError("Artifact manifest validation failed")
+    with zipfile.ZipFile(archive) as bundle:
+        if bundle.testzip() is not None:
+            raise ValueError("Artifact ZIP contains a corrupt entry")
+        if not {"pipeline_summary.json", "zocr.manifest.json"}.issubset(bundle.namelist()):
+            raise ValueError("Artifact ZIP is missing required outputs")
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -132,6 +146,7 @@ def _process_claimed_job(
 
     try:
         _zip_dir(str(out_dir), str(paths.artifacts_zip))
+        verify_artifacts(out_dir, paths.artifacts_zip)
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = f"Artifact ZIP failed: {exc}"

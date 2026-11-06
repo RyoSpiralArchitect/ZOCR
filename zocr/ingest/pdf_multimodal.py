@@ -130,14 +130,20 @@ def _collect_pdfminer_shapes(pdf_path: str) -> Dict[int, List[BBox]]:
     shapes: Dict[int, List[BBox]] = {}
     for page_no, layout in enumerate(extract_pages_fn(pdf_path), start=1):
         boxes: List[BBox] = []
+
+        def to_page_bbox(shape) -> BBox:
+            x0, y0, x1, y1 = shape.bbox
+            return (float(x0 - layout.x0), float(layout.y1 - y1),
+                    float(x1 - layout.x0), float(layout.y1 - y0))
+
         for element in layout:
             if isinstance(element, (LTLine_cls, LTRect_cls)):
-                boxes.append(_rect_to_bbox(element.bbox))
+                boxes.append(to_page_bbox(element))
             elif isinstance(element, LTFigure_cls):
                 # descend to capture nested lines within figures
                 for child in element:
                     if isinstance(child, (LTLine_cls, LTRect_cls)):
-                        boxes.append(_rect_to_bbox(child.bbox))
+                        boxes.append(to_page_bbox(child))
         shapes[page_no] = boxes
     return shapes
 

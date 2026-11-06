@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 NumericVector = Sequence[float]
 Encoder = Callable[[Sequence[Any]], Sequence[NumericVector]]
+
+
+def _validated_vector(value: NumericVector) -> List[float]:
+    try:
+        vector = [float(item) for item in value]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Encoder returned an invalid vector") from exc
+    if not vector or not all(math.isfinite(item) for item in vector):
+        raise ValueError("Encoder returned an empty or non-finite vector")
+    return vector
 
 
 @dataclass
@@ -140,32 +151,43 @@ class MultimodalEmbeddingService:
 
     def embed_objects(self, objects: Sequence[Dict[str, Any]]) -> VectorStore:
         text_inputs = [obj.get("text", "") for obj in objects]
-        text_vecs = list(self.backends.text_encoder(text_inputs))
+        text_vecs = [_validated_vector(vec) for vec in self.backends.text_encoder(text_inputs)]
 
         if len(text_vecs) != len(objects):
             raise ValueError("Text encoder returned mismatched number of embeddings")
+        if len({len(vec) for vec in text_vecs}) > 1:
+            raise ValueError("Text encoder returned mismatched vector dimensions")
 
         vision_vecs: List[Optional[NumericVector]] = []
         if self.backends.vision_encoder:
             vision_inputs: List[Any] = [obj.get("image") for obj in objects]
             try:
                 vision_outputs = list(self.backends.vision_encoder(vision_inputs))
+                if len(vision_outputs) != len(objects):
+                    raise ValueError("Vision encoder returned mismatched number of embeddings")
+                for vec in vision_outputs:
+                    if vec is None and not self.backends.vision_required:
+                        vision_vecs.append(None)
+                    else:
+                        vision_vecs.append(_validated_vector(vec))
+                if len({len(vec) for vec in vision_vecs if vec is not None}) > 1:
+                    raise ValueError("Vision encoder returned mismatched vector dimensions")
             except Exception:
                 if self.backends.vision_required:
                     raise
-                vision_outputs = [None for _ in objects]
-            if len(vision_outputs) != len(objects):
-                raise ValueError("Vision encoder returned mismatched number of embeddings")
-            for vec in vision_outputs:
-                vision_vecs.append(vec)
+                vision_vecs = [None for _ in objects]
         else:
             vision_vecs = [None for _ in objects]
 
         store = VectorStore()
         total = len(objects)
+        vision_dim = max((len(vec) for vec in vision_vecs if vec is not None), default=0)
         for idx, (obj, text_vec, vision_vec) in enumerate(zip(objects, text_vecs, vision_vecs)):
             layout_vec = self._layout_features(obj=obj, idx=idx, total=total)
-            fused = self.fusion.fuse(text=text_vec, vision=vision_vec, layout=layout_vec)
+            fusion_vision = vision_vec
+            if vision_vec is None and (self.fusion.config.strategy or "concat").lower() == "concat":
+                fusion_vision = [0.0] * vision_dim
+            fused = self.fusion.fuse(text=text_vec, vision=fusion_vision, layout=layout_vec)
             embeddings_block = {
                 "text": list(text_vec),
                 "vision": list(vision_vec) if vision_vec else None,

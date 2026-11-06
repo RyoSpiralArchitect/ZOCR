@@ -70,8 +70,13 @@ def test_empty_vision_output_is_rejected(required):
         vision_encoder=lambda batch: [],
         vision_required=required,
     ))
-    with pytest.raises(ValueError, match="mismatched"):
-        service.embed_objects([{"text": "pressure"}])
+    if required:
+        with pytest.raises(ValueError, match="mismatched"):
+            service.embed_objects([{"text": "pressure"}])
+    else:
+        entries = service.embed_objects([{"text": "pressure"}]).entries
+        assert len(entries) == 1
+        assert entries[0]["embeddings"]["vision"] is None
 
 
 @pytest.mark.parametrize("confidence, expected", [(0.0, 1.0), (0.2, 0.8), (1.0, 0.0)])

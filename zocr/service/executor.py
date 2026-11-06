@@ -6,6 +6,8 @@ import os
 import signal
 import subprocess
 import sys
+from threading import Thread
+import time
 from typing import Any
 
 
@@ -37,13 +39,29 @@ def execute_command(command: list[str], payload: dict[str, Any], timeout_sec: fl
 def execute_pipeline(*, timeout_sec: float = 900.0, **kwargs: Any) -> dict[str, Any]:
     try:
         return execute_command(
-            [sys.executable, "-m", "zocr.service.executor"], kwargs, timeout_sec,
+            [sys.executable, "-m", "zocr.service.executor", str(os.getpid())], kwargs, timeout_sec,
         )
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError("Pipeline timeout") from exc
 
 
+def watch_parent(parent_pid: int) -> None:
+    if os.name != "posix":
+        return
+
+    def monitor():
+        while os.getppid() == parent_pid:
+            time.sleep(.1)
+        if os.getpgrp() == os.getpid():
+            os.killpg(os.getpid(), signal.SIGKILL)
+        os._exit(1)
+
+    Thread(target=monitor, daemon=True).start()
+
+
 def main() -> None:
+    if len(sys.argv) > 1:
+        watch_parent(int(sys.argv[1]))
     payload = json.load(sys.stdin)
     with contextlib.redirect_stdout(sys.stderr):
         from zocr.orchestrator.zocr_pipeline import run_full_pipeline

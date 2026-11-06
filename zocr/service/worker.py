@@ -100,11 +100,11 @@ def main() -> None:
         },
     )
 
-    def handle(message_id: str, payload: Any) -> None:
+    def handle(message_id: str, payload: Any) -> bool:
         job_id, tenant_id = _decode_message(payload)
         if not job_id:
             queue.ack(group=queue_settings.group, message_id=message_id)
-            return
+            return True
         tenant_id = tenant_id or default_tenant or "default"
         with queue.keep_alive(
             group=queue_settings.group, consumer=consumer, message_id=message_id,
@@ -132,6 +132,7 @@ def main() -> None:
             },
             level="info" if status == "succeeded" else "error",
         )
+        return status != "busy"
 
     if args.drain_pending:
         while True:
@@ -144,10 +145,13 @@ def main() -> None:
             )
             if not pending:
                 break
+            busy = False
             for message_id, payload in pending:
-                handle(message_id, payload)
+                busy = not handle(message_id, payload) or busy
                 if args.once:
                     return
+            if busy:
+                break
 
     claim_cursor = "0-0"
     try:
@@ -181,3 +185,7 @@ def main() -> None:
                     return
     except KeyboardInterrupt:
         _log(logger, log_format, "worker_stopped", {"consumer": consumer})
+
+
+if __name__ == "__main__":
+    main()

@@ -6,6 +6,8 @@ import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from .confidence import record_confidence
+
 try:  # pragma: no cover - optional dependency
     from PIL import Image
 except Exception:  # pragma: no cover - fallback stub
@@ -205,6 +207,7 @@ def augment(
         for line in fr:
             ob = json.loads(line)
             meta = ob.setdefault("meta", {})
+            ob["confidence"] = record_confidence(ob)
             meta.setdefault("observed_text", None if meta.get("synthetic") else ob.get("text", ""))
             meta.setdefault("evidence_kind", "inferred" if meta.get("synthetic") else "observed")
             ip = ob.get("image_path")

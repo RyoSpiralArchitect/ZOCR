@@ -23,6 +23,7 @@ from ..artifacts.quality import quality_summary
 from ..utils.json_utils import json_ready
 from .executor import execute_pipeline
 from .execution_lock import execution_lock
+from .jobs import verify_artifacts
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _JOB_SCHEMA = "zocr.api_job"
@@ -1494,8 +1495,10 @@ def create_app():
         status = "unknown"
         error: Optional[str] = None
         claim = execution_lock(job_store, job_repository, job_id, tenant_id)
-        acquired = claim.__enter__()
+        entered = False
         try:
+            acquired = claim.__enter__()
+            entered = True
             if not acquired:
                 status = "busy"
                 return
@@ -1591,6 +1594,7 @@ def create_app():
                         manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
                         job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths["root"]))
                         _zip_dir(str(out_dir), str(paths["artifacts_zip"]))
+                        verify_artifacts(out_dir, paths["artifacts_zip"])
                         job_store.persist_tree(out_dir)
                         job_store.persist_file(paths["artifacts_zip"])
                     except Exception as exc:
@@ -1606,13 +1610,14 @@ def create_app():
                 job["updated_at"] = _utc_now_iso()
                 _write_job(job_id, tenant_id, job)
         finally:
-            claim.__exit__(None, None, None)
+            active_jobs.discard(job_key)
+            if entered:
+                claim.__exit__(None, None, None)
             dt = time.perf_counter() - job_t0
             with metrics_lock:
                 job_completions_total[status] += 1
                 job_duration_sum[status] += float(dt)
                 job_duration_count[status] += 1
-            active_jobs.discard(job_key)
             _log(
                 "job_finished",
                 {

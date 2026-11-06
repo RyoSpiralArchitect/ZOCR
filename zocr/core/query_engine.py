@@ -424,19 +424,15 @@ def _header_match_score(struct: Dict[str, Any], boosts: Dict[str, Any]) -> float
 
 
 def _confidence_penalty(confidence: Any) -> float:
-    if isinstance(confidence, (int, float)):
-        return 1.0 - max(0.0, min(1.0, float(confidence)))
-    if not confidence:
+    from .confidence import normalize_confidence
+
+    scores = normalize_confidence(confidence)
+    if not scores:
         return 0.0
-    try:
-        ocr = float(confidence.get("ocr", 1.0))
-    except Exception:
-        ocr = 1.0
-    try:
-        struct = float(confidence.get("structure", 1.0))
-    except Exception:
-        struct = 1.0
-    return float((1.0 - max(min(ocr, 1.0), 0.0)) * (1.0 - max(min(struct, 1.0), 0.0)))
+    penalty = 1.0
+    for score in scores.values():
+        penalty *= 1.0 - score
+    return penalty
 
 
 def _neighbor_boost(

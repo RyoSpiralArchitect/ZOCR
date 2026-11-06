@@ -101,6 +101,20 @@ def test_extract_counts_and_coordinates(page_graph, sample_pdf_path):
                 assert 0 <= cy0 < cy1 <= height
 
 
+def test_table_bbox_matches_source_position(page_graph):
+    table = next(obj for obj in page_graph.pages[1]["objects"] if obj.type == "table")
+    assert table.bbox == pytest.approx((69.5, 97.5, 374.5, 174.5), abs=.1)
+
+
+@pytest.mark.parametrize("filename", ["machine_schematic.pdf", "control_panel_table.pdf", "safety_flow.pdf"])
+def test_technical_document_fixtures_are_extractable(filename):
+    root = Path(__file__).resolve().parents[1] / "fixtures" / "techdocs"
+    graph = extract_pdf_multimodal(str(root / filename))
+    assert graph.pages
+    assert any(obj.type == "text" and obj.text for page in graph.pages for obj in page["objects"])
+    assert any(obj.thumbnail for page in graph.pages for obj in page["objects"])
+
+
 def test_chunking_groups_visual_regions(page_graph, tmp_path):
     chunks = chunk_page_graph(page_graph)
 

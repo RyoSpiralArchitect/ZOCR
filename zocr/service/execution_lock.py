@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -20,17 +21,33 @@ def execution_lock(store: Any, repository: Any, job_id: str, tenant_id: str) -> 
                     if acquired:
                         cursor.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
         return
-    import fcntl
-
     locks_dir = store.storage_dir / "execution-locks"
     locks_dir.mkdir(parents=True, exist_ok=True)
-    with (locks_dir / f"{key.hex()}.lock").open("a") as stream:
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
+    with (locks_dir / f"{key.hex()}.lock").open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+
+            stream.seek(0)
+            if not stream.read(1):
+                stream.write(b"0")
+                stream.flush()
+            stream.seek(0)
+            try:
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                yield False
+                return
+            unlock = lambda: (stream.seek(0), msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1))
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            unlock = lambda: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         try:
             yield True
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            unlock()

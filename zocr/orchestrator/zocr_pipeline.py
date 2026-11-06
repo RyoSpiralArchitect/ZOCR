@@ -4456,7 +4456,7 @@ def _patched_run_full_pipeline(
     toy_self_correction_details: Optional[Dict[str, Any]] = None
     toy_triggered = False
     toy_executed = False
-    if learning_jsonl_path and toy_snapshot is not None:
+    if learning_jsonl_path and toy_snapshot is not None and not toy_lite:
         toy_triggered, toy_self_correction_details = _should_toy_self_correct(export_signals, toy_snapshot)
         if toy_triggered:
             plan = toy_self_correction_details.get("plan") if isinstance(toy_self_correction_details, dict) else None
@@ -5006,6 +5006,7 @@ def _patched_run_full_pipeline(
     summary.update(quality_summary(outdir))
     _finalize_episode(outdir, summary)
 
+    summary["manifest_json"] = str(Path(outdir) / "zocr.manifest.json")
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
         json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
     try:
@@ -5013,10 +5014,7 @@ def _patched_run_full_pipeline(
     except Exception as e:
         print("Report generation skipped:", e)
     try:
-        manifest_path = _write_manifest(outdir, summary=summary, inputs=inputs)
-        summary["manifest_json"] = str(manifest_path)
-        with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:
-            json.dump(_json_ready(summary), f, ensure_ascii=False, indent=2)
+        _write_manifest(outdir, summary=summary, inputs=inputs)
     except Exception as exc:
         print("[WARN] Manifest generation skipped:", exc)
     set_stage_trace_sink(None)

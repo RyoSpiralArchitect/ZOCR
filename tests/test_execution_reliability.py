@@ -14,6 +14,45 @@ from zocr.service.jobs import process_job
 from zocr.service.storage import LocalJobStore
 
 
+def test_child_stops_after_supervisor_dies(tmp_path):
+    import contextlib
+    import os
+    import signal
+
+    if os.name != "posix":
+        pytest.skip("Process-group cleanup requires POSIX")
+    marker = tmp_path / "orphan-write.txt"
+    child = (
+        "import sys,time,pathlib;from zocr.service.executor import watch_parent;"
+        "watch_parent(int(sys.argv[1]));print('ready',flush=True);time.sleep(.6);"
+        f"pathlib.Path({str(marker)!r}).write_text('orphan')"
+    )
+    supervisor = (
+        "import subprocess,os,sys,time;"
+        f"child=subprocess.Popen([sys.executable,'-c',{child!r},str(os.getpid())],"
+        "stdout=subprocess.PIPE,text=True,start_new_session=True);"
+        "ready=child.stdout.readline().strip();print(str(child.pid)+' '+ready,flush=True);time.sleep(30)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", supervisor], stdout=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    child_pid = None
+    try:
+        pid, ready = process.stdout.readline().split()
+        child_pid = int(pid)
+        assert ready == "ready"
+        process.kill()
+        process.wait(timeout=5)
+        time.sleep(.8)
+        assert not marker.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if child_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child_pid, signal.SIGKILL)
+
+
 def test_executor_isolates_environment(monkeypatch):
     monkeypatch.delenv("ZOCR_CHILD_TEST", raising=False)
     result = execute_command([sys.executable, "-c", (
@@ -124,6 +163,25 @@ def test_postgres_execution_lock_releases_session_lock():
             raise RuntimeError("runner failed")
     assert cursor.execute.call_count == 2
     assert "pg_advisory_unlock" in cursor.execute.call_args.args[0]
+
+
+def test_resume_fingerprints_globbed_input_contents(tmp_path):
+    image = tmp_path / "page.png"
+    image.write_bytes(b"first")
+    out = tmp_path / "out"
+    out.mkdir()
+    options = {"inputs": [str(tmp_path / "*.png")]}
+    signature = prepare_resume(str(out), options)
+    image.write_bytes(b"second")
+    assert signature != prepare_resume(str(out), options)
+
+
+def test_resume_fingerprints_engine_versions(tmp_path, monkeypatch):
+    from zocr.orchestrator import resume
+
+    signature = prepare_resume(str(tmp_path), {})
+    monkeypatch.setattr(resume.metadata, "version", lambda package: "changed-version")
+    assert signature != prepare_resume(str(tmp_path), {})
 
 
 def test_resume_latest_failure_invalidates_success(tmp_path):

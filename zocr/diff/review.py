@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..artifacts.quality import quality_summary
+from ..core.confidence import record_confidence
 
 
 def source_evidence(record: dict[str, Any]) -> dict[str, Any]:
@@ -19,8 +20,11 @@ def source_evidence(record: dict[str, Any]) -> dict[str, Any]:
         "row": record.get("row"), "col": record.get("col"),
         "bbox": record.get("bbox"), "image_path": record.get("image_path") or meta.get("image_path"),
         "trace_id": record.get("trace_id") or meta.get("trace_id"),
-        "text": record.get("text"), "observed_text": meta.get("observed_text", record.get("text")),
-        "confidence": record.get("confidence", meta.get("confidence")),
+        "text": record.get("text"),
+        "observed_text": meta.get("observed_text", None if meta.get("synthetic") else record.get("text")),
+        "confidence": record_confidence(record),
+        "synthetic": bool(meta.get("synthetic")),
+        "synthetic_role": meta.get("synthetic_role"),
         "evidence_kind": meta.get("evidence_kind", "inferred" if meta.get("synthetic") else "observed"),
     }
 
