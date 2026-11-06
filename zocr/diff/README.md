@@ -14,6 +14,26 @@ zocr/diff/
  └─ cli.py             # CLI wrapper / CLI / enveloppe CLI
 ```
 
+## Evidence review
+
+Use `--out_review review.html` alongside `--a` / `--b` to generate a self-contained,
+local review page with old/new cell evidence, bounded source-image crops, OCR
+confidence, input hashes, and quality status. The orchestrator's `run_diff` also
+writes `review.html` and includes the review metadata in its handoff bundle.
+
+Image access is restricted to each run directory by default. Explicitly pass
+`--review-image-root /trusted/input/root` when source images live elsewhere;
+paths and symlinks outside that root are not read. The generated page contains
+source text and image crops and should be handled with the same confidentiality
+as the original documents.
+
+All detected changes start as `needs_review`; low-confidence OCR is labelled
+`possible_ocr_change`, not a confirmed document change. Enter a reviewer and a
+reason for each reviewed decision, then export `review-decisions.json`. Decisions
+are local browser state until exported; they do not alter or publish artifacts.
+Execution status is separate from `quality_status` and the downstream
+`publication_status` recommendation. Diagnostic downloads remain available.
+
 ## 入力要件 / Input expectations / Entrées attendues
 - **`cells.jsonl`**
   - **[JA]** 必須。`page` / `table_index` / `row` / `col` / `text` / `filters` / `trace_id` などを持つセル記録。

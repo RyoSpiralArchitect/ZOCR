@@ -35,6 +35,8 @@ from .history import load_history, print_history, read_meta, read_summary
 from .reporting import generate_report
 from .resume import prepare_resume, reusable_steps, step_integrity
 from ..artifacts.manifest import write_manifest as _write_manifest
+from ..artifacts.quality import quality_summary
+from ..diff.review import render_review
 from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
     DiffAssistPlanner,
@@ -217,6 +219,8 @@ def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
     diff_path.write_text(diff_text, encoding="utf-8")
     markdown_path.write_text(markdown_text, encoding="utf-8")
     diff_render_html(result["events"], html_path)
+    review_path = out_dir / "review.html"
+    render_review(result, review_path, cells_a=a_cells, cells_b=b_cells)
     plan_path.write_text(_json_dumps(assist_plan), encoding="utf-8")
     agentic_path.write_text(
         _json_dumps(assist_plan.get("agentic_requests", [])),
@@ -238,12 +242,14 @@ def run_diff(a_dir: Path, b_dir: Path, out_dir: Path) -> Dict[str, Any]:
         assist_plan=assist_plan,
         artifacts={
             "events_json": str(events_path),
+            "review_html": str(review_path),
             "diff_text_path": str(diff_path),
             "html_report_path": str(html_path),
             "markdown_report_path": str(markdown_path),
             "assist_plan": str(plan_path),
             "agentic_requests": str(agentic_path),
         },
+        extras={"review": result.get("review")},
     )
     (out_dir / "handoff_bundle.json").write_text(
         _json_dumps(handoff),
@@ -4997,6 +5003,7 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] bandit update skipped: {exc}")
 
+    summary.update(quality_summary(outdir))
     _finalize_episode(outdir, summary)
 
     with open(os.path.join(outdir, "pipeline_summary.json"), "w", encoding="utf-8") as f:

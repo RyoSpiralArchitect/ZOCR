@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..artifacts.manifest import write_manifest
+from ..artifacts.quality import quality_summary
 from .execution_lock import execution_lock
 
 
@@ -148,6 +149,7 @@ def _process_claimed_job(
         job_repository.write_job(job_id, tenant_id, job)
         return "failed", str(job["error"]), time.perf_counter() - t0
 
+    job.update(quality_summary(out_dir))
     job["status"] = "succeeded"
     job["error"] = None
     job["updated_at"] = _utc_now_iso()
