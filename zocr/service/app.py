@@ -18,12 +18,11 @@ from threading import Lock
 from typing import Any, Dict, Optional
 
 from .._version import __version__
-from ..artifacts.manifest import MANIFEST_FILENAME, write_manifest
-from ..artifacts.quality import quality_summary
+from ..artifacts.manifest import MANIFEST_FILENAME
 from ..utils.json_utils import json_ready
 from .executor import execute_pipeline
-from .execution_lock import execution_lock
-from .jobs import verify_artifacts
+from .jobs import process_job
+from .storage import result_paths
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _JOB_SCHEMA = "zocr.api_job"
@@ -675,8 +674,8 @@ def create_app():
 
         return _dependency
 
-    def _job_paths(job_id: str) -> Dict[str, Path]:
-        paths = job_store.job_paths(job_id)
+    def _job_paths(job_id: str, job: Optional[dict] = None) -> Dict[str, Path]:
+        paths = result_paths(job_store, job_id, job) if job is not None else job_store.job_paths(job_id)
         return {
             "root": paths.root,
             "job_json": paths.job_json,
@@ -1494,125 +1493,18 @@ def create_app():
         job_key = _tenant_job_key(job_id, tenant_id)
         status = "unknown"
         error: Optional[str] = None
-        claim = execution_lock(job_store, job_repository, job_id, tenant_id)
-        entered = False
         try:
-            acquired = claim.__enter__()
-            entered = True
-            if not acquired:
-                status = "busy"
-                return
             with anyio.CancelScope(shield=True):
-                paths = _job_paths(job_id)
-                try:
-                    job = _read_job(job_id, tenant_id)
-                except Exception:
-                    return
-
-                if job.get("status") in {"succeeded", "failed"}:
-                    status = job["status"]
-                    return
-                now = _utc_now_iso()
-                job["status"] = "running"
-                job["updated_at"] = now
-                _write_job(job_id, tenant_id, job)
-                status = "running"
-                _log("job_started", {"job_id": job_id, "tenant_id": tenant_id})
-                _audit("job.started", {"job_id": job_id}, tenant_id=tenant_id)
-
-                input_path = paths["input_dir"] / (job.get("input", {}) or {}).get("filename", "input")
-                try:
-                    job_store.ensure_local_file(input_path, force=True)
-                except FileNotFoundError:
-                    job["status"] = "failed"
-                    job["updated_at"] = _utc_now_iso()
-                    job["error"] = "Input file missing"
-                    status = "failed"
-                    error = str(job["error"])
-                    _write_job(job_id, tenant_id, job)
-                    return
-                if not input_path.exists():
-                    job["status"] = "failed"
-                    job["updated_at"] = _utc_now_iso()
-                    job["error"] = "Input file missing"
-                    status = "failed"
-                    error = str(job["error"])
-                    _write_job(job_id, tenant_id, job)
-                    return
-
-                out_dir = paths["out_dir"]
-                out_dir.mkdir(parents=True, exist_ok=True)
-                params = job.get("params") if isinstance(job.get("params"), dict) else {}
-                summary: Optional[Dict[str, Any]] = None
-                pipeline_ok = False
-                try:
-                    summary = await _run_pipeline(
-                        ignore_cancel=True,
-                        inputs=[str(input_path)],
-                        outdir=str(out_dir),
-                        dpi=int(params.get("dpi") or 200),
-                        domain_hint=params.get("domain"),
-                        k=int(params.get("k") or 10),
-                        seed=int(params.get("seed") or 24601),
-                        snapshot=bool(params.get("snapshot") or False),
-                        toy_lite=bool(params.get("toy_lite") or False),
-                    )
-                except TimeoutError:
-                    job["status"] = "failed"
-                    job["error"] = "Pipeline timeout"
-                    status = "failed"
-                    error = str(job["error"])
-                except asyncio.CancelledError:
-                    summary_path = out_dir / "pipeline_summary.json"
-                    for _ in range(50):
-                        if not summary_path.exists():
-                            time.sleep(0.01)
-                            continue
-                        try:
-                            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                        except Exception:
-                            summary = None
-                        if summary:
-                            break
-                        time.sleep(0.01)
-                    if summary:
-                        pipeline_ok = True
-                    else:
-                        job["status"] = "failed"
-                        job["error"] = "Pipeline cancelled"
-                        status = "failed"
-                        error = str(job["error"])
-                except Exception as exc:
-                    job["status"] = "failed"
-                    job["error"] = str(exc)
-                    status = "failed"
-                    error = str(job["error"])
-                else:
-                    pipeline_ok = True
-                if pipeline_ok and summary is not None:
-                    try:
-                        manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
-                        job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths["root"]))
-                        _zip_dir(str(out_dir), str(paths["artifacts_zip"]))
-                        verify_artifacts(out_dir, paths["artifacts_zip"])
-                        job_store.persist_tree(out_dir)
-                        job_store.persist_file(paths["artifacts_zip"])
-                    except Exception as exc:
-                        job["status"] = "failed"
-                        job["error"] = f"Persist failed: {exc}"
-                        status = "failed"
-                        error = str(job["error"])
-                    else:
-                        job.update(quality_summary(out_dir))
-                        job["status"] = "succeeded"
-                        job["error"] = None
-                        status = "succeeded"
-                job["updated_at"] = _utc_now_iso()
-                _write_job(job_id, tenant_id, job)
+                async with run_semaphore:
+                    _audit("job.started", {"job_id": job_id}, tenant_id=tenant_id)
+                    runner = functools.partial(execute_pipeline, timeout_sec=run_timeout_sec)
+                    status, error, _ = await anyio.to_thread.run_sync(functools.partial(
+                        process_job, job_id=job_id, tenant_id=tenant_id,
+                        job_store=job_store, job_repository=job_repository, run_full_pipeline=runner,
+                        monitor_ownership=True,
+                    ))
         finally:
             active_jobs.discard(job_key)
-            if entered:
-                claim.__exit__(None, None, None)
             dt = time.perf_counter() - job_t0
             with metrics_lock:
                 job_completions_total[status] += 1
@@ -1771,8 +1663,8 @@ def create_app():
     ) -> Dict[str, Any]:
         tenant_id = auth_ctx.tenant_id
         job = _read_job(job_id, tenant_id)
-        if include_summary:
-            paths = _job_paths(job_id)
+        if include_summary and job.get("status") == "succeeded":
+            paths = _job_paths(job_id, job)
             summary_path = paths["out_dir"] / "pipeline_summary.json"
             try:
                 job_store.ensure_local_file(summary_path, force=True)
@@ -1795,7 +1687,9 @@ def create_app():
         tenant_id = auth_ctx.tenant_id
         job = _read_job(job_id, tenant_id)
         request.state.job_id = job_id
-        paths = _job_paths(job_id)
+        if job.get("status") != "succeeded":
+            raise HTTPException(status_code=409, detail="Job has no published artifacts")
+        paths = _job_paths(job_id, job)
         zip_path = paths["artifacts_zip"]
         redirect_url = job_store.presigned_get_url(zip_path) if job_store.has_file(zip_path) else None
         if redirect_url:
@@ -1810,15 +1704,7 @@ def create_app():
         try:
             job_store.ensure_local_file(zip_path, force=True)
         except FileNotFoundError:
-            if job.get("status") != "succeeded":
-                raise HTTPException(status_code=409, detail="Job has no artifacts yet")
-            if not paths["out_dir"].exists():
-                raise HTTPException(status_code=404, detail="Artifacts zip missing")
-            try:
-                _zip_dir(str(paths["out_dir"]), str(zip_path))
-                job_store.persist_file(zip_path)
-            except Exception as exc:
-                raise HTTPException(status_code=500, detail=f"Failed to build zip: {exc}") from exc
+            raise HTTPException(status_code=404, detail="Published artifacts zip missing")
         _audit(
             "job.artifacts_zip.requested",
             {"job_id": job_id, "redirect": False},
@@ -1839,12 +1725,14 @@ def create_app():
         auth_ctx: RequestAuthContext = Depends(_require_request_context("zocr.jobs.read")),
     ) -> Response:
         tenant_id = auth_ctx.tenant_id
-        _read_job(job_id, tenant_id)
+        job = _read_job(job_id, tenant_id)
+        if job.get("status") != "succeeded":
+            raise HTTPException(status_code=409, detail="Job has no published artifacts")
         request.state.job_id = job_id
         artifact = str(artifact or "").strip()
         if not artifact:
             raise HTTPException(status_code=404, detail="Unknown artifact")
-        paths = _job_paths(job_id)
+        paths = _job_paths(job_id, job)
         out_dir = paths["out_dir"]
         manifest_path = out_dir / MANIFEST_FILENAME
         try:
@@ -1916,4 +1804,7 @@ def create_app():
         )
         return {"ok": True, "job_id": job_id}
 
+    from .review_api import install_review_routes
+
+    install_review_routes(app, job_store, job_repository, _require_request_context, _read_job, _audit)
     return app

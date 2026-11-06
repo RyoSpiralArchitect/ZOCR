@@ -77,6 +77,7 @@ _DEFAULT_ROLE_SCOPES: dict[str, tuple[str, ...]] = {
         "zocr.tenants.write",
         "zocr.tenants.approve",
         "zocr.tenants.override",
+        "zocr.reviews.approve",
     ),
 }
 

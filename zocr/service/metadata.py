@@ -834,8 +834,8 @@ class PostgresJobRepository:
                 "ZOCR_API_DATABASE_URL is required when ZOCR_API_METADATA_BACKEND=postgres."
             )
 
-    def _connect(self):
-        return self._psycopg.connect(self._dsn)
+    def _connect(self, **kwargs):
+        return self._psycopg.connect(self._dsn, **kwargs)
 
     def _maybe_init_schema(self) -> None:
         if not self._auto_init or self._initialized:
@@ -879,6 +879,14 @@ class PostgresJobRepository:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 payload JSONB NOT NULL,
                 PRIMARY KEY (tenant_id, job_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS zocr_document_reviews (
+                tenant_id TEXT NOT NULL,
+                review_id TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                PRIMARY KEY (tenant_id, review_id)
             )
             """,
             """

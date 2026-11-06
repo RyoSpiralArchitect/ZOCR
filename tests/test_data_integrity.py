@@ -95,7 +95,7 @@ def test_job_fails_when_required_artifact_cannot_be_created(tmp_path, monkeypatc
     store = MagicMock()
     store.storage_dir = tmp_path
     store.job_paths.return_value = SimpleNamespace(
-        root=root, input_dir=root / "input", out_dir=out,
+        root=root, job_json=root / "job.json", input_dir=root / "input", out_dir=out,
         artifacts_zip=root / "artifacts.zip",
     )
     repository = MagicMock()

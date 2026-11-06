@@ -115,7 +115,7 @@ def main() -> None:
                 tenant_id=tenant_id,
                 job_store=job_store,
                 job_repository=job_repository,
-                run_full_pipeline=run_full_pipeline,
+                run_full_pipeline=run_full_pipeline, monitor_ownership=True,
             )
         if status != "busy":
             queue.ack(group=queue_settings.group, message_id=message_id)

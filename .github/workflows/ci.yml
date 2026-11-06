@@ -68,10 +68,8 @@ jobs:
         ports:
           - 5000/tcp
     env:
-      ZOCR_TEST_REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports[6379] }}/0
-      ZOCR_TEST_POSTGRES_URL: postgresql://zocr_test:local_test_only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/zocr_test
-      ZOCR_TEST_S3_URL: http://127.0.0.1:${{ job.services.s3.ports[5000] }}
       ZOCR_TEST_BROWSER: "1"
+      ZOCR_TEST_DOCKER_FAILOVER: "1"
       PLAYWRIGHT_SKIP_BROWSER_GC: "1"
     steps:
       - uses: actions/checkout@v4
@@ -84,4 +82,24 @@ jobs:
           uv pip install --system --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" -e ".[dev,api_saas,multimodal,parquet,pdf,ocr_tess]" playwright==1.56.0
           python -m playwright install --with-deps chromium
       - name: Test real services, PDF extraction and review browser
+        env:
+          ZOCR_TEST_REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports['6379'] }}/0
+          ZOCR_TEST_POSTGRES_URL: postgresql://zocr_test:local_test_only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/zocr_test
+          ZOCR_TEST_S3_URL: http://127.0.0.1:${{ job.services.s3.ports['5000'] }}
         run: python -m pytest -q -rs
+
+  windows-execution:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install uv==0.7.19
+          $cutoff = (Get-Date).ToUniversalTime().AddDays(-7).ToString("yyyy-MM-ddTHH:mm:ssZ")
+          uv pip install --system --exclude-newer $cutoff -e ".[dev,api]"
+      - name: Verify native job isolation and fencing
+        run: python -m pytest -q -rs tests/test_windows_executor.py tests/test_execution_reliability.py tests/test_fenced_publication.py

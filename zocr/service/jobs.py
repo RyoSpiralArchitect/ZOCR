@@ -10,7 +10,8 @@ from typing import Any, Callable, Optional
 
 from ..artifacts.manifest import write_manifest
 from ..artifacts.quality import quality_summary
-from .execution_lock import execution_lock
+from .execution_lock import ExecutionLost, execution_session
+from .storage import result_paths
 
 
 def verify_artifacts(out_dir: Path, archive: Path) -> None:
@@ -65,19 +66,24 @@ def process_job(
     job_store: Any,
     job_repository: Any,
     run_full_pipeline: Callable[..., Any],
+    monitor_ownership: bool = False,
 ) -> tuple[str, Optional[str], float]:
-    with execution_lock(job_store, job_repository, job_id, tenant_id) as acquired:
-        if not acquired:
-            return "busy", None, 0.0
-        return _process_claimed_job(
-            job_id=job_id, tenant_id=tenant_id, job_store=job_store,
-            job_repository=job_repository, run_full_pipeline=run_full_pipeline,
-        )
+    try:
+        with execution_session(job_store, job_repository, job_id, tenant_id) as guard:
+            if guard is None:
+                return "busy", None, 0.0
+            return _process_claimed_job(
+                job_id=job_id, tenant_id=tenant_id, job_store=job_store,
+                job_repository=job_repository, run_full_pipeline=run_full_pipeline, guard=guard,
+                monitor_ownership=monitor_ownership,
+            )
+    except ExecutionLost as exc:
+        return "busy", str(exc), 0.0
 
 
 def _process_claimed_job(
     *, job_id: str, tenant_id: str, job_store: Any,
-    job_repository: Any, run_full_pipeline: Callable[..., Any],
+    job_repository: Any, run_full_pipeline: Callable[..., Any], guard: Any, monitor_ownership: bool,
 ) -> tuple[str, Optional[str], float]:
     t0 = time.perf_counter()
     job = job_repository.read_job(job_id, tenant_id)
@@ -89,9 +95,9 @@ def _process_claimed_job(
     job["status"] = "running"
     job["updated_at"] = _utc_now_iso()
     job["error"] = None
-    job_repository.write_job(job_id, tenant_id, job)
+    guard.write_job(job)
 
-    paths = job_store.job_paths(job_id)
+    paths = result_paths(job_store, job_id, job)
     input_meta = job.get("input") if isinstance(job.get("input"), dict) else {}
     input_filename = str((input_meta or {}).get("filename") or "input")
     input_path = paths.input_dir / input_filename
@@ -102,7 +108,7 @@ def _process_claimed_job(
         job["status"] = "failed"
         job["error"] = "Input file missing"
         job["updated_at"] = _utc_now_iso()
-        job_repository.write_job(job_id, tenant_id, job)
+        guard.write_job(job)
         return "failed", str(job["error"]), time.perf_counter() - t0
 
     out_dir = paths.out_dir
@@ -119,12 +125,13 @@ def _process_claimed_job(
             seed=int(params.get("seed") or 24601),
             snapshot=bool(params.get("snapshot") or False),
             toy_lite=bool(params.get("toy_lite") or False),
+            **({"ownership_check": guard.check} if monitor_ownership else {}),
         )
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = str(exc)
         job["updated_at"] = _utc_now_iso()
-        job_repository.write_job(job_id, tenant_id, job)
+        guard.write_job(job)
         return "failed", str(job["error"]), time.perf_counter() - t0
 
     summary_path = out_dir / "pipeline_summary.json"
@@ -141,7 +148,7 @@ def _process_claimed_job(
         job["status"] = "failed"
         job["error"] = f"Artifact manifest failed: {exc}"
         job["updated_at"] = _utc_now_iso()
-        job_repository.write_job(job_id, tenant_id, job)
+        guard.write_job(job)
         return "failed", str(job["error"]), time.perf_counter() - t0
 
     try:
@@ -151,9 +158,10 @@ def _process_claimed_job(
         job["status"] = "failed"
         job["error"] = f"Artifact ZIP failed: {exc}"
         job["updated_at"] = _utc_now_iso()
-        job_repository.write_job(job_id, tenant_id, job)
+        guard.write_job(job)
         return "failed", str(job["error"]), time.perf_counter() - t0
 
+    guard.write_job(job)
     try:
         job_store.persist_tree(out_dir)
         job_store.persist_file(paths.artifacts_zip)
@@ -161,12 +169,16 @@ def _process_claimed_job(
         job["status"] = "failed"
         job["error"] = f"Persist failed: {exc}"
         job["updated_at"] = _utc_now_iso()
-        job_repository.write_job(job_id, tenant_id, job)
+        guard.write_job(job)
         return "failed", str(job["error"]), time.perf_counter() - t0
 
+    job.setdefault("artifacts", {}).update({
+        "out_dir": str(out_dir.relative_to(paths.root)),
+        "artifacts_zip": str(paths.artifacts_zip.relative_to(paths.root)),
+    })
     job.update(quality_summary(out_dir))
     job["status"] = "succeeded"
     job["error"] = None
     job["updated_at"] = _utc_now_iso()
-    job_repository.write_job(job_id, tenant_id, job)
+    guard.write_job(job)
     return "succeeded", None, time.perf_counter() - t0

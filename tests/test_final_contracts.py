@@ -119,7 +119,8 @@ def test_persistence_failure_is_durably_failed(tmp_path, monkeypatch):
 
     def runner(**kwargs):
         summary = {"inputs": kwargs["inputs"]}
-        (paths.out_dir / "pipeline_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        from pathlib import Path
+        (Path(kwargs["outdir"]) / "pipeline_summary.json").write_text(json.dumps(summary), encoding="utf-8")
         return summary
 
     def fail(*args):

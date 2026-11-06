@@ -60,7 +60,7 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
     import boto3
     from fastapi.testclient import TestClient
     from zocr.service.app import create_app
-    from zocr.service.storage import S3JobStore
+    from zocr.service.storage import S3JobStore, result_paths
     from zocr.service.metadata import PostgresJobRepository
     from zocr.service.execution_lock import execution_lock
     from zocr.service.queue import RedisStreamQueue
@@ -117,5 +117,5 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
         assert queue._client.xpending(queue.stream, "workers")["pending"] == 0
     fresh = S3JobStore(storage_dir=tmp_path / "fresh", bucket=bucket,
                        endpoint_url=s3_url, force_path_style=True)
-    downloaded = fresh.ensure_local_file(fresh.job_paths(job_id).artifacts_zip)
+    downloaded = fresh.ensure_local_file(result_paths(fresh, job_id, job).artifacts_zip)
     assert downloaded.read_bytes() == archive.content
