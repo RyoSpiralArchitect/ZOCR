@@ -106,13 +106,21 @@ def process_job(
     try:
         manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
         job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths.root))
-    except Exception:
-        pass
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = f"Artifact manifest failed: {exc}"
+        job["updated_at"] = _utc_now_iso()
+        job_repository.write_job(job_id, tenant_id, job)
+        return "failed", str(job["error"]), time.perf_counter() - t0
 
     try:
         _zip_dir(str(out_dir), str(paths.artifacts_zip))
-    except Exception:
-        pass
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = f"Artifact ZIP failed: {exc}"
+        job["updated_at"] = _utc_now_iso()
+        job_repository.write_job(job_id, tenant_id, job)
+        return "failed", str(job["error"]), time.perf_counter() - t0
 
     try:
         job_store.persist_tree(out_dir)

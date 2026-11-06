@@ -154,7 +154,7 @@ class MultimodalEmbeddingService:
                 if self.backends.vision_required:
                     raise
                 vision_outputs = [None for _ in objects]
-            if vision_outputs and len(vision_outputs) != len(objects):
+            if len(vision_outputs) != len(objects):
                 raise ValueError("Vision encoder returned mismatched number of embeddings")
             for vec in vision_outputs:
                 vision_vecs.append(vec)
@@ -171,6 +171,7 @@ class MultimodalEmbeddingService:
                 "vision": list(vision_vec) if vision_vec else None,
                 "layout": list(layout_vec),
                 "fused": fused,
+                "hybrid": fused,
             }
             store.add(vector=fused, embeddings=embeddings_block, meta=dict(obj))
         return store

@@ -204,6 +204,9 @@ def augment(
     with open(jsonl_in, "r", encoding="utf-8") as fr:
         for line in fr:
             ob = json.loads(line)
+            meta = ob.setdefault("meta", {})
+            meta.setdefault("observed_text", None if meta.get("synthetic") else ob.get("text", ""))
+            meta.setdefault("evidence_kind", "inferred" if meta.get("synthetic") else "observed")
             ip = ob.get("image_path")
             bbox = ob.get("bbox", [0, 0, 0, 0])
             page_h = None
@@ -261,11 +264,13 @@ def augment(
                 filt["tax_amount"] = int(
                     round(float(filt["subtotal"]) * float(filt["tax_rate"]))
                 )
+                meta.setdefault("derived_fields", {})["tax_amount"] = {
+                    "method": "subtotal_times_tax_rate",
+                    "inputs": ["subtotal", "tax_rate"],
+                }
             ob.setdefault("meta", {})
             ob["meta"]["filters"] = filt
             records.append(ob)
-
-    records = _inject_structural_placeholders(records)
 
     with open(jsonl_out, "w", encoding="utf-8") as fw:
         for ob in records:

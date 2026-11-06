@@ -63,6 +63,10 @@ def sql_export(jsonl: str, outdir: str, prefix: str = "invoice") -> Dict[str, st
         "phash64",
         "lambda_shape",
         "trace",
+        "evidence_kind",
+        "observed_text",
+        "synthetic",
+        "derived_fields",
     ]
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as fw:
         wr = csv.writer(fw)
@@ -105,6 +109,10 @@ def sql_export(jsonl: str, outdir: str, prefix: str = "invoice") -> Dict[str, st
                         meta.get("phash64"),
                         meta.get("lambda_shape"),
                         filt.get("trace"),
+                        meta.get("evidence_kind", "inferred" if meta.get("synthetic") else "observed"),
+                        meta.get("observed_text", None if meta.get("synthetic") else ob.get("text")),
+                        bool(meta.get("synthetic", False)),
+                        json.dumps(meta.get("derived_fields", {}), ensure_ascii=False),
                     ]
                 )
     schema = f"""
@@ -114,7 +122,8 @@ CREATE TABLE IF NOT EXISTS {prefix}_cells (
   amount BIGINT, date TEXT, company TEXT, address TEXT, tax_id TEXT,
   postal_code TEXT, phone TEXT, tax_rate REAL, qty BIGINT, unit TEXT, subtotal BIGINT, tax_amount BIGINT, corporate_id TEXT,
   bbox_x1 INT, bbox_y1 INT, bbox_x2 INT, bbox_y2 INT,
-  confidence REAL, low_conf BOOLEAN, phash64 BIGINT, lambda_shape REAL, trace TEXT
+  confidence REAL, low_conf BOOLEAN, phash64 BIGINT, lambda_shape REAL, trace TEXT,
+  evidence_kind TEXT, observed_text TEXT, synthetic BOOLEAN, derived_fields TEXT
 );
 -- COPY {prefix}_cells FROM '{csv_path}' WITH CSV HEADER;
 """
