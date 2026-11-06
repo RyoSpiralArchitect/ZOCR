@@ -21,6 +21,7 @@ _STANDARD_ARTIFACTS: Dict[str, str] = {
     "auto_profile": "auto_profile.json",
     "contextual_jsonl": "doc.contextual.jsonl",
     "contextual_signals": "doc.contextual.jsonl.signals.json",
+    "contextual_quality": "doc.contextual.jsonl.quality.json",
     "contextual_learning": "doc.contextual.jsonl.learning.jsonl",
     "contextual_reanalyzed": "doc.contextual.reanalyzed.jsonl",
     "mm_jsonl": "doc.mm.jsonl",

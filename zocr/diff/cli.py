@@ -17,6 +17,7 @@ from .metrics import (
 )
 from .render import render_html, render_unified, render_markdown
 from .simple import SimpleTextDiffer
+from .review import render_review
 
 
 def _resolve_cells_path(value: str, label: str) -> Path:
@@ -136,6 +137,8 @@ def main() -> None:
     ap.add_argument("--out_json", default=None, help="save raw events JSON")
     ap.add_argument("--out_diff", default=None, help="save unified .diff-like text")
     ap.add_argument("--out_html", default=None, help="save HTML report")
+    ap.add_argument("--out_review", default=None, help="save evidence review HTML with decision export")
+    ap.add_argument("--review-image-root", default=None, help="allow image crops only beneath this directory")
     ap.add_argument(
         "--out_markdown",
         default=None,
@@ -226,6 +229,8 @@ def main() -> None:
     if not run_semantic:
         forbidden = {
             "--out_json": args.out_json,
+            "--out_review": args.out_review,
+            "--review-image-root": args.review_image_root,
             "--out_diff": args.out_diff,
             "--out_html": args.out_html,
             "--out_plan": args.out_plan,
@@ -248,6 +253,9 @@ def main() -> None:
         sec_b = _resolve_sections_path(args.sections_b)
         res = diff.compare_bundle(cells_a, cells_b, sec_a, sec_b)
         events = res["events"]
+        if args.out_review:
+            render_review(res, Path(args.out_review), cells_a=cells_a, cells_b=cells_b,
+                          image_root=Path(args.review_image_root) if args.review_image_root else None)
         assist_plan = planner.plan(events)
         res["assist_plan"] = assist_plan
 
@@ -296,6 +304,7 @@ def main() -> None:
                 "agentic_requests": str(Path(args.out_agentic).resolve()) if args.out_agentic else None,
             }
             extras = {
+                "review": res.get("review"),
                 "sections": {
                     "a": str(sec_a) if sec_a else None,
                     "b": str(sec_b) if sec_b else None,

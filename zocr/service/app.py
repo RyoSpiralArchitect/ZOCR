@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 
 from .._version import __version__
 from ..artifacts.manifest import MANIFEST_FILENAME, write_manifest
+from ..artifacts.quality import quality_summary
 from ..utils.json_utils import json_ready
 from .executor import execute_pipeline
 from .execution_lock import execution_lock
@@ -1598,6 +1599,7 @@ def create_app():
                         status = "failed"
                         error = str(job["error"])
                     else:
+                        job.update(quality_summary(out_dir))
                         job["status"] = "succeeded"
                         job["error"] = None
                         status = "succeeded"

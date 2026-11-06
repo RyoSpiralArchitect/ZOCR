@@ -6,7 +6,7 @@ import difflib
 import hashlib
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +16,7 @@ from .metrics import (
     summarize_textual_events,
 )
 from .scoring import estimate_confidence
+from .review import annotate_review, source_evidence
 
 try:
     from rapidfuzz import fuzz  # type: ignore
@@ -24,18 +25,25 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 # --------- ユーティリティ ---------
-def load_jsonl(path: Path) -> List[dict]:
+def load_jsonl(path: Path, *, strict: bool = True) -> List[dict]:
     items: List[dict] = []
     if not path.exists():
+        if strict:
+            raise FileNotFoundError(path)
         return items
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                items.append(json.loads(line))
-            except json.JSONDecodeError:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError(f"{path}:{line_number}: Expected a JSON object")
+                items.append(record)
+            except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(f"{path}:{line_number}: Invalid JSON") from exc
                 # 壊れた行は無視（必要ならログする）
                 continue
     return items
@@ -104,6 +112,8 @@ class Cell:
     header: Optional[str]
     filters: Dict[str, Any]
     trace_id: Optional[str]
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    doc_id: str = ""
 
 
 def to_cell(rec: dict) -> Cell:
@@ -117,9 +127,11 @@ def to_cell(rec: dict) -> Cell:
         header = rec["header"]
     elif "headers" in rec and isinstance(rec["headers"], list) and col < len(rec["headers"]):
         header = rec["headers"][col]
-    filters = rec.get("filters", {}) or rec.get("norm", {}) or {}
-    trace_id = rec.get("trace_id")
-    return Cell(page, table_index, row, col, text, header, filters, trace_id)
+    meta = rec.get("meta") or {}
+    filters = rec.get("filters", {}) or rec.get("norm", {}) or meta.get("filters") or {}
+    trace_id = rec.get("trace_id") or meta.get("trace_id")
+    return Cell(page, table_index, row, col, text, header, filters, trace_id,
+                source_evidence(rec), str(rec.get("doc_id") or ""))
 
 
 @dataclass
@@ -197,12 +209,12 @@ def ensure_path(path: Optional[Path]) -> Optional[Path]:
 
 
 def build_tables(cells: List[Cell]) -> Dict[str, TableView]:
-    groups: Dict[Tuple[int, int], List[Cell]] = defaultdict(list)
+    groups: Dict[Tuple[str, int, int], List[Cell]] = defaultdict(list)
     for c in cells:
-        groups[(c.page, c.table_index)].append(c)
+        groups[(c.doc_id, c.page, c.table_index)].append(c)
 
     tables: Dict[str, TableView] = {}
-    for (page, t_idx), arr in groups.items():
+    for (doc_id, page, t_idx), arr in groups.items():
         by_row: Dict[int, List[Cell]] = defaultdict(list)
         for c in arr:
             by_row[c.row].append(c)
@@ -272,7 +284,7 @@ def build_tables(cells: List[Cell]) -> Dict[str, TableView]:
             )
             row_meta[row_key] = RowMeta(signature=signature, ids=ids, dates=dates)
 
-        sig = f"page={page};table={t_idx}"
+        sig = f"doc={doc_id};page={page};table={t_idx}"
         hdr_sig = sha1("|".join(headers))
         table_id = f"{sig};sig={hdr_sig}"
 
@@ -498,6 +510,7 @@ class SemanticDiffer:
                 "trace_b": b.trace_id,
             }
             event["confidence"] = estimate_confidence(similarity=0.0)
+            event["evidence"] = {"a": [a.evidence] if a else [], "b": [b.evidence] if b else []}
             return event
         if b is None:
             event = {
@@ -511,24 +524,17 @@ class SemanticDiffer:
                 "trace_b": None,
             }
             event["confidence"] = estimate_confidence(similarity=0.0)
+            event["evidence"] = {"a": [a.evidence] if a else [], "b": [b.evidence] if b else []}
             return event
 
         a_txt, b_txt = norm_text(a.text), norm_text(b.text)
         if a_txt == b_txt:
             return None
 
-        a_num = (
-            a.filters.get("amount")
-            or a.filters.get("qty")
-            or a.filters.get("rate")
-            or try_number(a_txt)
-        )
-        b_num = (
-            b.filters.get("amount")
-            or b.filters.get("qty")
-            or b.filters.get("rate")
-            or try_number(b_txt)
-        )
+        a_num = next((a.filters[key] for key in ("amount", "qty", "rate")
+                      if a.filters.get(key) is not None), try_number(a_txt))
+        b_num = next((b.filters[key] for key in ("amount", "qty", "rate")
+                      if b.filters.get(key) is not None), try_number(b_txt))
 
         numeric_delta = relative_delta = None
         sim = str_sim(a_txt, b_txt)
@@ -553,6 +559,7 @@ class SemanticDiffer:
         event["confidence"] = estimate_confidence(
             similarity=sim, relative_delta=relative_delta, numeric_delta=numeric_delta
         )
+        event["evidence"] = {"a": [a.evidence], "b": [b.evidence]}
         return event
 
     def compare_tables(self, a: TableView, b: TableView) -> List[dict]:
@@ -568,6 +575,7 @@ class SemanticDiffer:
                 payload["row_key_b"] = row_key
             payload["row_origin"] = row_side.upper()
             payload.update(row_meta_fields(table.row_meta.get(row_key)))
+            payload["evidence"] = {row_side.lower(): [c.evidence for c in table.rows[row_key].values()]}
             events.append(payload)
 
         for ai, ah in enumerate(a.headers):
@@ -771,4 +779,5 @@ class SemanticDiffer:
         section_summary = summarize_section_events(events)
         if section_summary:
             summary["section_summary"] = section_summary
-        return {"events": events, "summary": summary}
+        review = annotate_review(events, cells_a, cells_b)
+        return {"events": events, "summary": summary, "review": review}
