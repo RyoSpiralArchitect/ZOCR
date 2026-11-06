@@ -5018,7 +5018,7 @@ def _patched_run_full_pipeline(
     except Exception as e:
         print("Report generation skipped:", e)
     try:
-        _write_manifest(outdir, summary=summary, inputs=inputs)
+        _write_manifest(outdir, summary=summary, inputs=inputs, hash_inputs=True)
     except Exception as exc:
         print("[WARN] Manifest generation skipped:", exc)
     set_stage_trace_sink(None)

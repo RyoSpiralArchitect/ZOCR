@@ -18,6 +18,7 @@ import time
 import unicodedata
 from collections import Counter, defaultdict, OrderedDict, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from statistics import median
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
@@ -5513,6 +5514,30 @@ def _shift_normed(arr: "np.ndarray", dx: int, dy: int):
     return out
 
 
+def _prepared_glyph_norms(glyph_img, size):
+    template = _resize_keep_ar(glyph_img, *size)
+    data = np.asarray(template, dtype=np.uint8)
+    if data.size == 0:
+        return
+    mask = (data > 32).astype(np.float32)
+    if float(mask.mean()) <= 1e-4:
+        mask = (data > 0).astype(np.float32)
+    norm = (mask - mask.mean()) / (mask.std() + 1e-6)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            shifted = _shift_normed(norm, dx, dy)
+            shifted.flags.writeable = False
+            yield shifted
+
+
+@lru_cache(maxsize=128)
+def _cached_glyph_norms(pixels: bytes, source_size: Tuple[int, int], target_size: Tuple[int, int]):
+    if (len(pixels) > 16384 or target_size[0] * target_size[1] > 4096
+            or min(source_size + target_size) <= 0 or source_size[0] * source_size[1] != len(pixels)):
+        raise ValueError("Glyph preparation cache size limit exceeded")
+    return tuple(_prepared_glyph_norms(Image.frombytes("L", source_size, pixels), target_size))
+
+
 def _glyph_match_threshold(allowed: Optional[Set[str]]) -> float:
     threshold = 0.52
     if allowed is None:
@@ -5720,21 +5745,11 @@ def _match_glyph_candidates(
         tpl_list = tpl if isinstance(tpl, (list, tuple)) else [tpl]
         variant_best = -1.0
         for glyph_img in tpl_list:
-            t = _resize_keep_ar(glyph_img, cw, ch)
-            b_u8 = _np.asarray(t, dtype=_np.uint8)
-            if b_u8.size == 0:
-                continue
-            b_mask = (b_u8 > 32).astype(_np.float32)
-            if float(b_mask.mean()) <= 1e-4:
-                b_mask = (b_u8 > 0).astype(_np.float32)
-            b_norm = (b_mask - b_mask.mean()) / (b_mask.std() + 1e-6)
-            score = -1.0
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    shifted = _shift_normed(b_norm, dx, dy)
-                    cand = float((cell_norm * shifted).mean())
-                    if cand > score:
-                        score = cand
+            if glyph_img.mode == "L" and cw * ch <= 4096 and glyph_img.width * glyph_img.height <= 16384:
+                variants = _cached_glyph_norms(glyph_img.tobytes(), glyph_img.size, (cw, ch))
+            else:
+                variants = _prepared_glyph_norms(glyph_img, (cw, ch))
+            score = max((float((cell_norm * shifted).mean()) for shifted in variants), default=-1.0)
             if score > variant_best:
                 variant_best = score
         if variant_best < -0.5:

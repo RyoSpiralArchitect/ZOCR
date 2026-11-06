@@ -54,3 +54,46 @@
   `final_export.quality.json`; missing/stale bindings must not certify publication.
 - Exercise S3 with both PostgreSQL and local metadata. Local review coordination
   still requires shared filesystem locks, even though ledger data persists in S3.
+
+# Toy glyph learning trials
+
+- Run `zocr-consensus toy-learn --dataset glyphs.jsonl --allowed-chars 0123456789 --out new-trial`.
+  The output directory must not already exist. Trials run in a fresh interpreter,
+  never modify the calling runtime and never auto-activate production memory.
+- Each JSONL record requires `id`, `image`, single-character `text`, `group_id`,
+  `split` (`train` or `holdout`), `approved: true`, `reviewer`, and `reason`.
+  Images must be inside the dataset directory. Training and holdout document groups
+  must be disjoint; repeated source or normalized glyph pixels are rejected.
+- Holdout data needs at least two document groups. It is selection data, not an
+  independent final test. Approval fields are asserted by the local dataset owner,
+  unlike authenticated server review actors. Do not claim page-level OCR accuracy.
+- `learning_report.json` records exact glyph accuracy, error rate, confidence
+  diagnostics, latency, dataset/model/runtime hashes and per-sample results.
+  `candidate_memory.json` is emitted only for strict improvement with zero
+  individual holdout regressions. Both artifacts contain sensitive information.
+- Test with `python -m pytest -q -s tests/test_toy_learning.py`. Timing diagnostics
+  are not CI speed thresholds. Cached preparation must preserve exact results;
+  its 128 entries are pixel-keyed, read-only and restricted to small templates.
+
+# Approved learning and independent cell evaluation
+
+- `zocr-consensus cell-eval --dataset cells.jsonl --out new-evaluation` measures raw
+  full-cell CER/WER, retaining blank-reference insertions. WER uses whitespace,
+  not Japanese linguistic segmentation. Each cell starts a fresh bounded process.
+- Cell JSONL adds `document`, `group_id`, `source_kind` (`fixture` or `real_document`),
+  and `split: test` to the approved image/text/reviewer/reason fields. File bytes and
+  document-family groups must not overlap the model's training or selection lineage.
+  A model without complete document lineage cannot certify an independent test.
+- Learning sample registration requires `zocr.reviews.approve`, explicit consent,
+  a current corrected review event, a document-family group, and an immutable split.
+  Train/selection samples require manually labelled glyph boxes in cell coordinates;
+  these spell the non-whitespace correction. No automatic character labelling is used.
+- Learning models/evaluations additionally require `zocr.jobs.run`. Objects and
+  document split assignments are tenant-local and immutable. Review revision changes
+  invalidate samples and derived models. Evaluations are persisted, not just exported.
+- Source input and archived page hashes must match the committed manifest; legacy
+  jobs without hashed original inputs must be rerun before learning registration.
+- PostgreSQL uses unique learning-object rows; S3/local metadata still needs shared
+  filesystem coordination. Candidates never auto-activate. Source-kind declarations
+  and document-family assignments are operator assertions, not proof of real-world
+  provenance. Fixture results must never be reported as real-document performance.
