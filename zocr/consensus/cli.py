@@ -40,6 +40,7 @@ __all__ = [
     "cli_stats",
     "cli_query",
     "cli_toy_bench",
+    "cli_toy_learn",
     "main",
 ]
 
@@ -493,6 +494,14 @@ def cli_toy_bench(args) -> None:
     )
 
 
+def cli_toy_learn(args) -> None:
+    from .learning import run_learning_trial
+
+    report = run_learning_trial(args.dataset, args.out, allowed_chars=args.allowed_chars, timeout_sec=args.timeout_sec)
+    print(json.dumps({"out": str(Path(args.out).resolve()), "baseline": report["baseline"],
+                      "candidate": report["candidate"], "selection": report["selection"]}, ensure_ascii=False))
+
+
 def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd")
 
@@ -554,6 +563,12 @@ def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argpars
     sp.add_argument("--save-fails", action="store_true", help="Copy failing crops into out/toy_bench_fails/")
     add_common(sp)
     sp.set_defaults(func=cli_toy_bench)
+    sp = sub.add_parser("toy-learn", help="Evaluate approved glyph learning in an isolated, non-production trial")
+    sp.add_argument("--dataset", required=True, help="Approved train/holdout glyph JSONL, split by document group")
+    sp.add_argument("--allowed-chars", required=True, help="Explicit recognition alphabet, independent of holdout labels")
+    sp.add_argument("--out", required=True, help="New private output directory; existing directories are never overwritten")
+    sp.add_argument("--timeout-sec", type=float, default=120)
+    sp.set_defaults(func=cli_toy_learn)
     return parser
 
 
@@ -619,7 +634,8 @@ def main():
             os.environ.pop("ZOCR_TESS_DOMAIN", None)
         else:
             os.environ["ZOCR_TESS_DOMAIN"] = dom
-    ensure_dir(args.out)
+    if args.cmd != "toy-learn":
+        ensure_dir(args.out)
     # subcommands (export/index/query) do not require re-running OCR
     if args.cmd:
         args.func(args)
