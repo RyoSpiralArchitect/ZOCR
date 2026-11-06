@@ -1587,13 +1587,7 @@ def create_app():
                     try:
                         manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
                         job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths["root"]))
-                    except Exception:
-                        pass
-                    try:
                         _zip_dir(str(out_dir), str(paths["artifacts_zip"]))
-                    except Exception:
-                        pass
-                    try:
                         job_store.persist_tree(out_dir)
                         job_store.persist_file(paths["artifacts_zip"])
                     except Exception as exc:

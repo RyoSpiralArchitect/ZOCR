@@ -423,7 +423,9 @@ def _header_match_score(struct: Dict[str, Any], boosts: Dict[str, Any]) -> float
     return float(score)
 
 
-def _confidence_penalty(confidence: Dict[str, Any]) -> float:
+def _confidence_penalty(confidence: Any) -> float:
+    if isinstance(confidence, (int, float)):
+        return 1.0 - max(0.0, min(1.0, float(confidence)))
     if not confidence:
         return 0.0
     try:
@@ -650,7 +652,9 @@ def hybrid_query(
         embeddings = ob.get("embeddings") or meta.get("embeddings") or {}
         dense = _cosine_sim(q_embedding, embeddings.get("text"))
         dense_layout = _cosine_sim(layout_embedding, embeddings.get("layout"))
-        dense_hybrid = _cosine_sim(hybrid_embedding, embeddings.get("hybrid"))
+        dense_hybrid = _cosine_sim(
+            hybrid_embedding, embeddings.get("hybrid", embeddings.get("fused"))
+        )
         dense_total = dense + (0.5 * dense_layout if dense_layout else 0.0)
 
         kw_boost = _kw_meta_boost(ob, toks, domain)
@@ -661,9 +665,10 @@ def hybrid_query(
             ob.get("region_id"), neighbor_graph, neighbor_seeds
         )
         intent_score = _intent_boost(q_text or "", _infer_object_type(ob), struct)
-        conf_penalty = _confidence_penalty(
-            ob.get("confidence") or meta.get("confidence") or {}
-        )
+        confidence = ob.get("confidence")
+        if confidence is None:
+            confidence = meta.get("confidence")
+        conf_penalty = _confidence_penalty(confidence)
 
         score = (
             weights["dense"] * dense_total
