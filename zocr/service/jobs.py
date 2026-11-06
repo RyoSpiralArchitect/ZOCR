@@ -143,7 +143,7 @@ def _process_claimed_job(
 
     try:
         manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
-        job.setdefault("artifacts", {})["manifest_json"] = str(manifest_path.relative_to(paths.root))
+        job.setdefault("artifacts", {})["manifest_json"] = manifest_path.relative_to(paths.root).as_posix()
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = f"Artifact manifest failed: {exc}"
@@ -173,8 +173,8 @@ def _process_claimed_job(
         return "failed", str(job["error"]), time.perf_counter() - t0
 
     job.setdefault("artifacts", {}).update({
-        "out_dir": str(out_dir.relative_to(paths.root)),
-        "artifacts_zip": str(paths.artifacts_zip.relative_to(paths.root)),
+        "out_dir": out_dir.relative_to(paths.root).as_posix(),
+        "artifacts_zip": paths.artifacts_zip.relative_to(paths.root).as_posix(),
     })
     job.update(quality_summary(out_dir))
     job["status"] = "succeeded"

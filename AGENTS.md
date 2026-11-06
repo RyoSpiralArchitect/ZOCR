@@ -19,14 +19,27 @@
 
 # Execution and review boundaries
 
-- Local execution locks require a shared filesystem across API/worker processes;
-  distributed execution uses PostgreSQL session advisory locks. Do not claim
-  network-partition fencing or exactly-once execution from these locks alone.
-- POSIX deadline enforcement kills the subprocess group; a child watchdog also
-  stops orphaned work after supervisor death. Windows descendant cleanup and
-  distributed database-failover fencing remain separate hardening work.
-- Review HTML is a local evidence/decision-export workflow, not a server-side
-  approval ledger. `publication_status` is a recommendation, not an access-control
-  rule. Diagnostic artifacts remain downloadable.
+- Local execution locks require a shared filesystem across API/worker processes.
+  Distributed execution requires one authoritative PostgreSQL primary: guarded
+  updates use the live lock session plus an execution token. This does not solve
+  database split-brain or provide exactly-once computation.
+- Each attempt writes its own immutable output namespace. Artifact endpoints only
+  serve the successful attempt selected by committed metadata, never a running
+  attempt or an on-demand reconstruction of an unpublished result.
+- POSIX execution kills process groups and watches supervisor death. Windows uses
+  a kill-on-close Job Object and assigns suspended children before resuming them.
+  The windows-execution CI job exercises native deadline and supervisor cleanup.
+- Review HTML still exports local decisions. The server review API binds source
+  manifests/cell hashes, authenticated actors, revision checks and hash-chained
+  decision history. Corrections are sidecars, not edits to source artifacts.
+  This is an application-level ledger, not WORM storage or protection from a
+  privileged administrator rewriting both data and hashes. Publication quality
+  recommendations remain separate from human review and access control.
+- `ZOCR_TEST_DOCKER_FAILOVER=1` runs dedicated streaming replication, primary stop
+  and standby promotion. It stops only containers it created and retains them.
+- `ZOCR_TEST_MINIO_URL` enables multipart/presign/cache/authentication checks against
+  dedicated loopback MinIO. The test image pins official MinIO source commit
+  `0d7408fc9969caf07de6a8c3a84f9fbb10a6739e` in `tests/fixtures/minio.Dockerfile`.
+  AWS deployment validation is intentionally not part of these local tests.
 - Preserve observed text and provenance. Generic augmentation must not fabricate
   invoice headers or overwrite weak OCR observations with inferred text.

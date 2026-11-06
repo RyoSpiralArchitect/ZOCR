@@ -29,10 +29,6 @@ def execution_lock(store: Any, repository: Any, job_id: str, tenant_id: str) -> 
             import msvcrt
 
             stream.seek(0)
-            if not stream.read(1):
-                stream.write(b"0")
-                stream.flush()
-            stream.seek(0)
             try:
                 msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError:
