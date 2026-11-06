@@ -192,8 +192,11 @@ class S3JobStore:
         return self._local.job_paths(job_id)
 
     def _key_for(self, path: Path) -> str:
-        rel = path.relative_to(self.jobs_dir)
-        return f"{self._base_prefix}/{rel.as_posix()}"
+        if path.is_relative_to(self.jobs_dir):
+            return f"{self._base_prefix}/{path.relative_to(self.jobs_dir).as_posix()}"
+        reviews = self.storage_dir / "reviews"
+        rel = path.relative_to(reviews)
+        return f"{self._base_prefix.removesuffix('/jobs')}/reviews/{rel.as_posix()}"
 
     def _is_missing_error(self, exc: Exception) -> bool:
         if not isinstance(exc, self._client_error):

@@ -43,3 +43,14 @@
   AWS deployment validation is intentionally not part of these local tests.
 - Preserve observed text and provenance. Generic augmentation must not fabricate
   invoice headers or overwrite weak OCR observations with inferred text.
+- Supported image extensions are shared in `zocr/utils/formats.py`; directory resume
+  fingerprints must cover every accepted input type, including BMP and WebP.
+- Review table matching must be deterministic across Python hash seeds and keep
+  documents separate. Renamed single-document version pairs may match by headers;
+  unrelated multi-document identities require explicit correspondence.
+- Exported page bitmaps are archived under `evidence/` and included in manifests.
+  RAG image references are relative to the run root, not temporary input paths.
+- Final quality diagnostics bind the contextual, augmented and RAG cell hashes in
+  `final_export.quality.json`; missing/stale bindings must not certify publication.
+- Exercise S3 with both PostgreSQL and local metadata. Local review coordination
+  still requires shared filesystem locks, even though ledger data persists in S3.

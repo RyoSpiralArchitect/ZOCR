@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 
+from ..utils.formats import IMAGE_EXTENSIONS
+
+
 STEP_OUTPUTS = {
     "OCR": "doc.zocr.json",
     "Export": "doc.contextual.jsonl",
@@ -40,7 +43,7 @@ def prepare_resume(outdir: str, options: dict[str, Any]) -> str:
                     inputs[str(path.resolve())] = file_hash(path)
                 elif path.is_dir():
                     for child in sorted(path.rglob("*")):
-                        if child.is_file() and child.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+                        if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS | {".pdf"}:
                             inputs[str(child.resolve())] = file_hash(child)
     code_root = Path(__file__).resolve().parents[1]
     code = {str(path.relative_to(code_root)): file_hash(path) for path in sorted(code_root.rglob("*.py"))}

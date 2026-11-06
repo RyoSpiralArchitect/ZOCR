@@ -4,6 +4,9 @@ from __future__ import annotations
 import math
 import os
 from typing import Any, Dict, List, Optional
+from pathlib import Path
+
+from ..artifacts.manifest import _sha256_file
 
 EXPORT_QUALITY_SCHEMA = "zocr.export_quality.v1"
 
@@ -346,6 +349,7 @@ def build_export_quality_report(
 
     return {
         "schema": EXPORT_QUALITY_SCHEMA,
+        "source_hashes": {Path(jsonl_path).name: _sha256_file(Path(jsonl_path))} if Path(jsonl_path).is_file() else {},
         "status": overall_status,
         "score": score,
         "summary": {

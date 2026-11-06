@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .confidence import record_confidence
@@ -244,6 +245,12 @@ def export_rag_bundle(
     ) as fw:
         for line in fr:
             ob = json.loads(line)
+            image_path = ob.get("image_path")
+            if isinstance(image_path, str):
+                image = Path(image_path).resolve()
+                root = Path(jsonl).resolve().parent
+                if image.is_relative_to(root / "evidence"):
+                    ob["image_path"] = image.relative_to(root).as_posix()
             fw.write(json.dumps(ob, ensure_ascii=False) + "\n")
             doc_ids.add(ob.get("doc_id"))
             lang = (ob.get("meta") or {}).get("lang")

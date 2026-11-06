@@ -22,6 +22,7 @@ _STANDARD_ARTIFACTS: Dict[str, str] = {
     "contextual_jsonl": "doc.contextual.jsonl",
     "contextual_signals": "doc.contextual.jsonl.signals.json",
     "contextual_quality": "doc.contextual.jsonl.quality.json",
+    "final_quality": "final_export.quality.json",
     "contextual_learning": "doc.contextual.jsonl.learning.jsonl",
     "contextual_reanalyzed": "doc.contextual.reanalyzed.jsonl",
     "mm_jsonl": "doc.mm.jsonl",
@@ -208,6 +209,8 @@ def build_manifest(
     artifacts: Dict[str, Dict[str, Any]] = {}
     missing_references: list[dict[str, str]] = []
     candidates: Dict[str, str] = dict(_STANDARD_ARTIFACTS)
+    for image in sorted((outdir_path / "evidence").glob("*.png")):
+        candidates[f"source_image_{image.stem}"] = image.relative_to(outdir_path).as_posix()
     if summary is not None:
         for key in sorted(_SUMMARY_ARTIFACT_KEYS):
             value = _string_path(summary.get(key))

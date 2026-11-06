@@ -23,6 +23,11 @@ def test_real_pipeline_subprocess_writes_valid_artifacts(tmp_path, table_image):
     assert saved["quality_status"] == summary["quality_status"]
     assert validate_path(out, strict=True, max_jsonl_lines=10000, write_manifest_flag=False) == 0
     assert not summary.get("toy_self_correction", {}).get("executed")
+    from zocr.diff.review import _crop
+    cells_path = out / "rag/cells.jsonl"
+    cells = [json.loads(line) for line in cells_path.read_text(encoding="utf-8").splitlines()]
+    assert cells and any(_crop(cell, cells_path, out) for cell in cells)
+    assert (out / "final_export.quality.json").is_file()
 
 
 def test_real_inline_api_pipeline_and_download(tmp_path, table_image, monkeypatch):

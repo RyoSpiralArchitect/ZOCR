@@ -35,7 +35,8 @@ from .history import load_history, print_history, read_meta, read_summary
 from .reporting import generate_report
 from .resume import prepare_resume, reusable_steps, step_integrity
 from ..artifacts.manifest import write_manifest as _write_manifest
-from ..artifacts.quality import quality_summary
+from ..artifacts.quality import quality_summary, write_final_quality
+from ..utils.formats import IMAGE_EXTENSIONS
 from ..diff.review import render_review
 from ..utils.json_utils import json_ready as _json_ready
 from ..diff import (
@@ -280,7 +281,8 @@ class MetaIntentPayload(TypedDict, total=False):
 
 
 _EPISODE_CONTEXT: Dict[str, Any] = {}
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+
+_IMAGE_EXTS = IMAGE_EXTENSIONS
 _INPUT_ENUM_FILE_EXCLUDES: Tuple[str, ...] = (
     "*.microscope.*",
     "*.xray*",
@@ -5003,6 +5005,7 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] bandit update skipped: {exc}")
 
+    write_final_quality(outdir, min_confidence=float(prof.get("ocr_min_conf", .58)))
     summary.update(quality_summary(outdir))
     _finalize_episode(outdir, summary)
 

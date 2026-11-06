@@ -53,9 +53,13 @@ def test_quality_status_controls_publication_recommendation(tmp_path):
     from zocr.artifacts.quality import quality_summary
 
     assert quality_summary(tmp_path)["publication_status"] == "review_required"
+    import hashlib
+    source = tmp_path / "doc.contextual.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    hashes = {source.name: hashlib.sha256(source.read_bytes()).hexdigest()}
     path = tmp_path / "doc.contextual.jsonl.quality.json"
     for status, publication in (("pass", "published"), ("warn", "review_required"), ("fail", "blocked")):
-        path.write_text(json.dumps({"schema": "zocr.export_quality.v1", "status": status}), encoding="utf-8")
+        path.write_text(json.dumps({"schema": "zocr.export_quality.v1", "status": status, "source_hashes": hashes}), encoding="utf-8")
         assert quality_summary(tmp_path) == {"quality_status": status, "publication_status": publication}
     path.write_text('invalid', encoding="utf-8")
     assert quality_summary(tmp_path)["quality_status"] == "unknown"

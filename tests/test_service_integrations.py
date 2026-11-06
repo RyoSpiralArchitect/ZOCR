@@ -53,8 +53,10 @@ def test_real_redis_heartbeat_reclaim_and_ack():
     assert queue.ack(group="workers", message_id=message_id) == 1
 
 
-@pytest.mark.parametrize("s3_environment", ["ZOCR_TEST_S3_URL", "ZOCR_TEST_MINIO_URL"])
-def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatch, s3_environment):
+@pytest.mark.parametrize(("s3_environment", "metadata_backend"), [
+    ("ZOCR_TEST_S3_URL", "postgres"), ("ZOCR_TEST_MINIO_URL", "postgres"), ("ZOCR_TEST_MINIO_URL", "local"),
+])
+def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatch, s3_environment, metadata_backend):
     redis_url = local_service("ZOCR_TEST_REDIS_URL")
     postgres_url = local_service("ZOCR_TEST_POSTGRES_URL")
     s3_url = local_service(s3_environment)
@@ -62,7 +64,7 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
     from fastapi.testclient import TestClient
     from zocr.service.app import create_app
     from zocr.service.storage import S3JobStore, result_paths
-    from zocr.service.metadata import PostgresJobRepository
+    from zocr.service.metadata import PostgresJobRepository, LocalJobRepository
     from zocr.service.execution_lock import execution_lock
     from zocr.service.queue import RedisStreamQueue
 
@@ -74,7 +76,7 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
         "ZOCR_API_STORAGE_DIR": str(tmp_path / "store"),
         "ZOCR_API_STORAGE_BACKEND": "s3", "ZOCR_API_S3_BUCKET": bucket,
         "ZOCR_API_S3_ENDPOINT_URL": s3_url, "ZOCR_API_S3_FORCE_PATH_STYLE": "1",
-        "ZOCR_API_S3_PRESIGN_ENABLED": "0", "ZOCR_API_METADATA_BACKEND": "postgres",
+        "ZOCR_API_S3_PRESIGN_ENABLED": "0", "ZOCR_API_METADATA_BACKEND": metadata_backend,
         "ZOCR_API_DATABASE_URL": postgres_url, "ZOCR_API_DB_AUTO_INIT": "1",
         "ZOCR_API_QUEUE_BACKEND": "redis", "ZOCR_API_REDIS_URL": redis_url,
         "ZOCR_API_REDIS_STREAM": "test-" + token, "ZOCR_API_REDIS_GROUP": "workers",
@@ -94,10 +96,12 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
         })
         assert response.status_code == 200, response.text
         job_id = response.json()["job"]["id"]
-        repository = PostgresJobRepository(dsn=postgres_url)
+        store = S3JobStore(storage_dir=tmp_path / "store", bucket=bucket, endpoint_url=s3_url, force_path_style=True)
+        repository = (PostgresJobRepository(dsn=postgres_url) if metadata_backend == "postgres"
+                      else LocalJobRepository(job_store=store))
         queue = RedisStreamQueue(url=redis_url, stream=settings["ZOCR_API_REDIS_STREAM"])
         command = [sys.executable, "-m", "zocr.service.worker", "--consumer", "pr4", "--once"]
-        with execution_lock(None, repository, job_id, "default") as acquired:
+        with execution_lock(store, repository, job_id, "default") as acquired:
             assert acquired
             busy = subprocess.run(command, capture_output=True, text=True, timeout=10)
             assert busy.returncode == 0, busy.stderr

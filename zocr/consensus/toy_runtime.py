@@ -7509,6 +7509,8 @@ def export_jsonl_with_ocr(doc_json_path: str,
             page_image = _load_page_image(page_image_path, lookup_idx, enum_idx)
             if page_image is None:
                 continue
+            from ..artifacts.evidence import archive_page_image
+            archived_image_path = archive_page_image(page_image, os.path.dirname(os.path.abspath(out_jsonl_path)))
             page_w, page_h = page_image.size
             page_index_int = int(lookup_idx) if lookup_idx is not None else int(enum_idx)
             tables = p.get("tables", []) if isinstance(p, dict) else []
@@ -7920,7 +7922,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                             "doc_id": doc.get("doc_id"),
                             "page": pidx, "table_index": ti, "row": r, "col": c,
                             "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
-                            "image_path": page_image_path or default_image_path,
+                            "image_path": archived_image_path or page_image_path or default_image_path,
                             "text": txt,
                             "search_unit": (txt or ctx_line),
                             "synthesis_window": ctx_line,
@@ -7962,7 +7964,7 @@ def export_jsonl_with_ocr(doc_json_path: str,
                                 "col": c,
                                 "bbox": [int(cx1), int(cy1), int(cx2), int(cy2)],
                                 "table_bbox": [int(x1), int(y1), int(x2), int(y2)],
-                                "image_path": page_image_path or default_image_path,
+                                "image_path": archived_image_path or page_image_path or default_image_path,
                                 "row_text": row_texts,
                                 "headers": headers,
                                 "observed_text": txt,

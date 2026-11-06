@@ -49,6 +49,23 @@ def test_minio_multipart_presign_and_fresh_cache(minio_store, tmp_path):
     assert store._client.head_object(Bucket=store.bucket, Key=store._key_for(path))["ContentLength"] == len(content)
 
 
+def test_minio_local_review_history_survives_fresh_cache(minio_store, tmp_path):
+    from test_review_ledger import new_review, bundle
+    from zocr.service.metadata import LocalJobRepository
+    from zocr.service.review_ledger import ReviewLedger
+
+    ledger = ReviewLedger(minio_store, LocalJobRepository(job_store=minio_store))
+    review = new_review(ledger)
+    approved = ledger.append(review["review_id"], "tenant-a", bundle(review), {"subject": "alice"})
+    fresh = S3JobStore(storage_dir=tmp_path / "fresh", bucket=minio_store.bucket,
+                       endpoint_url=minio_store._client.meta.endpoint_url, force_path_style=True)
+    restored = ReviewLedger(fresh, LocalJobRepository(job_store=fresh)).read(review["review_id"], "tenant-a")
+    assert restored == approved
+    assert restored["revision"] == 1
+    with pytest.raises(ValueError):
+        fresh._key_for(tmp_path / "outside.json")
+
+
 def test_minio_missing_and_authentication_errors_are_distinct(minio_store, tmp_path, monkeypatch):
     from botocore.exceptions import ClientError
 
