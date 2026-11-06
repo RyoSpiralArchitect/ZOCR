@@ -249,7 +249,7 @@ def export_rag_bundle(
             if isinstance(image_path, str):
                 image = Path(image_path).resolve()
                 root = Path(jsonl).resolve().parent
-                if image.is_relative_to(root / "evidence"):
+                if Path(outdir).resolve() == root / "rag" and image.is_relative_to(root / "evidence"):
                     ob["image_path"] = image.relative_to(root).as_posix()
             fw.write(json.dumps(ob, ensure_ascii=False) + "\n")
             doc_ids.add(ob.get("doc_id"))

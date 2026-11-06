@@ -102,3 +102,38 @@ def test_final_quality_is_bound_to_the_distributed_cells(tmp_path):
     assert quality_summary(tmp_path)["quality_status"] == "pass"
     cells.write_text('{"text":"changed"}\n', encoding="utf-8")
     assert quality_summary(tmp_path)["quality_status"] == "unknown"
+    cells.write_text(content, encoding="utf-8")
+    write_final_quality(tmp_path, export_complete=False)
+    assert quality_summary(tmp_path)["quality_status"] == "fail"
+    cells.write_text(content * 2, encoding="utf-8")
+    write_final_quality(tmp_path)
+    assert quality_summary(tmp_path)["quality_status"] == "fail"
+
+
+def test_archived_images_repair_interrupted_writes(tmp_path):
+    from pathlib import Path
+    from PIL import Image
+    from zocr.artifacts.evidence import archive_page_image
+
+    image = Image.new("RGB", (20, 20), "white")
+    target = Path(archive_page_image(image, tmp_path))
+    expected = target.read_bytes()
+    target.write_bytes(b"interrupted")
+    assert archive_page_image(image, tmp_path) == str(target)
+    assert target.read_bytes() == expected
+    assert len(list(target.parent.iterdir())) == 1
+
+
+def test_standalone_rag_preserves_source_image_base(tmp_path):
+    from pathlib import Path
+    from PIL import Image
+    from zocr.artifacts.evidence import archive_page_image
+    from zocr.core.exporters import export_rag_bundle
+
+    image = archive_page_image(Image.new("RGB", (20, 20), "white"), tmp_path)
+    source = tmp_path / "doc.mm.jsonl"
+    source.write_text(json.dumps({"doc_id": "doc", "page": 1, "table_index": 0, "text": "value",
+                                  "image_path": image}) + "\n", encoding="utf-8")
+    exported = export_rag_bundle(str(source), str(tmp_path / "standalone"))
+    record = json.loads(Path(exported["cells"]).read_text(encoding="utf-8"))
+    assert record["image_path"] == image

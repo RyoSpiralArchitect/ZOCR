@@ -5005,7 +5005,8 @@ def _patched_run_full_pipeline(
         except Exception as exc:
             print(f"[WARN] bandit update skipped: {exc}")
 
-    write_final_quality(outdir, min_confidence=float(prof.get("ocr_min_conf", .58)))
+    write_final_quality(outdir, min_confidence=float(prof.get("ocr_min_conf", .58)),
+                        export_complete="export_skipped" not in (summary.get("rag_bundle_status") or {}).get("issues", []))
     summary.update(quality_summary(outdir))
     _finalize_episode(outdir, summary)
 
