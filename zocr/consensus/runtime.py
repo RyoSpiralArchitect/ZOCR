@@ -249,6 +249,7 @@ def export_jsonl_with_ocr(
     ocr_engine: str = "toy",
     contextual: bool = True,
     ocr_min_conf: float = 0.58,
+    native_pages=None,
 ) -> int:
     """Delegate contextual export with OCR to the toy runtime implementation."""
 
@@ -259,6 +260,7 @@ def export_jsonl_with_ocr(
         ocr_engine=ocr_engine,
         contextual=contextual,
         ocr_min_conf=ocr_min_conf,
+        native_pages=native_pages,
     )
 
 

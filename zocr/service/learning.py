@@ -26,7 +26,7 @@ class LearningRegistry:
         self.source, self.read_job = source, read_job
 
     def _path(self, tenant, key):
-        if not isinstance(key, str) or not re.fullmatch(r"(?:sample|model|document|evaluation)-[0-9a-f]{64}", key):
+        if not isinstance(key, str) or not re.fullmatch(r"(?:sample|model|document|evaluation|exposure)-[0-9a-f]{64}", key):
             raise ValueError("Invalid learning object id")
         return self.store.storage_dir / "reviews" / normalize_tenant_id(tenant) / "learning" / (key + ".json")
 
@@ -104,6 +104,8 @@ class LearningRegistry:
             raise ValueError("Explicit consent and train/selection/test role are required")
         if request.get("source_kind") not in ("fixture", "real_document"):
             raise ValueError("Declare fixture or real_document provenance")
+        if request["role"] == "test" and request["source_kind"] == "real_document" and request.get("final_test_attestation") is not True:
+            raise ValueError("Explicit attestation of an unseen, unused independent final family is required")
         group = request.get("document_group_id")
         if not isinstance(group, str) or not 1 <= len(group.strip()) <= 256:
             raise ValueError("An explicit document-family group id is required")
@@ -168,9 +170,18 @@ class LearningRegistry:
                                            if any(d["event_id"] == event_id for d in entry["decisions"])),
                   "expected": correction["text"], "reason": decision["reason"],
                   "png": self._png(crop), "glyphs": encoded, "source_cell_bbox": list(original_box),
-                  "annotation_bbox": list(box), "automatic_activation": False}
+                  "annotation_bbox": list(box), "automatic_activation": False,
+                  "final_test_attestation": request.get("final_test_attestation") is True,
+                  "evaluation_protocol": "one-shot-family-v1" if request["role"] == "test" else None}
         self._current(tenant, sample)
-        self._put(tenant, "document-" + digest({"group": group}), {"document_group_id": group, "role": request["role"]})
+        group_key = "document-" + digest({"group": group})
+        assignment = {"document_group_id": group, "role": request["role"]}
+        if request["role"] == "test":
+            assignment["final_evaluation_protocol"] = "one-shot-family-v1"
+            previous = self.get(tenant, group_key)
+            if previous is not None and previous.get("final_evaluation_protocol") != "one-shot-family-v1":
+                raise ReviewConflict("Legacy final families may already be exposed; use a fresh unseen family")
+        self._put(tenant, group_key, assignment)
         self._put(tenant, "document-" + document_hash, {"document_sha256": document_hash,
                                                     "document_group_id": group, "role": request["role"]})
         return self._put(tenant, "sample-" + digest(sample), sample)
@@ -253,6 +264,28 @@ class LearningRegistry:
         samples = self._samples(tenant, ids)
         if any(sample["role"] != "test" for sample in samples):
             raise ValueError("Final evaluation requires separately assigned test documents")
+        if any(sample.get("evaluation_protocol") != "one-shot-family-v1" for sample in samples):
+            raise ReviewConflict("Legacy final samples may already be exposed; use a new unseen final family")
+        samples.sort(key=lambda sample: sample["object_id"])
+        ids = [sample["object_id"] for sample in samples]
+        evaluation_id = "evaluation-" + digest({"protocol": "one-shot-family-v1", "model": model["integrity_sha256"],
+                                                "samples": {sample["object_id"]: sample["integrity_sha256"] for sample in samples}})
+        families = sorted({sample["document_group_id"] for sample in samples})
+        exposures = {"exposure-" + digest({"document_group_id": group}): group for group in families}
+        reservations = [self.get(tenant, key) for key in exposures]
+        cached = self.get(tenant, evaluation_id)
+        if any(reservations):
+            if any(value is None or value["evaluation_id"] != evaluation_id for value in reservations):
+                raise ReviewConflict("Final document family already exposed; use a new unseen final family")
+            if cached is None:
+                raise ReviewConflict("Final evaluation was consumed without a complete result; use a new unseen final family")
+            return cached
+        if cached is not None:
+            raise RuntimeError("Final evaluation has no matching exposure reservation")
+        for key, group in exposures.items():
+            self._put(tenant, key, {"schema": "zocr.final_test_exposure.v1", "document_group_id": group,
+                                    "evaluation_id": evaluation_id, "model_id": model_id, "actor": actor,
+                                    "policy": "Reserved before execution; interruption conservatively consumes this family."})
         with tempfile.TemporaryDirectory(prefix="zocr-independent-cells-") as directory:
             root = Path(directory)
             rows = []
@@ -275,5 +308,7 @@ class LearningRegistry:
         result = {"schema": "zocr.tenant_model_evaluation.v1", "model_id": model_id, "sample_ids": ids,
                   "actor": actor, "baseline": baseline, "candidate": candidate,
                   "decision": compare_cell_evaluations(baseline, candidate),
-                  "automatic_activation": False, "test_results_must_not_be_used_as_training_labels": True}
-        return self._put(tenant, "evaluation-" + digest(result), result)
+                  "automatic_activation": False, "test_results_must_not_be_used_as_training_labels": True,
+                  "evaluation_protocol": {"version": "one-shot-family-v1", "final_family_reuse": "forbidden",
+                                          "exposure_ids": sorted(exposures), "interruption_consumes_family": True}}
+        return self._put(tenant, evaluation_id, result)

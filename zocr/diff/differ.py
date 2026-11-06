@@ -130,16 +130,26 @@ class Cell:
 
 def to_cell(rec: dict) -> Cell:
     page = int(rec.get("page", -1))
-    table_index = int(rec.get("table_index", rec.get("table", -1)))
-    row = int(rec.get("row", -1))
-    col = int(rec.get("col", -1))
+    meta = rec.get("meta") or {}
+    if not isinstance(meta, dict):
+        raise ValueError("Invalid source metadata")
+    if meta.get("record_kind") == "text_region":
+        if any(rec.get(key) is not None for key in ("table_index", "row", "col")):
+            raise ValueError("Text regions cannot claim physical table coordinates")
+        order = meta.get("native_order", meta.get("region_index"))
+        if type(order) is not int or order < 0:
+            raise ValueError("Text region requires a deterministic observation order")
+        table_index, row, col = -1, order, 0
+    else:
+        table_index = int(rec.get("table_index", rec.get("table", -1)))
+        row = int(rec.get("row", -1))
+        col = int(rec.get("col", -1))
     text = rec.get("text") or rec.get("value") or ""
     header = None
     if "header" in rec:
         header = rec["header"]
     elif "headers" in rec and isinstance(rec["headers"], list) and col < len(rec["headers"]):
         header = rec["headers"][col]
-    meta = rec.get("meta") or {}
     filters = rec.get("filters", {}) or rec.get("norm", {}) or meta.get("filters") or {}
     trace_id = rec.get("trace_id") or meta.get("trace_id") or meta.get("trace")
     return Cell(page, table_index, row, col, text, header, filters, trace_id,

@@ -46,7 +46,7 @@ def write_final_quality(outdir: str | Path, *, min_confidence: float = .58, expo
     if not cells.is_file():
         return
     baseline = _bound_status(root / "doc.contextual.jsonl.quality.json", root, "doc.contextual.jsonl")
-    count = uncertain = 0
+    count = uncertain = abstained = missing_ocr = 0
     with cells.open(encoding="utf-8") as stream:
         for line in stream:
             if not line.strip():
@@ -57,20 +57,22 @@ def write_final_quality(outdir: str | Path, *, min_confidence: float = .58, expo
             image = record.get("image_path")
             source = (root / image).resolve() if isinstance(image, str) else None
             count += 1
-            uncertain += bool(confidence is None or confidence < min_confidence or meta.get("synthetic")
+            abstained += int(meta.get("recognition_status") == "abstained")
+            missing_ocr += int(bool(meta.get("required_ocr_missing")))
+            uncertain += bool(meta.get("recognition_status") == "abstained" or confidence is None or confidence < min_confidence or meta.get("synthetic")
                               or meta.get("evidence_kind", "observed") != "observed" or meta.get("needs_review")
                               or source is None or not source.is_relative_to(root.resolve()) or not source.is_file())
     augmented = root / "doc.mm.jsonl"
     with augmented.open(encoding="utf-8") if augmented.is_file() else io.StringIO() as stream:
         expected_count = sum(bool(line.strip()) for line in stream)
-    status = ("fail" if not export_complete or not count or count != expected_count or baseline == "fail"
+    status = ("fail" if not export_complete or not count or abstained == count or missing_ocr or count != expected_count or baseline == "fail"
               else "warn" if uncertain or baseline == "warn" else baseline)
     hashes = {name: _sha256_file(root / name) for name in (
         "rag/cells.jsonl", "doc.mm.jsonl", "doc.contextual.jsonl",
     ) if (root / name).is_file()}
     report = {"schema": "zocr.final_export_quality.v1", "status": status, "source_hashes": hashes,
               "baseline_status": baseline, "records": count, "expected_records": expected_count,
-              "export_complete": export_complete, "uncertain_records": uncertain,
+              "export_complete": export_complete, "uncertain_records": uncertain, "abstained_records": abstained, "missing_ocr_regions": missing_ocr,
               "minimum_confidence": min_confidence,
               "policy": "Final export diagnostics, not human verification or an access-control gate."}
     (root / "final_export.quality.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -117,3 +117,43 @@
 - Canonical document-group IDs are whitespace-trimmed. Learning and evaluation
   share a tenant execution lock. Repeated test-cell occurrences retain corpus
   weighting; reports expose unique pixel and document counts, not IID confidence.
+
+# Real-document exploratory probes
+
+- Explicit supported image/PDF filenames are honored even below `out*` directories;
+  directory scans still exclude output/debug/tmp folders to prevent recursive ingestion.
+- The Digital Agency `03_仕様書等` bundle is one 2023 MyNaPortal procurement family;
+  separate PDFs in that bundle are not independently assigned train/test families.
+- PDF text-layer extraction is not OCR. Embedded text is only a proxy reference
+  until gold annotations are independently reviewed; inspected exploratory samples
+  must not later be presented as an untouched final test.
+- Local ignored results are under `out-digital-agency-20261106/`, including a
+  comparison HTML, original-file hash checks and separate Mac/Linux reports.
+  Source PDFs, crops and reports are not committed. No approved-correction trial
+  or production-model update was performed in this exploratory run.
+- The main pipeline now prefers visible, usable PDF text on native-only pages,
+  archives its page pixels, and records original PDF hashes, 1-based source pages,
+  pixel/PDF boxes and source kind. Non-tabular regions keep null table/row/column.
+  Text-layer extraction has no invented OCR confidence and remains review-required.
+- `--ocr-engine vision` uses on-device Apple Vision revision 3 on macOS with Swift,
+  defaulting to Japanese/English without language correction. It is not Toy learning.
+  Bridge source/binary hashes and OS revision are auditable; OS-managed model weight
+  bytes are unavailable, so no frozen model hash or cross-OS reproducibility is claimed.
+- Run `ZOCR_TEST_VISION=1 python -m pytest -q tests/test_ocr_quality.py` on macOS
+  to include real image recognition and compilation. Linux/Windows do not silently
+  substitute Toy OCR when an explicit provider/language is unavailable.
+- Mixed PDF pages retain native text even without a compatible image recognizer;
+  unattempted embedded-image regions are explicit `image_region` observations,
+  with `required_ocr_missing` and blocked final quality. They are not fabricated OCR.
+- `/review` is a same-origin manual annotation shell. Source pixels require API
+  authorization, current manifests, bounded/overlapping crops and matching hashes.
+  Confirmation, per-glyph boxes and learning consent are separate manual actions.
+  Save corrections in a batch before registering samples; later review revisions
+  invalidate previously registered samples, even when another cell was edited.
+- Server final evaluations reserve each document family before execution. Identical
+  requests only return the persisted report; another model/sample set and interrupted
+  evaluations cannot reuse that family. Legacy final samples/families are retired
+  rather than promoted to fresh test data. Real final samples require explicit
+  unseen-family attestation, which is an operator assertion, not provenance proof.
+- Standalone exploratory/offline scripts do not provide the server's one-shot
+  reservation guarantee. Keep inspected real-document probes developmental.
