@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -192,7 +193,7 @@ def _normalize_api_key_record(api_key: str, payload: Any, *, fallback_subject: s
         api_key=api_key,
         subject=subject,
         tenant_id=tenant_id,
-        is_admin=is_admin or tenant_id is None or "admin" in roles,
+        is_admin=is_admin or "admin" in roles,
         roles=roles,
         scopes=scopes,
     )
@@ -484,8 +485,18 @@ class AuthBackend:
 
         now = time.time()
         skew = float(self.jwt.clock_skew_sec)
-        exp = payload.get("exp")
-        if exp is not None and now > float(exp) + skew:
+        dates = {}
+        for claim in ("exp", "nbf", "iat"):
+            value = payload.get(claim)
+            if value is not None:
+                try:
+                    if isinstance(value, bool) or not math.isfinite(float(value)):
+                        raise ValueError("Invalid numeric date")
+                    dates[claim] = float(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise AuthError(401, "Invalid JWT numeric date") from exc
+        exp = dates.get("exp")
+        if exp is not None and now > exp + skew:
             raise AuthError(401, "JWT expired")
         nbf = payload.get("nbf")
         if nbf is not None and now + skew < float(nbf):
@@ -671,6 +682,8 @@ class AuthBackend:
         return expanded
 
     def can_override_tenant(self, principal: Principal) -> bool:
+        if principal.tenant_id is not None:
+            return False
         if principal.is_admin:
             return True
         scopes = self.expanded_scopes(principal)

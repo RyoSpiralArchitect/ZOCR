@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import re
 import uuid
 from contextlib import contextmanager
@@ -162,6 +163,13 @@ class ReviewLedger:
                             or not isinstance(correction.get("text"), str) or len(correction["text"]) > 20000):
                         raise ValueError("Cell correction requires side and bounded text")
                     decision["correction"] = {"side": correction["side"], "text": correction["text"]}
+                    if "bbox" in correction:
+                        box = correction["bbox"]
+                        if (not isinstance(box, list) or len(box) != 4
+                                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in box)
+                                or not (0 <= box[0] < box[2] and 0 <= box[1] < box[3])):
+                            raise ValueError("Correction bbox must be a finite, positive source-image region")
+                        decision["correction"]["bbox"] = list(box)
                 decisions.append(decision)
             entry = {
                 "revision": record["revision"] + 1, "submission_id": submission, "request_hash": request_hash,

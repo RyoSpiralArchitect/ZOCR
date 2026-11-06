@@ -33,6 +33,21 @@ def test_raw_cer_wer_preserve_blank_errors_and_unicode():
         text_metrics([])
 
 
+def test_final_cell_regression_veto_is_not_masked_by_aggregate_improvement():
+    from zocr.consensus.cell_evaluation import compare_cell_evaluations
+
+    old = {"predictions": [{"id": "a", "expected": "2358", "predicted": "2358"},
+                           {"id": "b", "expected": "00000000", "predicted": "xxxxxxxx"}]}
+    new = {"predictions": [{"id": "a", "expected": "2358", "predicted": "5555"},
+                           {"id": "b", "expected": "00000000", "predicted": "00000000"}]}
+    decision = compare_cell_evaluations(old, new)
+    assert decision["recommended_action"] == "reject"
+    assert decision["regressions"] == ["a"]
+    assert not decision["activation_supported"]
+    with pytest.raises(ValueError, match="identities"):
+        compare_cell_evaluations(old, {"predictions": []})
+
+
 def test_same_document_with_different_group_name_is_not_independent(tmp_path):
     path, _ = cell_dataset(tmp_path)
     document_hash = hashlib.sha256((tmp_path / "cell.png").read_bytes()).hexdigest()

@@ -63,7 +63,8 @@
 - Each JSONL record requires `id`, `image`, single-character `text`, `group_id`,
   `split` (`train` or `holdout`), `approved: true`, `reviewer`, and `reason`.
   Images must be inside the dataset directory. Training and holdout document groups
-  must be disjoint; repeated source or normalized glyph pixels are rejected.
+  must be disjoint; repeated source/normalized glyph pixels across splits or with
+  conflicting labels are rejected. Same-label repeats within a split are allowed.
 - Holdout data needs at least two document groups. It is selection data, not an
   independent final test. Approval fields are asserted by the local dataset owner,
   unlike authenticated server review actors. Do not claim page-level OCR accuracy.
@@ -97,3 +98,22 @@
   filesystem coordination. Candidates never auto-activate. Source-kind declarations
   and document-family assignments are operator assertions, not proof of real-world
   provenance. Fixture results must never be reported as real-document performance.
+- Corrections may carry an explicit source-page `bbox` when segmentation is wrong.
+  Learning verifies image bounds and overlap with the original cell, records both
+  rectangles, and never changes the observed cell. This is human region correction,
+  not a claim that table segmentation has been learned or automatically fixed.
+- `tests/test_learning_operational.py` uses dedicated Redis/Postgres/MinIO and real
+  workers/OCR. It exercises consent, model selection, independent cell evaluation,
+  fresh-cache rehydration and revocation for both PostgreSQL and S3/local metadata.
+- Glyph selection is not production approval. Models have `production_eligible: false`;
+  any per-cell CER/WER regression triggers an independent-test rejection even when
+  aggregate results improve. Passing this veto still only recommends manual review.
+  Never tune on a final test after inspecting a regression; use new train/selection
+  data and a new independent final set for the next improvement experiment.
+- API-key tenant omission never grants admin. A tenant-bound admin role grants
+  no platform-governance access; platform root uses an explicitly privileged,
+  tenant-unbound principal. Explicit governance scopes retain their separate
+  approval workflow. Tenant-bound audit reads remain limited to their own tenant.
+- Canonical document-group IDs are whitespace-trimmed. Learning and evaluation
+  share a tenant execution lock. Repeated test-cell occurrences retain corpus
+  weighting; reports expose unique pixel and document counts, not IID confidence.
