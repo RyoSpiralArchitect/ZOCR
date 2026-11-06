@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import platform
 from statistics import median
-import subprocess
 import sys
 import time
 from typing import Any
@@ -18,6 +17,7 @@ from PIL import Image, ImageOps
 
 from .._version import __version__
 from ..bench import _percentile
+from ..service.executor import execute_command
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -79,6 +79,14 @@ def load_glyph_dataset(dataset: str | Path, allowed_chars: str) -> dict[str, Any
             image_path = (path.parent / record["image"]).resolve()
             if not image_path.is_relative_to(path.parent):
                 raise ValueError("Image is outside the dataset directory")
+            document_hash = None
+            if "document" in record:
+                if not isinstance(record["document"], str):
+                    raise ValueError("Invalid document path")
+                document = (path.parent / record["document"]).resolve()
+                if not document.is_relative_to(path.parent):
+                    raise ValueError("Document is outside the dataset directory")
+                document_hash = hashlib.sha256(_read_bounded(document, 64 * 1024 * 1024)).hexdigest()
             image_bytes = _read_bounded(image_path, 4 * 1024 * 1024)
             image = _glyph_image(image_bytes)
             buffer = io.BytesIO()
@@ -94,7 +102,8 @@ def load_glyph_dataset(dataset: str | Path, allowed_chars: str) -> dict[str, Any
             groups[split].add(record["group_id"])
             samples.append({"id": record["id"], "label": label, "split": split, "group_id": record["group_id"],
                             "png": base64.b64encode(png).decode("ascii"), "glyph_sha256": pixel_hash,
-                            "source_sha256": source_hash, "annotation_sha256": hashlib.sha256(_json_bytes(record)).hexdigest()})
+                            "source_sha256": source_hash, "document_sha256": document_hash,
+                            "annotation_sha256": hashlib.sha256(_json_bytes(record)).hexdigest()})
             if len(samples) > 1000:
                 raise ValueError("At most 1000 glyph samples are supported per trial")
         except (ValueError, TypeError, OSError, Image.DecompressionBombError) as exc:
@@ -103,6 +112,12 @@ def load_glyph_dataset(dataset: str | Path, allowed_chars: str) -> dict[str, Any
         raise ValueError("Training data and holdout samples from at least two independent document groups are required")
     if groups["train"] & groups["holdout"]:
         raise ValueError("A document group cannot appear in both training and holdout splits")
+    documents = {split: {sample["document_sha256"] for sample in samples
+                         if sample["split"] == split and sample["document_sha256"]} for split in groups}
+    if documents["train"] & documents["holdout"]:
+        raise ValueError("Training and holdout reuse the same source document bytes")
+    if all(sample["document_sha256"] for sample in samples) and len(documents["holdout"]) < 2:
+        raise ValueError("Holdout requires two distinct source documents, not renamed groups")
     return {"dataset_sha256": hashlib.sha256(raw).hexdigest(), "allowed_chars": allowed_chars, "samples": samples}
 
 
@@ -162,6 +177,13 @@ def _worker(request: dict) -> dict[str, Any]:
     selection = select_candidate(baseline, candidate)
     model_hash = hashlib.sha256(_json_bytes(baseline_model)).hexdigest()
     memory["learning_trial"] = {"dataset_sha256": request["dataset_sha256"], "parent_model_sha256": model_hash,
+                                "document_lineage_complete": all(sample.get("document_sha256") for sample in request["samples"]),
+                                "training_group_ids": sorted({sample["group_id"] for sample in request["samples"] if sample["split"] == "train"}),
+                                "selection_group_ids": sorted({sample["group_id"] for sample in request["samples"] if sample["split"] == "holdout"}),
+                                "training_document_sha256": sorted({sample["document_sha256"] for sample in request["samples"]
+                                                                     if sample["split"] == "train" and sample.get("document_sha256")}),
+                                "selection_document_sha256": sorted({sample["document_sha256"] for sample in request["samples"]
+                                                                      if sample["split"] == "holdout" and sample.get("document_sha256")}),
                                 "training_glyph_sha256": [sample["glyph_sha256"] for sample in request["samples"]
                                                           if sample["split"] == "train"]}
     report = {"schema": "zocr.glyph_learning_trial.v1", "scope": "isolated_glyph_matching",
@@ -191,11 +213,8 @@ def run_learning_trial(dataset: str | Path, outdir: str | Path, *, allowed_chars
     if output.exists():
         raise FileExistsError(f"Choose a new output directory: {output}")
     request = load_glyph_dataset(dataset, allowed_chars)
-    result = subprocess.run([sys.executable, "-m", "zocr.consensus.learning", "--worker"],
-                            input=_json_bytes(request), capture_output=True, timeout=timeout_sec)
-    if result.returncode:
-        raise RuntimeError("Isolated glyph learning failed: " + result.stderr.decode("utf-8", errors="replace")[-2000:])
-    response = json.loads(result.stdout)
+    response = execute_command([sys.executable, "-m", "zocr.consensus.learning", "--worker", str(os.getpid())],
+                               request, timeout_sec)
     output.mkdir(mode=0o700, parents=True)
     artifacts = {"learning_report.json": response["report"]}
     if response["memory"] is not None:
@@ -208,8 +227,10 @@ def run_learning_trial(dataset: str | Path, outdir: str | Path, *, allowed_chars
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--worker"]:
+    from ..service.executor import watch_parent
+    if len(sys.argv) != 3 or sys.argv[1] != "--worker":
         raise SystemExit("Use the consensus toy-learn subcommand to run a validated learning trial.")
+    watch_parent(int(sys.argv[2]))
     raw_request = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
     if len(raw_request) > 32 * 1024 * 1024:
         raise SystemExit("Oversized learning request")

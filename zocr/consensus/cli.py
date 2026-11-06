@@ -41,6 +41,7 @@ __all__ = [
     "cli_query",
     "cli_toy_bench",
     "cli_toy_learn",
+    "cli_cell_eval",
     "main",
 ]
 
@@ -494,6 +495,17 @@ def cli_toy_bench(args) -> None:
     )
 
 
+def cli_cell_eval(args) -> None:
+    from .cell_evaluation import evaluate_cells
+    from .learning import _read_bounded
+
+    memory = json.loads(_read_bounded(Path(args.memory), 16 * 1024 * 1024)) if args.memory else None
+    report = evaluate_cells(args.dataset, args.out, memory=memory, allowed_chars=args.allowed_chars,
+                            timeout_sec=args.timeout_sec)
+    print(json.dumps({"out": args.out, "metrics": report["metrics"],
+                      "real_document_samples": report["real_document_samples"]}, ensure_ascii=False))
+
+
 def cli_toy_learn(args) -> None:
     from .learning import run_learning_trial
 
@@ -569,6 +581,13 @@ def _patch_cli_for_export_and_search(parser: argparse.ArgumentParser) -> argpars
     sp.add_argument("--out", required=True, help="New private output directory; existing directories are never overwritten")
     sp.add_argument("--timeout-sec", type=float, default=120)
     sp.set_defaults(func=cli_toy_learn)
+    sp = sub.add_parser("cell-eval", help="Evaluate frozen OCR on independent full-cell test data")
+    sp.add_argument("--dataset", required=True)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--memory", default=None)
+    sp.add_argument("--allowed-chars", default=None)
+    sp.add_argument("--timeout-sec", type=float, default=120)
+    sp.set_defaults(func=cli_cell_eval)
     return parser
 
 
@@ -634,7 +653,7 @@ def main():
             os.environ.pop("ZOCR_TESS_DOMAIN", None)
         else:
             os.environ["ZOCR_TESS_DOMAIN"] = dom
-    if args.cmd != "toy-learn":
+    if args.cmd not in {"toy-learn", "cell-eval"}:
         ensure_dir(args.out)
     # subcommands (export/index/query) do not require re-running OCR
     if args.cmd:

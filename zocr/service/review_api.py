@@ -10,6 +10,8 @@ from .storage import result_paths
 def install_review_routes(app, store, repository, require_context, read_job, audit):
     from fastapi import Depends, HTTPException, Request
 
+    from .learning import LearningRegistry
+
     ledger = ReviewLedger(store, repository)
 
     def actor(context):
@@ -45,6 +47,68 @@ def install_review_routes(app, store, repository, require_context, read_job, aud
         if record is None:
             raise HTTPException(status_code=404, detail="Unknown review")
         return record
+
+    learning = LearningRegistry(store, repository, ledger, source, read_job)
+
+    def learning_call(operation):
+        import subprocess
+        try:
+            return operation()
+        except ReviewConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Unknown tenant learning object") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (subprocess.TimeoutExpired, TimeoutError) as exc:
+            raise HTTPException(status_code=504, detail="Isolated learning/evaluation deadline exceeded") from exc
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail="Verified learning source is unavailable") from exc
+
+    @app.post("/v1/reviews/{review_id}/learning-samples")
+    def register_learning_sample(request: Request, review_id: str, payload: dict,
+                                 context=Depends(require_context("zocr.reviews.approve"))):
+        sample = learning_call(lambda: learning.register(context.tenant_id, review_id, payload, actor(context)))
+        audit("learning.sample.registered", {"object_id": sample["object_id"], "role": sample["role"]},
+              request=request, principal=context.principal, tenant_id=context.tenant_id)
+        return {"sample": sample}
+
+    @app.get("/v1/learning/{object_id}")
+    def read_learning_object(object_id: str, context=Depends(require_context("zocr.jobs.read"))):
+        def read():
+            value = learning.get(context.tenant_id, object_id)
+            if value is None or object_id.startswith("document-"):
+                raise KeyError(object_id)
+            if object_id.startswith("sample-"):
+                learning._current(context.tenant_id, value)
+            else:
+                learning._samples(context.tenant_id, value["sample_ids"])
+                if object_id.startswith("evaluation-"):
+                    model = learning.get(context.tenant_id, value["model_id"])
+                    if model is None:
+                        raise KeyError(value["model_id"])
+                    learning._samples(context.tenant_id, model["sample_ids"])
+            return value
+        return {"object": learning_call(read)}
+
+    @app.post("/v1/learning/models")
+    def train_learning_candidate(request: Request, payload: dict,
+                                 context=Depends(require_context("zocr.jobs.run")),
+                                 approval=Depends(require_context("zocr.reviews.approve"))):
+        candidate = learning_call(lambda: learning.train(context.tenant_id, payload.get("sample_ids"),
+                                                         payload.get("allowed_chars"), actor(context)))
+        audit("learning.candidate.created", {"object_id": candidate["object_id"]}, request=request,
+              principal=context.principal, tenant_id=context.tenant_id)
+        return {"candidate": candidate}
+
+    @app.post("/v1/learning/models/{model_id}/evaluations")
+    def evaluate_learning_candidate(request: Request, model_id: str, payload: dict,
+                                    context=Depends(require_context("zocr.jobs.run")),
+                                    approval=Depends(require_context("zocr.reviews.approve"))):
+        result = learning_call(lambda: learning.evaluate(context.tenant_id, model_id, payload.get("sample_ids"), actor(context)))
+        audit("learning.candidate.evaluated", {"model_id": model_id}, request=request,
+              principal=context.principal, tenant_id=context.tenant_id)
+        return {"evaluation": result}
 
     @app.post("/v1/reviews")
     def create_review(request: Request, payload: dict,

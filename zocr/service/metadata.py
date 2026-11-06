@@ -890,6 +890,14 @@ class PostgresJobRepository:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS zocr_learning_objects (
+                tenant_id TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                PRIMARY KEY (tenant_id, object_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS zocr_tenant_plans (
                 plan_name TEXT PRIMARY KEY,
                 max_active_jobs INTEGER,

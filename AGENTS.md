@@ -74,3 +74,26 @@
 - Test with `python -m pytest -q -s tests/test_toy_learning.py`. Timing diagnostics
   are not CI speed thresholds. Cached preparation must preserve exact results;
   its 128 entries are pixel-keyed, read-only and restricted to small templates.
+
+# Approved learning and independent cell evaluation
+
+- `zocr-consensus cell-eval --dataset cells.jsonl --out new-evaluation` measures raw
+  full-cell CER/WER, retaining blank-reference insertions. WER uses whitespace,
+  not Japanese linguistic segmentation. Each cell starts a fresh bounded process.
+- Cell JSONL adds `document`, `group_id`, `source_kind` (`fixture` or `real_document`),
+  and `split: test` to the approved image/text/reviewer/reason fields. File bytes and
+  document-family groups must not overlap the model's training or selection lineage.
+  A model without complete document lineage cannot certify an independent test.
+- Learning sample registration requires `zocr.reviews.approve`, explicit consent,
+  a current corrected review event, a document-family group, and an immutable split.
+  Train/selection samples require manually labelled glyph boxes in cell coordinates;
+  these spell the non-whitespace correction. No automatic character labelling is used.
+- Learning models/evaluations additionally require `zocr.jobs.run`. Objects and
+  document split assignments are tenant-local and immutable. Review revision changes
+  invalidate samples and derived models. Evaluations are persisted, not just exported.
+- Source input and archived page hashes must match the committed manifest; legacy
+  jobs without hashed original inputs must be rerun before learning registration.
+- PostgreSQL uses unique learning-object rows; S3/local metadata still needs shared
+  filesystem coordination. Candidates never auto-activate. Source-kind declarations
+  and document-family assignments are operator assertions, not proof of real-world
+  provenance. Fixture results must never be reported as real-document performance.

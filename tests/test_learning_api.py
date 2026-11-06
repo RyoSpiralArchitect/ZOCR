@@ -1,0 +1,148 @@
+import json
+import uuid
+from pathlib import Path
+
+import pytest
+from PIL import Image, ImageDraw, ImageFont
+
+from zocr.artifacts.evidence import archive_page_image
+from zocr.artifacts.manifest import write_manifest
+from zocr.service.metadata import LocalJobRepository
+from zocr.service.storage import LocalJobStore
+
+
+@pytest.fixture
+def learning_api(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from zocr.service.app import create_app
+
+    monkeypatch.setenv("ZOCR_API_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setenv("ZOCR_API_JOBS_RESUME_ON_STARTUP", "0")
+    monkeypatch.setenv("ZOCR_API_JOBS_CLEANUP_ON_STARTUP", "0")
+    monkeypatch.setenv("ZOCR_API_KEYS_JSON", json.dumps({
+        "alice": {"subject": "alice", "tenant_id": "tenant-a", "roles": ["admin"]},
+        "operator": {"tenant_id": "tenant-a", "roles": ["operator"]},
+        "other": {"tenant_id": "tenant-b", "roles": ["admin"]},
+    }))
+    store = LocalJobStore(tmp_path)
+    repository = LocalJobRepository(job_store=store)
+    auth = {"X-API-Key": "alice"}
+    with TestClient(create_app()) as client:
+        def make(scale, role="train", group=None):
+            image = Image.new("L", (96, 24), 255)
+            draw = ImageDraw.Draw(image)
+            for index, char in enumerate("2358"):
+                draw.text((index * 24 + 4, 3), char, fill=0, font=ImageFont.load_default())
+            image = image.resize((96 * scale, 24 * scale), Image.Resampling.LANCZOS)
+            jobs = []
+            for text in ("0000", "0001"):
+                job_id = uuid.uuid4().hex
+                paths = store.job_paths(job_id)
+                paths.input_dir.mkdir(parents=True)
+                original = paths.input_dir / "source.png"
+                image.save(original)
+                (paths.out_dir / "rag").mkdir(parents=True)
+                evidence = archive_page_image(image, paths.out_dir)
+                (paths.out_dir / "rag" / "cells.jsonl").write_text(json.dumps({
+                    "doc_id": "doc", "page": 1, "table_index": 0, "row": 1, "col": 0,
+                    "header": "Amount", "text": text, "bbox": [0, 0, *image.size], "confidence": .4,
+                    "image_path": str(Path(evidence).relative_to(paths.out_dir)),
+                }) + "\n", encoding="utf-8")
+                summary = {"inputs": [str(original)]}
+                (paths.out_dir / "pipeline_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+                write_manifest(paths.out_dir, summary=summary, inputs=[str(original)], hash_inputs=True)
+                repository.write_job(job_id, "tenant-a", {"status": "succeeded", "input": {"filename": "source.png"}})
+                jobs.append(job_id)
+            response = client.post("/v1/reviews", headers=auth, json={"job_a": jobs[0], "job_b": jobs[1]})
+            assert response.status_code == 200, response.text
+            review = response.json()["review"]
+            event = review["result"]["events"][0]["event_id"]
+            decision = {"expected_revision": 0, "submission_id": uuid.uuid4().hex,
+                        "source_hashes": review["result"]["review"]["source_hashes"],
+                        "decisions": [{"event_id": event, "status": "corrected", "reason": "Verified fixture pixels",
+                                       "correction": {"side": "b", "text": "2358"}}]}
+            response = client.post(f"/v1/reviews/{review['review_id']}/decisions", headers=auth, json=decision)
+            assert response.status_code == 200, response.text
+            request = {"expected_revision": 1, "event_id": event, "role": role, "consent": True,
+                       "document_group_id": group or f"fixture-document-{scale}", "source_kind": "fixture",
+                       "glyphs": [{"text": char, "bbox": [i * 24 * scale, 0, (i + 1) * 24 * scale, 24 * scale]}
+                                  for i, char in enumerate("2358")] if role != "test" else []}
+            return review, request, jobs
+        yield client, make, auth, store
+
+
+def register(client, make, auth, scale, role="train", group=None):
+    review, request, jobs = make(scale, role, group)
+    response = client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth, json=request)
+    assert response.status_code == 200, response.text
+    return response.json()["sample"], review, request, jobs
+
+
+def test_consent_is_actor_bound_and_tenant_scoped(learning_api):
+    client, make, auth, store = learning_api
+    sample, review, request, jobs = register(client, make, auth, 2)
+    assert sample["consent_actor"]["subject"] == "alice"
+    assert sample["automatic_activation"] is False
+    url = f"/v1/learning/{sample['object_id']}"
+    assert client.get(url, headers={"X-API-Key": "other"}).status_code == 404
+    response = client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers={"X-API-Key": "operator"}, json=request)
+    assert response.status_code == 403
+    assert client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth, json=dict(request, consent=False)).status_code == 422
+    assert client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth, json=request).json()["sample"] == sample
+    assert (store.job_paths(jobs[1]).out_dir / "rag" / "cells.jsonl").read_text().find("0001") >= 0
+
+
+def test_document_bytes_and_families_cannot_cross_splits(learning_api):
+    client, make, auth, _ = learning_api
+    register(client, make, auth, 2, "train", "document-family")
+    for scale, group in ((2, "renamed-document"), (3, "document-family")):
+        review, request, _ = make(scale, "test", group)
+        response = client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth, json=request)
+        assert response.status_code == 409, response.text
+
+
+@pytest.mark.parametrize("part", ["input", "evidence"])
+def test_tampered_original_or_pixels_cannot_supply_training_labels(learning_api, part):
+    client, make, auth, store = learning_api
+    review, request, jobs = make(2)
+    paths = store.job_paths(jobs[1])
+    target = paths.input_dir / "source.png" if part == "input" else next((paths.out_dir / "evidence").glob("*.png"))
+    target.write_bytes(target.read_bytes() + b"tampered")
+    response = client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth, json=request)
+    assert response.status_code == 409, response.text
+
+
+def test_changed_review_revokes_existing_learning_sample(learning_api):
+    client, make, auth, _ = learning_api
+    sample, review, request, _ = register(client, make, auth, 2)
+    revoke = {"expected_revision": 1, "submission_id": "withdraw-consent",
+              "source_hashes": review["result"]["review"]["source_hashes"],
+              "decisions": [{"event_id": request["event_id"], "status": "needs_review", "reason": "Withdraw learning consent"}]}
+    assert client.post(f"/v1/reviews/{review['review_id']}/decisions", headers=auth, json=revoke).status_code == 200
+    assert client.get(f"/v1/learning/{sample['object_id']}", headers=auth).status_code == 409
+
+
+def test_training_creates_immutable_candidate_and_excludes_final_test(learning_api):
+    client, make, auth, _ = learning_api
+    samples = [register(client, make, auth, scale, role)[0] for scale, role in ((2, "train"), (3, "selection"), (4, "selection"))]
+    final = register(client, make, auth, 5, "test")[0]
+    ids = [sample["object_id"] for sample in samples]
+    response = client.post("/v1/learning/models", headers=auth, json={"sample_ids": ids, "allowed_chars": "2358"})
+    assert response.status_code == 200, response.text
+    model = response.json()["candidate"]
+    assert model["report"]["baseline"]["samples"] == 8
+    assert model["automatic_activation"] is False
+    assert client.get(f"/v1/learning/{model['object_id']}", headers={"X-API-Key": "other"}).status_code == 404
+    rejected = client.post("/v1/learning/models", headers=auth, json={"sample_ids": ids + [final["object_id"]], "allowed_chars": "2358"})
+    assert rejected.status_code == 422
+    if model["memory"] is not None:
+        response = client.post(f"/v1/learning/models/{model['object_id']}/evaluations", headers=auth,
+                               json={"sample_ids": [final["object_id"]]})
+        assert response.status_code == 200, response.text
+        evaluation = response.json()["evaluation"]
+        assert evaluation["baseline"]["metrics"]["samples"] == 1
+        assert evaluation["candidate"]["real_document_samples"] == 0
+        assert not evaluation["automatic_activation"]
+        stored = client.get(f"/v1/learning/{evaluation['object_id']}", headers=auth)
+        assert stored.status_code == 200
+        assert stored.json()["object"] == evaluation
