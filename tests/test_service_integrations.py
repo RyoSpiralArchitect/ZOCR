@@ -53,10 +53,11 @@ def test_real_redis_heartbeat_reclaim_and_ack():
     assert queue.ack(group="workers", message_id=message_id) == 1
 
 
-def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatch):
+@pytest.mark.parametrize("s3_environment", ["ZOCR_TEST_S3_URL", "ZOCR_TEST_MINIO_URL"])
+def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatch, s3_environment):
     redis_url = local_service("ZOCR_TEST_REDIS_URL")
     postgres_url = local_service("ZOCR_TEST_POSTGRES_URL")
-    s3_url = local_service("ZOCR_TEST_S3_URL")
+    s3_url = local_service(s3_environment)
     import boto3
     from fastapi.testclient import TestClient
     from zocr.service.app import create_app
@@ -81,8 +82,11 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
         "ZOCR_API_JOBS_RESUME_ON_STARTUP": "0", "ZOCR_API_RUN_TIMEOUT_SEC": "60",
         "ZOCR_TOY_SWEEPS": "1", "ZOCR_TOY_SWEEP_LIMIT": "1",
     }
+    if s3_environment == "ZOCR_TEST_MINIO_URL":
+        settings.update(AWS_ACCESS_KEY_ID="zocr_test", AWS_SECRET_ACCESS_KEY="zocr_test_local_only")
     for key, value in settings.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
     boto3.client("s3", endpoint_url=s3_url).create_bucket(Bucket=bucket)
     with TestClient(create_app()) as client:
         response = client.post("/v1/jobs?toy_lite=true&k=1", files={
@@ -109,6 +113,11 @@ def test_real_api_redis_worker_postgres_and_s3(tmp_path, table_image, monkeypatc
         with zipfile.ZipFile(io.BytesIO(archive.content)) as bundle:
             assert bundle.testzip() is None
             assert "zocr.manifest.json" in bundle.namelist()
+        review = client.post("/v1/reviews", json={"job_a": job_id, "job_b": job_id})
+        assert review.status_code == 200, review.text
+        assert review.json()["review"]["review_status"] == "no_changes"
+        review_id = review.json()["review"]["review_id"]
+        assert client.get(f"/v1/reviews/{review_id}/history").json()["revision"] == 0
         updated_at = job["updated_at"]
         queue.enqueue(job_id, "default")
         replay = subprocess.run(command, capture_output=True, text=True, timeout=10)

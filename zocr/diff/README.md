@@ -56,6 +56,8 @@ Execution status is separate from `quality_status` and the downstream
   Corrections do not mutate OCR output. This is an application-level audit trail,
   not WORM storage or a cryptographic defense against privileged DB administrators.
   With authentication disabled, the actor is explicitly unauthenticated.
+  Review snapshots retain hashes and extracted events; they do not pin source
+  jobs against deletion/retention. Archive original evidence separately when needed.
 - Distributed deployments require PostgreSQL metadata and one authoritative
   primary. Local metadata/reviews require durable shared filesystem coordination.
   Run normal schema initialization/migrations to create `zocr_document_reviews`;

@@ -150,7 +150,7 @@ class ReviewLedger:
                     raise ValueError("Unknown or duplicate event_id")
                 seen.add(event_id)
                 status, reason = supplied_decision.get("status"), supplied_decision.get("reason")
-                if status not in {"approved", "rejected", "needs_review", "corrected"}:
+                if not isinstance(status, str) or status not in {"approved", "rejected", "needs_review", "corrected"}:
                     raise ValueError("Unknown decision status")
                 if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 4000:
                     raise ValueError("Each decision requires a bounded reason")
@@ -158,7 +158,7 @@ class ReviewLedger:
                 if status == "corrected":
                     correction = supplied_decision.get("correction")
                     if (events[event_id].get("type") != "cell_updated" or not isinstance(correction, dict)
-                            or correction.get("side") not in {"a", "b"}
+                            or not isinstance(correction.get("side"), str) or correction["side"] not in {"a", "b"}
                             or not isinstance(correction.get("text"), str) or len(correction["text"]) > 20000):
                         raise ValueError("Cell correction requires side and bounded text")
                     decision["correction"] = {"side": correction["side"], "text": correction["text"]}

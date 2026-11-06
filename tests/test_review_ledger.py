@@ -52,6 +52,10 @@ def test_ledger_rejects_stale_foreign_or_unknown_decisions(ledger):
     request["decisions"][0]["event_id"] = "unknown"
     with pytest.raises(ValueError):
         ledger.append(review["review_id"], "tenant-a", request, {"subject": "alice"})
+    request = bundle(review)
+    request["decisions"][0]["status"] = []
+    with pytest.raises(ValueError):
+        ledger.append(review["review_id"], "tenant-a", request, {"subject": "alice"})
     ledger.append(review["review_id"], "tenant-a", bundle(review), {"subject": "alice"})
     request = dict(bundle(review), submission_id="different")
     with pytest.raises(ReviewConflict):
@@ -98,7 +102,10 @@ def test_postgres_review_append_is_serialized(tmp_path):
 def test_corrections_are_separate_from_source_result(ledger):
     review = new_review(ledger)
     request = bundle(review, status="corrected")
-    request["decisions"][0]["correction"] = {"side": "b", "text": "123"}
+    request["decisions"][0]["correction"] = {"side": [], "text": "123"}
+    with pytest.raises(ValueError):
+        ledger.append(review["review_id"], "tenant-a", request, {"subject": "alice"})
+    request["decisions"][0]["correction"]["side"] = "b"
     result = ledger.append(review["review_id"], "tenant-a", request, {"subject": "alice"})
     assert result["result"] == review["result"]
     assert result["review_status"] == "correction_required"
