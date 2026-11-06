@@ -46,6 +46,22 @@ def text_metrics(pairs):
             "word_tokenization": "Unicode whitespace; not linguistic Japanese word segmentation"}
 
 
+def compare_cell_evaluations(baseline, candidate):
+    old, new = baseline["predictions"], candidate["predictions"]
+    if [row["id"] for row in old] != [row["id"] for row in new]:
+        raise ValueError("Evaluation sample identities do not match")
+    regressions = []
+    for a, b in zip(old, new):
+        if a["expected"] != b["expected"]:
+            raise ValueError("Evaluation reference labels changed")
+        raw = a["expected"]
+        if (edit_distance(raw, b["predicted"]) > edit_distance(raw, a["predicted"])
+                or edit_distance(raw.split(), b["predicted"].split()) > edit_distance(raw.split(), a["predicted"].split())):
+            regressions.append(a["id"])
+    return {"scope": "independent_full_cell", "regressions": regressions,
+            "recommended_action": "reject" if regressions else "manual_review_only", "activation_supported": False}
+
+
 def load_cell_dataset(path, memory=None):
     path = Path(path).resolve()
     raw = _read_bounded(path, 2 * 1024 * 1024)
@@ -124,6 +140,7 @@ def evaluate_cells(dataset, outdir, *, memory=None, allowed_chars=None, timeout_
                                      {"png": sample["png"], "memory": memory, "alphabet": allowed_chars}, remaining)
         predictions.append({**{key: value for key, value in sample.items() if key != "png"}, **prediction})
     report = {"schema": "zocr.cell_evaluation.v1", "scope": "full_cell_ocr", "split": "independent_test",
+              "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "dataset_sha256": snapshot["dataset_sha256"], "model_sha256": hashlib.sha256(_json_bytes(memory)).hexdigest(),
               "model": "explicit_memory" if memory else "builtin_atlas", "allowed_chars": allowed_chars,
               "metrics": text_metrics([(row["expected"], row["predicted"]) for row in predictions]),

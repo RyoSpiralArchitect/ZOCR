@@ -13,7 +13,7 @@ from PIL import Image
 
 from ..artifacts.manifest import MANIFEST_FILENAME
 from ..consensus.learning import _glyph_image, _read_bounded, run_learning_trial
-from ..consensus.cell_evaluation import evaluate_cells
+from ..consensus.cell_evaluation import compare_cell_evaluations, evaluate_cells
 from .execution_lock import execution_lock
 from .metadata import normalize_tenant_id
 from .review_ledger import ReviewConflict, digest
@@ -135,7 +135,10 @@ class LearningRegistry:
         with Image.open(io.BytesIO(raw)) as image:
             if image.width * image.height > 40_000_000:
                 raise ValueError("Evidence image is too large")
-            box = self._box(cell.get("bbox"), image.size)
+            original_box = self._box(cell.get("bbox"), image.size)
+            box = self._box(correction.get("bbox", cell.get("bbox")), image.size)
+            if max(original_box[0], box[0]) >= min(original_box[2], box[2]) or max(original_box[1], box[1]) >= min(original_box[3], box[3]):
+                raise ValueError("Corrected region must overlap its original source cell")
             crop = image.crop(box).convert("L")
         if crop.width * crop.height > 1_000_000:
             raise ValueError("Cell crop is too large")
@@ -163,7 +166,8 @@ class LearningRegistry:
                   "correction_actor": next(entry["actor"] for entry in reversed(review["history"])
                                            if any(d["event_id"] == event_id for d in entry["decisions"])),
                   "expected": correction["text"], "reason": decision["reason"],
-                  "png": self._png(crop), "glyphs": encoded, "automatic_activation": False}
+                  "png": self._png(crop), "glyphs": encoded, "source_cell_bbox": list(original_box),
+                  "annotation_bbox": list(box), "automatic_activation": False}
         self._current(tenant, sample)
         self._put(tenant, "document-" + digest({"group": group}), {"document_group_id": group, "role": request["role"]})
         self._put(tenant, "document-" + document_hash, {"document_sha256": document_hash,
@@ -227,7 +231,9 @@ class LearningRegistry:
                 self._current(tenant, sample)
             record = {"schema": "zocr.tenant_learning_candidate.v1", "actor": actor, "sample_ids": ids,
                       "sample_revisions": {sample["object_id"]: sample["review_revision"] for sample in samples},
-                      "report": report, "memory": memory, "automatic_activation": False}
+                      "report": report, "memory": memory, "automatic_activation": False,
+                      "selection_scope": "glyph_only", "production_eligible": False,
+                      "requires_independent_cell_evaluation": True}
             return self._put(tenant, "model-" + digest(record), record)
 
     def evaluate(self, tenant, model_id, ids, actor):
@@ -261,5 +267,6 @@ class LearningRegistry:
         self._samples(tenant, model["sample_ids"])
         result = {"schema": "zocr.tenant_model_evaluation.v1", "model_id": model_id, "sample_ids": ids,
                   "actor": actor, "baseline": baseline, "candidate": candidate,
+                  "decision": compare_cell_evaluations(baseline, candidate),
                   "automatic_activation": False, "test_results_must_not_be_used_as_training_labels": True}
         return self._put(tenant, "evaluation-" + digest(result), result)

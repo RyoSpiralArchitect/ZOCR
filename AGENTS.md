@@ -97,3 +97,15 @@
   filesystem coordination. Candidates never auto-activate. Source-kind declarations
   and document-family assignments are operator assertions, not proof of real-world
   provenance. Fixture results must never be reported as real-document performance.
+- Corrections may carry an explicit source-page `bbox` when segmentation is wrong.
+  Learning verifies image bounds and overlap with the original cell, records both
+  rectangles, and never changes the observed cell. This is human region correction,
+  not a claim that table segmentation has been learned or automatically fixed.
+- `tests/test_learning_operational.py` uses dedicated Redis/Postgres/MinIO and real
+  workers/OCR. It exercises consent, model selection, independent cell evaluation,
+  fresh-cache rehydration and revocation for both PostgreSQL and S3/local metadata.
+- Glyph selection is not production approval. Models have `production_eligible: false`;
+  any per-cell CER/WER regression triggers an independent-test rejection even when
+  aggregate results improve. Passing this veto still only recommends manual review.
+  Never tune on a final test after inspecting a regression; use new train/selection
+  data and a new independent final set for the next improvement experiment.

@@ -146,3 +146,27 @@ def test_training_creates_immutable_candidate_and_excludes_final_test(learning_a
         stored = client.get(f"/v1/learning/{evaluation['object_id']}", headers=auth)
         assert stored.status_code == 200
         assert stored.json()["object"] == evaluation
+
+
+@pytest.mark.parametrize("bbox, expected", [([2, 2, 190, 46], 200), ([0, 0, 1000, 1000], 422),
+                                            ([0.1, 0.1, 0.2, 0.2], 422)])
+def test_explicit_region_correction_preserves_original_source(learning_api, bbox, expected):
+    client, make, auth, store = learning_api
+    review, request, jobs = make(2, "test")
+    source = store.job_paths(jobs[1]).out_dir / "rag" / "cells.jsonl"
+    before = source.read_bytes()
+    response = client.post(f"/v1/reviews/{review['review_id']}/decisions", headers=auth, json={
+        "expected_revision": 1, "submission_id": "region-correction",
+        "source_hashes": review["result"]["review"]["source_hashes"],
+        "decisions": [{"event_id": request["event_id"], "status": "corrected", "reason": "Checked segmentation region",
+                       "correction": {"side": "b", "text": "2358", "bbox": bbox}}],
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["review"]["decisions"][request["event_id"]]["correction"]["bbox"] == bbox
+    response = client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth,
+                           json=dict(request, expected_revision=2))
+    assert response.status_code == expected, response.text
+    assert source.read_bytes() == before
+    if expected == 200:
+        assert response.json()["sample"]["source_cell_bbox"] == [0, 0, 192, 48]
+        assert response.json()["sample"]["annotation_bbox"] == bbox

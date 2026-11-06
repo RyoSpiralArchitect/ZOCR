@@ -142,7 +142,7 @@ def _process_claimed_job(
             pass
 
     try:
-        manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id)
+        manifest_path = write_manifest(out_dir, summary=summary, inputs=[str(input_path)], run_id=job_id, hash_inputs=True)
         job.setdefault("artifacts", {})["manifest_json"] = manifest_path.relative_to(paths.root).as_posix()
     except Exception as exc:
         job["status"] = "failed"
