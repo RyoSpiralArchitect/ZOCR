@@ -117,3 +117,17 @@
 - Canonical document-group IDs are whitespace-trimmed. Learning and evaluation
   share a tenant execution lock. Repeated test-cell occurrences retain corpus
   weighting; reports expose unique pixel and document counts, not IID confidence.
+
+# Real-document exploratory probes
+
+- Keep pipeline inputs outside `out*` directories: `_collect_pages` currently applies
+  output-path exclusion patterns even to explicit image filenames under them.
+- The Digital Agency `03_仕様書等` bundle is one 2023 MyNaPortal procurement family;
+  separate PDFs in that bundle are not independently assigned train/test families.
+- PDF text-layer extraction is not OCR. Embedded text is only a proxy reference
+  until gold annotations are independently reviewed; inspected exploratory samples
+  must not later be presented as an untouched final test.
+- Local ignored results are under `out-digital-agency-20261106/`, including a
+  comparison HTML, original-file hash checks and separate Mac/Linux reports.
+  Source PDFs, crops and reports are not committed. No approved-correction trial
+  or production-model update was performed in this exploratory run.
