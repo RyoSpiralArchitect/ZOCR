@@ -107,6 +107,7 @@ class LearningRegistry:
         group = request.get("document_group_id")
         if not isinstance(group, str) or not 1 <= len(group.strip()) <= 256:
             raise ValueError("An explicit document-family group id is required")
+        group = group.strip()
         event_id = request.get("event_id")
         if not isinstance(event_id, str):
             raise ValueError("Invalid event id")
@@ -237,6 +238,12 @@ class LearningRegistry:
             return self._put(tenant, "model-" + digest(record), record)
 
     def evaluate(self, tenant, model_id, ids, actor):
+        with execution_lock(self.store, self.repository, "learning-trial", tenant) as acquired:
+            if not acquired:
+                raise ReviewConflict("Another tenant learning/evaluation trial is running")
+            return self._evaluate(tenant, model_id, ids, actor)
+
+    def _evaluate(self, tenant, model_id, ids, actor):
         model = self.get(tenant, model_id)
         if model is None or not model_id.startswith("model-"):
             raise KeyError("Unknown tenant model")

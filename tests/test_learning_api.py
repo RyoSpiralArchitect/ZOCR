@@ -95,7 +95,7 @@ def test_consent_is_actor_bound_and_tenant_scoped(learning_api):
 def test_document_bytes_and_families_cannot_cross_splits(learning_api):
     client, make, auth, _ = learning_api
     register(client, make, auth, 2, "train", "document-family")
-    for scale, group in ((2, "renamed-document"), (3, "document-family")):
+    for scale, group in ((2, "renamed-document"), (3, "document-family"), (4, " document-family ")):
         review, request, _ = make(scale, "test", group)
         response = client.post(f"/v1/reviews/{review['review_id']}/learning-samples", headers=auth, json=request)
         assert response.status_code == 409, response.text

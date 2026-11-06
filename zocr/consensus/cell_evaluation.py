@@ -71,7 +71,7 @@ def load_cell_dataset(path, memory=None):
     if memory is not None and (not lineage.get("document_lineage_complete") or not lineage.get("training_document_sha256")):
         raise ValueError("Candidate memory lacks document-level training lineage")
     excluded = set(lineage.get("training_document_sha256", [])) | set(lineage.get("selection_document_sha256", []))
-    rows, ids, pixels, docs = [], set(), set(), {}
+    rows, ids, pixels, docs = [], set(), {}, {}
     for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -94,7 +94,8 @@ def load_cell_dataset(path, memory=None):
                 docs[document] = hashlib.sha256(_read_bounded(document, 64 * 1024 * 1024)).hexdigest()
             document_hash = docs[document]
             excluded_groups = set(lineage.get("training_group_ids", [])) | set(lineage.get("selection_group_ids", []))
-            if document_hash in excluded or row.get("group_id", document_hash) in excluded_groups:
+            row["group_id"] = row["group_id"].strip()
+            if document_hash in excluded or row["group_id"] in excluded_groups:
                 raise ValueError("Test document was used for training or candidate selection")
             data = _read_bounded(image_path, 4 * 1024 * 1024)
             with Image.open(io.BytesIO(data)) as image:
@@ -104,10 +105,12 @@ def load_cell_dataset(path, memory=None):
                 pixel_hash = hashlib.sha256(_json_bytes(image.size) + image.tobytes()).hexdigest()
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG")
-            if row["id"] in ids or pixel_hash in pixels:
-                raise ValueError("Repeated evaluation IDs or pixels")
+            if row["id"] in ids:
+                raise ValueError("Repeated evaluation IDs")
+            if pixel_hash in pixels and pixels[pixel_hash] != row["text"]:
+                raise ValueError("Conflicting reference labels for identical cell pixels")
             ids.add(row["id"])
-            pixels.add(pixel_hash)
+            pixels[pixel_hash] = row["text"]
             rows.append({"id": row["id"], "expected": row["text"], "document_sha256": document_hash,
                          "source_kind": row["source_kind"], "pixels_sha256": pixel_hash,
                          "annotation_sha256": hashlib.sha256(_json_bytes(row)).hexdigest(),
@@ -145,6 +148,8 @@ def evaluate_cells(dataset, outdir, *, memory=None, allowed_chars=None, timeout_
               "model": "explicit_memory" if memory else "builtin_atlas", "allowed_chars": allowed_chars,
               "metrics": text_metrics([(row["expected"], row["predicted"]) for row in predictions]),
               "predictions": predictions, "training_or_selection": False,
+              "unique_cell_pixel_count": len({row["pixels_sha256"] for row in predictions}),
+              "document_count": len({row["document_sha256"] for row in predictions}),
               "real_document_samples": sum(row["source_kind"] == "real_document" for row in predictions),
               "limitations": ["Source kind and gold labels are asserted by the dataset owner.",
                               "Repeated inspection of final-test results can bias later model selection.",

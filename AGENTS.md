@@ -63,7 +63,8 @@
 - Each JSONL record requires `id`, `image`, single-character `text`, `group_id`,
   `split` (`train` or `holdout`), `approved: true`, `reviewer`, and `reason`.
   Images must be inside the dataset directory. Training and holdout document groups
-  must be disjoint; repeated source or normalized glyph pixels are rejected.
+  must be disjoint; repeated source/normalized glyph pixels across splits or with
+  conflicting labels are rejected. Same-label repeats within a split are allowed.
 - Holdout data needs at least two document groups. It is selection data, not an
   independent final test. Approval fields are asserted by the local dataset owner,
   unlike authenticated server review actors. Do not claim page-level OCR accuracy.
@@ -109,3 +110,10 @@
   aggregate results improve. Passing this veto still only recommends manual review.
   Never tune on a final test after inspecting a regression; use new train/selection
   data and a new independent final set for the next improvement experiment.
+- API-key tenant omission never grants admin. A tenant-bound admin role grants
+  no platform-governance access; platform root uses an explicitly privileged,
+  tenant-unbound principal. Explicit governance scopes retain their separate
+  approval workflow. Tenant-bound audit reads remain limited to their own tenant.
+- Canonical document-group IDs are whitespace-trimmed. Learning and evaluation
+  share a tenant execution lock. Repeated test-cell occurrences retain corpus
+  weighting; reports expose unique pixel and document counts, not IID confidence.

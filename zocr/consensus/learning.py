@@ -58,7 +58,7 @@ def load_glyph_dataset(dataset: str | Path, allowed_chars: str) -> dict[str, Any
     path = Path(dataset).resolve()
     raw = _read_bounded(path, 2 * 1024 * 1024)
     samples = []
-    ids, pixels, sources = set(), set(), set()
+    ids, pixels, sources = set(), {}, {}
     groups = {"train": set(), "holdout": set()}
     for line_number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not line.strip():
@@ -94,11 +94,14 @@ def load_glyph_dataset(dataset: str | Path, allowed_chars: str) -> dict[str, Any
             png = buffer.getvalue()
             pixel_hash = hashlib.sha256(png).hexdigest()
             source_hash = hashlib.sha256(image_bytes).hexdigest()
-            if record["id"] in ids or pixel_hash in pixels or source_hash in sources:
-                raise ValueError("Duplicate IDs or repeated image pixels would contaminate the evaluation")
+            if record["id"] in ids:
+                raise ValueError("Duplicate IDs would contaminate the evaluation")
+            for seen, key in ((pixels, pixel_hash), (sources, source_hash)):
+                if key in seen and seen[key] != (split, label):
+                    raise ValueError("Cross-split or conflicting image pixels would contaminate the evaluation")
+                seen[key] = (split, label)
             ids.add(record["id"])
-            pixels.add(pixel_hash)
-            sources.add(source_hash)
+            record["group_id"] = record["group_id"].strip()
             groups[split].add(record["group_id"])
             samples.append({"id": record["id"], "label": label, "split": split, "group_id": record["group_id"],
                             "png": base64.b64encode(png).decode("ascii"), "glyph_sha256": pixel_hash,

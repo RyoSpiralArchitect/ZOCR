@@ -641,6 +641,9 @@ def create_app():
                     authorization=authorization,
                 )
                 auth_backend.require_scopes(principal, *required_scopes)
+                if (auth_backend.enabled and principal.tenant_id is not None and principal.is_admin
+                        and request.url.path.startswith("/v1/admin/") and request.url.path != "/v1/admin/audit-events"):
+                    raise AuthError(403, "Tenant-bound admin does not grant platform governance")
                 request.state.principal = principal
                 request.state.tenant_id = principal.tenant_id
                 _apply_rate_limit(
